@@ -1,0 +1,49 @@
+{
+  "format": "ciao-phase2-provider-output-v1",
+  "comment": "Host-side provider parsing cases. Consumed by the Rust suite; the app never sees raw provider output. All content is synthetic.",
+  "tmux": {
+    "version_stdout": "tmux 3.6b\n",
+    "version_expected": "3.6b",
+    "version_below_minimum_stdout": "tmux 2.9a\n",
+    "list_stdout": "api\u001f1\u001f3\u001f1789000000\nbad name\u001f0\u001f1\u001f1789000200\n0\u001f0\u001f1\u001f1789000100\nevil\u001fx\u001f1\u001f1789000300\ntoo\u001fmany\u001f1\u001f2\u001f1789000400\n",
+    "list_expected": {
+      "sessions": [
+        {
+          "name": "api",
+          "attached": true,
+          "windows": 3,
+          "created_unix": 1789000000
+        },
+        {
+          "name": "0",
+          "attached": false,
+          "windows": 1,
+          "created_unix": 1789000100
+        }
+      ],
+      "omitted": 3
+    },
+    "no_server_stderr": "no server running on /private/tmp/tmux-501/default\n"
+  },
+  "herdr": {
+    "version_stdout": "herdr 0.7.4\n",
+    "version_expected": "0.7.4",
+    "version_below_minimum_stdout": "herdr 0.6.9\n",
+    "list_stdout": "{\"sessions\":[{\"default\":true,\"name\":\"default\",\"running\":true,\"session_dir\":\"/Users/example/.config/herdr\",\"socket_path\":\"/Users/example/.config/herdr/herdr.sock\"},{\"default\":false,\"name\":\"boxes\",\"running\":false,\"session_dir\":\"/Users/example/.config/herdr/sessions/boxes\",\"socket_path\":\"/Users/example/.config/herdr/sessions/boxes/herdr.sock\",\"future_field\":{\"ignored\":true}},{\"default\":false,\"name\":\"bad name!\",\"running\":true}]}",
+    "list_expected": {
+      "sessions": [
+        {
+          "name": "default",
+          "running": true,
+          "is_default": true
+        },
+        {
+          "name": "boxes",
+          "running": false,
+          "is_default": false
+        }
+      ],
+      "omitted": 1
+    }
+  }
+}

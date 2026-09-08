@@ -1,0 +1,164 @@
+{
+  "format": "ciao-phase9-terminal-commands-v1",
+  "comment": "The slash-command list a phone offers for a terminal pane. Rows are seeded from a live 2026-08-20 read of the pinned pair (Claude Code 2.1.233 / Agent SDK 0.3.233) via supportedCommands(), which reported 138 commands on the owner's Mac: a built-in with an argument hint, one carrying the vendor's aliases (/cost and /stats both resolve to /usage), a plugin-namespaced skill reachable by its unprefixed shorthand, one with no description at all, and one hand-kept terminal-only command the vendor advertises nowhere. Descriptions here are already clipped to the wire bound; the vendor's own run past 400 bytes. Every entry under refused_* is annotated in `why` alongside the frame. Unknown *keys* are skipped by consumers rather than refused, so a newer host cannot delete the feature on an older app; unknown or malformed *values* are still refused whole.",
+  "request": {
+    "v": 1,
+    "type": "request",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "method": "terminal.commands.v1",
+    "params": {
+      "target": "herdr.attach",
+      "session": "default"
+    }
+  },
+  "response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "commands": [
+        {
+          "name": "compact",
+          "hint": "<optional custom summarization instructions>",
+          "description": "Summarize the conversation so far and free up context"
+        },
+        {
+          "name": "usage",
+          "description": "Show plan usage limits and current consumption",
+          "aliases": [
+            "cost",
+            "stats"
+          ]
+        },
+        {
+          "name": "woz:woz-review",
+          "description": "WOZCODE deep multi-persona code review",
+          "aliases": [
+            "woz-review"
+          ]
+        },
+        {
+          "name": "context"
+        },
+        {
+          "name": "exit",
+          "description": "Leave Claude Code and return to the shell",
+          "terminal": true
+        }
+      ]
+    }
+  },
+  "empty_response_comment": "Every reason the host cannot vouch for a list looks identical on the wire: no agent in the pane, an agent that is not Claude, no managed runtime installed, a probe that timed out. The phone shows no picker for all of them and never learns which.",
+  "empty_response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "commands": []
+    }
+  },
+  "refused_requests": [
+    {
+      "why": "A plain shell has no multiplexer to ask, so it is refused rather than answered empty.",
+      "frame": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "terminal.commands.v1",
+        "params": {
+          "target": "shell",
+          "session": "default"
+        }
+      }
+    },
+    {
+      "why": "An agent route names no provider either.",
+      "frame": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "terminal.commands.v1",
+        "params": {
+          "target": "agent_route",
+          "session": "default"
+        }
+      }
+    },
+    {
+      "why": "A session name outside the §5.4 alphabet never reaches a provider argv.",
+      "frame": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "terminal.commands.v1",
+        "params": {
+          "target": "herdr.attach",
+          "session": "=default"
+        }
+      }
+    }
+  ],
+  "refused_responses": [
+    {
+      "why": "A command name carrying whitespace would be typed into a terminal as two words.",
+      "frame": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {
+          "commands": [
+            {
+              "name": "two words"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "why": "A name is an identifier; a slash inside one names a path, not a command.",
+      "frame": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {
+          "commands": [
+            {
+              "name": "a/b"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "why": "An empty name would render as a bare slash.",
+      "frame": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {
+          "commands": [
+            {
+              "name": ""
+            }
+          ]
+        }
+      }
+    },
+    {
+      "why": "A control byte in display text is refused even though the name is fine.",
+      "frame": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {
+          "commands": [
+            {
+              "name": "compact",
+              "description": "bell\u0007here"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

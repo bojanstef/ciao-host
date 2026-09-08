@@ -1,0 +1,37 @@
+{
+  "format": "generated-disposable-v2",
+  "reference_time": 1784479700,
+  "host_endpoint_id": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6",
+  "relay_url": "https://relay.example.invalid/",
+  "valid_expires_at": 1784480000,
+  "expired_expires_at": 1784479699,
+  "valid_uri": "ciao://pair/AgABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uL2pdAQCuWP-IMyQayC1v92EQRu1ntQctFCxYjQBj6ULZp1UCtmh0dHBzOi8vcmVsYXkuZXhhbXBsZS5pbnZhbGlkLw",
+  "expired_uri": "ciao://pair/AgABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uL2pc_9OuWP-IMyQayC1v92EQRu1ntQctFCxYjQBj6ULZp1UCtmh0dHBzOi8vcmVsYXkuZXhhbXBsZS5pbnZhbGlkLw",
+  "malformed": [
+    {
+      "name": "invalid_base64url",
+      "mutation": "invalid_base64url",
+      "error": "malformed"
+    },
+    {
+      "name": "wrong_version",
+      "mutation": "wrong_version",
+      "error": "unsupported_version"
+    },
+    {
+      "name": "truncated",
+      "mutation": "truncated",
+      "error": "malformed"
+    },
+    {
+      "name": "invalid_relay_url",
+      "mutation": "invalid_relay_url",
+      "error": "invalid_ticket"
+    },
+    {
+      "name": "oversized_payload",
+      "mutation": "oversized_payload",
+      "error": "too_long"
+    }
+  ]
+}

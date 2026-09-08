@@ -1,0 +1,43 @@
+{
+  "format": "ciao-phase1-host-hello-v1",
+  "request": {
+    "v": 1,
+    "type": "request",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "method": "host.hello",
+    "params": {
+      "min_protocol": 1,
+      "max_protocol": 1
+    }
+  },
+  "response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "selected_protocol": 1,
+      "host_endpoint_id": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6",
+      "installation_endpoint_id": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "capabilities": [
+        "terminal.shell"
+      ],
+      "limits": {
+        "max_terminal_streams": 1,
+        "max_frame_payload_bytes": 16384,
+        "max_cols": 500,
+        "max_rows": 300,
+        "max_pixel_width": 16384,
+        "max_pixel_height": 16384
+      }
+    }
+  },
+  "error": {
+    "v": 1,
+    "type": "error",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "error": {
+      "code": "unsupported_version",
+      "message": "This Ciao host protocol version is not supported."
+    }
+  }
+}

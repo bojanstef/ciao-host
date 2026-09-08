@@ -1,0 +1,55 @@
+{
+  "request": {
+    "v": 1,
+    "type": "request",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "method": "host.info",
+    "params": {}
+  },
+  "response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v": 1,
+      "display_name": "fixture-host",
+      "platform": "linux",
+      "distribution": "debian",
+      "distribution_version": "13",
+      "architecture": "x86_64",
+      "machine_token": "3f2a9c8d1e4b5a6f7c8d9e0f1a2b3c4d",
+      "version": "0.1.8"
+    }
+  },
+  "valid_display_names": [
+    "a",
+    "fixture-host",
+    "1234567890123456789012345678901234567890123456789012345678901234",
+    "Hôte"
+  ],
+  "invalid_display_names": [
+    "",
+    " leading",
+    "trailing ",
+    "line\nbreak",
+    "control\u0085",
+    "separator\u2028",
+    "override\u202e",
+    "isolate\u2066",
+    "12345678901234567890123456789012345678901234567890123456789012345"
+  ],
+  "valid_tokens": ["a", "debian", "rocky-9", "13.1_x86", "12345678901234567890123456789012"],
+  "invalid_tokens": ["", "Debian", "has space", "plus+metadata", "123456789012345678901234567890123", "é"],
+  "valid_machine_tokens": [
+    "3f2a9c8d1e4b5a6f7c8d9e0f1a2b3c4d",
+    "00000000000000000000000000000000"
+  ],
+  "invalid_machine_tokens": [
+    "",
+    "3f2a9c8d1e4b5a6f7c8d9e0f1a2b3c4",
+    "3f2a9c8d1e4b5a6f7c8d9e0f1a2b3c4dd",
+    "3F2A9C8D1E4B5A6F7C8D9E0F1A2B3C4D",
+    "3f2a9c8d1e4b5a6f7c8d9e0f1a2b3g4d",
+    "3f2a9c8d-e4b5a6f7c8d9e0f1a2b3c4d"
+  ]
+}

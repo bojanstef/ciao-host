@@ -1,0 +1,960 @@
+{
+  "v": 1,
+  "negotiation": {
+    "legacy_capabilities": [
+      "terminal.shell",
+      "workspace.snapshot",
+      "agent.session.v1",
+      "terminal.agent_route.v1"
+    ],
+    "current_capabilities": [
+      "terminal.shell",
+      "workspace.snapshot",
+      "agent.session.v1",
+      "terminal.agent_route.v1",
+      "agent.session.managed.v1"
+    ]
+  },
+  "list": {
+    "v": 1,
+    "type": "agent_session_list",
+    "sessions": [
+      {
+        "v": 1,
+        "session_id": "managed-live",
+        "adapter_family": "Fixture",
+        "adapter_version": "1.0.0",
+        "topology": "managed",
+        "presence": "live",
+        "process_generation": 3,
+        "observation": {
+          "coverage": "authoritative",
+          "reason_code": "worker_stream",
+          "last_authoritative_at": 1700000100
+        },
+        "turn": {
+          "state": "idle"
+        },
+        "capabilities": {
+          "history": "live_tail",
+          "commands": {
+            "prompt": true,
+            "steer": false,
+            "follow_up": false,
+            "interrupt": true
+          },
+          "interactions": {
+            "permission": {
+              "enabled": true,
+              "max_questions": 1,
+              "max_options_per_question": 4,
+              "allows_free_text": false
+            },
+            "question": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "plan_decision": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "review_decision": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "elicitation": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "generic_choice": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            }
+          },
+          "pending_rehydration": "current_process",
+          "terminal_continuity": "unavailable"
+        },
+        "workspace_display": "Fixture workspace",
+        "terminal_fallback": {
+          "continuity": "unavailable",
+          "availability_reason": "managed_headless"
+        },
+        "revision": 4,
+        "updated_at": 1700000101
+      },
+      {
+        "v": 1,
+        "session_id": "managed-stored",
+        "adapter_family": "Fixture",
+        "adapter_version": "1.0.0",
+        "topology": "managed",
+        "presence": "stored",
+        "stored_reason": "stopped",
+        "process_generation": 2,
+        "observation": {
+          "coverage": "unavailable",
+          "reason_code": "worker_not_running"
+        },
+        "turn": {
+          "state": "idle"
+        },
+        "capabilities": {
+          "history": "none",
+          "commands": {
+            "prompt": false,
+            "steer": false,
+            "follow_up": false,
+            "interrupt": false
+          },
+          "interactions": {
+            "permission": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "question": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "plan_decision": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "review_decision": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "elicitation": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "generic_choice": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            }
+          },
+          "pending_rehydration": "none",
+          "terminal_continuity": "unavailable"
+        },
+        "workspace_display": "Fixture workspace",
+        "terminal_fallback": {
+          "continuity": "unavailable",
+          "availability_reason": "managed_headless"
+        },
+        "revision": 9,
+        "updated_at": 1700000102
+      },
+      {
+        "v": 1,
+        "session_id": "managed-released",
+        "adapter_family": "Fixture",
+        "adapter_version": "1.0.0",
+        "topology": "managed",
+        "presence": "stored",
+        "stored_reason": "released",
+        "process_generation": 4,
+        "observation": {
+          "coverage": "unavailable",
+          "reason_code": "worker_not_running"
+        },
+        "turn": {
+          "state": "idle"
+        },
+        "capabilities": {
+          "history": "none",
+          "commands": {
+            "prompt": false,
+            "steer": false,
+            "follow_up": false,
+            "interrupt": false
+          },
+          "interactions": {
+            "permission": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "question": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "plan_decision": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "review_decision": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "elicitation": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            },
+            "generic_choice": {
+              "enabled": false,
+              "max_questions": 0,
+              "max_options_per_question": 0,
+              "allows_free_text": false
+            }
+          },
+          "pending_rehydration": "none",
+          "terminal_continuity": "resumable_session"
+        },
+        "workspace_display": "Fixture workspace",
+        "terminal_fallback": {
+          "continuity": "resumable_session",
+          "handback_session": "ciao-fixture-a1b2c3d4"
+        },
+        "revision": 12,
+        "updated_at": 1700000103
+      }
+    ],
+    "omitted_sessions": 0
+  },
+  "snapshot": {
+    "v": 1,
+    "session_id": "managed-live",
+    "snapshot_epoch": 2,
+    "revision": 4,
+    "process_generation": 3,
+    "adapter": {
+      "family": "Fixture",
+      "version": "1.0.0",
+      "compatibility": "compatible"
+    },
+    "topology": "managed",
+    "presence": "live",
+    "control_owner": "none",
+    "observation": {
+      "coverage": "authoritative",
+      "reason_code": "worker_stream",
+      "last_authoritative_at": 1700000100
+    },
+    "turn": {
+      "state": "running",
+      "run_id": "run-1",
+      "activity": "responding"
+    },
+    "capabilities": {
+      "history": "live_tail",
+      "commands": {
+        "prompt": true,
+        "steer": false,
+        "follow_up": false,
+        "interrupt": true
+      },
+      "interactions": {
+        "permission": {
+          "enabled": true,
+          "max_questions": 1,
+          "max_options_per_question": 4,
+          "allows_free_text": false
+        },
+        "question": {
+          "enabled": false,
+          "max_questions": 0,
+          "max_options_per_question": 0,
+          "allows_free_text": false
+        },
+        "plan_decision": {
+          "enabled": false,
+          "max_questions": 0,
+          "max_options_per_question": 0,
+          "allows_free_text": false
+        },
+        "review_decision": {
+          "enabled": false,
+          "max_questions": 0,
+          "max_options_per_question": 0,
+          "allows_free_text": false
+        },
+        "elicitation": {
+          "enabled": false,
+          "max_questions": 0,
+          "max_options_per_question": 0,
+          "allows_free_text": false
+        },
+        "generic_choice": {
+          "enabled": false,
+          "max_questions": 0,
+          "max_options_per_question": 0,
+          "allows_free_text": false
+        }
+      },
+      "pending_rehydration": "current_process",
+      "terminal_continuity": "unavailable"
+    },
+    "pending_interactions": [],
+    "timeline_window": {
+      "entries": [
+        {
+          "entry_id": "entry-boundary",
+          "entry_revision": 1,
+          "sequence": 1,
+          "timestamp": 1700000100,
+          "state": "complete",
+          "kind": "system",
+          "body": {
+            "type": "text",
+            "text": "Synthetic history boundary."
+          },
+          "truncation": {
+            "truncated": false
+          }
+        },
+        {
+          "entry_id": "entry-user",
+          "entry_revision": 1,
+          "sequence": 2,
+          "timestamp": 1700000101,
+          "state": "complete",
+          "kind": "user_message",
+          "body": {
+            "type": "text",
+            "text": "Synthetic user entry."
+          },
+          "truncation": {
+            "truncated": false
+          }
+        },
+        {
+          "entry_id": "entry-assistant",
+          "entry_revision": 1,
+          "sequence": 3,
+          "timestamp": 1700000102,
+          "state": "streaming",
+          "kind": "assistant_message",
+          "body": {
+            "type": "text",
+            "text": "Synthetic assistant fragment."
+          },
+          "truncation": {
+            "truncated": false
+          }
+        }
+      ],
+      "has_older": false,
+      "history_boundary": "resume",
+      "oldest_sequence": 1,
+      "newest_sequence": 3,
+      "truncated": false
+    },
+    "terminal_fallback": {
+      "continuity": "unavailable",
+      "availability_reason": "managed_headless"
+    },
+    "latest_command_receipts": []
+  },
+  "stored_reason_cases": [
+    "stopped",
+    "daemon_restart",
+    "worker_crash",
+    "unsupported_version",
+    "externally_owned"
+  ],
+  "workspaces": {
+    "v": 1,
+    "type": "agent_workspace_list",
+    "workspaces": [
+      {
+        "workspace_id": "workspace-a",
+        "display_label": "Fixture workspace A"
+      },
+      {
+        "workspace_id": "workspace-b",
+        "display_label": "Fixture workspace B"
+      }
+    ],
+    "omitted_workspaces": 0
+  },
+  "lifecycle_opens": [
+    {
+      "v": 1,
+      "type": "agent_stream_open",
+      "client_instance_id": "fixture-client",
+      "operation": "agent.workspaces.list",
+      "capabilities": [
+        "agent.session.v1",
+        "agent.session.managed.v1"
+      ]
+    },
+    {
+      "v": 1,
+      "type": "agent_stream_open",
+      "client_instance_id": "fixture-client",
+      "operation": "agent.managed.start",
+      "capabilities": [
+        "agent.session.v1",
+        "agent.session.managed.v1"
+      ],
+      "workspace_id": "workspace-a",
+      "lifecycle_command_id": "lifecycle-start"
+    },
+    {
+      "v": 1,
+      "type": "agent_stream_open",
+      "client_instance_id": "fixture-client",
+      "operation": "agent.managed.stop",
+      "capabilities": [
+        "agent.session.v1",
+        "agent.session.managed.v1"
+      ],
+      "session_id": "managed-live",
+      "lifecycle_command_id": "lifecycle-stop",
+      "expected_generation": 3
+    },
+    {
+      "v": 1,
+      "type": "agent_stream_open",
+      "client_instance_id": "fixture-client",
+      "operation": "agent.managed.resume",
+      "capabilities": [
+        "agent.session.v1",
+        "agent.session.managed.v1"
+      ],
+      "session_id": "managed-stored",
+      "lifecycle_command_id": "lifecycle-resume"
+    },
+    {
+      "v": 1,
+      "type": "agent_stream_open",
+      "client_instance_id": "fixture-client",
+      "operation": "agent.managed.release",
+      "capabilities": [
+        "agent.session.v1",
+        "agent.session.managed.v1"
+      ],
+      "session_id": "managed-live",
+      "lifecycle_command_id": "lifecycle-release"
+    }
+  ],
+  "lifecycle_outcomes": [
+    {
+      "v": 1,
+      "command_id": "lifecycle-start",
+      "state": "accepted",
+      "session_id": "managed-new"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-start",
+      "state": "accepted",
+      "session_id": "managed-new",
+      "deduplicated": true
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-stop",
+      "state": "accepted",
+      "session_id": "managed-live"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-resume",
+      "state": "accepted",
+      "session_id": "managed-stored",
+      "process_generation": 3
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-start-unsupported",
+      "state": "refused",
+      "reason_code": "unsupported_version"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-start-runtime",
+      "state": "refused",
+      "reason_code": "runtime_unavailable"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-start-record-limit",
+      "state": "refused",
+      "reason_code": "record_limit"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-start-workspace",
+      "state": "refused",
+      "reason_code": "unknown_workspace"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-stop-stale",
+      "state": "refused",
+      "reason_code": "stale_generation"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-resume-foreign",
+      "state": "refused",
+      "reason_code": "foreign_owner_live"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-resume-external",
+      "state": "refused",
+      "reason_code": "externally_owned"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-resume-live",
+      "state": "refused",
+      "reason_code": "already_live"
+    },
+    {
+      "v": 1,
+      "command_id": "lifecycle-resume-unknown",
+      "state": "refused",
+      "reason_code": "unknown_session"
+    }
+  ],
+  "interaction_response_commands": [
+    {
+      "v": 1,
+      "command_id": "respond-allow",
+      "session_id": "managed-live",
+      "snapshot_epoch": 2,
+      "expected_generation": 3,
+      "kind": {
+        "type": "interaction_response",
+        "interaction_id": "interaction-managed-permission",
+        "interaction_revision": 1,
+        "answer": {
+          "type": "choices",
+          "choice_ids": [
+            "allow-once"
+          ]
+        }
+      }
+    },
+    {
+      "v": 1,
+      "command_id": "respond-deny",
+      "session_id": "managed-live",
+      "snapshot_epoch": 2,
+      "expected_generation": 3,
+      "kind": {
+        "type": "interaction_response",
+        "interaction_id": "interaction-managed-permission",
+        "interaction_revision": 1,
+        "answer": {
+          "type": "choices",
+          "choice_ids": [
+            "deny"
+          ]
+        }
+      }
+    },
+    {
+      "v": 1,
+      "command_id": "respond-questions",
+      "session_id": "managed-live",
+      "snapshot_epoch": 2,
+      "expected_generation": 3,
+      "kind": {
+        "type": "interaction_response",
+        "interaction_id": "interaction-managed-question",
+        "interaction_revision": 1,
+        "answer": {
+          "type": "questions",
+          "answers": [
+            {
+              "question_id": "q0",
+              "choice_ids": [
+                "q0-o1"
+              ]
+            },
+            {
+              "question_id": "q1",
+              "choice_ids": [
+                "q1-o0"
+              ],
+              "text": "and FreeBSD"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "interaction_resolution_cases": [
+    {
+      "name": "applied",
+      "receipt_state": "applied",
+      "interaction_resolution": "applied"
+    },
+    {
+      "name": "already_resolved",
+      "receipt_state": "rejected",
+      "interaction_resolution": "already_resolved"
+    },
+    {
+      "name": "stale_revision",
+      "receipt_state": "rejected",
+      "interaction_resolution": "stale"
+    },
+    {
+      "name": "expired_by_interrupt",
+      "receipt_state": "rejected",
+      "interaction_resolution": "expired"
+    },
+    {
+      "name": "unknown_interaction",
+      "receipt_state": "rejected",
+      "interaction_resolution": "unknown_interaction"
+    }
+  ],
+  "permission_cases": [
+    {
+      "interaction_id": "interaction-managed-permission",
+      "interaction_revision": 1,
+      "kind": "permission",
+      "blocking": true,
+      "created_at": 1700000110,
+      "title": "Synthetic tool permission",
+      "body": "Synthetic bounded permission body.",
+      "response_schema": {
+        "type": "choices",
+        "minimum": 1,
+        "maximum": 1,
+        "choices": [
+          {
+            "choice_id": "allow-once",
+            "label": "Allow once",
+            "scope": "once"
+          },
+          {
+            "choice_id": "allow-local-settings",
+            "label": "Always allow in this workspace",
+            "scope": "local_settings"
+          },
+          {
+            "choice_id": "deny",
+            "label": "Deny",
+            "scope": "request"
+          }
+        ]
+      },
+      "terminal_fallback": {
+        "continuity": "unavailable",
+        "availability_reason": "managed_headless"
+      },
+      "state": "pending"
+    },
+    {
+      "interaction_id": "interaction-managed-question",
+      "interaction_revision": 1,
+      "kind": "question",
+      "blocking": true,
+      "created_at": 1700000112,
+      "title": "Claude has 2 questions",
+      "body": "",
+      "response_schema": {
+        "type": "questions",
+        "questions": [
+          {
+            "question_id": "q0",
+            "prompt": "Which transport should it use?",
+            "response_kind": "single_choice",
+            "required": true,
+            "header": "Transport",
+            "options": [
+              {
+                "choice_id": "q0-o0",
+                "label": "Iroh",
+                "description": "Direct QUIC where possible."
+              },
+              {
+                "choice_id": "q0-o1",
+                "label": "Relay only",
+                "description": "Always through the relay."
+              }
+            ],
+            "max_text_bytes": 4096
+          },
+          {
+            "question_id": "q1",
+            "prompt": "Which platforms should it cover?",
+            "response_kind": "multi_choice",
+            "required": true,
+            "header": "Platforms",
+            "options": [
+              {
+                "choice_id": "q1-o0",
+                "label": "macOS",
+                "description": "The qualified host."
+              },
+              {
+                "choice_id": "q1-o1",
+                "label": "Linux",
+                "description": "Unaccepted."
+              }
+            ],
+            "max_text_bytes": 4096
+          }
+        ]
+      },
+      "terminal_fallback": {
+        "continuity": "unavailable",
+        "availability_reason": "managed_headless"
+      },
+      "state": "pending"
+    },
+    {
+      "interaction_id": "interaction-managed-unsupported",
+      "interaction_revision": 1,
+      "kind": "unsupported",
+      "blocking": true,
+      "created_at": 1700000111,
+      "body": "Synthetic unsupported request.",
+      "response_schema": {
+        "type": "choices",
+        "minimum": 1,
+        "maximum": 1,
+        "choices": [
+          {
+            "choice_id": "deny",
+            "label": "Deny",
+            "scope": "request"
+          }
+        ]
+      },
+      "terminal_fallback": {
+        "continuity": "unavailable",
+        "availability_reason": "managed_headless"
+      },
+      "state": "pending"
+    }
+  ],
+  "receipt_cases": [
+    {
+      "command_id": "prompt-accepted",
+      "session_id": "managed-live",
+      "process_generation": 3,
+      "snapshot_epoch": 2,
+      "state": "accepted",
+      "updated_at": 1700000120
+    },
+    {
+      "command_id": "prompt-applied-replay",
+      "session_id": "managed-live",
+      "process_generation": 3,
+      "snapshot_epoch": 2,
+      "state": "applied",
+      "updated_at": 1700000121,
+      "application_evidence": "replay_correlated"
+    },
+    {
+      "command_id": "interrupt-applied-receipt",
+      "session_id": "managed-live",
+      "process_generation": 3,
+      "snapshot_epoch": 2,
+      "state": "applied",
+      "updated_at": 1700000122,
+      "application_evidence": "interrupt_receipt"
+    },
+    {
+      "command_id": "prompt-outcome-unknown",
+      "session_id": "managed-live",
+      "process_generation": 3,
+      "snapshot_epoch": 2,
+      "state": "outcome_unknown",
+      "updated_at": 1700000123,
+      "reason_code": "worker_exited"
+    },
+    {
+      "command_id": "prompt-stale-stored",
+      "session_id": "managed-live",
+      "process_generation": 3,
+      "snapshot_epoch": 2,
+      "state": "unavailable",
+      "updated_at": 1700000124,
+      "reason_code": "presence_stored"
+    }
+  ],
+  "deltas": [
+    {
+      "v": 1,
+      "session_id": "managed-live",
+      "snapshot_epoch": 2,
+      "process_generation": 3,
+      "base_revision": 4,
+      "revision": 5,
+      "changes": [
+        {
+          "type": "upsert_interaction",
+          "interaction": {
+            "interaction_id": "interaction-managed-permission",
+            "interaction_revision": 1,
+            "kind": "permission",
+            "blocking": true,
+            "created_at": 1700000110,
+            "title": "Synthetic tool permission",
+            "body": "Synthetic bounded permission body.",
+            "response_schema": {
+              "type": "choices",
+              "minimum": 1,
+              "maximum": 1,
+              "choices": [
+                {
+                  "choice_id": "allow-once",
+                  "label": "Allow once",
+                  "scope": "once"
+                },
+                {
+                  "choice_id": "deny",
+                  "label": "Deny",
+                  "scope": "request"
+                }
+              ]
+            },
+            "terminal_fallback": {
+              "continuity": "unavailable",
+              "availability_reason": "managed_headless"
+            },
+            "state": "pending"
+          }
+        }
+      ]
+    },
+    {
+      "v": 1,
+      "session_id": "managed-live",
+      "snapshot_epoch": 2,
+      "process_generation": 3,
+      "base_revision": 5,
+      "revision": 6,
+      "changes": [
+        {
+          "type": "remove_interaction",
+          "interaction_id": "interaction-managed-permission",
+          "resolution": "applied"
+        },
+        {
+          "type": "turn",
+          "turn": {
+            "state": "running",
+            "run_id": "run-1",
+            "activity": "responding"
+          }
+        }
+      ]
+    },
+    {
+      "v": 1,
+      "session_id": "managed-live",
+      "snapshot_epoch": 2,
+      "process_generation": 3,
+      "base_revision": 6,
+      "revision": 7,
+      "changes": [
+        {
+          "type": "command_receipt",
+          "receipt": {
+            "command_id": "prompt-accepted",
+            "session_id": "managed-live",
+            "process_generation": 3,
+            "snapshot_epoch": 2,
+            "state": "applied",
+            "updated_at": 1700000125,
+            "application_evidence": "replay_correlated"
+          }
+        }
+      ]
+    },
+    {
+      "v": 1,
+      "session_id": "managed-live",
+      "snapshot_epoch": 2,
+      "process_generation": 3,
+      "base_revision": 7,
+      "revision": 8,
+      "changes": [
+        {
+          "type": "model_catalogue",
+          "models": [
+            {
+              "value": "claude-opus-5[1m]",
+              "display_name": "Opus 5 (1M)",
+              "supports_effort": true,
+              "supported_effort_levels": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            },
+            {
+              "value": "claude-sonnet-5",
+              "display_name": "Sonnet 5",
+              "supports_effort": false
+            }
+          ]
+        },
+        {
+          "type": "model",
+          "model": "claude-opus-5[1m]"
+        },
+        {
+          "type": "effort",
+          "effort": "xhigh"
+        }
+      ]
+    }
+  ],
+  "hostile_route_delta": {
+    "v": 1,
+    "session_id": "managed-live",
+    "snapshot_epoch": 2,
+    "process_generation": 3,
+    "base_revision": 4,
+    "revision": 5,
+    "changes": [
+      {
+        "type": "terminal_fallback",
+        "terminal_fallback": {
+          "continuity": "exact_live",
+          "route_id": "route-fabricated"
+        }
+      }
+    ]
+  },
+  "fences": {
+    "stale_generation": 2,
+    "stale_epoch": 1,
+    "duplicate_revision": 4,
+    "gapped_revision": 7
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "notification_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "nonce": "AAECAwQFBgcICQoL",
+  "aad": "ciao-notify-activity-v1",
+  "plaintext": "{\"v\":1,\"host\":\"Studio Mac\",\"updated_at\":1755421200,\"sessions\":[{\"id\":\"11111111111111111111111111111111\",\"agent\":\"Claude\",\"workspace\":\"ciao\",\"prompt\":\"Fix the reconnect wedge\",\"state\":\"needs_input\",\"updated_at\":1755421195},{\"id\":\"22222222222222222222222222222222\",\"agent\":\"Pi\",\"workspace\":\"relay-lab\",\"state\":\"active\",\"updated_at\":1755421170}]}",
+  "sealed": "AAECAwQFBgcICQoL8tl-IhMmiWLf7EyHuicsML0F1o4-VODYhbUD5wCwwl2Y5Uish2qTogYFQ-1Rpr4RTrSFVo5Ny-h717d0snXFrVsR2O_fNh3Y9Sd8jSlN7cDr73YDXlvBDz9mwT_pTDOOfO9dwsboBdiTOpTSzOWVusssOln8OSXaY09DsAtUzDbABaafkxG8BSh8XVYOTBlV2QHzUDFNijdKwdNZwTvSXFzW74bYJ-DG-RsCdwKTwyKtIMc-cnlAN7Z6i_UUaf1-qTIrrU_fem9JKVFrqRkMeUDi9AtTOptlJxgVkIY2B98FJyiKrII30ujIOnSZKqa-wm2ZyllJmKyMslnp188zELGjMLtbZpq2-r36KR7T5Myla4b6NL4T23AVDQ12B5tsBV08dJZE3TlhFXz5tnsuYk0SieyPpx36fsp_4Q5BG9lmP_pgfQPw6s3WTLki8aaIX52_aN01AAUShvEz91cXLiYDAhh-27g"
+}

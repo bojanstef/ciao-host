@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "note": "ADR 005 sealed notification payload. ChaCha20-Poly1305 (RFC 8439): 12-byte nonce, 16-byte tag, wire form nonce ‖ ciphertext ‖ tag, base64url. The key is the one notification-key-v1.json derives, so the two fixtures chain: a pairing that agrees that key seals exactly this. The nonce is RFC 8439 section 2.8.2's, so a mismatch tells apart a broken cipher from broken framing. Plaintext keys are sorted because the host serializes a map; the device parses JSON and does not depend on the order. The host name carries a non-ASCII apostrophe on purpose — it is what a Mac is really called, and it pins UTF-8 handling across all three languages.",
+  "notification_key": "8ENERr542G6GfkLGv8hM71cr8Dqa2xSHy26C6mYWHsU",
+  "nonce": "BwAAAEBBQkNERUZH",
+  "aad": "ciao-notify-payload-v1",
+  "plaintext": "{\"host\":\"Alice’s Example Mac\",\"kind\":\"permission_prompt\",\"session\":\"claude-9f2c1a7e\",\"title\":\"seal the notification payload\",\"v\":1,\"workspace\":\"ciao\"}",
+  "sealed": "BwAAAEBBQkNERUZHjYBwu3hy-Z89rPTqwCqz5sMWmTrfGhE-E_2_xTCImZ1xCrE5smN95oQjkreD5B_KBPy27HYOl-qB45zbzNram0z6bCF_gsjUJZgcVtk6iFPaj3d_ly5FvSq1RCg-0Ho8qC09dUJhnGmhk8d5rLOd_t8NpUdsxgRMz6uDFj6_DelLueEd8J6Rz8WvGOHWB-hGVTGpJ6vE0EfIn7wTJBfhf2H-rN8Rnzk6"
+}

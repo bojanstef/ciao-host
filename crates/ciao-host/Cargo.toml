@@ -1,0 +1,40 @@
+[package]
+name = "ciao-host"
+version = "0.1.42"
+description = "Ciao host CLI and daemon"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ciao"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+clap.workspace = true
+iroh.workspace = true
+iroh-relay.workspace = true
+iroh-tickets.workspace = true
+nix.workspace = true
+parking_lot.workspace = true
+portable-pty.workspace = true
+qrcode.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+x25519-dalek.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

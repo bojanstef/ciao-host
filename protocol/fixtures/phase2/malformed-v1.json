@@ -1,0 +1,108 @@
+{
+  "format": "ciao-phase2-malformed-v1",
+  "session_names": {
+    "valid": ["a", "0", "api", "new-work", "box_1", "A-b_9", "0123456789012345678901234567890123456789012345678901234567890123"],
+    "invalid": [
+      "",
+      "-flag",
+      "_lead",
+      "bad name",
+      "semi;colon",
+      "dollar$",
+      "back`tick",
+      "dot.dot",
+      "slash/etc",
+      "café",
+      "tab\tsep",
+      "unit\u001fsep",
+      "newline\nname",
+      "01234567890123456789012345678901234567890123456789012345678901234"
+    ]
+  },
+  "snapshot_requests": [
+    {
+      "name": "unknown_param_field",
+      "json": "{\"v\":1,\"type\":\"request\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"method\":\"workspace.snapshot\",\"params\":{\"path\":\"/etc\"}}",
+      "error": "malformed_request"
+    },
+    {
+      "name": "missing_params",
+      "json": "{\"v\":1,\"type\":\"request\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"method\":\"workspace.snapshot\"}",
+      "error": "malformed_request"
+    },
+    {
+      "name": "short_request_id",
+      "json": "{\"v\":1,\"type\":\"request\",\"request_id\":\"c2hvcnQ\",\"method\":\"workspace.snapshot\",\"params\":{}}",
+      "error": "invalid_request_id"
+    },
+    {
+      "name": "wrong_version",
+      "json": "{\"v\":2,\"type\":\"request\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"method\":\"workspace.snapshot\",\"params\":{}}",
+      "error": "unsupported_version"
+    }
+  ],
+  "snapshot_results": [
+    {
+      "name": "unknown_state",
+      "json": "{\"v\":1,\"type\":\"response\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"result\":{\"v\":1,\"providers\":{\"tmux\":{\"state\":\"exploded\"},\"herdr\":{\"state\":\"not_installed\"}},\"omitted_sessions\":0}}",
+      "error": "invalid_control_value"
+    },
+    {
+      "name": "hostile_session_name",
+      "json": "{\"v\":1,\"type\":\"response\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"result\":{\"v\":1,\"providers\":{\"tmux\":{\"state\":\"available\",\"sessions\":[{\"name\":\"bad name\",\"attached\":false,\"windows\":1,\"created_unix\":1}]},\"herdr\":{\"state\":\"not_installed\"}},\"omitted_sessions\":0}}",
+      "error": "invalid_control_value"
+    },
+    {
+      "name": "oversize_version",
+      "json": "{\"v\":1,\"type\":\"response\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"result\":{\"v\":1,\"providers\":{\"tmux\":{\"state\":\"available\",\"version\":\"33333333333333333333333333333333333333333333333333333333333333333\",\"sessions\":[]},\"herdr\":{\"state\":\"not_installed\"}},\"omitted_sessions\":0}}",
+      "error": "invalid_control_value"
+    },
+    {
+      "name": "filesystem_path_field",
+      "json": "{\"v\":1,\"type\":\"response\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"result\":{\"v\":1,\"providers\":{\"tmux\":{\"state\":\"available\",\"sessions\":[]},\"herdr\":{\"state\":\"available\",\"sessions\":[{\"name\":\"default\",\"running\":true,\"is_default\":true,\"socket_path\":\"/tmp/x\"}]}},\"omitted_sessions\":0}}",
+      "error": "malformed_request"
+    },
+    {
+      "name": "sessions_on_missing_provider",
+      "json": "{\"v\":1,\"type\":\"response\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"result\":{\"v\":1,\"providers\":{\"tmux\":{\"state\":\"not_installed\",\"sessions\":[]},\"herdr\":{\"state\":\"not_installed\"}},\"omitted_sessions\":0}}",
+      "error": "invalid_control_value"
+    }
+  ],
+  "open_frames": [
+    {
+      "name": "session_missing",
+      "json": "{\"v\":1,\"target\":\"tmux.attach\",\"cols\":80,\"rows\":24,\"pixel_width\":0,\"pixel_height\":0}",
+      "error": "invalid_target"
+    },
+    {
+      "name": "session_on_shell",
+      "json": "{\"v\":1,\"target\":\"shell\",\"session\":\"api\",\"cols\":80,\"rows\":24,\"pixel_width\":0,\"pixel_height\":0}",
+      "error": "invalid_target"
+    },
+    {
+      "name": "hostile_name_space",
+      "json": "{\"v\":1,\"target\":\"tmux.attach\",\"session\":\"bad name\",\"cols\":80,\"rows\":24,\"pixel_width\":0,\"pixel_height\":0}",
+      "error": "invalid_target"
+    },
+    {
+      "name": "hostile_name_leading_dash",
+      "json": "{\"v\":1,\"target\":\"tmux.attach\",\"session\":\"-L/tmp/evil\",\"cols\":80,\"rows\":24,\"pixel_width\":0,\"pixel_height\":0}",
+      "error": "invalid_target"
+    },
+    {
+      "name": "hostile_name_oversize",
+      "json": "{\"v\":1,\"target\":\"herdr.attach\",\"session\":\"01234567890123456789012345678901234567890123456789012345678901234\",\"cols\":80,\"rows\":24,\"pixel_width\":0,\"pixel_height\":0}",
+      "error": "invalid_target"
+    },
+    {
+      "name": "unknown_target",
+      "json": "{\"v\":1,\"target\":\"zellij.attach\",\"session\":\"a\",\"cols\":80,\"rows\":24,\"pixel_width\":0,\"pixel_height\":0}",
+      "error": "unsupported_target"
+    },
+    {
+      "name": "unknown_field",
+      "json": "{\"v\":1,\"target\":\"tmux.attach\",\"session\":\"api\",\"command\":\"rm\",\"cols\":80,\"rows\":24,\"pixel_width\":0,\"pixel_height\":0}",
+      "error": "malformed_request"
+    }
+  ]
+}

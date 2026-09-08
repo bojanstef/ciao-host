@@ -1,0 +1,203 @@
+{
+  "format": "ciao-phase8-workspace-tabs-v1",
+  "comment": "Synthetic provider examples retaining the observed Herdr 0.8.0 and tmux 3.7b schema shapes. Workspace labels have been anonymized for publication. Covers one annotated tab per provider, unannotated tabs, workspace grouping, spaced and empty window names, malformed entries and errors.",
+  "snapshot_response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v": 1,
+      "providers": {
+        "tmux": {
+          "state": "available",
+          "version": "3.7b",
+          "sessions": [
+            {
+              "name": "api",
+              "attached": true,
+              "windows": 3,
+              "created_unix": 1789000000,
+              "tabs": [
+                {
+                  "id": "@1",
+                  "label": "vim",
+                  "focused": false
+                },
+                {
+                  "id": "@2",
+                  "label": "two words here",
+                  "focused": true,
+                  "agent_session_id": "session-a"
+                },
+                {
+                  "id": "@5",
+                  "label": "7",
+                  "focused": false
+                }
+              ]
+            },
+            {
+              "name": "lab",
+              "attached": false,
+              "windows": 1,
+              "created_unix": 1789000500
+            }
+          ]
+        },
+        "herdr": {
+          "state": "available",
+          "version": "0.8.0",
+          "sessions": [
+            {
+              "name": "default",
+              "running": true,
+              "is_default": true
+            },
+            {
+              "name": "boxes",
+              "running": true,
+              "is_default": false,
+              "tabs": [
+                {
+                  "id": "wV:tC",
+                  "label": "example-api",
+                  "focused": false,
+                  "status": "idle",
+                  "workspace": "example-api"
+                },
+                {
+                  "id": "wX:t19",
+                  "label": "example-lab",
+                  "focused": true,
+                  "status": "working",
+                  "agent_session_id": "session-b",
+                  "workspace": "iroh"
+                },
+                {
+                  "id": "wX:t8",
+                  "label": "example-site",
+                  "focused": false,
+                  "status": "unknown",
+                  "workspace": "iroh"
+                }
+              ]
+            },
+            {
+              "name": "checkout-api",
+              "running": false,
+              "is_default": false
+            }
+          ]
+        }
+      },
+      "omitted_sessions": 0
+    }
+  },
+  "snapshot_legacy_response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v": 1,
+      "providers": {
+        "tmux": {
+          "state": "available",
+          "version": "3.7b",
+          "sessions": [
+            {
+              "name": "api",
+              "attached": true,
+              "windows": 3,
+              "created_unix": 1789000000
+            }
+          ]
+        },
+        "herdr": {
+          "state": "available",
+          "version": "0.8.0",
+          "sessions": [
+            {
+              "name": "default",
+              "running": true,
+              "is_default": true
+            }
+          ]
+        }
+      },
+      "omitted_sessions": 0
+    }
+  },
+  "open_frames": [
+    {
+      "name": "tmux_attach_tab",
+      "payload": {
+        "v": 1,
+        "target": "tmux.attach",
+        "session": "api",
+        "tab": "@2",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    },
+    {
+      "name": "herdr_attach_tab",
+      "payload": {
+        "v": 1,
+        "target": "herdr.attach",
+        "session": "boxes",
+        "tab": "wX:t19",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    }
+  ],
+  "invalid_open_frames": [
+    {
+      "name": "create_refuses_tab",
+      "payload": {
+        "v": 1,
+        "target": "tmux.create",
+        "session": "new-work",
+        "tab": "@2",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    },
+    {
+      "name": "shell_refuses_tab",
+      "payload": {
+        "v": 1,
+        "target": "shell",
+        "tab": "@2",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    },
+    {
+      "name": "malformed_tab_id",
+      "payload": {
+        "v": 1,
+        "target": "herdr.attach",
+        "session": "boxes",
+        "tab": "wX:t19; rm -rf /",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    }
+  ],
+  "herdr_tab_list_stdout": "{\"id\":\"cli:tab:list\",\"result\":{\"tabs\":[{\"agent_status\":\"idle\",\"focused\":false,\"label\":\"example-api\",\"number\":12,\"pane_count\":1,\"tab_id\":\"wV:tC\",\"workspace_id\":\"wV\"},{\"agent_status\":\"working\",\"focused\":true,\"label\":\"example-lab\",\"number\":41,\"pane_count\":1,\"tab_id\":\"wX:t19\",\"workspace_id\":\"wX\"},{\"agent_status\":\"unknown\",\"focused\":false,\"label\":\"example-site\",\"number\":8,\"pane_count\":1,\"tab_id\":\"wX:t8\",\"workspace_id\":\"wX\"},{\"agent_status\":\"idle\",\"focused\":false,\"label\":\"evil\",\"number\":9,\"pane_count\":1,\"tab_id\":\"has space\",\"workspace_id\":\"wX\"}],\"type\":\"tab_list\"}}",
+  "herdr_tab_list_error_stdout": "{\"id\":\"cli:tab:list\",\"error\":{\"code\":\"server_not_running\",\"message\":\"no herdr server is running at /home/user/.config/herdr/sessions/x/herdr.sock; run `herdr session attach x` to start or attach it\"}}",
+  "tmux_window_list_stdout": "@1 0 1 api vim\n@2 1 2 api two words here\n@5 0 7 api \n@9 1 1 lab sleep\n@7 0 1 ghost zsh\nnot a window line\n",
+  "herdr_workspace_list_stdout": "{\"id\":\"cli:workspace:list\",\"result\":{\"type\":\"workspace_list\",\"workspaces\":[{\"active_tab_id\":\"wV:tC\",\"agent_status\":\"idle\",\"focused\":false,\"label\":\"example-api\",\"number\":1,\"pane_count\":1,\"tab_count\":1,\"workspace_id\":\"wV\"},{\"active_tab_id\":\"wX:t19\",\"agent_status\":\"working\",\"focused\":true,\"label\":\"  iroh\\u0007  \",\"number\":2,\"pane_count\":2,\"tab_count\":2,\"workspace_id\":\"wX\"},{\"active_tab_id\":\"wZ:t1\",\"agent_status\":\"idle\",\"focused\":false,\"label\":\"unused\",\"number\":3,\"pane_count\":1,\"tab_count\":1,\"workspace_id\":\"wZ\"},{\"label\":\"spaced id\",\"number\":4,\"workspace_id\":\"has space\"},{\"label\":\"\",\"number\":5,\"workspace_id\":\"wQ\"}]}}",
+  "herdr_workspace_list_error_stdout": "{\"id\":\"cli:workspace:list\",\"error\":{\"code\":\"server_not_running\",\"message\":\"no herdr server is running at /home/user/.config/herdr/sessions/x/herdr.sock\"}}"
+}

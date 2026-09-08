@@ -1,0 +1,57 @@
+{
+  "format": "ciao-phase1-malformed-v1",
+  "rpc_bodies": [
+    {
+      "name": "unsupported_version",
+      "json": "{\"v\":2,\"type\":\"request\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"method\":\"host.hello\",\"params\":{\"min_protocol\":2,\"max_protocol\":2}}",
+      "error": "unsupported_version"
+    },
+    {
+      "name": "unknown_method",
+      "json": "{\"v\":1,\"type\":\"request\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"method\":\"shell.exec\",\"params\":{\"min_protocol\":1,\"max_protocol\":1}}",
+      "error": "unsupported_method"
+    },
+    {
+      "name": "short_request_id",
+      "json": "{\"v\":1,\"type\":\"request\",\"request_id\":\"c2hvcnQ\",\"method\":\"host.hello\",\"params\":{\"min_protocol\":1,\"max_protocol\":1}}",
+      "error": "invalid_request_id"
+    },
+    {
+      "name": "unknown_field",
+      "json": "{\"v\":1,\"type\":\"request\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"method\":\"host.hello\",\"params\":{\"min_protocol\":1,\"max_protocol\":1},\"command\":\"forbidden\"}",
+      "error": "malformed_request"
+    },
+    {
+      "name": "duplicate_required_key",
+      "json": "{\"v\":1,\"v\":1,\"type\":\"request\",\"request_id\":\"AAECAwQFBgcICQoLDA0ODw\",\"method\":\"host.hello\",\"params\":{\"min_protocol\":1,\"max_protocol\":1}}",
+      "error": "malformed_request"
+    },
+    {
+      "name": "invalid_utf8_representative",
+      "json": "not-json",
+      "error": "malformed_request"
+    }
+  ],
+  "terminal_headers_hex": [
+    {
+      "name": "input_zero_length",
+      "hex": "0300000000",
+      "error": "zero_length"
+    },
+    {
+      "name": "input_oversized",
+      "hex": "0300004001",
+      "error": "frame_too_large"
+    },
+    {
+      "name": "resize_wrong_length",
+      "hex": "0500000007",
+      "error": "invalid_dimensions"
+    },
+    {
+      "name": "unknown_type",
+      "hex": "0900000000",
+      "error": "unknown_frame_type"
+    }
+  ]
+}

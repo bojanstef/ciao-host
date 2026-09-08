@@ -1,0 +1,698 @@
+{
+ "v": 1,
+ "negotiation": {
+  "legacy_capabilities": [
+   "terminal.shell",
+   "workspace.snapshot"
+  ],
+  "current_capabilities": [
+   "terminal.shell",
+   "workspace.snapshot",
+   "agent.session.v1",
+   "terminal.agent_route.v1"
+  ]
+ },
+ "list": {
+  "v": 1,
+  "type": "agent_session_list",
+  "sessions": [
+   {
+    "v": 1,
+    "session_id": "session-a",
+    "adapter_family": "Fixture",
+    "adapter_version": "1.0.0",
+    "topology": "attached",
+    "presence": "live",
+    "takeover": "promote",
+    "process_generation": 7,
+    "observation": {
+     "coverage": "partial",
+     "reason_code": "extension_ui_partial",
+     "last_authoritative_at": 1700000000
+    },
+    "turn": {
+     "state": "idle"
+    },
+    "capabilities": {
+     "history": "full",
+     "commands": {
+      "prompt": true,
+      "steer": true,
+      "follow_up": true,
+      "interrupt": false
+     },
+     "interactions": {
+      "permission": {
+       "enabled": false,
+       "max_questions": 0,
+       "max_options_per_question": 0,
+       "allows_free_text": false
+      },
+      "question": {
+       "enabled": false,
+       "max_questions": 0,
+       "max_options_per_question": 0,
+       "allows_free_text": false
+      },
+      "plan_decision": {
+       "enabled": false,
+       "max_questions": 0,
+       "max_options_per_question": 0,
+       "allows_free_text": false
+      },
+      "review_decision": {
+       "enabled": false,
+       "max_questions": 0,
+       "max_options_per_question": 0,
+       "allows_free_text": false
+      },
+      "elicitation": {
+       "enabled": false,
+       "max_questions": 0,
+       "max_options_per_question": 0,
+       "allows_free_text": false
+      },
+      "generic_choice": {
+       "enabled": false,
+       "max_questions": 0,
+       "max_options_per_question": 0,
+       "allows_free_text": false
+      }
+     },
+     "pending_rehydration": "current_process",
+     "terminal_continuity": "exact_live"
+    },
+    "workspace_display": "Fixture workspace",
+    "terminal_fallback": {
+     "continuity": "exact_live",
+     "route_id": "route-a"
+    },
+    "recent_prompt": "Fixture prompt naming the conversation",
+    "revision": 10,
+    "updated_at": 1700000010
+   }
+  ],
+  "omitted_sessions": 0
+ },
+ "snapshot": {
+  "v": 1,
+  "session_id": "session-a",
+  "snapshot_epoch": 3,
+  "revision": 10,
+  "process_generation": 7,
+  "adapter": {
+   "family": "Fixture",
+   "version": "1.0.0",
+   "compatibility": "compatible"
+  },
+  "topology": "attached",
+  "presence": "live",
+  "control_owner": "shared",
+  "observation": {
+   "coverage": "partial",
+   "reason_code": "extension_ui_partial",
+   "last_authoritative_at": 1700000000
+  },
+  "turn": {
+   "state": "unknown",
+   "reason_code": "partial_observation"
+  },
+  "capabilities": {
+   "history": "full",
+   "commands": {
+    "prompt": true,
+    "steer": true,
+    "follow_up": true,
+    "interrupt": false
+   },
+   "interactions": {
+    "permission": {
+     "enabled": false,
+     "max_questions": 0,
+     "max_options_per_question": 0,
+     "allows_free_text": false
+    },
+    "question": {
+     "enabled": false,
+     "max_questions": 0,
+     "max_options_per_question": 0,
+     "allows_free_text": false
+    },
+    "plan_decision": {
+     "enabled": false,
+     "max_questions": 0,
+     "max_options_per_question": 0,
+     "allows_free_text": false
+    },
+    "review_decision": {
+     "enabled": false,
+     "max_questions": 0,
+     "max_options_per_question": 0,
+     "allows_free_text": false
+    },
+    "elicitation": {
+     "enabled": false,
+     "max_questions": 0,
+     "max_options_per_question": 0,
+     "allows_free_text": false
+    },
+    "generic_choice": {
+     "enabled": false,
+     "max_questions": 0,
+     "max_options_per_question": 0,
+     "allows_free_text": false
+    }
+   },
+   "pending_rehydration": "current_process",
+   "terminal_continuity": "exact_live"
+  },
+  "pending_interactions": [],
+  "timeline_window": {
+   "entries": [
+    {
+     "entry_id": "entry-user",
+     "entry_revision": 1,
+     "sequence": 1,
+     "timestamp": 1700000001,
+     "state": "complete",
+     "kind": "user_message",
+     "body": {
+      "type": "text",
+      "text": "Synthetic user entry."
+     },
+     "truncation": {
+      "truncated": false
+     }
+    },
+    {
+     "entry_id": "entry-assistant",
+     "entry_revision": 1,
+     "sequence": 2,
+     "timestamp": 1700000002,
+     "state": "streaming",
+     "kind": "assistant_message",
+     "body": {
+      "type": "text",
+      "text": "Synthetic assistant fragment."
+     },
+     "truncation": {
+      "truncated": false
+     }
+    },
+    {
+     "entry_id": "entry-tool",
+     "entry_revision": 1,
+     "sequence": 3,
+     "timestamp": 1700000003,
+     "state": "complete",
+     "kind": "tool",
+     "body": {
+      "type": "tool",
+      "tool": {
+       "name": "fixture_tool",
+       "status": "complete",
+       "input_preview": "Synthetic bounded input.",
+       "result_preview": "Synthetic bounded result."
+      }
+     },
+     "truncation": {
+      "truncated": false
+     }
+    }
+   ],
+   "has_older": true,
+   "oldest_sequence": 1,
+   "newest_sequence": 3,
+   "truncated": false
+  },
+  "terminal_fallback": {
+   "continuity": "exact_live",
+   "route_id": "route-a"
+  },
+  "latest_command_receipts": [
+   {
+    "command_id": "command-existing",
+    "session_id": "session-a",
+    "process_generation": 7,
+    "snapshot_epoch": 3,
+    "state": "accepted",
+    "updated_at": 1700000009
+   }
+  ]
+ },
+ "page": {
+  "v": 1,
+  "type": "agent_timeline_page",
+  "session_id": "session-a",
+  "snapshot_epoch": 3,
+  "process_generation": 7,
+  "entries": [
+   {
+    "entry_id": "entry-older",
+    "entry_revision": 1,
+    "sequence": 1,
+    "timestamp": 1699999999,
+    "state": "complete",
+    "kind": "system",
+    "body": {
+     "type": "text",
+     "text": "Synthetic older entry."
+    },
+    "truncation": {
+     "truncated": true,
+     "reason_code": "content_bound",
+     "original_bytes": 65536
+    }
+   }
+  ],
+  "has_older": false,
+  "aggregate_bytes": 256
+ },
+ "deltas": [
+  {
+   "v": 1,
+   "session_id": "session-a",
+   "snapshot_epoch": 3,
+   "process_generation": 7,
+   "base_revision": 10,
+   "revision": 11,
+   "changes": [
+    {
+     "type": "upsert_entry",
+     "entry": {
+      "entry_id": "entry-assistant",
+      "entry_revision": 2,
+      "sequence": 2,
+      "timestamp": 1700000002,
+      "state": "streaming",
+      "kind": "assistant_message",
+      "body": {
+       "type": "text",
+       "text": "Synthetic assistant replacement."
+      },
+      "truncation": {
+       "truncated": false
+      }
+     }
+    }
+   ]
+  },
+  {
+   "v": 1,
+   "session_id": "session-a",
+   "snapshot_epoch": 3,
+   "process_generation": 7,
+   "base_revision": 11,
+   "revision": 12,
+   "changes": [
+    {
+     "type": "upsert_entry",
+     "entry": {
+      "entry_id": "entry-assistant",
+      "entry_revision": 3,
+      "sequence": 2,
+      "timestamp": 1700000002,
+      "state": "complete",
+      "kind": "assistant_message",
+      "body": {
+       "type": "text",
+       "text": "Synthetic assistant completion."
+      },
+      "truncation": {
+       "truncated": false
+      }
+     }
+    }
+   ]
+  },
+  {
+   "v": 1,
+   "session_id": "session-a",
+   "snapshot_epoch": 3,
+   "process_generation": 7,
+   "base_revision": 12,
+   "revision": 13,
+   "changes": [
+    {
+     "type": "observation",
+     "observation": {
+      "coverage": "stale",
+      "reason_code": "stream_gap"
+     }
+    }
+   ]
+  }
+ ],
+ "downgrade_delta": {
+  "v": 1,
+  "session_id": "session-a",
+  "snapshot_epoch": 3,
+  "process_generation": 7,
+  "base_revision": 10,
+  "revision": 11,
+  "changes": [
+   {
+    "type": "upsert_entry",
+    "entry": {
+     "entry_id": "entry-warning",
+     "entry_revision": 1,
+     "sequence": 4,
+     "timestamp": 1700000011,
+     "state": "complete",
+     "kind": "warning",
+     "body": {
+      "type": "text",
+      "text": "Synthetic continuity notice."
+     },
+     "truncation": {
+      "truncated": false
+     }
+    }
+   },
+   {
+    "type": "terminal_fallback",
+    "terminal_fallback": {
+     "continuity": "workspace_only",
+     "route_id": "route-workspace",
+     "availability_reason": "exact_context_unavailable"
+    }
+   }
+  ]
+ },
+ "unknown_delta": {
+  "v": 1,
+  "session_id": "session-a",
+  "snapshot_epoch": 3,
+  "process_generation": 7,
+  "base_revision": 10,
+  "revision": 11,
+  "changes": [
+   {
+    "type": "future_request_envelope",
+    "future_field": "ignored"
+   }
+  ]
+ },
+ "interaction_cases": [
+  {
+   "interaction_id": "interaction-permission",
+   "interaction_revision": 1,
+   "kind": "permission",
+   "blocking": true,
+   "created_at": 1700000020,
+   "title": "Synthetic permission request",
+   "body": "Synthetic bounded request body.",
+   "response_schema": {
+    "type": "choices",
+    "minimum": 1,
+    "maximum": 1,
+    "choices": [
+     {
+      "choice_id": "allow-once",
+      "label": "Allow once",
+      "scope": "once"
+     },
+     {
+      "choice_id": "allow-session",
+      "label": "Allow for session",
+      "scope": "session"
+     },
+     {
+      "choice_id": "deny",
+      "label": "Deny",
+      "scope": "request"
+     }
+    ]
+   },
+   "terminal_fallback": {
+    "continuity": "exact_live",
+    "route_id": "route-a"
+   },
+   "state": "pending"
+  },
+  {
+   "interaction_id": "interaction-single",
+   "interaction_revision": 1,
+   "kind": "question",
+   "blocking": true,
+   "created_at": 1700000021,
+   "body": "Synthetic single-choice question.",
+   "response_schema": {
+    "type": "questions",
+    "questions": [
+     {
+      "question_id": "question-single",
+      "prompt": "Choose one synthetic option.",
+      "response_kind": "single_choice",
+      "required": true,
+      "options": [
+       {
+        "choice_id": "choice-a",
+        "label": "Option A"
+       },
+       {
+        "choice_id": "choice-b",
+        "label": "Option B"
+       }
+      ]
+     }
+    ]
+   },
+   "terminal_fallback": {
+    "continuity": "exact_live",
+    "route_id": "route-a"
+   },
+   "state": "pending"
+  },
+  {
+   "interaction_id": "interaction-multi",
+   "interaction_revision": 1,
+   "kind": "question",
+   "blocking": true,
+   "created_at": 1700000022,
+   "body": "Synthetic multi-question request.",
+   "response_schema": {
+    "type": "questions",
+    "questions": [
+     {
+      "question_id": "question-multi",
+      "prompt": "Choose bounded synthetic options.",
+      "response_kind": "multi_choice",
+      "required": false,
+      "options": [
+       {
+        "choice_id": "choice-c",
+        "label": "Option C"
+       },
+       {
+        "choice_id": "choice-d",
+        "label": "Option D"
+       }
+      ]
+     },
+     {
+      "question_id": "question-text",
+      "prompt": "Provide synthetic text.",
+      "response_kind": "free_text",
+      "required": true,
+      "options": [],
+      "max_text_bytes": 32768
+     }
+    ]
+   },
+   "terminal_fallback": {
+    "continuity": "exact_live",
+    "route_id": "route-a"
+   },
+   "state": "pending"
+  },
+  {
+   "interaction_id": "interaction-elicitation",
+   "interaction_revision": 1,
+   "kind": "elicitation",
+   "blocking": true,
+   "created_at": 1700000023,
+   "body": "Synthetic free-text request.",
+   "response_schema": {
+    "type": "free_text",
+    "maximum_bytes": 32768
+   },
+   "terminal_fallback": {
+    "continuity": "exact_live",
+    "route_id": "route-a"
+   },
+   "state": "pending"
+  },
+  {
+   "interaction_id": "interaction-plan",
+   "interaction_revision": 1,
+   "kind": "plan_decision",
+   "blocking": true,
+   "created_at": 1700000024,
+   "body": "Synthetic decision separate from plan content.",
+   "response_schema": {
+    "type": "choices",
+    "minimum": 1,
+    "maximum": 1,
+    "choices": [
+     {
+      "choice_id": "plan-continue",
+      "label": "Continue"
+     },
+     {
+      "choice_id": "plan-revise",
+      "label": "Revise"
+     }
+    ]
+   },
+   "terminal_fallback": {
+    "continuity": "exact_live",
+    "route_id": "route-a"
+   },
+   "state": "pending"
+  },
+  {
+   "interaction_id": "interaction-review",
+   "interaction_revision": 1,
+   "kind": "review_decision",
+   "blocking": true,
+   "created_at": 1700000025,
+   "body": "Synthetic decision separate from review content.",
+   "response_schema": {
+    "type": "choices",
+    "minimum": 1,
+    "maximum": 1,
+    "choices": [
+     {
+      "choice_id": "review-accept",
+      "label": "Accept"
+     },
+     {
+      "choice_id": "review-return",
+      "label": "Return"
+     }
+    ]
+   },
+   "terminal_fallback": {
+    "continuity": "exact_live",
+    "route_id": "route-a"
+   },
+   "state": "pending"
+  },
+  {
+   "interaction_id": "interaction-unsupported",
+   "interaction_revision": 1,
+   "kind": "unsupported",
+   "blocking": true,
+   "created_at": 1700000026,
+   "body": "",
+   "response_schema": {
+    "type": "unsupported"
+   },
+   "terminal_fallback": {
+    "continuity": "exact_live",
+    "route_id": "route-a"
+   },
+   "state": "pending"
+  },
+  {
+   "interaction_id": "interaction-race",
+   "interaction_revision": 2,
+   "kind": "generic_choice",
+   "blocking": true,
+   "created_at": 1700000027,
+   "body": "Synthetic race fixture.",
+   "response_schema": {
+    "type": "choices",
+    "minimum": 1,
+    "maximum": 1,
+    "choices": [
+     {
+      "choice_id": "race-choice",
+      "label": "Choice"
+     }
+    ]
+   },
+   "terminal_fallback": {
+    "continuity": "exact_live",
+    "route_id": "route-a"
+   },
+   "state": "answered_elsewhere"
+  }
+ ],
+ "receipt_cases": [
+  {
+   "command_id": "command-accepted",
+   "session_id": "session-a",
+   "process_generation": 7,
+   "snapshot_epoch": 3,
+   "state": "accepted",
+   "updated_at": 1700000030
+  },
+  {
+   "command_id": "command-applied",
+   "session_id": "session-a",
+   "process_generation": 7,
+   "snapshot_epoch": 3,
+   "state": "applied",
+   "updated_at": 1700000031,
+   "application_evidence": "adapter_event"
+  },
+  {
+   "command_id": "command-unknown",
+   "session_id": "session-a",
+   "process_generation": 7,
+   "snapshot_epoch": 3,
+   "state": "outcome_unknown",
+   "updated_at": 1700000032,
+   "reason_code": "bridge_disconnected"
+  },
+  {
+   "command_id": "command-stale",
+   "session_id": "session-a",
+   "process_generation": 7,
+   "snapshot_epoch": 3,
+   "state": "stale",
+   "updated_at": 1700000033,
+   "reason_code": "generation_changed"
+  },
+  {
+   "command_id": "command-unavailable",
+   "session_id": "session-a",
+   "process_generation": 7,
+   "snapshot_epoch": 3,
+   "state": "unavailable",
+   "updated_at": 1700000034,
+   "reason_code": "exact_route_lost"
+  },
+  {
+   "command_id": "command-rejected",
+   "session_id": "session-a",
+   "process_generation": 7,
+   "snapshot_epoch": 3,
+   "state": "rejected",
+   "updated_at": 1700000035,
+   "reason_code": "adapter_rejected"
+  }
+ ],
+ "observation_cases": [
+  {
+   "coverage": "partial",
+   "reason_code": "extension_ui_partial"
+  },
+  {
+   "coverage": "stale",
+   "reason_code": "connection_lost"
+  },
+  {
+   "coverage": "unavailable",
+   "reason_code": "bridge_absent"
+  }
+ ],
+ "fences": {
+  "stale_generation": 6,
+  "stale_epoch": 2,
+  "duplicate_revision": 10,
+  "gapped_revision": 13
+ }
+}

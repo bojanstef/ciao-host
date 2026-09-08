@@ -1,0 +1,158 @@
+{
+  "format": "ciao-phase2-workspace-snapshot-v1",
+  "capabilities": [
+    "terminal.shell",
+    "host.info",
+    "workspace.snapshot",
+    "terminal.tmux",
+    "terminal.herdr"
+  ],
+  "request": {
+    "v": 1,
+    "type": "request",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "method": "workspace.snapshot",
+    "params": {}
+  },
+  "responses": {
+    "full": {
+      "v": 1,
+      "type": "response",
+      "request_id": "AAECAwQFBgcICQoLDA0ODw",
+      "result": {
+        "v": 1,
+        "providers": {
+          "tmux": {
+            "state": "available",
+            "version": "3.6b",
+            "sessions": [
+              {
+                "name": "api",
+                "attached": true,
+                "windows": 3,
+                "created_unix": 1789000000
+              },
+              {
+                "name": "0",
+                "attached": false,
+                "windows": 1,
+                "created_unix": 1789000100
+              }
+            ]
+          },
+          "herdr": {
+            "state": "available",
+            "version": "0.7.4",
+            "sessions": [
+              {
+                "name": "default",
+                "running": true,
+                "is_default": true
+              },
+              {
+                "name": "boxes",
+                "running": false,
+                "is_default": false
+              }
+            ]
+          }
+        },
+        "omitted_sessions": 0
+      }
+    },
+    "empty": {
+      "v": 1,
+      "type": "response",
+      "request_id": "AAECAwQFBgcICQoLDA0ODw",
+      "result": {
+        "v": 1,
+        "providers": {
+          "tmux": {
+            "state": "available",
+            "version": "3.6b",
+            "sessions": []
+          },
+          "herdr": {
+            "state": "available",
+            "version": "0.7.4",
+            "sessions": []
+          }
+        },
+        "omitted_sessions": 0
+      }
+    },
+    "degraded": {
+      "v": 1,
+      "type": "response",
+      "request_id": "AAECAwQFBgcICQoLDA0ODw",
+      "result": {
+        "v": 1,
+        "providers": {
+          "tmux": {
+            "state": "error",
+            "version": "3.6b"
+          },
+          "herdr": {
+            "state": "not_installed"
+          }
+        },
+        "omitted_sessions": 0
+      }
+    },
+    "unsupported": {
+      "v": 1,
+      "type": "response",
+      "request_id": "AAECAwQFBgcICQoLDA0ODw",
+      "result": {
+        "v": 1,
+        "providers": {
+          "tmux": {
+            "state": "unsupported_version",
+            "version": "2.9a"
+          },
+          "herdr": {
+            "state": "available",
+            "version": "0.7.4",
+            "sessions": [
+              {
+                "name": "default",
+                "running": true,
+                "is_default": true
+              }
+            ]
+          }
+        },
+        "omitted_sessions": 2
+      }
+    }
+  },
+  "errors": {
+    "not_ready": {
+      "v": 1,
+      "type": "error",
+      "request_id": "AAECAwQFBgcICQoLDA0ODw",
+      "error": {
+        "code": "not_ready",
+        "message": "The Ciao host connection is not ready for this request."
+      }
+    },
+    "busy": {
+      "v": 1,
+      "type": "error",
+      "request_id": "AAECAwQFBgcICQoLDA0ODw",
+      "error": {
+        "code": "busy",
+        "message": "A workspace snapshot is already in progress."
+      }
+    },
+    "method_unknown": {
+      "v": 1,
+      "type": "error",
+      "request_id": "AAECAwQFBgcICQoLDA0ODw",
+      "error": {
+        "code": "method_unknown",
+        "message": "This Ciao host method is not supported."
+      }
+    }
+  }
+}

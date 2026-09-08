@@ -1,0 +1,11 @@
+{
+  "v": 1,
+  "pairing_id": "AAECAwQFBgcICQoLDA0ODw",
+  "capability_hash": "icdGBFLt3_EZ_qBBnnhcdN4v-xOdvnQyOspKAeGYpdw",
+  "host_endpoint_id": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6",
+  "installation_endpoint_id": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "client_nonce": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+  "server_nonce": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8",
+  "expires_at": 1784480000,
+  "transcript_hash": "-bkrvXum5AqYXTQXkwZfijebdsZF30gQnw3oi3j3kUo"
+}

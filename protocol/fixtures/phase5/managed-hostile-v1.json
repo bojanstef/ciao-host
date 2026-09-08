@@ -1,0 +1,59 @@
+{
+ "v": 1,
+ "cases": [
+  {
+   "name": "unknown_topology_decodes_tolerantly",
+   "topology": "holographic",
+   "expect": "unsupported_render"
+  },
+  {
+   "name": "unknown_presence_decodes_tolerantly",
+   "presence": "hibernating",
+   "expect": "unsupported_render"
+  },
+  {
+   "name": "stored_reason_on_live_presence",
+   "stored_reason": "stopped",
+   "expect": "invalid"
+  },
+  {
+   "name": "stored_presence_with_running_turn",
+   "expect": "invalid"
+  },
+  {
+   "name": "stored_presence_with_commands",
+   "expect": "invalid"
+  },
+  {
+   "name": "stored_presence_on_attached_topology",
+   "expect": "invalid"
+  },
+  {
+   "name": "managed_with_exact_live_continuity",
+   "expect": "invalid"
+  },
+  {
+   "name": "managed_route_fabrication_delta",
+   "expect": "invalid"
+  },
+  {
+   "name": "workspace_label_over_bound",
+   "declared_label_bytes": 129,
+   "expect": "invalid"
+  },
+  {
+   "name": "workspace_list_over_bound",
+   "declared_count": 65,
+   "expect": "invalid"
+  },
+  {
+   "name": "managed_operation_without_managed_capability",
+   "expect": "invalid"
+  },
+  {
+   "name": "unknown_managed_operation",
+   "operation": "agent.managed.fork",
+   "expect": "unexpected"
+  }
+ ]
+}

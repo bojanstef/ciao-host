@@ -1,0 +1,85 @@
+name: Host checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Debug-only checks. Empty is NOT a working production relay credential.
+      CIAO_RELAY_TOKEN: ''
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc -Vv
+          cargo -V
+      - name: Resolve and build the standalone tree
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo build --locked
+      - name: Format and lint
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          shellcheck --severity=warning scripts/install.sh
+          python3 scripts/host_notices.py --check
+      - name: Build tests
+        run: cargo test --locked -p ciao-host --no-run
+      - name: Host tests (no live-probe flags)
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --kill-after=30 900 cargo test --locked -p ciao-host -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/host-test.log"
+          python3 - "$RUNNER_TEMP/host-test.log" <<'PY'
+          import pathlib, re, sys
+          text = pathlib.Path(sys.argv[1]).read_text()
+          passed = sum(map(int, re.findall(r'test result: ok\. (\d+) passed', text)))
+          print(f'{passed} host tests passed (some live gates may return early)')
+          assert passed > 0, 'no host tests executed'
+          PY
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.2.23
+      - name: Installer and offline integrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Deliberately named: never sweep live conformance or model-turn probes into CI.
+          for test in \
+            scripts/install.test.js \
+            integrations/pi/ciao-agent-session.test.ts \
+            integrations/claude/attached-hook-conformance.test.ts \
+            integrations/codex/attached-hook-conformance.test.ts \
+            integrations/codex/write-conformance.test.ts \
+            integrations/codex/generate-conformance.test.ts \
+            integrations/claude/managed-worker/worker.test.ts
+          do
+            timeout --kill-after=10 180 bun test "$test" 2>&1 | tee "$RUNNER_TEMP/integration-test.log"
+            python3 - "$RUNNER_TEMP/integration-test.log" <<'PY'
+          import pathlib, re, sys
+          text = pathlib.Path(sys.argv[1]).read_text()
+          passed = sum(map(int, re.findall(r'^\s*(\d+) pass$', text, re.M)))
+          print(f'{passed} integration tests passed in this file')
+          assert passed > 0, 'no integration tests executed'
+          PY
+          done
+
+# No secrets, publish permissions, artifacts, deployments or release jobs.
+# Native macOS checks and physical/runtime acceptance remain separate local gates.

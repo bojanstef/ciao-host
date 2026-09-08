@@ -1,0 +1,72 @@
+{
+  "format": "ciao-phase2-terminal-targets-v1",
+  "open_frames": [
+    {
+      "name": "shell",
+      "payload": {
+        "v": 1,
+        "target": "shell",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    },
+    {
+      "name": "tmux_attach",
+      "payload": {
+        "v": 1,
+        "target": "tmux.attach",
+        "session": "api",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    },
+    {
+      "name": "tmux_create",
+      "payload": {
+        "v": 1,
+        "target": "tmux.create",
+        "session": "new-work",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    },
+    {
+      "name": "herdr_attach",
+      "payload": {
+        "v": 1,
+        "target": "herdr.attach",
+        "session": "default",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    },
+    {
+      "name": "herdr_create",
+      "payload": {
+        "v": 1,
+        "target": "herdr.create",
+        "session": "box_1",
+        "cols": 80,
+        "rows": 24,
+        "pixel_width": 0,
+        "pixel_height": 0
+      }
+    }
+  ],
+  "argv": {
+    "comment": "Host-side fixed argv. <bin> is the resolved provider binary path; <home> is the account home directory. The shell target uses the unchanged Phase 1 login-shell path and has no fixed argv here. tmux carries -u because Ciao\u0027s daemon has no UTF-8 locale for tmux to infer one from, and a tmux client without one draws every non-ASCII character as an underscore.",
+    "tmux_attach": ["<bin>", "-u", "attach-session", "-t", "=api"],
+    "tmux_create": ["<bin>", "-u", "new-session", "-A", "-s", "new-work", "-c", "<home>"],
+    "herdr_attach": ["<bin>", "session", "attach", "default"],
+    "herdr_create": ["<bin>", "--session", "box_1"]
+  },
+  "terminal_error_codes": ["invalid_target", "provider_unavailable"]
+}

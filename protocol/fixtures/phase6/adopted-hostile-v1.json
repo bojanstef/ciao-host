@@ -1,0 +1,30 @@
+{
+ "v": 1,
+ "cases": [
+  {
+   "name": "adopted_with_stored_presence",
+   "presence": "stored",
+   "expect": "invalid"
+  },
+  {
+   "name": "adopted_with_unavailable_continuity",
+   "terminal_continuity": "unavailable",
+   "expect": "invalid"
+  },
+  {
+   "name": "adopted_with_exact_live_continuity",
+   "terminal_continuity": "exact_live",
+   "expect": "invalid"
+  },
+  {
+   "name": "adopted_registration_with_terminal_control_owner",
+   "control_owner": "terminal",
+   "expect": "invalid"
+  },
+  {
+   "name": "adopted_registration_validates_like_managed",
+   "control_owner": "none",
+   "expect": "valid"
+  }
+ ]
+}

@@ -1,0 +1,38 @@
+{
+  "v": 1,
+  "cases": [
+    {
+      "name": "zero_length",
+      "hex": "00000000",
+      "expect": "zero_length"
+    },
+    {
+      "name": "frame_limit_plus_one",
+      "declared_length": 65537,
+      "expect": "frame_too_large"
+    },
+    {
+      "name": "malformed_utf8",
+      "hex": "00000001ff",
+      "expect": "malformed_json"
+    },
+    {
+      "name": "unknown_union",
+      "json": {
+        "type": "future_request_envelope",
+        "future_field": "synthetic"
+      },
+      "expect": "unsupported"
+    },
+    {
+      "name": "stale_generation",
+      "generation": 6,
+      "expect": "resync_required"
+    },
+    {
+      "name": "stale_epoch",
+      "epoch": 2,
+      "expect": "resync_required"
+    }
+  ]
+}

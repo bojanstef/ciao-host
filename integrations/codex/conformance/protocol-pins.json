@@ -1,0 +1,128 @@
+{
+	"pin": "0.147.0",
+	"generatedBy": "integrations/codex/generate-conformance.mjs",
+	"counts": {
+		"clientMethods": 95,
+		"serverNotifications": 70
+	},
+	"requiredClientMethods": [
+		"thread/read",
+		"thread/list",
+		"hooks/list",
+		"thread/resume",
+		"thread/archive",
+		"turn/start",
+		"turn/steer",
+		"turn/interrupt",
+		"model/list"
+	],
+	"adoptedServerRequests": [
+		"item/commandExecution/requestApproval",
+		"item/fileChange/requestApproval",
+		"item/tool/requestUserInput"
+	],
+	"commandExecutionDecisions": [
+		"accept",
+		"acceptForSession",
+		"cancel",
+		"decline"
+	],
+	"fileChangeDecisions": [
+		"accept",
+		"acceptForSession",
+		"cancel",
+		"decline"
+	],
+	"adoptedNotifications": [
+		"turn/started",
+		"turn/completed",
+		"item/started",
+		"item/completed",
+		"item/agentMessage/delta"
+	],
+	"steerRequiredParams": [
+		"expectedTurnId",
+		"input",
+		"threadId"
+	],
+	"interruptRequiredParams": [
+		"threadId",
+		"turnId"
+	],
+	"threadStartSandboxIsMode": true,
+	"sandboxModes": [
+		"danger-full-access",
+		"read-only",
+		"workspace-write"
+	],
+	"hookEventNames": [
+		"permissionRequest",
+		"postCompact",
+		"postToolUse",
+		"preCompact",
+		"preToolUse",
+		"sessionEnd",
+		"sessionStart",
+		"stop",
+		"subagentStart",
+		"subagentStop",
+		"userPromptSubmit"
+	],
+	"hookSources": [
+		"cloudManagedConfig",
+		"cloudRequirements",
+		"legacyManagedConfigFile",
+		"legacyManagedConfigMdm",
+		"mdm",
+		"plugin",
+		"project",
+		"sessionFlags",
+		"system",
+		"unknown",
+		"user"
+	],
+	"hookRunStatus": [
+		"blocked",
+		"completed",
+		"failed",
+		"running",
+		"stopped"
+	],
+	"threadItemTypes": [
+		"agentMessage",
+		"collabAgentToolCall",
+		"commandExecution",
+		"contextCompaction",
+		"dynamicToolCall",
+		"enteredReviewMode",
+		"exitedReviewMode",
+		"fileChange",
+		"hookPrompt",
+		"imageGeneration",
+		"imageView",
+		"mcpToolCall",
+		"plan",
+		"reasoning",
+		"sleep",
+		"subAgentActivity",
+		"userMessage",
+		"webSearch"
+	],
+	"threadStatusTypes": [
+		"active",
+		"idle",
+		"notLoaded",
+		"systemError"
+	],
+	"turnStatus": [
+		"completed",
+		"failed",
+		"inProgress",
+		"interrupted"
+	],
+	"threadActiveFlags": [
+		"waitingOnApproval",
+		"waitingOnUserInput"
+	],
+	"schemaDigest": "9bec458cc869f8ee49a316675a0004fb25430283ec4bb4d936189eb4295f9079"
+}

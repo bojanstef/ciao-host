@@ -1,0 +1,11 @@
+{
+ "v": 1,
+ "workspace_list_count": 64,
+ "workspace_list_bytes": 65536,
+ "workspace_display_label_bytes": 128,
+ "lifecycle_receipts": 32,
+ "worker_registration_token_bits": 128,
+ "worker_registration_token_validity_seconds": 30,
+ "worker_graceful_stop_seconds": 10,
+ "worker_spawn_registration_deadline_seconds": 30
+}
