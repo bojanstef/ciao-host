@@ -382,13 +382,19 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 },
                 Some(TurnState::Idle),
             ),
-            // GAP(drift): an unknown event name goes untallied here, unlike the Claude hook,
-            // because this adapter has nothing safe to ride the name on — any dispatch carries
-            // a registration, and an observer registration overwrites the session's turn (the
-            // doc comment above). Tallying would mean inventing an event that says nothing
-            // about the turn, which is the exact clobber this `None` exists to avoid. Revisit
-            // when Spec 017 Phase 2 reworks the gate in this file anyway.
-            _ => return Ok(None),
+            // Accounting only: a dispatch would register and clobber the observed turn.
+            _ => {
+                if !crate::codex_adapter::known_hook_event(event_name) {
+                    crate::drift::note(
+                        "codex",
+                        "hook_event",
+                        "unknown_event",
+                        event_name,
+                        Some(&facts.adapter_version),
+                    );
+                }
+                return Ok(None);
+            }
         }
     };
 
@@ -480,7 +486,7 @@ fn run_id(turn_id: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
@@ -612,6 +618,103 @@ mod tests {
     fn turn(mut value: Value) -> Value {
         value["turn_id"] = json!("019fbfaf-d510-7a53-8f65-908113821582");
         value
+    }
+
+    fn hook_notes(names: &[&str]) -> Vec<crate::drift::DriftSignature> {
+        crate::drift::snapshot()
+            .vendors
+            .get("codex")
+            .map(|vendor| {
+                vendor
+                    .signatures
+                    .iter()
+                    .filter(|note| {
+                        note.surface == "hook_event" && names.contains(&note.name.as_str())
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // Called once by the conformance rehearsal; fixtures stay at the vendor boundary.
+    pub(crate) fn rehearse_hook_novelty() {
+        for event in ["Interrupt", "not a vocabulary token\n"] {
+            let name = crate::drift::sanitize_name(event);
+            let count = || {
+                hook_notes(&[&name])
+                    .iter()
+                    .filter(|note| note.kind == "unknown_event" && note.name == name)
+                    .map(|note| note.count)
+                    .sum::<u64>()
+            };
+            let before = count();
+            assert!(map_hook_input(&common(event), &facts()).unwrap().is_none());
+            assert_eq!(count(), before + 1, "exactly one sanitized note for {name}");
+        }
+
+        // Scope snapshots to these fixtures, not concurrent tests' other novel names.
+        let names = [
+            "Interrupt",
+            "invalid",
+            "PreCompact",
+            "PostCompact",
+            "SubagentStart",
+            "SubagentStop",
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "PermissionRequest",
+            "SessionEnd",
+        ];
+        let before = hook_notes(&names);
+        for event in ["PreCompact", "PostCompact", "SubagentStart", "SubagentStop"] {
+            assert!(map_hook_input(&common(event), &facts()).unwrap().is_none());
+        }
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "PermissionRequest",
+            "SessionEnd",
+        ] {
+            let mut payload = turn(common(event));
+            payload["prompt"] = json!("Synthetic prompt.");
+            payload["last_assistant_message"] = json!("Done.");
+            payload["tool_name"] = json!("Bash");
+            payload["tool_use_id"] = json!("synthetic-tool");
+            payload["tool_input"] = json!({"command": "echo hello"});
+            payload["tool_response"] = json!("hello");
+            let turn_id = payload["turn_id"].as_str().unwrap();
+            let expected = match event {
+                "SessionStart" | "SessionEnd" => TurnState::Idle,
+                "Stop" => TurnState::Completed {
+                    run_id: Some(run_id(turn_id)),
+                },
+                "PermissionRequest" => TurnState::AwaitingInteraction {
+                    run_id: Some(run_id(turn_id)),
+                },
+                _ => running(turn_id),
+            };
+            let dispatch = map_hook_input(&payload, &facts()).unwrap().unwrap();
+            assert_eq!(dispatch.turn, Some(expected), "{event}");
+        }
+        // Candidate metadata does not authorize admission or even novelty tallying.
+        let mut candidate = facts();
+        candidate.adapter_version = "0.154.0".into();
+        let dispatch = map_hook_input(&common("Interrupt"), &candidate)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            dispatch.event,
+            CodexHookEventFrame::Heartbeat { .. }
+        ));
+        assert_eq!(dispatch.turn, None);
+        assert_eq!(hook_notes(&names), before);
     }
 
     #[test]
