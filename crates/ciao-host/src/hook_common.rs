@@ -315,6 +315,190 @@ pub(crate) fn trace_outcome(paths: &CiaoPaths, file_name: &str, event: &str, res
         .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
+/// Successful version *facts*, never admission verdicts. Fixed slots bound persistent storage
+/// without a directory scan or a pruning race. Collisions cost a fresh probe, not correctness.
+const VERSION_CACHE_SLOTS: u8 = 64;
+const MAX_NATIVE_VERSION_CACHE_BYTES: u64 = 512;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeVersionFact {
+    v: u8,
+    image: String,
+    version: String,
+}
+
+/// Cache only a proven native image, not an npm script and its unenumerated dependencies.
+/// The caller supplies an OS-bound executable reference (Linux /proc/PID/exe), NOT PATH or a
+/// canonicalized install path. Opening it keeps that inode alive during lookup/probing. Kernel
+/// image device/inode plus nanosecond change/modify stamps fence replacement, exec and reuse;
+/// Linux denies writes to an executing image. A second observation fences an exec during the
+/// operation. No elapsed-time fallback can answer for a different image.
+///
+/// Claude's existing cache intentionally stays separate: it versions a JS launcher, refreshes
+/// on SessionStart, and falls back host-wide without image proof. Sharing that policy would
+/// reproduce the stale-version admission hazard here; this helper shares only native facts.
+/// Carry/schema admission remains owned by codex_carry and the normal classifier.
+pub(crate) async fn cached_native_version<F, Fut>(
+    paths: &CiaoPaths,
+    image: &std::path::Path,
+    probe: F,
+) -> Result<(String, bool)>
+where
+    F: FnOnce(std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let (held_image, identity) = native_image_identity(image)?;
+    let slot = native_version_slot(&paths.run_dir, &identity);
+    let cached =
+        read_native_version_fact(&paths.run_dir, &slot).filter(|fact| fact.image == identity);
+    let reused = cached.is_some();
+    let version = match cached {
+        Some(fact) => fact.version,
+        None => {
+            // Probe the opened inode, not a process that might exec A → B → A while we
+            // await. The reference belongs to this hook (parent of the version subprocess),
+            // so CLOEXEC does not close it out from under the child.
+            #[cfg(target_os = "linux")]
+            let probe_image = {
+                use std::os::fd::AsRawFd;
+                std::path::PathBuf::from(format!(
+                    "/proc/{}/fd/{}",
+                    std::process::id(),
+                    held_image.as_raw_fd()
+                ))
+            };
+            #[cfg(not(target_os = "linux"))]
+            let probe_image = image.to_owned(); // test fixtures; no production caller here
+            probe(probe_image).await?
+        }
+    };
+    if crate::agent_protocol::parse_version(&version).is_none() {
+        bail!("native version response is invalid");
+    }
+    // Keep the original file open until after the second lookup: a recycled inode cannot
+    // masquerade as it while held, and a changed process image never inherits its version.
+    let (_, after) = native_image_identity(image)?;
+    if after != identity {
+        bail!("running executable changed during version observation");
+    }
+    drop(held_image);
+    if !reused && native_cache_directory_is_private(&paths.run_dir) {
+        let fact = NativeVersionFact {
+            v: 1,
+            image: identity,
+            version: version.clone(),
+        };
+        // Missing/corrupt caches are misses. An unsafe entry is never followed or repaired;
+        // storage failure must not discard a freshly established version and its hook event.
+        let safe_target = match fs::symlink_metadata(&slot) {
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            Ok(metadata) => private_cache_file(&metadata),
+        };
+        if safe_target
+            && let Ok(bytes) = serde_json::to_vec(&fact)
+            && bytes.len() as u64 <= MAX_NATIVE_VERSION_CACHE_BYTES
+        {
+            let _ = crate::storage::atomic_write_private(&slot, &bytes);
+        }
+    }
+    Ok((version, reused))
+}
+
+fn native_image_identity(path: &std::path::Path) -> Result<(fs::File, String)> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| anyhow!("running executable is unavailable"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow!("running executable metadata is unavailable"))?;
+    if !metadata.is_file() {
+        bail!("running executable is not a regular image");
+    }
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic)
+        .map_err(|_| anyhow!("running executable header is unavailable"))?;
+    if magic != *b"\x7fELF" {
+        bail!("running executable is not a native ELF image");
+    }
+    let stamp = format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.mode()
+    );
+    Ok((
+        file,
+        keyed_digest(b"ciao-native-version-v1\0", "image", &stamp),
+    ))
+}
+
+fn native_version_slot(run_dir: &std::path::Path, identity: &str) -> std::path::PathBuf {
+    let slot = u8::from_str_radix(&identity[..2], 16).expect("image digest is hexadecimal")
+        % VERSION_CACHE_SLOTS;
+    run_dir.join(format!(".native-version-{slot:02}.json"))
+}
+
+fn native_cache_directory_is_private(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == nix::unistd::Uid::effective().as_raw()
+            && metadata.mode() & 0o777 == 0o700
+    })
+}
+
+fn private_cache_file(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_file()
+        && metadata.uid() == nix::unistd::Uid::effective().as_raw()
+        && metadata.mode() & 0o777 == 0o600
+        && metadata.nlink() == 1
+}
+
+fn read_native_version_fact(
+    run_dir: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<NativeVersionFact> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !native_cache_directory_is_private(run_dir) {
+        return None;
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !private_cache_file(&metadata)
+        || metadata.len() == 0
+        || metadata.len() > MAX_NATIVE_VERSION_CACHE_BYTES
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_NATIVE_VERSION_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_NATIVE_VERSION_CACHE_BYTES {
+        return None;
+    }
+    let fact: NativeVersionFact = serde_json::from_slice(&bytes).ok()?;
+    (fact.v == 1
+        && fact.image.len() == 32
+        && fact.image.bytes().all(|b| b.is_ascii_hexdigit())
+        && crate::agent_protocol::parse_version(&fact.version).is_some())
+    .then_some(fact)
+}
+
 pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -326,6 +510,212 @@ mod tests {
     use super::*;
     use crate::agent_protocol::MAX_LIVE_TEXT_DELTA_BYTES;
     use serde_json::json;
+
+    fn native_cache_fixture() -> (tempfile::TempDir, CiaoPaths, std::path::PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let paths = CiaoPaths::for_home(home.path());
+        crate::storage::ensure_private_directory(&paths.run_dir).unwrap();
+        let image = home.path().join("native");
+        fs::write(&image, b"\x7fELFsynthetic image").unwrap();
+        (home, paths, image)
+    }
+
+    async fn fact(paths: &CiaoPaths, image: &std::path::Path, version: &str) -> (String, bool) {
+        cached_native_version(paths, image, |_| std::future::ready(Ok(version.to_owned())))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_cache_replacement_mutation_and_exec_invalidate_even_at_the_same_path() {
+        let (home, paths, image) = native_cache_fixture();
+        assert_eq!(
+            fact(&paths, &image, "0.147.0").await,
+            ("0.147.0".into(), false)
+        );
+        assert_eq!(
+            fact(&paths, &image, "0.999.0").await,
+            ("0.147.0".into(), true)
+        );
+        let replacement = home.path().join("replacement");
+        fs::write(&replacement, b"\x7fELFsynthetic image").unwrap();
+        fs::rename(&replacement, &image).unwrap();
+        assert_eq!(
+            fact(&paths, &image, "0.146.0").await,
+            ("0.146.0".into(), false)
+        );
+        fs::write(&image, b"\x7fELFin-place change of a different size").unwrap();
+        assert_eq!(
+            fact(&paths, &image, "0.153.4").await,
+            ("0.153.4".into(), false)
+        );
+        // A process that execs while being probed must not publish either fact as current.
+        fs::remove_file(&image).unwrap();
+        fs::write(&image, b"\x7fELFbefore exec").unwrap();
+        let result = cached_native_version(&paths, &image, |_| {
+            fs::write(&replacement, b"\x7fELFafter exec").unwrap();
+            fs::rename(&replacement, &image).unwrap();
+            std::future::ready(Ok("0.147.0".into()))
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("changed"));
+        assert_eq!(
+            fact(&paths, &image, "0.153.4").await,
+            ("0.153.4".into(), false)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_cache_failures_are_not_cached_and_missing_images_never_fall_back() {
+        let (_home, paths, image) = native_cache_fixture();
+        for message in [
+            "timeout",
+            "spawn failed",
+            "nonzero",
+            "malformed",
+            "oversized",
+        ] {
+            let result = cached_native_version(&paths, &image, |_| {
+                std::future::ready(Err(anyhow!(message.to_owned())))
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(fs::read_dir(&paths.run_dir).unwrap().count(), 0);
+        }
+        assert!(
+            cached_native_version(&paths, &image, |_| std::future::ready(Ok("beta".into())))
+                .await
+                .is_err()
+        );
+        assert!(!fact(&paths, &image, "0.147.0").await.1);
+        fs::remove_file(&image).unwrap();
+        assert!(
+            cached_native_version(&paths, &image, |_| async {
+                panic!("a missing image cannot inherit the cached version or probe PATH");
+            })
+            .await
+            .is_err()
+        );
+        fs::write(&image, b"#!/bin/sh\necho codex-cli 0.147.0").unwrap();
+        assert!(
+            cached_native_version(&paths, &image, |_| async {
+                panic!("a script cannot vouch for its dependencies");
+            })
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_cache_corrupt_unknown_and_overbound_records_are_misses() {
+        let (_home, paths, image) = native_cache_fixture();
+        fact(&paths, &image, "0.147.0").await;
+        let (_, identity) = native_image_identity(&image).unwrap();
+        let slot = native_version_slot(&paths.run_dir, &identity);
+        let valid = fs::read(&slot).unwrap();
+        for bytes in [
+            Vec::new(),
+            b"not-json".to_vec(),
+            vec![b' '; MAX_NATIVE_VERSION_CACHE_BYTES as usize + 1],
+            serde_json::to_vec(&json!({"v":2,"image":identity,"version":"0.147.0"})).unwrap(),
+            serde_json::to_vec(&json!({"v":1,"image":identity,"version":"beta"})).unwrap(),
+            serde_json::to_vec(
+                &json!({"v":1,"image":identity,"version":"0.147.0","extra":"ignored?"}),
+            )
+            .unwrap(),
+            serde_json::to_vec(&json!({"v":1,"image":"f".repeat(32),"version":"0.147.0"})).unwrap(),
+        ] {
+            crate::storage::atomic_write_private(&slot, &bytes).unwrap();
+            assert_eq!(
+                fact(&paths, &image, "0.153.4").await,
+                ("0.153.4".into(), false)
+            );
+        }
+        crate::storage::atomic_write_private(&slot, &valid).unwrap();
+        assert_eq!(
+            fact(&paths, &image, "0.999.0").await,
+            ("0.147.0".into(), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_cache_unsafe_storage_is_not_followed_or_repaired_and_does_not_drop_fresh_facts()
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (home, paths, image) = native_cache_fixture();
+        let (_, identity) = native_image_identity(&image).unwrap();
+        let slot = native_version_slot(&paths.run_dir, &identity);
+        let outside = home.path().join("outside");
+        fs::write(&outside, b"preserve me").unwrap();
+        symlink(&outside, &slot).unwrap();
+        assert!(!fact(&paths, &image, "0.147.0").await.1);
+        assert!(
+            fs::symlink_metadata(&slot)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"preserve me");
+        fs::remove_file(&slot).unwrap();
+        fs::hard_link(&outside, &slot).unwrap();
+        assert!(!fact(&paths, &image, "0.147.0").await.1);
+        assert_eq!(fs::read(&outside).unwrap(), b"preserve me");
+        fs::remove_file(&slot).unwrap();
+        fs::create_dir(&slot).unwrap();
+        assert!(!fact(&paths, &image, "0.147.0").await.1);
+        assert!(slot.is_dir());
+        fs::remove_dir(&slot).unwrap();
+        fact(&paths, &image, "0.147.0").await;
+        fs::set_permissions(&slot, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            fact(&paths, &image, "0.153.4").await,
+            ("0.153.4".into(), false)
+        );
+        assert_eq!(
+            fs::metadata(&slot).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::remove_file(&slot).unwrap();
+        fs::set_permissions(&paths.run_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!fact(&paths, &image, "0.153.4").await.1);
+        assert!(!slot.exists());
+        fs::remove_dir(&paths.run_dir).unwrap();
+        assert!(!fact(&paths, &image, "0.153.4").await.1);
+        assert!(!paths.run_dir.exists(), "hooks do not create daemon state");
+        let other = home.path().join("other");
+        crate::storage::ensure_private_directory(&other).unwrap();
+        symlink(&other, &paths.run_dir).unwrap();
+        assert!(!fact(&paths, &image, "0.153.4").await.1);
+        assert_eq!(fs::read_dir(other).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_cache_fixed_slots_bound_storage_without_evicting_unrelated_state() {
+        let (home, paths, _) = native_cache_fixture();
+        let unrelated = paths.run_dir.join("unrelated.json");
+        fs::write(&unrelated, b"preserve me").unwrap();
+        for n in 0..192 {
+            let image = home.path().join(format!("image-{n}"));
+            fs::write(&image, format!("\x7fELFimage-{n}")).unwrap();
+            let version = format!("0.147.{n}");
+            assert_eq!(
+                fact(&paths, &image, &version).await,
+                (version.clone(), false)
+            );
+            assert_eq!(fact(&paths, &image, "0.999.0").await, (version, true));
+        }
+        let files = fs::read_dir(&paths.run_dir)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert!(files.len() > 1 && files.len() <= VERSION_CACHE_SLOTS as usize + 1);
+        for file in files {
+            if file.path() != unrelated {
+                assert!(file.metadata().unwrap().len() <= MAX_NATIVE_VERSION_CACHE_BYTES);
+            }
+        }
+        assert_eq!(fs::read(unrelated).unwrap(), b"preserve me");
+    }
 
     #[test]
     fn text_bounds_preserve_utf8_and_report_original_size() {

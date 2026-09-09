@@ -669,6 +669,11 @@ fn contracts() -> [ParityContract; 4] {
             id: "codex",
             // 2026-09-08: history/adopted functionCallOutput text projection only.
             // No wire events, capabilities, hook registration or pin membership changed.
+            // Linux hook version facts now use the kernel-bound running image and bounded
+            // private native-image cache (codex_hook::tests::slow_launcher_cold_and_warm_*),
+            // not a new npm launcher per event or Claude's unqualified last-known fallback.
+            // Cache misses never change this row's admission/capability rules. macOS still
+            // probes fresh: no kernel image proof here means no cached identity claim.
             family: "Codex",
             topology: "attached",
             connection: AdapterConnectionKind::TransientEvent,

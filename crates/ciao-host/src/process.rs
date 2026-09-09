@@ -155,6 +155,18 @@ fn linux_identity_from_records(pid: u32, boot: &[u8], stat: &[u8]) -> Option<Str
     Some(format!("linux:{}:{ticks}", boot.to_ascii_lowercase()))
 }
 
+/// Linux's executable reference names the *mapped image*, even when argv[0] is relative or
+/// an updater has unlinked/replaced its original pathname. Keep the procfs reference rather
+/// than canonicalizing it to that replaceable pathname. Callers must validate the image at
+/// use (and again after a probe); a process may exit or exec between inspections.
+///
+/// No PATH/argv fallback: those name an installation, not necessarily this running image.
+#[cfg(target_os = "linux")]
+pub(crate) fn kernel_executable(pid: u32) -> Option<std::path::PathBuf> {
+    (pid != 0 && i32::try_from(pid).is_ok())
+        .then(|| std::path::PathBuf::from(format!("/proc/{pid}/exe")))
+}
+
 pub(crate) async fn parent(pid: u32) -> Option<u32> {
     ps_field(pid, &[], "ppid=", false).await?.parse().ok()
 }
@@ -280,6 +292,37 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("test orphan {pid} never armed its SIGTERM trap");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_executable_refers_to_the_running_inode_not_relative_argv_or_replaced_install() {
+        use std::os::unix::{fs::MetadataExt, process::CommandExt};
+        let home = tempdir().unwrap();
+        let binary = home.path().join("codex");
+        fs::copy("/bin/sleep", &binary).unwrap();
+        let mut child = Command::new(&binary)
+            .arg0("codex")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let reference = kernel_executable(child.id()).unwrap();
+        let original = fs::metadata(&reference).unwrap();
+        assert_eq!(original.ino(), fs::metadata(&binary).unwrap().ino());
+        let replacement = home.path().join("replacement");
+        fs::copy("/bin/true", &replacement).unwrap();
+        fs::rename(&replacement, &binary).unwrap();
+        assert_ne!(fs::metadata(&binary).unwrap().ino(), original.ino());
+        assert_eq!(fs::metadata(&reference).unwrap().ino(), original.ino());
+        assert_eq!(
+            fs::read(&reference).unwrap(),
+            fs::read("/bin/sleep").unwrap()
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(fs::metadata(&reference).is_err());
+        assert!(kernel_executable(0).is_none());
+        assert!(kernel_executable(u32::MAX).is_none());
     }
 
     #[test]

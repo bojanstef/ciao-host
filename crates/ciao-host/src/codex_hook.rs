@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value};
 use tokio::time::timeout;
 
@@ -39,9 +39,9 @@ use crate::{
 };
 
 const MAX_CODEX_HOOK_INPUT_BYTES: usize = 1024 * 1024;
-/// `codex --version` is a Rust binary behind a thin wrapper and answers in well under 150ms on
-/// the grounded machine, so it is asked every time rather than cached — the Claude hook's per-process
-/// version cache exists because its `--version` is a slow JavaScript bundle.
+/// The npm/Node launcher can exceed this budget on a slow host even though the native image
+/// answers in ~100ms. Linux probes the running image once and caches that fact instead of
+/// increasing the timeout or borrowing a version from some other installation/session.
 const HOOK_VERSION_TIMEOUT: Duration = Duration::from_millis(400);
 /// How far up the process tree to look for the Codex process. The hook's own parent is Codex on
 /// the grounded machine; the allowance covers a vendor that later interposes a shell.
@@ -88,7 +88,22 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
     event.push_str(hook_event_name);
 
     let process_id = codex_process_id().await?;
-    let adapter_version = installed_codex_version().await?;
+    #[cfg(target_os = "linux")]
+    let image = Some(
+        crate::process::kernel_executable(process_id)
+            .ok_or_else(|| anyhow!("Codex executable reference is unavailable"))?,
+    );
+    // macOS has no kernel-bound image reference here. Keep its existing fresh probe rather
+    // than cache an install path that may no longer describe the running TUI after an update.
+    #[cfg(not(target_os = "linux"))]
+    let image: Option<std::path::PathBuf> = None;
+    let adapter_version = version_from_sources(
+        paths,
+        image.as_deref(),
+        std::path::Path::new("codex"),
+        probe_codex_version,
+    )
+    .await?;
     let facts = HookRuntimeFacts {
         process_id,
         process_nonce: opaque_digest("process", &process_id.to_string()),
@@ -109,12 +124,16 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
         })
         .transpose()?;
     timeout(HOOK_DELIVERY_TIMEOUT, async {
-        deliver(paths, CODEX_HOOK_PROTOCOL_VERSION, &registration, &event).await?;
+        deliver(paths, CODEX_HOOK_PROTOCOL_VERSION, &registration, &event)
+            .await
+            .context("Codex event delivery")?;
         // Second connection, after the entry: one connection carries one event. The entry goes
         // first so a turn that says "working" is never on screen before the prompt that caused
         // it, and so losing the second delivery costs a turn state rather than a message.
         if let Some(turn) = turn {
-            deliver(paths, CODEX_HOOK_PROTOCOL_VERSION, &registration, &turn).await?;
+            deliver(paths, CODEX_HOOK_PROTOCOL_VERSION, &registration, &turn)
+                .await
+                .context("Codex turn delivery")?;
         }
         Ok(())
     })
@@ -161,17 +180,73 @@ fn command_is_codex(command: &str) -> bool {
         .is_some_and(|name| name == "codex")
 }
 
-async fn installed_codex_version() -> Result<String> {
-    let output = timeout(
-        HOOK_VERSION_TIMEOUT,
-        tokio::process::Command::new("codex")
+async fn version_from_sources<F, Fut>(
+    paths: &CiaoPaths,
+    image: Option<&std::path::Path>,
+    launcher: &std::path::Path,
+    probe: F,
+) -> Result<String>
+where
+    F: FnOnce(std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    if let Some(image) = image {
+        let began = std::time::Instant::now();
+        let (version, reused) =
+            crate::hook_common::cached_native_version(paths, image, probe).await?;
+        let category = if reused {
+            "version-cache-hit"
+        } else {
+            "version-image-probe"
+        };
+        trace_outcome(paths, "codex-hook.trace.log", category, &Ok(()));
+        tracing::debug!(
+            reused,
+            elapsed_ms = began.elapsed().as_millis(),
+            "Codex version fact observed"
+        );
+        Ok(version)
+    } else {
+        probe(launcher.to_owned()).await
+    }
+}
+
+async fn probe_codex_version(binary: std::path::PathBuf) -> Result<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    timeout(HOOK_VERSION_TIMEOUT, async {
+        let mut child = tokio::process::Command::new(binary)
             .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .kill_on_drop(true)
-            .output(),
-    )
+            .spawn()
+            .map_err(|_| anyhow!("Codex version process could not start"))?;
+        let mut stdout = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("version stdout is piped")
+            .take(257)
+            .read_to_end(&mut stdout)
+            .await
+            .map_err(|_| anyhow!("Codex version response could not be read"))?;
+        if stdout.len() > 256 {
+            bail!("Codex version response exceeded its bound");
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|_| anyhow!("Codex version process could not be reaped"))?;
+        parse_codex_version_output(&std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
+    })
     .await
-    .map_err(|_| anyhow!("Codex version check timed out"))??;
-    parse_codex_version_output(&output)
+    .map_err(|_| anyhow!("Codex version check timed out"))?
 }
 
 /// `codex --version` answers `codex-cli 0.147.0`.
@@ -409,6 +484,110 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn slow_launcher_cold_and_warm_use_the_running_image_not_another_path_version() {
+        use std::{cell::Cell, fs};
+        let home = tempfile::tempdir().unwrap();
+        let paths = CiaoPaths::for_home(home.path());
+        crate::storage::ensure_private_directory(&paths.run_dir).unwrap();
+        let image = home.path().join("native-image");
+        fs::write(&image, b"\x7fELFsynthetic native image").unwrap();
+        let launcher = home.path().join("npm-launcher");
+        let probes = Cell::new(0);
+        // Deterministic timeout at the old launch boundary, not a wall-clock sleep that can
+        // turn green when a loaded test machine schedules differently. The native image has
+        // its own answer; PATH could equally have been upgraded to a different version.
+        let cold = version_from_sources(&paths, Some(&image), &launcher, |binary| {
+            probes.set(probes.get() + 1);
+            let result = if binary != launcher {
+                Ok(PINNED_CODEX_VERSION.to_owned())
+            } else {
+                Err(anyhow!("Codex version check timed out"))
+            };
+            std::future::ready(result)
+        })
+        .await;
+        assert_eq!(cold.unwrap(), PINNED_CODEX_VERSION);
+        assert_eq!(probes.get(), 1, "cold must establish a real fact");
+        let warm = version_from_sources(&paths, Some(&image), &launcher, |_| {
+            probes.set(probes.get() + 1);
+            std::future::ready(Err(anyhow!("warm must not spawn")))
+        })
+        .await;
+        assert_eq!(warm.unwrap(), PINNED_CODEX_VERSION);
+        assert_eq!(probes.get(), 1, "warm must reuse only that image's fact");
+    }
+
+    #[tokio::test]
+    async fn version_probe_bounds_output_time_and_errors_without_leaking_response_values() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let home = tempfile::tempdir().unwrap();
+        let binary = home.path().join("probe");
+        for script in [
+            "printf 'PRIVATE-CANARY'; exit 1",
+            "printf 'PRIVATE-CANARY'",
+            "while :; do printf 'PRIVATE-CANARY'; done",
+            "exec /bin/sleep 30",
+        ] {
+            fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let began = std::time::Instant::now();
+            let error = probe_codex_version(binary.clone()).await.unwrap_err();
+            assert!(!format!("{error:#}").contains("PRIVATE-CANARY"));
+            assert!(began.elapsed() < std::time::Duration::from_secs(3));
+        }
+        fs::remove_file(&binary).unwrap();
+        assert!(
+            probe_codex_version(binary)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("could not start")
+        );
+    }
+
+    /// Zero model turns; caller names a live, already-authorized staging TUI. Uses a private
+    /// temporary cache so cold/warm measurements neither consume nor erase daemon state.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires an explicitly named live staging Codex TUI"]
+    async fn grounded_running_codex_version_cache_cold_warm() {
+        let pid: u32 = std::env::var("CIAO_TEST_CODEX_TUI_PID")
+            .expect("name the staging TUI")
+            .parse()
+            .unwrap();
+        let launcher = std::path::PathBuf::from(
+            std::env::var("CIAO_TEST_CODEX_LAUNCHER").expect("name the normal npm launcher"),
+        );
+        let home = tempfile::tempdir().unwrap();
+        let paths = CiaoPaths::for_home(home.path());
+        crate::storage::ensure_private_directory(&paths.run_dir).unwrap();
+        let image = crate::process::kernel_executable(pid).unwrap();
+        // Establish that the motivating normal launcher still exceeds the unchanged budget.
+        let began = std::time::Instant::now();
+        let old = probe_codex_version(launcher.clone()).await;
+        println!(
+            "normal_launcher_budget elapsed_ms={} timed_out={}",
+            began.elapsed().as_millis(),
+            old.as_ref()
+                .is_err_and(|e| e.to_string() == "Codex version check timed out")
+        );
+        assert!(old.unwrap_err().to_string().contains("timed out"));
+        for n in 0..3 {
+            let began = std::time::Instant::now();
+            let (version, reused) =
+                crate::hook_common::cached_native_version(&paths, &image, probe_codex_version)
+                    .await
+                    .unwrap();
+            println!(
+                "running_image sample={n} elapsed_ms={} reused={reused} version={version}",
+                began.elapsed().as_millis()
+            );
+            assert_eq!(version, PINNED_CODEX_VERSION);
+            assert_eq!(reused, n != 0);
+        }
+    }
 
     fn facts() -> HookRuntimeFacts {
         HookRuntimeFacts {
