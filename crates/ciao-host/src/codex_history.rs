@@ -656,6 +656,7 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
+        crate::process::settled_executable(child.id());
         let resolved = codex_binary_of(child.id())
             .await
             .expect("a relative argv[0] still names its running image");

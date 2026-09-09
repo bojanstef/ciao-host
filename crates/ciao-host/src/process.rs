@@ -182,6 +182,24 @@ pub(crate) async fn installed_executable(pid: u32) -> Option<std::path::PathBuf>
     ((image.dev(), image.ino()) == (installed.dev(), installed.ino())).then_some(path)
 }
 
+/// `posix_spawn` returns as soon as the child's exec releases the vfork parent, which the kernel
+/// does a few instructions before that child's `mm` switches (`exec_mmap`), so for an instant
+/// `/proc/<pid>/exe` still names the spawner's own image. A running TUI never sits in that
+/// window; a test that inspects its child right after spawning does — one miss in 150 runs on
+/// a Debian guest and one on a hosted runner, both reporting the test binary's inode.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn settled_executable(pid: u32) -> std::path::PathBuf {
+    let reference = kernel_executable(pid).expect("a live child has an executable reference");
+    let own = std::env::current_exe().expect("the test knows its own image");
+    for _ in 0..2000 {
+        if std::fs::read_link(&reference).is_ok_and(|target| target != own) {
+            return reference;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("child {pid} never left the spawner's image");
+}
+
 pub(crate) async fn parent(pid: u32) -> Option<u32> {
     ps_field(pid, &[], "ppid=", false).await?.parse().ok()
 }
@@ -321,7 +339,7 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        let reference = kernel_executable(child.id()).unwrap();
+        let reference = settled_executable(child.id());
         let original = fs::metadata(&reference).unwrap();
         assert_eq!(original.ino(), fs::metadata(&binary).unwrap().ino());
         let replacement = home.path().join("replacement");
