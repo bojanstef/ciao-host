@@ -26,7 +26,6 @@ use crate::{
     codex_adapter::codex_run_id,
     codex_app_server,
     hook_common::{bounded_preview, bounded_text, keyed_digest, no_truncation},
-    process::command as process_command,
 };
 
 const CODEX_HISTORY_DOMAIN: &[u8] = b"ciao-codex-history-v1\0";
@@ -109,9 +108,22 @@ pub(crate) fn spawn_history_read(
 /// Not a `PATH` lookup: the daemon's environment comes from a service manager and need not
 /// contain the user's tool installs at all. Reading it from the process also means the
 /// app-server is the same build as the TUI, which is what the version pin is for.
+///
+/// Linux asks the kernel which image is mapped rather than trusting argv[0]: a TUI started as
+/// plain `codex` at a shell carries a relative argv[0], and this lookup refused it (grounded
+/// 2026-09-08, 12 of 12 reads), which cost that session its history and this machine its
+/// discovery evidence. Other platforms keep the argv[0] reading until an equivalent kernel
+/// fact is grounded there.
 async fn codex_binary_of(process_id: u32) -> Option<PathBuf> {
-    let command = process_command(process_id).await?;
-    let binary = PathBuf::from(command.split_ascii_whitespace().next()?);
+    #[cfg(target_os = "linux")]
+    let binary = crate::process::installed_executable(process_id).await?;
+    #[cfg(not(target_os = "linux"))]
+    let binary = PathBuf::from(
+        crate::process::command(process_id)
+            .await?
+            .split_ascii_whitespace()
+            .next()?,
+    );
     (binary.is_absolute() && binary.file_name()? == "codex").then_some(binary)
 }
 
@@ -625,5 +637,88 @@ mod tests {
         assert!(!claim("fixture-codex-session", 1));
         // A restarted TUI is a new generation and a new conversation to fill in.
         assert!(claim("fixture-codex-session", 2));
+    }
+
+    /// A shell starts `codex` with a relative argv[0]; the grounded lookup refused exactly that
+    /// shape (2026-09-08, 12 of 12 reads), which cost the session its history and the machine
+    /// its discovery evidence. The kernel's image is what enrichment runs, and only its durable
+    /// pathname — never the process-bound procfs reference — may be spawned later or recorded.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_tui_started_by_bare_name_resolves_to_its_image_and_never_to_a_procfs_reference() {
+        use std::os::unix::process::CommandExt;
+        let home = tempfile::tempdir().unwrap();
+        let binary = home.path().join("codex");
+        std::fs::copy("/bin/sleep", &binary).unwrap();
+        let installed = binary.canonicalize().unwrap();
+        let mut child = std::process::Command::new(&binary)
+            .arg0("codex")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let resolved = codex_binary_of(child.id())
+            .await
+            .expect("a relative argv[0] still names its running image");
+        assert_eq!(resolved, installed);
+        assert!(
+            !resolved.starts_with("/proc"),
+            "evidence must outlive the process"
+        );
+        // An unrelated process keeps its own name; only an image named codex is Codex.
+        let mut other = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert_eq!(codex_binary_of(other.id()).await, None);
+        other.kill().unwrap();
+        other.wait().unwrap();
+        // An updater that replaced the install leaves the process on its old image: no
+        // pathname holds that image any more, so nothing is spawnable later or recordable.
+        let replacement = home.path().join("replacement");
+        std::fs::copy("/bin/true", &replacement).unwrap();
+        std::fs::rename(&replacement, &binary).unwrap();
+        assert_eq!(codex_binary_of(child.id()).await, None);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(codex_binary_of(child.id()).await, None);
+    }
+
+    /// Zero model turns, read-only: `CIAO_CODEX_HISTORY_PROBE_PID` names a live, already
+    /// authorized staging TUI and `CIAO_CODEX_HISTORY_PROBE_THREAD` its thread. Resolves and
+    /// reads exactly the way enrichment does; prints counts and categories only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "opt-in, read-only: CIAO_CODEX_HISTORY_PROBE_PID and _THREAD name a live TUI"]
+    async fn grounded_history_read_resolves_a_live_tui_by_its_running_image() {
+        let pid: u32 = std::env::var("CIAO_CODEX_HISTORY_PROBE_PID")
+            .expect("an existing TUI pid")
+            .parse()
+            .expect("a numeric pid");
+        let thread = std::env::var("CIAO_CODEX_HISTORY_PROBE_THREAD").expect("its thread id");
+        let began = std::time::Instant::now();
+        let binary = codex_binary_of(pid)
+            .await
+            .expect("the running image resolves");
+        println!(
+            "history_probe resolved_us={} absolute={} basename_codex={} procfs={}",
+            began.elapsed().as_micros(),
+            binary.is_absolute(),
+            binary.file_name().is_some_and(|name| name == "codex"),
+            binary.starts_with("/proc")
+        );
+        let entries = read_thread_once(&binary, &thread).await;
+        let mut kinds = std::collections::BTreeMap::new();
+        for entry in &entries {
+            *kinds.entry(entry.kind.as_str()).or_insert(0usize) += 1;
+        }
+        println!(
+            "history_probe entries={} kinds={kinds:?} elapsed_ms={}",
+            entries.len(),
+            began.elapsed().as_millis()
+        );
+        assert!(
+            !entries.is_empty(),
+            "a conversation with completed turns reads as entries"
+        );
     }
 }

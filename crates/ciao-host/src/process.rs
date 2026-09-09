@@ -167,6 +167,21 @@ pub(crate) fn kernel_executable(pid: u32) -> Option<std::path::PathBuf> {
         .then(|| std::path::PathBuf::from(format!("/proc/{pid}/exe")))
 }
 
+/// The pathname the running image is still installed at — what may outlive the process, be
+/// spawned later and be persisted as evidence, unlike the reference above. `None` once an
+/// updater has unlinked or replaced it: the link then reads `… (deleted)` or names a different
+/// inode, and no pathname could spawn this image again. Callers still bind the name they expect.
+#[cfg(target_os = "linux")]
+pub(crate) async fn installed_executable(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let reference = kernel_executable(pid)?;
+    let path = tokio::fs::read_link(&reference).await.ok()?;
+    let (image, installed) =
+        tokio::join!(tokio::fs::metadata(&reference), tokio::fs::metadata(&path));
+    let (image, installed) = (image.ok()?, installed.ok()?);
+    ((image.dev(), image.ino()) == (installed.dev(), installed.ino())).then_some(path)
+}
+
 pub(crate) async fn parent(pid: u32) -> Option<u32> {
     ps_field(pid, &[], "ppid=", false).await?.parse().ok()
 }
