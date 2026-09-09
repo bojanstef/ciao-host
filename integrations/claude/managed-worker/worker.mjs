@@ -108,14 +108,12 @@ const sdk = await import(
 // ---------------------------------------------------------------- framing
 
 const socket = net.connect(config.socketPath);
-socket.on("error", () => process.exit(1));
-// A dropped daemon connection arrives as 'end' + 'close', never 'error', and writes to a
-// destroyed socket return false without erroring — this worker outlived its bridge for hours
-// exactly that way (2026-08-09). Registration tokens are one-time, so there is no way back on
-// this socket; exiting nonzero lets the reaper store the session as worker_crash within a
-// second, which the phone shows as stopped-and-resumable. Clean shutdown is unaffected:
-// `shutdown` calls `process.exit` synchronously before any close event can be delivered.
-socket.on("close", () => process.exit(1));
+// EOF already means no more daemon commands. Waiting for `close` can strand the worker behind
+// queued snapshot writes when the peer stops reading (reproduced on Bun 1.2.23). Registration
+// tokens are one-time: exit nonzero so the reaper can store a resumable worker_crash, rather
+// than leaving an invisible live worker. Explicit `shutdown` still exits 0 synchronously,
+// before any resulting socket event can be delivered.
+for (const event of ["error", "end", "close"]) socket.on(event, () => process.exit(1));
 await new Promise((resolve, reject) => {
 	socket.once("connect", resolve);
 	socket.once("error", reject);

@@ -207,28 +207,35 @@ async function startWorker(
 	models?: unknown[],
 	extraEnv?: Record<string, string>,
 	hold?: boolean,
+	bridge: { eofOnRegister?: boolean; runtime?: string } = {},
 ): Promise<Harness> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-managed-worker-"));
 	const socketPath = path.join(root, "agent.sock");
 	const frames: Record<string, unknown>[] = [];
 	let peer: net.Socket | undefined;
 
-	const server = net.createServer((socket) => {
+	const server = net.createServer({ allowHalfOpen: Boolean(bridge.eofOnRegister) }, (socket) => {
 		peer = socket;
 		socket.on(
 			"data",
 			decodeFrames((frame) => {
 				frames.push(frame);
 				if (frame.type === "register") {
-					socket.write(
-						encodeFrame({
-							v: 1,
-							type: "registered",
-							session_id: SESSION_ID,
-							process_generation: 1,
-							snapshot_epoch: 1,
-						}),
-					);
+					const registered = encodeFrame({
+						v: 1,
+						type: "registered",
+						session_id: SESSION_ID,
+						process_generation: 1,
+						snapshot_epoch: 1,
+					});
+					if (bridge.eofOnRegister) {
+						// Send the acknowledgement and EOF together, but never drain the snapshot.
+						// This keeps the worker's writes backpressured after its command side ends.
+						socket.pause();
+						socket.end(registered);
+					} else {
+						socket.write(registered);
+					}
 				}
 			}),
 		);
@@ -240,7 +247,7 @@ async function startWorker(
 
 	plantFakeSdk(root, script, permission, history, models, hold);
 
-	const child = Bun.spawn([process.execPath, WORKER], {
+	const child = Bun.spawn([bridge.runtime ?? process.execPath, WORKER], {
 		env: {
 			...process.env,
 			CIAO_MANAGED_SOCKET: socketPath,
@@ -259,6 +266,7 @@ async function startWorker(
 	resources.push(async () => {
 		child.kill();
 		peer?.destroy();
+		await child.exited;
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 		fs.rmSync(root, { recursive: true, force: true });
 	});
@@ -1399,11 +1407,6 @@ test("a synthetic assistant message is shown, and its non-model is never reporte
 	expect(JSON.stringify(frames)).not.toContain("<synthetic>");
 });
 
-/// A dropped daemon connection arrives as 'end' + 'close', never 'error', and writes to a
-/// destroyed socket return false without ever erroring — so a worker that only watched 'error'
-/// outlived its bridge indefinitely, invisible to every list and unable to re-register (spawn
-/// tokens are one-time). Exiting nonzero is what turns that state into a truthful stored
-/// (worker_crash) row the phone can resume.
 /// A finished message is a display body, not a wire delta: the host renders up to its 48 KiB
 /// timeline bound (MAX_TIMELINE_TEXT_BYTES) and the attached adapter already delivers that
 /// much, but the managed worker used to cut the same reply at the 16 KiB delta bound because
@@ -1446,6 +1449,71 @@ test("a finished message between the delta and timeline bounds arrives whole", a
 	});
 });
 
+// Node is the production interpreter; Bun is the CI runner and the historical test interpreter.
+// Both must observe lost command input without waiting for queued snapshot writes to drain.
+const WORKER_RUNTIMES = [
+	["Bun", process.execPath],
+	["Node", Bun.which("node") ?? "node"],
+] as const;
+
+function backpressuredHistory(): HistoryFixture {
+	return {
+		sessionID: "11111111-2222-4333-8444-555555555555",
+		fileSize: 3 * 1024 * 1024,
+		// Below both history bounds, but larger than a Unix socket's buffers. No sleeps or
+		// scheduler luck are needed to leave writes pending while the daemon stops reading.
+		messages: Array.from({ length: 80 }, (_, i) => ({
+			type: "user",
+			uuid: `history-${i}`,
+			message: { role: "user", content: "x".repeat(32 * 1024) },
+		})),
+	};
+}
+
+test.each(WORKER_RUNTIMES)(
+	"bridge EOF during a backpressured snapshot exits nonzero under %s",
+	async (_, runtime) => {
+		const { child, frames } = await startWorker(
+			[],
+			undefined,
+			backpressuredHistory(),
+			undefined,
+			undefined,
+			true,
+			{ eofOnRegister: true, runtime },
+		);
+		await eventually(() => frames.some((frame) => frame.type === "register"));
+		const registration = frames.find((frame) => frame.type === "register");
+		expect(registration?.history_complete).toBe(true);
+		await eventually(() => child.exitCode !== null);
+		expect(child.exitCode).toBe(1);
+	},
+);
+
+test.each(WORKER_RUNTIMES)(
+	"an explicit host shutdown still exits cleanly under %s",
+	async (_, runtime) => {
+		const { child, frames, send } = await startWorker(
+			[],
+			undefined,
+			backpressuredHistory(),
+			undefined,
+			undefined,
+			true,
+			{ runtime },
+		);
+		await eventually(() => frames.some((frame) => frame.type === "snapshot_end"));
+		// The same history succeeds with a draining peer: exit 1 in the EOF case cannot be a
+		// bad fixture, missing runtime, failed SDK import or an unconditionally failing worker.
+		expect(frames.filter((frame) => frame.type === "snapshot_entry")).toHaveLength(80);
+		expect(child.exitCode).toBe(null);
+		send({ v: 1, type: "shutdown" });
+		expect(await child.exited).toBe(0);
+	},
+);
+
+// A full peer close must also exit nonzero: error-only handling used to leave an invisible
+// worker that could neither receive commands nor re-register with its consumed spawn token.
 test("a worker whose bridge drops exits instead of running on invisibly", async () => {
 	const { child, frames, dropPeer } = await startWorker(
 		[],
