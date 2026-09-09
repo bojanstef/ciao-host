@@ -792,6 +792,153 @@ mod tests {
         );
     }
 
+    // Exercise the real process reader -> authenticated nonce -> supervisor chain. A fixed
+    // fixture nonce alone cannot catch a clock-derived identity clearing a live timeline.
+    async fn process_identity_retention_journey(duration: std::time::Duration) {
+        use crate::agent_protocol::{CommandCapabilities, ToolTimelineBody};
+        use std::process::{Command, Stdio};
+
+        struct Sleeper(std::process::Child);
+        impl Sleeper {
+            fn spawn() -> Self {
+                Self(
+                    Command::new("/bin/sleep")
+                        .arg("120")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                )
+            }
+        }
+        impl Drop for Sleeper {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                self.0.wait().unwrap();
+            }
+        }
+        async fn register(sessions: &AgentSessionSupervisor, pid: u32) -> RegisteredAgentSession {
+            let mut facts = AgentAdapterRegistry::production()
+                .select(&pi_registration(Some("pi")), Some(std::process::id()))
+                .unwrap()
+                .registration;
+            facts.process_id = pid;
+            facts.process_nonce = authenticated_process_nonce(
+                "fixture-nonce",
+                pid,
+                &process_start_fingerprint(pid).await.unwrap(),
+            );
+            facts.capabilities.commands = CommandCapabilities::none();
+            facts.capabilities.pending_rehydration = "none".into();
+            facts.control_owner = "terminal".into();
+            sessions.register_observer(facts).await.unwrap()
+        }
+        let temporary = tempdir().unwrap();
+        let sessions = AgentSessionSupervisor::load(
+            &temporary.path().join("agent-metadata.json"),
+            WorkspaceConfig::with_binary_dirs(Vec::new()),
+        )
+        .unwrap();
+        let child = Sleeper::spawn();
+        let first = register(&sessions, child.0.id()).await;
+        for (source, kind, body) in [
+            (
+                "prompt",
+                "user_message",
+                TimelineBody::Text {
+                    text: "Synthetic prompt".into(),
+                },
+            ),
+            (
+                "tool",
+                "tool",
+                TimelineBody::Tool {
+                    tool: ToolTimelineBody {
+                        name: "fixture".into(),
+                        status: "completed".into(),
+                        input_preview: Some("{}".into()),
+                        result_preview: Some("\"café\\nsecond line\"".into()),
+                    },
+                },
+            ),
+        ] {
+            sessions
+                .upsert_bridge_entry(
+                    &first.session_id,
+                    NormalizedTimelineEntry {
+                        source_id: source.into(),
+                        source_revision: 1,
+                        timestamp: 1,
+                        state: "complete".into(),
+                        kind: kind.into(),
+                        body,
+                        truncation: Truncation {
+                            truncated: false,
+                            reason_code: None,
+                            original_bytes: None,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let before = sessions.snapshot(&first.session_id).unwrap();
+        assert_eq!(before.timeline_window.entries.len(), 2);
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut readings = 0;
+        loop {
+            let next = register(&sessions, child.0.id()).await;
+            let after = sessions.snapshot(&next.session_id).unwrap();
+            assert_eq!(next.session_id, first.session_id);
+            assert_eq!(
+                next.process_generation, first.process_generation,
+                "same live process lost its generation"
+            );
+            assert_eq!(next.snapshot_epoch, first.snapshot_epoch);
+            assert_eq!(
+                after.timeline_window.entries, before.timeline_window.entries,
+                "prompt/tool history must survive re-registration"
+            );
+            readings += 1;
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let old_pid = child.0.id();
+        drop(child);
+        let replacement = Sleeper::spawn();
+        assert_ne!(replacement.0.id(), old_pid);
+        let next = register(&sessions, replacement.0.id()).await;
+        assert_eq!(next.session_id, first.session_id);
+        assert_eq!(next.process_generation, first.process_generation + 1);
+        assert_ne!(next.snapshot_epoch, first.snapshot_epoch);
+        assert!(
+            sessions
+                .snapshot(&next.session_id)
+                .unwrap()
+                .timeline_window
+                .entries
+                .is_empty(),
+            "a genuine replacement must not inherit the old process's live tail"
+        );
+        eprintln!(
+            "process identity journey: {readings} same-process registrations retained prompt/tool; replacement fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_identity_retains_history_and_fences_replacement() {
+        process_identity_retention_journey(std::time::Duration::ZERO).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "grounded Linux clock-drift soak; run explicitly on a disposable Linux host"]
+    async fn grounded_linux_process_identity_retains_history_across_clock_drift() {
+        process_identity_retention_journey(std::time::Duration::from_secs(65)).await;
+    }
+
     #[test]
     fn registry_rejects_unknown_or_ambiguous_adapter_dispatch() {
         let registry = AgentAdapterRegistry::production();

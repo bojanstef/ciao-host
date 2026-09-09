@@ -6,7 +6,8 @@
 //!
 //! Every `ps` read goes through [`crate::workspace::run_bounded`], so it inherits the same
 //! fixed-argv, cleaned-environment, timed, capped-output policy as every other non-PTY
-//! provider invocation. This module resolves the `ps` path and owns no other process policy.
+//! provider invocation. Linux start identity instead reads bounded kernel procfs records: `ps`
+//! derives its displayed start time from wall time, which can change for a still-live process.
 
 use std::{path::Path, time::Duration};
 
@@ -70,12 +71,17 @@ pub(crate) async fn command(pid: u32) -> Option<String> {
     ps_field(pid, &["-ww"], "command=", true).await
 }
 
-/// When a process started, as `ps` reports it. Bounded to printable ASCII so it can be used as
-/// an opaque identity component; `None` when it is unreadable or shaped unexpectedly.
+/// An opaque process-start identity component, never a display timestamp. Linux uses the boot
+/// UUID plus `/proc/<pid>/stat` start ticks, fencing both PID reuse and reboot without wall-clock
+/// conversion. Other platforms retain `ps lstart`. Unreadable/malformed Linux records fail closed
+/// (no `ps` fallback). Callers must also bind the PID; raw components stay host-local.
 ///
 /// The bound is the caller's, because what this fingerprint has to fit inside is the caller's
 /// identifier vocabulary, not a fact about processes.
 pub(crate) async fn start_fingerprint(pid: u32, max_bytes: usize) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let value = linux_start_fingerprint(Path::new("/proc"), pid).await?;
+    #[cfg(not(target_os = "linux"))]
     let value = ps_field(pid, &[], "lstart=", true).await?;
     (!value.is_empty()
         && value.len() <= max_bytes
@@ -83,6 +89,70 @@ pub(crate) async fn start_fingerprint(pid: u32, max_bytes: usize) -> Option<Stri
             .bytes()
             .all(|byte| byte.is_ascii_graphic() || byte == b' '))
     .then_some(value)
+}
+
+#[cfg(any(target_os = "linux", test))]
+const MAX_PROC_STAT_BYTES: usize = 4096;
+
+#[cfg(any(target_os = "linux", test))]
+async fn linux_start_fingerprint(proc_root: &Path, pid: u32) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    async fn read_bounded(path: &Path, cap: usize) -> Option<Vec<u8>> {
+        let file = tokio::fs::File::open(path).await.ok()?;
+        let mut bytes = Vec::new();
+        file.take((cap + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .ok()?;
+        (bytes.len() <= cap).then_some(bytes)
+    }
+
+    if pid == 0 || i32::try_from(pid).is_err() {
+        return None;
+    }
+    // procfs reports zero file lengths; cap the actual reads rather than trusting metadata.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let boot = read_bounded(&proc_root.join("sys/kernel/random/boot_id"), 37).await?;
+        let stat =
+            read_bounded(&proc_root.join(format!("{pid}/stat")), MAX_PROC_STAT_BYTES).await?;
+        linux_identity_from_records(pid, &boot, &stat)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_identity_from_records(pid: u32, boot: &[u8], stat: &[u8]) -> Option<String> {
+    let boot = std::str::from_utf8(boot).ok()?.trim_end_matches('\n');
+    if boot.len() != 36
+        || !boot.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return None;
+    }
+    // comm is parenthesized, not escaped: it can contain spaces, ')' and non-UTF-8 bytes.
+    // The numeric tail contains no ')', so only the final delimiter identifies field 3.
+    if !stat.starts_with(format!("{pid} (").as_bytes()) {
+        return None;
+    }
+    let close = stat.iter().rposition(|&byte| byte == b')')?;
+    let tail = std::str::from_utf8(stat.get(close + 1..)?).ok()?;
+    if !tail.starts_with(' ') {
+        return None;
+    }
+    let ticks = tail.split_ascii_whitespace().nth(19)?; // field 22, tail begins at 3
+    if ticks.is_empty() || !ticks.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let ticks: u64 = ticks.parse().ok()?;
+    Some(format!("linux:{}:{ticks}", boot.to_ascii_lowercase()))
 }
 
 pub(crate) async fn parent(pid: u32) -> Option<u32> {
@@ -307,6 +377,108 @@ mod tests {
             command(u32::MAX).await.is_none(),
             "an impossible pid must not yield a command line"
         );
+    }
+
+    const BOOT_A: &[u8] = b"12345678-1234-1234-1234-123456789abc\n";
+    const BOOT_B: &[u8] = b"12345678-1234-1234-1234-123456789abd\n";
+
+    fn stat_record(pid: u32, comm: &[u8], ticks: &str) -> Vec<u8> {
+        let mut record = format!("{pid} (").into_bytes();
+        record.extend_from_slice(comm);
+        // state (3), eighteen fields (4..21), starttime (22), then unrelated fields.
+        record.extend_from_slice(format!(") S {}{ticks} 999 888\n", "0 ".repeat(18)).as_bytes());
+        record
+    }
+
+    #[test]
+    fn linux_identity_parses_comm_and_fences_pid_reuse_and_reboot() {
+        let first = stat_record(42, b"name with ) ( spaces\n\xff)", "12345");
+        let same = stat_record(42, b"renamed", "12345");
+        let reused = stat_record(42, b"renamed", "12346");
+        let identity = linux_identity_from_records(42, BOOT_A, &first).unwrap();
+        assert_eq!(identity, "linux:12345678-1234-1234-1234-123456789abc:12345");
+        assert_eq!(
+            Some(identity.clone()),
+            linux_identity_from_records(42, BOOT_A, &same)
+        );
+        assert_ne!(
+            Some(identity.clone()),
+            linux_identity_from_records(42, BOOT_A, &reused)
+        );
+        assert_ne!(
+            Some(identity),
+            linux_identity_from_records(42, BOOT_B, &first)
+        );
+        assert!(linux_identity_from_records(43, BOOT_A, &first).is_none());
+        for ticks in ["-1", "+1", "1x", "18446744073709551616"] {
+            assert!(
+                linux_identity_from_records(42, BOOT_A, &stat_record(42, b"x", ticks)).is_none()
+            );
+        }
+        for boot in [
+            b"".as_slice(),
+            b"not-a-boot-id",
+            b"12345678-1234-1234-1234-123456789abg",
+        ] {
+            assert!(linux_identity_from_records(42, boot, &first).is_none());
+        }
+        for stat in [b"".as_slice(), b"42 (broken", b"42 (x) S 0", b"42 (x)S 0"] {
+            assert!(linux_identity_from_records(42, BOOT_A, stat).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_identity_reads_are_bounded_and_fail_closed() {
+        let temp = tempdir().unwrap();
+        let boot = temp.path().join("sys/kernel/random/boot_id");
+        let stat = temp.path().join("42/stat");
+        fs::create_dir_all(boot.parent().unwrap()).unwrap();
+        fs::create_dir_all(stat.parent().unwrap()).unwrap();
+        assert!(linux_start_fingerprint(temp.path(), 42).await.is_none());
+        fs::write(&boot, BOOT_A).unwrap();
+        assert!(linux_start_fingerprint(temp.path(), 42).await.is_none());
+        fs::write(&stat, stat_record(42, b"x", "18446744073709551615")).unwrap();
+        assert_eq!(
+            linux_start_fingerprint(temp.path(), 42)
+                .await
+                .unwrap()
+                .len(),
+            63
+        );
+        fs::write(&stat, vec![b'x'; MAX_PROC_STAT_BYTES + 1]).unwrap();
+        assert!(linux_start_fingerprint(temp.path(), 42).await.is_none());
+        fs::write(&stat, stat_record(42, b"x", "1")).unwrap();
+        fs::write(&boot, [BOOT_A, b"\n"].concat()).unwrap();
+        assert!(linux_start_fingerprint(temp.path(), 42).await.is_none());
+        fs::remove_file(&boot).unwrap();
+        assert!(linux_start_fingerprint(temp.path(), 42).await.is_none());
+        assert!(linux_start_fingerprint(temp.path(), 0).await.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_start_fingerprint_uses_boot_identity_and_kernel_ticks() {
+        let pid = std::process::id();
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        // comm can itself contain spaces and ')'; fields after its final ')' start at 3.
+        let ticks: u64 = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_ascii_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let expected = format!("linux:{}:{ticks}", boot.trim());
+        let actual = start_fingerprint(pid, 64).await.unwrap();
+        assert!(
+            actual == expected,
+            "identity must use boot ID and kernel ticks, not wall time"
+        );
+        assert!(start_fingerprint(u32::MAX, 64).await.is_none());
+        assert!(start_fingerprint(0, 64).await.is_none());
     }
 
     #[tokio::test]
