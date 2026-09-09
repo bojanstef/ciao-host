@@ -86,7 +86,7 @@ This export supplies **no production token** and no private packaging/signing co
 
 ## Contributing and reporting security issues
 
-For non-sensitive bugs or proposed host patches, use this repository's issues/PRs once it is published. Small, tested changes are welcome; the host and shared protocol are maintained in the private monorepo and reconciled into this reviewed export, not developed independently here. See [export maintenance](EXPORT.md). Protocol changes must be tested against the app before inclusion.
+This repository is the authoritative home for host code, integration sources, vendor pins and shared protocol fixtures. For non-sensitive bugs or proposed host patches, use its issues/PRs. Small, tested changes are welcome. The private app repository consumes a pinned host revision; it does not maintain another host implementation. Protocol changes must be tested against the app before inclusion. See [source ownership and publication boundaries](EXPORT.md).
 
 For a suspected vulnerability, contact **[privacy@ciaooo.app](mailto:privacy@ciaooo.app)** privately (the published Ciao privacy contact). Send a minimal description first, with no credentials or private content. This is ordinary email, not an advertised encrypted channel, bug bounty or response-time guarantee. Do not post exploit details or sensitive logs publicly while coordinating a report.
 
