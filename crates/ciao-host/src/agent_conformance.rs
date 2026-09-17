@@ -667,6 +667,9 @@ fn contracts() -> [ParityContract; 4] {
         },
         ParityContract {
             id: "codex",
+            // Hook novelty now tallies locally against hookEventNames, without dispatch.
+            // Capability, event and registration sets stay unchanged; Interrupt is not mapped
+            // and 0.154.0 is not admitted. See future_shaped_input_codex_hook_novelty_without_dispatch.
             // 2026-09-08: history/adopted functionCallOutput text projection only.
             // No wire events, capabilities, hook registration or pin membership changed.
             // Linux hook version facts now use the kernel-bound running image and bounded
@@ -1308,4 +1311,10 @@ fn future_shaped_input_function_output_projection_and_novelty() {
             .iter()
             .any(|s| s.kind == "unknown_item" && s.name == "reasoning")
     );
+}
+
+/// Hook novelty is accounting only, not another canonical event or capability.
+#[test]
+fn future_shaped_input_codex_hook_novelty_without_dispatch() {
+    crate::codex_hook::tests::rehearse_hook_novelty();
 }

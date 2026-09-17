@@ -56,6 +56,28 @@ pub(crate) fn known_thread_item(item_type: &str) -> bool {
         });
     KNOWN.is_empty() || KNOWN.contains(item_type)
 }
+/// Hook payloads use PascalCase; the grounded schema uses camelCase. Known but
+/// deliberately ignored hooks are not novelty. An unreadable/missing extract stays quiet.
+pub(crate) fn known_hook_event(event_name: &str) -> bool {
+    known_hook_event_in_extract(event_name, PROTOCOL_PINS)
+}
+
+fn known_hook_event_in_extract(event_name: &str, extract: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Pins {
+        #[serde(rename = "hookEventNames", default)]
+        hook_event_names: Vec<String>,
+    }
+    let Ok(pins) = serde_json::from_str::<Pins>(extract) else {
+        return true;
+    };
+    let mut normalized = event_name.to_owned();
+    if let Some(first) = normalized.get_mut(..1) {
+        first.make_ascii_lowercase();
+    }
+    pins.hook_event_names.is_empty() || pins.hook_event_names.contains(&normalized)
+}
+
 /// Separates this vendor's digests from every other adapter's. Frozen: changing it renumbers
 /// every live Codex entry.
 pub(crate) const CODEX_DIGEST_DOMAIN: &[u8] = b"ciao-codex-hook-v1\0";
@@ -229,6 +251,28 @@ mod tests {
             "workspace_path": "/private/synthetic/Fixture workspace"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn hook_membership_normalizes_payload_names_and_fails_quiet() {
+        assert!(known_hook_event("PreCompact"));
+        assert!(known_hook_event("UserPromptSubmit"));
+        assert!(!known_hook_event("Interrupt"));
+        for extract in [
+            "",
+            "not json",
+            "{}",
+            r#"{"hookEventNames":null}"#,
+            r#"{"hookEventNames":[]}"#,
+            r#"{"hookEventNames":[42]}"#,
+        ] {
+            assert!(known_hook_event_in_extract("Interrupt", extract));
+        }
+        // An explicit future extract is evidence of membership, not permission to dispatch.
+        assert!(known_hook_event_in_extract(
+            "Interrupt",
+            r#"{"hookEventNames":["interrupt"]}"#,
+        ));
     }
 
     #[test]
