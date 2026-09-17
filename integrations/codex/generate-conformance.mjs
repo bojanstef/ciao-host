@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PINNED_CODEX_VERSION = "0.147.0";
+const PINNED_CODEX_VERSION = "0.154.0";
 const OUTPUT = path.join(import.meta.dirname, "conformance", "protocol-pins.json");
 
 // A discriminant is spelled `const` for some variants and a one-value `enum` for others; the

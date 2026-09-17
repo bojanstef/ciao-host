@@ -1,9 +1,9 @@
 {
-	"pin": "0.147.0",
+	"pin": "0.154.0",
 	"generatedBy": "integrations/codex/generate-conformance.mjs",
 	"counts": {
-		"clientMethods": 95,
-		"serverNotifications": 70
+		"clientMethods": 99,
+		"serverNotifications": 81
 	},
 	"requiredClientMethods": [
 		"thread/read",
@@ -56,6 +56,7 @@
 		"workspace-write"
 	],
 	"hookEventNames": [
+		"interrupt",
 		"permissionRequest",
 		"postCompact",
 		"postToolUse",
@@ -97,6 +98,7 @@
 		"enteredReviewMode",
 		"exitedReviewMode",
 		"fileChange",
+		"functionCallOutput",
 		"hookPrompt",
 		"imageGeneration",
 		"imageView",
@@ -124,5 +126,5 @@
 		"waitingOnApproval",
 		"waitingOnUserInput"
 	],
-	"schemaDigest": "9bec458cc869f8ee49a316675a0004fb25430283ec4bb4d936189eb4295f9079"
+	"schemaDigest": "58ac6068641da086604bf92e3ff0488ddef72941ad89962fbb7cf2694be8ef33"
 }

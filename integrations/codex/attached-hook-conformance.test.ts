@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const PINNED_CODEX_VERSION = "0.147.0";
+const PINNED_CODEX_VERSION = "0.154.0";
 const runGrounded = process.env.CIAO_TEST_CODEX_CLI === "1";
 const groundedTest = runGrounded ? test : test.skip;
 const pins = JSON.parse(
@@ -99,11 +99,16 @@ function listedHooks(response: any): any[] {
 
 test("the pins record the protocol the adapter was built against", () => {
 	expect(pins.pin).toBe(PINNED_CODEX_VERSION);
-	// 90→95 at the 0.146.1→0.147.0 bump: five additive thread-section methods
-	// (threadSection/{create,delete,list,update}, thread/section/move), nothing removed and
-	// no notification moved. This literal is the tripwire that makes someone look — if it
-	// fails, diff both binaries' generate-json-schema output before editing the number.
-	expect(pins.counts).toEqual({ clientMethods: 95, serverNotifications: 70 });
+	// 95→99 and 70→81 at the 0.147.0→0.154.0 bump, both binaries' generate-json-schema output
+	// diffed on 2026-09-17: four additive client methods (plugin/reconcile, thread/items/list,
+	// thread/revert, thread/turns/list) and eleven additive notifications (autoApprovalReview/
+	// strictReviewRequired, mcpServer/event/stream/notification, modelProvider/authRecovery
+	// {Started,Completed}, project/changed, thread/project/updated, thread/queue/changed,
+	// thread/realtime/item/{started,completed,transcript/delta}, thread/reverted); nothing
+	// removed. Before that, 90→95 at 0.146.1→0.147.0 was five additive thread-section methods.
+	// This literal is the tripwire that makes someone look — if it fails, diff both binaries'
+	// generate-json-schema output before editing the number.
+	expect(pins.counts).toEqual({ clientMethods: 99, serverNotifications: 81 });
 	// Without these two the adapter has no join key and no history; their absence is
 	// categorical rather than a degradation.
 	expect(pins.requiredClientMethods).toContain("thread/read");

@@ -322,6 +322,11 @@ pub(crate) fn distill_schema_dir(directory: &Path) -> Result<PinExtract> {
                 "turn/start",
                 "turn/steer",
                 "turn/interrupt",
+                // Added to the generator on 2026-08-18 and never mirrored here: until the
+                // 0.154.0 re-grounding ran the opt-in lock test, this port distilled eight
+                // methods against a pins file listing nine, so no installed binary could ever
+                // read as carried. The lock test is the fence; run it at every bump.
+                "model/list",
             ],
             &client_methods,
         ),
@@ -1014,7 +1019,7 @@ mod tests {
     #[test]
     fn the_embedded_extract_parses_and_matches_itself() {
         let embedded = embedded_extract().expect("embedded pins parse");
-        assert_eq!(embedded.counts.client_methods, 95);
+        assert_eq!(embedded.counts.client_methods, 99);
         assert!(embedded.thread_item_types.contains(&"agentMessage".into()));
         assert!(embedded.read_set_changes(embedded).is_empty());
 
@@ -1031,13 +1036,18 @@ mod tests {
 
     #[test]
     fn a_verdict_covers_only_the_exact_binary_it_judged() {
+        // Computed, not spelled: a prover speaks only for a later minor of the pin, so the
+        // literal form of these versions flips meaning at every pin bump (vendor policy trap #3).
+        let pin = crate::codex_adapter::PINNED_CODEX_VERSION;
+        let later = crate::agent_protocol::one_minor_past(pin);
+        let even_later = crate::agent_protocol::one_minor_past(&later);
         let directory = tempfile::tempdir().unwrap();
         let binary = directory.path().join("codex");
         std::fs::write(&binary, b"synthetic codex").unwrap();
         let (size, mtime) = binary_stat(&binary).unwrap();
         let verdict = CarryVerdict {
             v: VERDICT_FILE_VERSION,
-            version: "0.148.0".into(),
+            version: later.clone(),
             binary: BinaryIdentity {
                 path: binary.to_string_lossy().into_owned(),
                 size,
@@ -1051,14 +1061,14 @@ mod tests {
         };
         store_verdict(directory.path(), &verdict);
         assert_eq!(load_verdict(directory.path()), Some(verdict.clone()));
-        assert!(verdict_covers(&verdict, "0.148.0", &binary));
+        assert!(verdict_covers(&verdict, &later, &binary));
         assert!(
-            !verdict_covers(&verdict, "0.149.0", &binary),
+            !verdict_covers(&verdict, &even_later, &binary),
             "another version"
         );
 
         assert_eq!(
-            state_for("0.148.0", directory.path(), Some(&binary)),
+            state_for(&later, directory.path(), Some(&binary)),
             VendorVersionState::Carried
         );
         assert_eq!(
@@ -1079,9 +1089,9 @@ mod tests {
         // The binary moves under the verdict: stat misses, the carry lapses, nothing is
         // admitted on stale evidence.
         std::fs::write(&binary, b"synthetic codex, replaced").unwrap();
-        assert!(!verdict_covers(&verdict, "0.148.0", &binary));
+        assert!(!verdict_covers(&verdict, &later, &binary));
         assert_eq!(
-            state_for("0.148.0", directory.path(), Some(&binary)),
+            state_for(&later, directory.path(), Some(&binary)),
             VendorVersionState::Unsupported
         );
 
