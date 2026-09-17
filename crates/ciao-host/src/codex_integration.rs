@@ -437,8 +437,24 @@ mod tests {
         // split Claude had. It costs more here: attached hooks are Codex's only surface, so a
         // wrong refusal loses the whole integration rather than the read-only half of it.
         assert!(codex_version_supported(PINNED_CODEX_VERSION));
-        assert!(codex_version_supported("0.147.9"), "a later patch");
-        assert!(!codex_version_supported("0.146.1"), "an older patch");
+        let (major, minor, _) = {
+            let mut parts = PINNED_CODEX_VERSION
+                .split('.')
+                .map(|p| p.parse::<u32>().unwrap());
+            (
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+            )
+        };
+        assert!(
+            codex_version_supported(&format!("{major}.{minor}.9")),
+            "a later patch"
+        );
+        assert!(
+            !codex_version_supported(&format!("{major}.{}.1", minor - 1)),
+            "an older minor"
+        );
         // Computed, not spelled: the literal form of this case silently flips meaning at every
         // pin bump (vendor-version-policy trap #3). A 0.x minor stays refused until Phase 3
         // proves it mechanically.
@@ -446,8 +462,14 @@ mod tests {
             !codex_version_supported(&one_minor_past(PINNED_CODEX_VERSION)),
             "a minor bump of a 0.x pin"
         );
-        assert!(!codex_version_supported("1.147.0"), "a major bump");
-        assert!(!codex_version_supported("0.147.1-rc1"), "a prerelease");
+        assert!(
+            !codex_version_supported(&format!("{}.{minor}.0", major + 1)),
+            "a major bump"
+        );
+        assert!(
+            !codex_version_supported(&format!("{major}.{minor}.1-rc1")),
+            "a prerelease"
+        );
         assert!(!codex_version_supported(""), "an unparseable version");
     }
 

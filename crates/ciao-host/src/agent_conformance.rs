@@ -667,9 +667,11 @@ fn contracts() -> [ParityContract; 4] {
         },
         ParityContract {
             id: "codex",
-            // Hook novelty now tallies locally against hookEventNames, without dispatch.
-            // Capability, event and registration sets stay unchanged; Interrupt is not mapped
-            // and 0.154.0 is not admitted. See future_shaped_input_codex_hook_novelty_without_dispatch.
+            // Hook novelty tallies locally against hookEventNames, without dispatch. The
+            // 0.154.0 re-grounding admits that version and lists Interrupt as deliberately
+            // ignored; capability, event and registration sets stay unchanged. See
+            // future_shaped_input_codex_hook_novelty_without_dispatch and
+            // future_shaped_input_codex_grounded_vocabulary_is_accounted.
             // 2026-09-08: history/adopted functionCallOutput text projection only.
             // No wire events, capabilities, hook registration or pin membership changed.
             // Linux hook version facts now use the kernel-bound running image and bounded
@@ -1280,7 +1282,8 @@ fn topology_flags_and_service_frames_match_the_ledger() {
 /// Vendor projection tolerance is separate from the strict canonical-frame suite above.
 #[test]
 fn future_shaped_input_function_output_projection_and_novelty() {
-    assert!(!crate::codex_adapter::known_thread_item(
+    // Grounded since the 0.154.0 re-grounding, and projected: a known type rendered as a tool.
+    assert!(crate::codex_adapter::known_thread_item(
         "functionCallOutput"
     ));
     let response = json!({"thread":{"turns":[{"id":"scope","items":[
@@ -1297,20 +1300,32 @@ fn future_shaped_input_function_output_projection_and_novelty() {
         entry.validate().unwrap();
     }
     let ledger = crate::drift::snapshot();
-    for name in ["functionCallOutput", "ScopeConformanceFutureItem"] {
-        assert!(
-            ledger.vendors["codex"]
-                .signatures
-                .iter()
-                .any(|s| s.surface == "history_item" && s.kind == "unknown_item" && s.name == name)
-        );
-    }
     assert!(
-        !ledger.vendors["codex"]
+        ledger.vendors["codex"]
             .signatures
             .iter()
-            .any(|s| s.kind == "unknown_item" && s.name == "reasoning")
+            .any(|s| s.surface == "history_item"
+                && s.kind == "unknown_item"
+                && s.name == "ScopeConformanceFutureItem")
     );
+    for grounded in ["reasoning", "functionCallOutput"] {
+        assert!(
+            !ledger.vendors["codex"]
+                .signatures
+                .iter()
+                .any(|s| s.kind == "unknown_item" && s.name == grounded),
+            "{grounded} is grounded vocabulary and never novelty"
+        );
+    }
+}
+
+/// Re-grounding the extract must never absorb a name nobody decided about: every grounded hook
+/// event is dispatched or deliberately ignored, every grounded item type projected or
+/// deliberately categorical.
+#[test]
+fn future_shaped_input_codex_grounded_vocabulary_is_accounted() {
+    crate::codex_hook::tests::rehearse_grounded_hook_vocabulary();
+    crate::codex_history::tests::rehearse_grounded_thread_items();
 }
 
 /// Hook novelty is accounting only, not another canonical event or capability.

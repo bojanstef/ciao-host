@@ -1946,7 +1946,7 @@ mod tests {
             rollout: Some(rollout.clone()),
             workspace_display: "e2e".into(),
             workspace_path: Some(cwd.to_string_lossy().into_owned()),
-            adapter_version: "0.147.0".into(),
+            adapter_version: crate::codex_adapter::PINNED_CODEX_VERSION.into(),
         };
 
         // A push with no paired devices is a no-op, which is exactly what a test wants.

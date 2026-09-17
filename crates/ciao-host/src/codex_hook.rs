@@ -249,7 +249,7 @@ async fn probe_codex_version(binary: std::path::PathBuf) -> Result<String> {
     .map_err(|_| anyhow!("Codex version check timed out"))?
 }
 
-/// `codex --version` answers `codex-cli 0.147.0`.
+/// `codex --version` answers `codex-cli <version>`, for example `codex-cli 0.147.0`.
 pub(crate) fn parse_codex_version_output(output: &std::process::Output) -> Result<String> {
     if !output.status.success() || output.stdout.is_empty() || output.stdout.len() > 256 {
         bail!("Codex returned an invalid version response");
@@ -267,6 +267,23 @@ pub(crate) fn parse_codex_version_output(output: &std::process::Output) -> Resul
     }
     Ok(version.into())
 }
+
+/// Grounded hook events this adapter deliberately does not ride, spelled as the payload spells
+/// them. Every name the pins file lists must be either dispatched below or named here: the
+/// conformance rehearsal `future_shaped_input_codex_grounded_vocabulary_is_accounted` fails a
+/// re-grounding that adds a name nobody decided about, which is what keeps regenerating the
+/// extract from silently absorbing vendor vocabulary (Spec 017 §4.2).
+///
+/// `Interrupt` (0.154.0) ends a turn from the person's side. Riding it on a `Turn` frame is a
+/// proposal, not a repair: an interrupted turn has no `last_assistant_message`, and Codex's
+/// `Stop` still follows and closes the turn, so nothing is lost by observing it silently.
+pub(crate) const IGNORED_HOOK_EVENTS: &[&str] = &[
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+    "Interrupt",
+];
 
 /// Maps one hook payload to a registration plus one event, or to nothing at all.
 ///
@@ -382,6 +399,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 },
                 Some(TurnState::Idle),
             ),
+            name if IGNORED_HOOK_EVENTS.contains(&name) => return Ok(None),
             // Accounting only: a dispatch would register and clobber the observed turn.
             _ => {
                 if !crate::codex_adapter::known_hook_event(event_name) {
@@ -637,9 +655,49 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
+    /// Every name the embedded grounding lists is either dispatched or deliberately ignored.
+    /// Called by the conformance rehearsal; this is the fence that makes re-grounding safe.
+    pub(crate) fn rehearse_grounded_hook_vocabulary() {
+        let extract = crate::codex_carry::embedded_extract().expect("embedded pins parse");
+        assert!(
+            extract.hook_event_names.len() >= 11,
+            "the grounding names the hook surface"
+        );
+        for name in &extract.hook_event_names {
+            let mut payload_name = name.clone();
+            if let Some(first) = payload_name.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            let mut payload = turn(common(&payload_name));
+            payload["prompt"] = json!("Synthetic prompt.");
+            payload["last_assistant_message"] = json!("Done.");
+            payload["tool_name"] = json!("Bash");
+            payload["tool_use_id"] = json!("synthetic-tool");
+            payload["tool_input"] = json!({"command": "echo hello"});
+            payload["tool_response"] = json!("hello");
+            let dispatched = map_hook_input(&payload, &facts())
+                .unwrap_or_else(|error| panic!("grounded hook event {name} must map: {error}"))
+                .is_some();
+            assert!(
+                dispatched || IGNORED_HOOK_EVENTS.contains(&payload_name.as_str()),
+                "grounded hook event {name} is neither dispatched nor deliberately ignored"
+            );
+            assert!(
+                crate::codex_adapter::known_hook_event(&payload_name),
+                "the payload spelling of {name} must round-trip to the grounding"
+            );
+        }
+        for ignored in IGNORED_HOOK_EVENTS {
+            assert!(
+                crate::codex_adapter::known_hook_event(ignored),
+                "an ignored event must still be grounded vocabulary, not a stale entry: {ignored}"
+            );
+        }
+    }
+
     // Called once by the conformance rehearsal; fixtures stay at the vendor boundary.
     pub(crate) fn rehearse_hook_novelty() {
-        for event in ["Interrupt", "not a vocabulary token\n"] {
+        for event in ["ScopeConformanceFutureHook", "not a vocabulary token\n"] {
             let name = crate::drift::sanitize_name(event);
             let count = || {
                 hook_notes(&[&name])
@@ -655,6 +713,7 @@ pub(crate) mod tests {
 
         // Scope snapshots to these fixtures, not concurrent tests' other novel names.
         let names = [
+            "ScopeConformanceFutureHook",
             "Interrupt",
             "invalid",
             "PreCompact",
@@ -670,7 +729,7 @@ pub(crate) mod tests {
             "SessionEnd",
         ];
         let before = hook_notes(&names);
-        for event in ["PreCompact", "PostCompact", "SubagentStart", "SubagentStop"] {
+        for event in IGNORED_HOOK_EVENTS {
             assert!(map_hook_input(&common(event), &facts()).unwrap().is_none());
         }
         for event in [
@@ -703,10 +762,11 @@ pub(crate) mod tests {
             let dispatch = map_hook_input(&payload, &facts()).unwrap().unwrap();
             assert_eq!(dispatch.turn, Some(expected), "{event}");
         }
-        // Candidate metadata does not authorize admission or even novelty tallying.
+        // Candidate metadata does not authorize admission or even novelty tallying: a minor past
+        // the pin registers a heartbeat and says nothing else, whatever event it names.
         let mut candidate = facts();
-        candidate.adapter_version = "0.154.0".into();
-        let dispatch = map_hook_input(&common("Interrupt"), &candidate)
+        candidate.adapter_version = crate::agent_protocol::one_minor_past(PINNED_CODEX_VERSION);
+        let dispatch = map_hook_input(&common("ScopeConformanceFutureHook"), &candidate)
             .unwrap()
             .unwrap();
         assert!(matches!(

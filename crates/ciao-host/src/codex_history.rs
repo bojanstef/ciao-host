@@ -203,6 +203,24 @@ pub(crate) fn map_thread(result: &Value, live_run_id: &str) -> Vec<NormalizedTim
     entries
 }
 
+/// Grounded thread-item types this adapter deliberately renders as a categorical
+/// `unsupported` card rather than projecting. Every name the pins file lists must be either
+/// matched by an arm in `map_item` or named here; the conformance rehearsal
+/// `future_shaped_input_codex_grounded_vocabulary_is_accounted` fails a re-grounding that adds
+/// a type nobody decided about.
+pub(crate) const CATEGORICAL_THREAD_ITEMS: &[&str] = &[
+    "contextCompaction",
+    "enteredReviewMode",
+    "exitedReviewMode",
+    "hookPrompt",
+    "imageGeneration",
+    "imageView",
+    "plan",
+    "reasoning",
+    "sleep",
+    "subAgentActivity",
+];
+
 fn map_item(
     item: &Value,
     turn_id: &str,
@@ -275,14 +293,24 @@ fn map_item(
         // Reasoning, plans, review-mode markers, compaction, and anything Codex adds after this
         // pin. Named categorically so the reader can see that something happened here. A type
         // the pin never listed is additionally tallied as drift (Spec 017 §4.2) — the card says
-        // something happened, the ledger says the vendor moved.
-        _ => (
-            "unsupported",
-            TimelineBody::Unsupported {
-                reason_code: "codex_history_item".into(),
-            },
-            no_truncation(),
-        ),
+        // something happened, the ledger says the vendor moved. A type the pin does list that
+        // is neither projected above nor deliberately categorical is a decision nobody made;
+        // the build-time rehearsal refuses that, and the runtime tally is the second fence.
+        _ => {
+            if item_type != "functionCallOutput"
+                && !CATEGORICAL_THREAD_ITEMS.contains(&item_type)
+                && crate::codex_adapter::known_thread_item(item_type)
+            {
+                crate::drift::note("codex", "history_item", "unmapped_item", item_type, None);
+            }
+            (
+                "unsupported",
+                TimelineBody::Unsupported {
+                    reason_code: "codex_history_item".into(),
+                },
+                no_truncation(),
+            )
+        }
     };
     let entry = NormalizedTimelineEntry {
         source_id,
@@ -398,7 +426,7 @@ pub(crate) fn content_text(item: &Value) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn function_output_projection_privacy_shapes_and_bounds() {
         for output in [
@@ -492,6 +520,41 @@ mod tests {
     }
 
     use super::*;
+
+    /// Every grounded thread-item type is projected or deliberately categorical. Called by the
+    /// conformance rehearsal; the fence that makes re-grounding the extract safe.
+    pub(crate) fn rehearse_grounded_thread_items() {
+        let extract = crate::codex_carry::embedded_extract().expect("embedded pins parse");
+        assert!(
+            extract.thread_item_types.len() >= 18,
+            "the grounding names the item surface"
+        );
+        for name in &extract.thread_item_types {
+            // Enough fields for every projecting arm to have something to project.
+            let response = json!({"thread":{"turns":[{"id":"scope","items":[
+                {"id":"item-1","type":name,"text":"t","output":"o","command":"c",
+                 "content":[{"type":"input_text","text":"t"}]}
+            ]}]}});
+            let entries = map_thread(&response, "");
+            assert_eq!(
+                entries.len(),
+                1,
+                "grounded item {name} must yield exactly one entry"
+            );
+            let kind = entries[0].kind.as_str();
+            assert!(
+                kind != "unsupported" || CATEGORICAL_THREAD_ITEMS.contains(&name.as_str()),
+                "grounded thread item {name} is neither projected nor deliberately categorical"
+            );
+            assert!(crate::codex_adapter::known_thread_item(name));
+        }
+        for categorical in CATEGORICAL_THREAD_ITEMS {
+            assert!(
+                crate::codex_adapter::known_thread_item(categorical),
+                "a categorical item must still be grounded vocabulary, not a stale entry: {categorical}"
+            );
+        }
+    }
 
     /// A verbatim `thread/read` response from Codex 0.146.0, captured 2026-08-01.
     fn grounded_response() -> Value {

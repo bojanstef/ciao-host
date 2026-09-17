@@ -1,4 +1,4 @@
-//! Codex CLI 0.147.0 attached-hook adapter wire (Spec 012).
+//! Codex CLI attached-hook adapter wire (Spec 012), grounded at `PINNED_CODEX_VERSION`.
 //!
 //! A Ciao-owned hook command converts Codex hook payloads into this bounded local protocol.
 //! Raw transcript paths and vendor objects never enter the daemon or the canonical phone wire.
@@ -27,7 +27,7 @@ use crate::{
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
 
-pub(crate) const PINNED_CODEX_VERSION: &str = "0.147.0";
+pub(crate) const PINNED_CODEX_VERSION: &str = "0.154.0";
 pub(crate) const CODEX_HOOK_PROTOCOL_VERSION: u8 = 1;
 
 /// The distilled schema extract this pin was grounded against, embedded so the daemon can tell
@@ -257,7 +257,9 @@ mod tests {
     fn hook_membership_normalizes_payload_names_and_fails_quiet() {
         assert!(known_hook_event("PreCompact"));
         assert!(known_hook_event("UserPromptSubmit"));
-        assert!(!known_hook_event("Interrupt"));
+        // Grounded since the 0.154.0 re-grounding; novel names are synthetic on purpose.
+        assert!(known_hook_event("Interrupt"));
+        assert!(!known_hook_event("ScopeConformanceFutureHook"));
         for extract in [
             "",
             "not json",
@@ -266,12 +268,15 @@ mod tests {
             r#"{"hookEventNames":[]}"#,
             r#"{"hookEventNames":[42]}"#,
         ] {
-            assert!(known_hook_event_in_extract("Interrupt", extract));
+            assert!(known_hook_event_in_extract(
+                "ScopeConformanceFutureHook",
+                extract
+            ));
         }
         // An explicit future extract is evidence of membership, not permission to dispatch.
         assert!(known_hook_event_in_extract(
-            "Interrupt",
-            r#"{"hookEventNames":["interrupt"]}"#,
+            "ScopeConformanceFutureHook",
+            r#"{"hookEventNames":["scopeConformanceFutureHook"]}"#,
         ));
     }
 
