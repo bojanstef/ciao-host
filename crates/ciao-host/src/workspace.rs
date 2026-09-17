@@ -1217,6 +1217,63 @@ pub(crate) async fn run_bounded(
     }
 }
 
+/// Creates a tmux session detached, as a child of the DAEMON rather than of a terminal's PTY,
+/// before that terminal's client attaches to it. Reports whether the session exists afterwards,
+/// which is the only thing the caller cares about: `new-session -d` on a name that already
+/// exists fails with `duplicate session`, so the failure arm asks instead of guessing.
+///
+/// `-A` is deliberately absent. It looks like the idempotent spelling and is not: with the
+/// session already there, `-A` makes this an *attach*, and an attach with no terminal fails
+/// (`open terminal failed: not a terminal`, exit 1) even alongside `-d` — measured 2026-09-17,
+/// after the daemon logged a pre-create failure for a session it had itself just created.
+///
+/// Why it exists: `new-session -A` in the PTY starts the tmux *server* there too when no server
+/// is running, and a server inside the PTY's own session is reachable by the cleanup ladder's
+/// process-group signals. `cleanup_terminal` detaches the client first precisely to avoid that,
+/// but the detach is a bounded provider call that can fail or lose a race — on 2026-09-17 a
+/// reattach landed 0.68 s into an old terminal's `ConnectionLost` cleanup, the attach client
+/// exited 1, and the phone was left with no session. `pty.rs`'s own create-survival test records
+/// the mechanism in a comment and excludes it as "a path production never takes"; production
+/// takes it whenever the detach does not win. With the server owned by the daemon there is no
+/// race to lose: `valid_owned_group` can never match a process group outside the PTY's session.
+///
+/// Best effort by design — a false return leaves the old behaviour in place rather than refusing
+/// an open, because the PTY's own `new-session -A` still creates the session if this did not.
+pub(crate) async fn ensure_detached_tmux_session(
+    program: &Path,
+    session: &str,
+    home: &Path,
+) -> bool {
+    if !valid_session_name(session) {
+        return false;
+    }
+    let Some(home) = home.to_str() else {
+        return false;
+    };
+    let created = run_bounded(
+        program,
+        &[
+            TMUX_FORCE_UTF8,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-c",
+            home,
+        ],
+    )
+    .await
+    .is_ok_and(|output| output.status_success);
+    if created {
+        return true;
+    }
+    // The ordinary reason to be here is that the session already exists, which is success.
+    let target = format!("={session}");
+    run_bounded(program, &["has-session", "-t", &target])
+        .await
+        .is_ok_and(|output| output.status_success)
+}
+
 /// Detaches exactly the tmux client connected to Ciao's trusted PTY. The target is derived from
 /// the local PTY allocation, never from a remote request, and provider output remains bounded and
 /// discarded like every other non-PTY provider invocation.

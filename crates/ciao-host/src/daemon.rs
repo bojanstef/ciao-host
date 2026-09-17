@@ -3580,6 +3580,20 @@ async fn handle_terminal_stream(
         );
     }
 
+    // Own the tmux server here rather than inside the terminal's PTY, so no teardown of this
+    // or any later terminal can signal it. See `ensure_detached_tmux_session`.
+    if let Ok(crate::host_protocol::TerminalTarget::TmuxCreate) = open.validated_target()
+        && agent_plan.is_none()
+        && let Some(session) = open.session.as_deref()
+        && let Some(tmux) = state
+            .workspace
+            .resolve(crate::host_protocol::ProviderKind::Tmux)
+        && let Ok(account) = resolve_account()
+        && !crate::workspace::ensure_detached_tmux_session(&tmux, session, &account.home).await
+    {
+        tracing::debug!("detached tmux pre-create did not report success; attaching anyway");
+    }
+
     let tmux_detach_binary = tmux_detach_binary(&open, &state, agent_plan.as_ref());
     let mut spawn_task = match spawn_terminal_child(&open, &state, agent_plan.as_ref()) {
         Ok(task) => task,

@@ -1531,6 +1531,87 @@ mod tests {
         assert!(survived, "new tmux session died with the Ciao client");
     }
 
+    /// The path `tmux_created_session_survives_ciao_client_cleanup` excludes as "one production
+    /// never takes": cleanup with the client still ATTACHED, because the detach failed or lost
+    /// its race. Production takes it — measured on the spare phone, 2026-09-17, where a reattach
+    /// landed 0.68 s into an old terminal's `ConnectionLost` cleanup, the new attach client
+    /// exited 1, and the app was left with no session at all. The session must survive it, which
+    /// it does only because the daemon now owns the server (`ensure_detached_tmux_session`); with
+    /// that pre-create removed, this test fails and the session is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tmux_session_survives_cleanup_of_a_client_that_was_never_detached() {
+        let config = crate::workspace::WorkspaceConfig::for_home(&resolve_account().unwrap().home);
+        let tmux = config
+            .resolve(crate::host_protocol::ProviderKind::Tmux)
+            .expect("tmux is required on the target Mac for the undetached-cleanup test");
+        let socket_dir = tempfile::tempdir().unwrap();
+        let session_name = format!("ciao-undetached-{}", rand::random::<u32>());
+        let account = resolve_account().unwrap();
+
+        // What the daemon now does before spawning the terminal: create the session detached,
+        // as a child of this process rather than of the PTY. Run against the test's own socket,
+        // so `ensure_detached_tmux_session`'s production argv is mirrored rather than called.
+        let created = isolated_tmux(&tmux, socket_dir.path())
+            .args([
+                "-u",
+                "new-session",
+                "-A",
+                "-d",
+                "-s",
+                &session_name,
+                "-c",
+                account.home.to_str().unwrap(),
+            ])
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            created,
+            "the detached pre-create must establish the session"
+        );
+
+        let (program, args) = crate::workspace::target_command(
+            crate::host_protocol::TerminalTarget::TmuxCreate,
+            &session_name,
+            &tmux,
+            &account.home,
+        )
+        .unwrap();
+        let mut client = PtySession::spawn_with_factory(
+            dimensions(),
+            Arc::new(IsolatedTmuxAttachFactory {
+                program,
+                args,
+                socket_dir: socket_dir.path().to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(5), client.next_output())
+            .await
+            .expect("tmux attach produced no output");
+
+        // No detach. The ladder runs against an attached client, exactly as it does when
+        // `detach_tmux_client` fails or a reattach is already in flight.
+        client.cleanup(CleanupReason::ConnectionLost).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let target = format!("={session_name}");
+        let survived = isolated_tmux(&tmux, socket_dir.path())
+            .args(["has-session", "-t", &target])
+            .status()
+            .unwrap()
+            .success();
+        let _ = isolated_tmux(&tmux, socket_dir.path())
+            .args(["kill-server"])
+            .status();
+        assert!(
+            survived,
+            "the tmux session died with an undetached Ciao client, so a reattach has nothing \
+             to attach to"
+        );
+    }
+
     /// Uses the production socket/environment rather than a test-only TMUX_TMPDIR: a session
     /// created through Ciao must be visible to the next production workspace snapshot.
     // Spec 004 §8.3: portable across the accepted Unix hosts; Linux cleanup semantics are
