@@ -1570,6 +1570,45 @@ mod tests {
 
     use super::*;
 
+    /// The pre-create has to leave a session standing, and it has to be cheap: it sits on the
+    /// path of every `tmux.create` open. Uses the production socket deliberately — the same
+    /// reason `tmux_created_session_is_rediscovered_by_production_snapshot` does, since
+    /// `run_bounded` clears the environment and a test-only `TMUX_TMPDIR` would not survive it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_pre_create_leaves_a_session_standing_and_costs_little() {
+        let config = WorkspaceConfig::for_home(&crate::pty::resolve_account().unwrap().home);
+        let Some(tmux) = config.resolve(crate::host_protocol::ProviderKind::Tmux) else {
+            return; // No tmux on this machine; nothing to prove.
+        };
+        let home = crate::pty::resolve_account().unwrap().home;
+        let session = format!("ciao-precreate-{}", rand::random::<u32>());
+
+        let began = StdInstant::now();
+        let created = ensure_detached_tmux_session(&tmux, &session, &home).await;
+        let elapsed = began.elapsed();
+        assert!(
+            created,
+            "the pre-create must report the session as existing"
+        );
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let target = format!("={session}");
+        let alive = run_bounded(&tmux, &["has-session", "-t", &target])
+            .await
+            .is_ok_and(|output| output.status_success);
+        let _ = run_bounded(&tmux, &["kill-session", "-t", &target]).await;
+        assert!(
+            alive,
+            "the pre-created session did not outlive its own creation"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the pre-create took {elapsed:?}; it sits on every tmux.create open, and a timeout \
+             here means the spawned client's pipes are being held open by the server it forked"
+        );
+    }
+
     /// The maintenance sandbox supplies bytes from a real provider in a disposable HOME.
     /// Exercise the production parser rather than implement another parser in its JS probe.
     #[test]
