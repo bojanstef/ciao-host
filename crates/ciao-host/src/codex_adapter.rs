@@ -27,7 +27,7 @@ use crate::{
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
 
-pub(crate) const PINNED_CODEX_VERSION: &str = "0.154.0";
+pub(crate) const PINNED_CODEX_VERSION: &str = "0.155.1";
 pub(crate) const CODEX_HOOK_PROTOCOL_VERSION: u8 = 1;
 
 /// The distilled schema extract this pin was grounded against, embedded so the daemon can tell
