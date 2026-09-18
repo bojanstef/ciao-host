@@ -10,7 +10,9 @@
 //! over what the command runs — so a byte-stable command keeps its trust across every Ciao
 //! upgrade, while any variation re-gates all of Ciao's hooks behind an interactive review and
 //! silently stops the live tail. `frozen_command_survives_an_upgrade` is the test that makes
-//! changing it a deliberate act.
+//! changing it a deliberate act. Trust is also keyed by an entry's position in its event's list,
+//! so a reinstall must leave Ciao's group where it was: moving it to the end re-gates it and the
+//! neighbouring entry that slides into the old slot (`a_reinstall_keeps_ciao_in_its_trusted_slot`).
 
 use std::{
     env, fs,
@@ -262,8 +264,18 @@ fn merge_ciao_hooks(existing: Option<Value>, command: &str) -> Result<Value> {
             Some(Value::Null) | None => Vec::new(),
             Some(_) => bail!("the Codex hooks file has an event that is not a list"),
         };
+        // Codex keys trust by position in this list (`event:group:hook` under `[hooks.state]`),
+        // so the refreshed entry takes the slot the stale one held. Pushing it to the end
+        // re-gated Ciao's hook and the neighbouring tool's hook that slid into the old slot.
+        let fresh = json!({"hooks": [ciao_hook_entry(event, command)]});
+        let slot = groups
+            .iter()
+            .position(|group| hook_group_is_ciao(group, command));
         groups.retain(|group| !hook_group_is_ciao(group, command));
-        groups.push(json!({"hooks": [ciao_hook_entry(event, command)]}));
+        match slot {
+            Some(index) => groups.insert(index, fresh),
+            None => groups.push(fresh),
+        }
         hooks.insert(event.into(), Value::Array(groups));
     }
     document.insert("hooks".into(), Value::Object(hooks));
@@ -531,6 +543,48 @@ mod tests {
         assert_eq!(merged["somethingElse"], foreign["somethingElse"]);
         let pruned = remove_ciao_hooks(merged, COMMAND);
         assert_eq!(pruned, foreign);
+    }
+
+    /// Codex keys a hook's trust by its position in the event's list (`event:group:hook` under
+    /// `[hooks.state]`), not by what it is. A reinstall that moved Ciao's group to the end
+    /// re-gated Ciao's `SessionStart` hook and the neighbouring tool's hook that slid into the
+    /// slot it left, so the refreshed entry has to take the slot the stale one held.
+    #[test]
+    fn a_reinstall_keeps_ciao_in_its_trusted_slot() {
+        let first = json!({
+            "matcher": "startup|resume",
+            "hooks": [{"type": "command", "command": "first-tool", "timeout": 5}]
+        });
+        let last = json!({"hooks": [{"type": "command", "command": "last-tool", "timeout": 10}]});
+        let stale = json!({"hooks": [{"type": "command", "command": COMMAND, "timeout": 1}]});
+        let existing = json!({
+            "hooks": {
+                "SessionStart": [first, stale, last, stale],
+                "Stop": [{"hooks": [{"type": "command", "command": "someone-elses-tool", "timeout": 3}]}]
+            }
+        });
+        let merged = merge_ciao_hooks(Some(existing.clone()), COMMAND).unwrap();
+        let session_start = merged["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            session_start.len(),
+            3,
+            "one Ciao group, in place, duplicates dropped"
+        );
+        assert_eq!(session_start[0], first);
+        assert_eq!(
+            session_start[1],
+            json!({"hooks": [ciao_hook_entry("SessionStart", COMMAND)]}),
+            "the refreshed entry took the stale one's slot"
+        );
+        assert_eq!(session_start[2], last);
+        // An event with no Ciao group still gets one, after everything already there.
+        let stop = merged["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop[0], existing["hooks"]["Stop"][0]);
+        assert_eq!(
+            stop[1],
+            json!({"hooks": [ciao_hook_entry("Stop", COMMAND)]})
+        );
+        assert_eq!(stop.len(), 2);
     }
 
     /// Codex clamps a `SessionEnd` hook to 3s and prints a warning into the TUI when it has to.
