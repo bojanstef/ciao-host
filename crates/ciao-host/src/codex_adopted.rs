@@ -138,6 +138,26 @@ pub(crate) async fn rollout_holders(rollout: &Path) -> Result<Vec<u32>> {
         .collect())
 }
 
+/// Where the binary evidence lives: `codex-runtime.json` beside the agent metadata. One
+/// spelling, because the daemon's registry writes it and `codex_integration::codex_binary`
+/// reads it from whichever process has to name the binary.
+pub(crate) fn runtime_file(paths: &crate::storage::CiaoPaths) -> PathBuf {
+    paths
+        .agent_metadata_file
+        .with_file_name("codex-runtime.json")
+}
+
+/// The binary a previous registration proved, read off disk. A missing, unreadable, malformed,
+/// or relative record reads as no evidence at all; whether the path still names this user's
+/// regular file is the reader's check, made at use.
+pub(crate) fn recorded_binary_evidence(runtime_file: &std::path::Path) -> Option<PathBuf> {
+    std::fs::read(runtime_file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value["binary"].as_str().map(PathBuf::from))
+        .filter(|path| path.is_absolute())
+}
+
 /// One adopter per thread, and a way to reach it — plus the two pieces of durable Codex
 /// evidence the entry points need: the last binary a real registration proved (never `PATH`),
 /// and a bounded cache of unheld threads for the directory.
@@ -275,11 +295,7 @@ impl AdoptionRegistry {
     /// previous daemon recorded, so a machine that ran Codex once keeps its discovery across
     /// restarts.
     pub(crate) fn load(runtime_file: PathBuf) -> Self {
-        let binary = std::fs::read(&runtime_file)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|value| value["binary"].as_str().map(PathBuf::from))
-            .filter(|path| path.is_absolute());
+        let binary = recorded_binary_evidence(&runtime_file);
         Self {
             inner: Mutex::new(HashMap::new()),
             runtime_file: Some(runtime_file),
