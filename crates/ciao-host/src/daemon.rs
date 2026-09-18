@@ -766,9 +766,7 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     // categorically while stored sessions stay listed.
     let managed_workers: SharedWorkerTable = Arc::new(WorkerTable::default());
     let codex_adoptions = Arc::new(crate::codex_adopted::AdoptionRegistry::load(
-        paths
-            .agent_metadata_file
-            .with_file_name("codex-runtime.json"),
+        crate::codex_adopted::runtime_file(&paths),
     ));
     let managed_sessions = ManagedSessionDirectory::load(
         &paths.agent_managed_file,

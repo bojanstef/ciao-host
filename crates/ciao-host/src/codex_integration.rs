@@ -406,16 +406,58 @@ pub(crate) fn installed_codex_version(paths: &CiaoPaths) -> Result<Option<String
     Ok(Some(parse_codex_version_output(&output)?))
 }
 
-/// `PATH` first, then the per-user location the npm install writes to — a daemon started by a
+/// The Codex binary this machine runs, for every process that has to name it: the daemon, a
+/// hook, the CLI.
+///
+/// The binary a live registration proved comes first — `codex-runtime.json` (Spec 013 §8),
+/// recorded by the daemon from the observed process and refreshed on every session's first
+/// turn. It is the exact native image the user's Codex runs, so it spawns standalone; and being
+/// one path for every process, the carry verdict the daemon writes covers what the hook gate
+/// and `ciao agent status` resolve. Nothing else answers under launchd, whose `PATH` is
+/// `/usr/bin:/bin:/usr/sbin:/sbin`: a mise-, npm-, nvm- or Homebrew-installed `codex` is not
+/// on it, and enumerating install roots would not have helped — the file found there is a Node
+/// launcher that dies with `env: node: No such file or directory` (exit 127, grounded
+/// 2026-09-18), so a later 0.x minor stayed refused on every such machine: `codex carry check
+/// failed … codex binary not found`, three versions running.
+///
+/// Then `PATH`, then the per-user location the npm install writes to — a daemon started by a
 /// service manager frequently has neither the user's `PATH` nor a reason to care, and reporting
 /// a correctly installed Codex as absent is a false negative in the first place anyone looks.
+///
+/// ponytail: a machine whose record still names an older install (a retained Node version
+/// after a switch) verifies that one, which `extract_installed` refuses as answering the wrong
+/// version; the record refreshes on the new session's first turn and the retry lands after
+/// `RECHECK_BACKOFF`. A bounded stall, not the permanent refusal this replaces.
 pub(crate) fn codex_binary(paths: &CiaoPaths) -> Option<PathBuf> {
-    if Command::new("codex").arg("--version").output().is_ok() {
+    resolve_codex_binary(paths, env::var_os("PATH").as_deref())
+}
+
+/// `path` is the `PATH` the probe runs under, handed in so a test can give it launchd's value
+/// without touching this process's environment.
+fn resolve_codex_binary(paths: &CiaoPaths, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if let Some(proved) =
+        crate::codex_adopted::recorded_binary_evidence(&crate::codex_adopted::runtime_file(paths))
+        && owned_regular_file(&proved)
+    {
+        return Some(proved);
+    }
+    let mut probe = Command::new("codex");
+    probe.arg("--version");
+    if let Some(path) = path {
+        probe.env("PATH", path);
+    }
+    if probe.output().is_ok() {
         return Some(PathBuf::from("codex"));
     }
     let candidate = paths.home.join(".local/bin/codex");
-    let metadata = fs::metadata(&candidate).ok()?;
-    (metadata.is_file() && metadata.uid() == current_uid()).then_some(candidate)
+    owned_regular_file(&candidate).then_some(candidate)
+}
+
+/// Same-user regular files only (through symlinks, so a version manager's alias counts): an
+/// absent binary must keep reading as absent rather than as any executable named `codex` that
+/// happens to be reachable.
+fn owned_regular_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.uid() == current_uid())
 }
 
 fn current_uid() -> u32 {
@@ -615,5 +657,105 @@ mod tests {
             installed_events(&document, COMMAND).len(),
             CIAO_EVENTS.len()
         );
+    }
+
+    /// What launchd hands the daemon. A mise-, npm-, nvm- or Homebrew-installed Codex lives
+    /// nowhere on it, so the daemon that has to verify a later 0.x minor before carrying it
+    /// (Spec 023: compatible updates need no daemon release) could not even name the binary:
+    /// `codex carry check failed … codex binary not found`, three versions running.
+    const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+    fn executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// What a live, authenticated registration records (Spec 013 §8), through the registry that
+    /// owns the file, so this test breaks if that record ever moves or changes shape.
+    fn prove(paths: &CiaoPaths, binary: &Path) {
+        let file = crate::codex_adopted::runtime_file(paths);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        crate::codex_adopted::AdoptionRegistry::load(file)
+            .record_binary_evidence(binary.to_owned());
+    }
+
+    #[test]
+    fn the_daemon_finds_the_codex_a_live_registration_proved_without_the_users_path() {
+        let temporary = tempdir().unwrap();
+        let paths = CiaoPaths::for_home(temporary.path());
+        let launchd = Some(std::ffi::OsStr::new(LAUNCHD_PATH));
+        // A mise-style Node install: the real file under the version directory, reached
+        // through the `lts` alias symlink the user's shell resolves.
+        let installs = temporary.path().join(".local/share/mise/installs/node");
+        let real = installs.join("24.13.0/bin/codex");
+        executable(&real, "#!/bin/sh\necho codex-cli 0.155.0\n");
+        std::os::unix::fs::symlink("24.13.0", installs.join("lts")).unwrap();
+        let through_alias = installs.join("lts/bin/codex");
+
+        // Before anything proved a binary there is honestly nothing: launchd's `PATH` has no
+        // `codex` and `~/.local/bin` is empty. This is also the check that the probe really
+        // runs under the injected `PATH` — on a machine with `codex` on the shell's `PATH`, a
+        // probe that ignored the injection would answer here.
+        assert_eq!(resolve_codex_binary(&paths, launchd), None);
+
+        prove(&paths, &through_alias);
+        let found = resolve_codex_binary(&paths, launchd).expect("the proved binary is found");
+        // Kept as recorded, not canonicalized: one string for every process is what the carry
+        // verdict compares. Stat follows the alias to the real file, which is what it hashes.
+        assert_eq!(found, through_alias);
+        let stat = fs::metadata(&found).unwrap();
+        assert!(stat.is_file());
+        assert_eq!(stat.len(), fs::metadata(&real).unwrap().len());
+        assert!(
+            fs::symlink_metadata(installs.join("lts"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn the_proved_binary_is_one_path_for_every_process_and_is_checked_at_use() {
+        let temporary = tempdir().unwrap();
+        let paths = CiaoPaths::for_home(temporary.path());
+        // The user's shell: a launcher named `codex` on `PATH`, as an npm prefix provides.
+        let shell_bin = temporary.path().join("shell-bin");
+        executable(&shell_bin.join("codex"), "#!/bin/sh\nexit 0\n");
+        let shell_path = format!("{}:{LAUNCHD_PATH}", shell_bin.display());
+        let shell = Some(std::ffi::OsStr::new(&shell_path));
+        let launchd = Some(std::ffi::OsStr::new(LAUNCHD_PATH));
+
+        // No record: today's answer, the bare name the shell resolves.
+        assert_eq!(
+            resolve_codex_binary(&paths, shell),
+            Some(PathBuf::from("codex"))
+        );
+
+        // A record wins even where `PATH` has an answer: the daemon (launchd `PATH`), the hook
+        // and the CLI (the user's `PATH`) then name the same file, so the verdict the daemon
+        // writes covers what `ciao agent status` and the hook gate resolve.
+        let native = temporary
+            .path()
+            .join("node_modules/@openai/codex-darwin-arm64/bin/codex");
+        executable(&native, "#!/bin/sh\necho codex-cli 0.155.0\n");
+        prove(&paths, &native);
+        assert_eq!(resolve_codex_binary(&paths, shell), Some(native.clone()));
+        assert_eq!(resolve_codex_binary(&paths, launchd), Some(native.clone()));
+
+        // A record is evidence, not trust: once the file it names is gone, or is not this
+        // user's regular file, the lookup falls through to what it can still see.
+        fs::remove_file(&native).unwrap();
+        assert_eq!(
+            resolve_codex_binary(&paths, shell),
+            Some(PathBuf::from("codex"))
+        );
+        assert_eq!(resolve_codex_binary(&paths, launchd), None);
+        fs::create_dir_all(&native).unwrap();
+        assert_eq!(resolve_codex_binary(&paths, launchd), None);
+        let local_bin = paths.home.join(".local/bin/codex");
+        executable(&local_bin, "#!/bin/sh\nexit 0\n");
+        assert_eq!(resolve_codex_binary(&paths, launchd), Some(local_bin));
     }
 }
