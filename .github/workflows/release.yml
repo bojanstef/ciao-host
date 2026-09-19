@@ -82,7 +82,36 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  linux-record:
+    # The native record runs on the plain runner as its unprivileged user, the same environment the
+    # repository's `host` check is green in: six host tests assert permission refusals and a
+    # container's root is refused nothing.
+    needs: head
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml) and tmux for the PTY tests
+        run: |
+          rustup toolchain install
+          rustup show
+          rustc -Vv
+          cargo -V
+          tmux -V || (sudo apt-get update -q && sudo apt-get install -y -q tmux && tmux -V)
+      - name: Native record (fmt, clippy, host tests)
+        run: python3 scripts/release_build.py native --out dist/native-linux-x64.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ciao-linux-x64-record
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
   linux:
+    # The release binary is built inside manylinux_2_28 so it keeps the glibc 2.28 floor the
+    # channel's binaries have always had; the record above is the platform's checks at this head.
     needs: head
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -104,13 +133,8 @@ jobs:
           rustup show
           rustc -Vv
           cargo -V
-          # The PTY tests drive a real tmux; the owner's Mac had one, a fresh image does not.
-          dnf -q -y install tmux >/dev/null
-          tmux -V
           ldd --version | head -1
           python3 --version
-      - name: Native record (fmt, clippy, host tests)
-        run: python3 scripts/release_build.py native --out dist/native-linux-x64.json
       - name: Release build and archive
         run: python3 scripts/release_build.py pack --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -121,7 +145,7 @@ jobs:
           retention-days: 30
 
   manifest:
-    needs: [darwin, linux]
+    needs: [darwin, linux-record, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
