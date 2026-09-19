@@ -40,6 +40,7 @@ jobs:
           cargo clippy --locked --workspace --all-targets -- -D warnings
           shellcheck --severity=warning scripts/install.sh
           python3 scripts/host_notices.py --check
+          python3 -m unittest scripts/test_release_build.py
       - name: Build tests
         run: cargo test --locked -p ciao-host --no-run
       - name: Host tests (no live-probe flags)
@@ -81,5 +82,8 @@ jobs:
           PY
           done
 
-# No secrets, publish permissions, artifacts, deployments or release jobs.
-# Native macOS checks and physical/runtime acceptance remain separate local gates.
+# No secrets, publish permissions, artifacts, deployments or release jobs here. The release
+# archives, both platforms' native records and the check run that binds them are
+# .github/workflows/release.yml (hosted, macOS included, since 2026-09-19); publishing stays with
+# the private product repository's separately credentialed release driver. Physical and runtime
+# acceptance remain separate local gates.

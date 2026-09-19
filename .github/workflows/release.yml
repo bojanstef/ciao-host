@@ -1,0 +1,180 @@
+name: Release artifacts
+
+# Builds both host release archives and both platforms' native records at one exact commit, on
+# GitHub-hosted runners, and binds every file's digest to that commit in a check run named
+# `release-artifacts`. Nothing here publishes: the private product repository's release driver
+# downloads these artifacts, verifies them against the check run, stages and soaks the Linux
+# candidate, and publishes to the channel with its own credentials (Spec 023, "Release from the
+# server", 2026-09-19). Every push to main builds, so the artifacts for a merged release bump exist
+# before the owner asks for the release; workflow_dispatch rebuilds a head whose artifacts expired.
+#
+# The darwin job is the reason this workflow exists on hosted runners at all: the host repository
+# is public, so Actions is free here including macOS, and the owner moved the darwin build and
+# record off their Mac on 2026-09-19. The linux job builds inside manylinux_2_28 so the binary keeps
+# the glibc 2.28 floor the cross-compiled channel binaries have always had; a plain ubuntu-24.04
+# build would raise it to 2.39 and strand Debian 12 and Ubuntu 22.04 hosts.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      head:
+        description: The commit the caller expects this run to build. The run fails if main has moved past it.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One run per commit: a dispatch at a head a push already built waits for it rather than racing it.
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  # The relay admission token every release binary embeds. Absent on a fork or before the owner
+  # created the secret, the pack step refuses by name (`relay_token_required`); the native record
+  # needs no token and still runs.
+  CIAO_RELAY_TOKEN: ${{ secrets.CIAO_RELAY_TOKEN }}
+
+jobs:
+  head:
+    # A dispatched run builds whatever `main` is when it starts; the caller names the head it wants
+    # and this refuses anything else, so the server's "find or dispatch a run at exactly this head"
+    # can never be answered by the wrong commit.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: The dispatched head is this run's head
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.head != '' && inputs.head != github.sha }}
+        run: |
+          echo "::error::release_build: dispatched_head_is_not_this_run ($GITHUB_SHA)"
+          exit 2
+
+  darwin:
+    needs: head
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml) and tmux for the PTY tests
+        run: |
+          rustup toolchain install
+          rustup show
+          rustc -Vv
+          cargo -V
+          brew install tmux
+          tmux -V
+      - name: Native record (fmt, clippy, host tests)
+        # One retry: pty::tests::tmux_session_survives_cleanup_of_a_client_that_was_never_detached
+        # gives tmux two seconds to outlive a client and lost once in two hosted runs (2026-09-19);
+        # a green record is still a whole green run, never a partial one.
+        run: python3 scripts/release_build.py native --out dist/native-darwin-arm64.json || python3 scripts/release_build.py native --out dist/native-darwin-arm64.json
+      - name: Release build and archive
+        run: python3 scripts/release_build.py pack --out dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ciao-darwin-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  linux-record:
+    # The native record runs on the plain runner as its unprivileged user, the same environment the
+    # repository's `host` check is green in: six host tests assert permission refusals and a
+    # container's root is refused nothing.
+    needs: head
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml) and tmux for the PTY tests
+        run: |
+          rustup toolchain install
+          rustup show
+          rustc -Vv
+          cargo -V
+          tmux -V || (sudo apt-get update -q && sudo apt-get install -y -q tmux && tmux -V)
+      - name: Native record (fmt, clippy, host tests)
+        # One retry: pty::tests::tmux_session_survives_cleanup_of_a_client_that_was_never_detached
+        # gives tmux two seconds to outlive a client and lost once in two hosted runs (2026-09-19);
+        # a green record is still a whole green run, never a partial one.
+        run: python3 scripts/release_build.py native --out dist/native-linux-x64.json || python3 scripts/release_build.py native --out dist/native-linux-x64.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ciao-linux-x64-record
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  linux:
+    # The release binary is built inside manylinux_2_28 so it keeps the glibc 2.28 floor the
+    # channel's binaries have always had; the record above is the platform's checks at this head.
+    needs: head
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain (rust-toolchain.toml)
+        run: |
+          # The checkout is owned by the runner's uid and this shell is the container's root; git
+          # refuses a directory owned by someone else until it is named safe.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install
+          rustup show
+          rustc -Vv
+          cargo -V
+          ldd --version | head -1
+          python3 --version
+      - name: Release build and archive
+        run: python3 scripts/release_build.py pack --out dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ciao-linux-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  manifest:
+    needs: [darwin, linux-record, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ciao-*
+          merge-multiple: true
+          path: dist
+      - name: Verify both platforms, write release.json and the check-run body
+        run: python3 scripts/release_build.py manifest --dist dist --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      - name: Bind the digests to this commit (check run release-artifacts)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST "repos/$GITHUB_REPOSITORY/check-runs" --input dist/check-run.json --jq '{id, name, head_sha, conclusion}'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ciao-release-manifest
+          path: |
+            dist/release.json
+            dist/check-run.json
+          if-no-files-found: error
+          retention-days: 30
