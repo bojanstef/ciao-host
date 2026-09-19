@@ -65,6 +65,7 @@ jobs:
           persist-credentials: false
       - name: Toolchain (rust-toolchain.toml)
         run: |
+          rustup toolchain install
           rustup show
           rustc -Vv
           cargo -V
@@ -91,9 +92,13 @@ jobs:
           persist-credentials: false
       - name: Toolchain (rust-toolchain.toml)
         run: |
+          # The checkout is owned by the runner's uid and this shell is the container's root; git
+          # refuses a directory owned by someone else until it is named safe.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install
           rustup show
           rustc -Vv
           cargo -V
