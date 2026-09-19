@@ -16,9 +16,7 @@ name: Release artifacts
 
 on:
   push:
-    # task/release-workflow is temporary: it proves this workflow on its own branch before
-    # the pull request merges, because workflow_dispatch resolves a workflow on the default branch.
-    branches: [main, task/release-workflow]
+    branches: [main]
   workflow_dispatch:
     inputs:
       head:
