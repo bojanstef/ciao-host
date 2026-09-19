@@ -63,12 +63,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Toolchain (rust-toolchain.toml)
+      - name: Toolchain (rust-toolchain.toml) and tmux for the PTY tests
         run: |
           rustup toolchain install
           rustup show
           rustc -Vv
           cargo -V
+          brew install tmux
+          tmux -V
       - name: Native record (fmt, clippy, host tests)
         run: python3 scripts/release_build.py native --out dist/native-darwin-arm64.json
       - name: Release build and archive
@@ -102,6 +104,9 @@ jobs:
           rustup show
           rustc -Vv
           cargo -V
+          # The PTY tests drive a real tmux; the owner's Mac had one, a fresh image does not.
+          dnf -q -y install tmux >/dev/null
+          tmux -V
           ldd --version | head -1
           python3 --version
       - name: Native record (fmt, clippy, host tests)
