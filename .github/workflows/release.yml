@@ -165,7 +165,7 @@ jobs:
           merge-multiple: true
           path: dist
       - name: Verify both platforms, write release.json and the check-run body
-        run: python3 scripts/release_build.py manifest --dist dist --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        run: python3 scripts/release_build.py manifest --dist dist --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --run-id "$GITHUB_RUN_ID"
       - name: Bind the digests to this commit (check run release-artifacts)
         env:
           GH_TOKEN: ${{ github.token }}

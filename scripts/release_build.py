@@ -248,10 +248,16 @@ def read_record(path, head):
     return value
 
 
-def manifest(runner, root, dist, *, run_url=None, emit=print):
+def manifest(runner, root, dist, *, run_url=None, run_id=None, emit=print):
     """Both platforms' archives, sidecars and records in `dist/`, verified, then `release.json` and
-    the check-run body. Anything missing, extra or disagreeing is a refusal by name."""
+    the check-run body. Anything missing, extra or disagreeing is a refusal by name. `run_id` is this
+    workflow run's, carried on the check run as `external_id`: GitHub files a check run created with
+    the workflow token under whichever Actions suite it likes and rewrites `details_url` to the check
+    run's own page (observed on the first main run, 2026-09-19), so `external_id` is the one field
+    that binds the check run to the run whose artifacts it describes."""
     root, dist = Path(root), Path(dist)
+    if run_id is not None and not re.fullmatch(r"[1-9][0-9]{0,15}", str(run_id)):
+        raise Refused("run_id_invalid")
     head = head_and_clean(runner, root)
     version = cargo_version(root)
     artifacts, records, files = [], {}, {}
@@ -290,6 +296,8 @@ def manifest(runner, root, dist, *, run_url=None, emit=print):
             "output": {"title": f"Release artifacts {version} at {head[:12]}", "summary": canonical(record)}}
     if run_url:
         body["details_url"] = run_url
+    if run_id is not None:
+        body["external_id"] = str(run_id)
     (dist / "check-run.json").write_text(canonical(body) + "\n")
     emit(f"release.json for {version} at {head[:12]}: {len(files)} files bound to the {CHECK_NAME} check")
     return record
@@ -325,6 +333,7 @@ def main(argv=None, *, runner=run, environ=None):
     assembler = commands.add_parser("manifest", help="verify both platforms' files, write release.json and the check-run body")
     assembler.add_argument("--dist", type=Path, default=ROOT / "dist")
     assembler.add_argument("--run-url", help="this workflow run's page, carried on the check run")
+    assembler.add_argument("--run-id", help="this workflow run's id, carried on the check run as external_id")
     args = parser.parse_args(argv)
     environ = os.environ if environ is None else environ
     try:
@@ -333,7 +342,7 @@ def main(argv=None, *, runner=run, environ=None):
         elif args.command == "pack":
             print(canonical(pack(runner, args.root, args.out, environ)))
         else:
-            print(canonical(manifest(runner, args.root, args.dist, run_url=args.run_url)))
+            print(canonical(manifest(runner, args.root, args.dist, run_url=args.run_url, run_id=args.run_id)))
         return 0
     except Refused as error:
         print(f"::error::release_build: {error}", file=sys.stderr)
