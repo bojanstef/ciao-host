@@ -188,7 +188,7 @@ class ManifestTests(unittest.TestCase):
         return rb.manifest(FakeRunner(self.root), self.root, self.dist, emit=lambda _line: None, **kwargs)
 
     def test_the_manifest_binds_every_file_to_the_head_and_writes_the_check_run_body(self):
-        record = self.manifest(run_url="https://github.com/bojanstef/ciao-host/actions/runs/1")
+        record = self.manifest(run_url="https://github.com/bojanstef/ciao-host/actions/runs/1", run_id="35477571308")
         release = json.loads((self.dist / "release.json").read_text())
         self.assertEqual([a["target"] for a in release["artifacts"]], sorted(rb.RELEASE_TARGETS))
         self.assertEqual(release["v"], 1)
@@ -204,6 +204,9 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual((body["name"], body["head_sha"], body["status"], body["conclusion"]),
                          ("release-artifacts", HEAD, "completed", "success"))
         self.assertEqual(body["details_url"], "https://github.com/bojanstef/ciao-host/actions/runs/1")
+        self.assertEqual(body["external_id"], "35477571308", "the one field GitHub leaves alone; it names the run whose artifacts these are")
+        with self.assertRaisesRegex(rb.Refused, "run_id_invalid"):
+            self.manifest(run_id="not-a-run")
         self.assertEqual(json.loads(body["output"]["summary"]), record, "the summary IS the record, canonical")
         self.assertIn("0.1.2", body["output"]["title"])
 
