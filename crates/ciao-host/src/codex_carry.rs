@@ -1022,7 +1022,7 @@ mod tests {
         // A pin home: this literal is the embedded pins' own `counts.clientMethods`, and a
         // re-grounding rewrites it with the extract (0.154.0 said 99; 0.155.1 says 102). It stayed
         // behind on 2026-09-19 and turned public main red, so the maintenance table now names it.
-        assert_eq!(embedded.counts.client_methods, 102);
+        assert_eq!(embedded.counts.client_methods, 101);
         assert!(embedded.thread_item_types.contains(&"agentMessage".into()));
         assert!(embedded.read_set_changes(embedded).is_empty());
 

@@ -1,8 +1,8 @@
 {
-	"pin": "0.155.1",
+	"pin": "0.156.0",
 	"generatedBy": "integrations/codex/generate-conformance.mjs",
 	"counts": {
-		"clientMethods": 102,
+		"clientMethods": 101,
 		"serverNotifications": 82
 	},
 	"requiredClientMethods": [
@@ -126,5 +126,5 @@
 		"waitingOnApproval",
 		"waitingOnUserInput"
 	],
-	"schemaDigest": "358d21ec68d48fa0cda9f0353d6c531ac5444d5751f800314b520c654abf7ef0"
+	"schemaDigest": "bddb4e2bcc41aa989c4debe25185de648f9b5426146406ffafb445957ad33db0"
 }
