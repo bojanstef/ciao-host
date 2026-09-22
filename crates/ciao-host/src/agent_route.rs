@@ -16,7 +16,9 @@ use crate::{
     agent_protocol::{MAX_OPAQUE_ID_BYTES, valid_opaque_id},
     host_protocol::{ProviderKind, valid_session_name, valid_tab_id},
     process,
-    workspace::{WorkspaceConfig, focus_tab, run_bounded},
+    workspace::{
+        WorkspaceConfig, focus_tab, parse_herdr_tab_list, run_bounded, sanitize_tab_label,
+    },
 };
 
 const ROUTE_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -116,6 +118,69 @@ pub(crate) struct TerminalRouteResolver {
 impl TerminalRouteResolver {
     pub(crate) fn new(workspace: WorkspaceConfig) -> Self {
         Self { workspace }
+    }
+
+    /// The tab's own name, so an alert can say which of four conversations in one project
+    /// wants something. The workspace cannot: all four of them are the same directory.
+    ///
+    /// Read live rather than carried on the proof, because a tab is renamed far more often than
+    /// a route goes stale — the label is display text, never routing data, and deliberately
+    /// absent from `revalidate` for exactly that reason. Every failure is `None`: a notification
+    /// that cannot name the tab says the workspace instead, which is what it said before.
+    ///
+    /// Only the notification path calls this, and the notify gate caps that at twelve alerts per
+    /// ten minutes. A coalesced alert pays for a lookup it will not use, which is one bounded
+    /// provider call an hour in the worst case and not worth a cache that could go stale.
+    pub(crate) async fn tab_label(&self, proof: &AgentRouteProof) -> Option<String> {
+        match proof {
+            AgentRouteProof::Tmux {
+                binary, window_id, ..
+            } => {
+                // Re-validated before argv, the way `target_command` re-validates a session name:
+                // a proof is minted from provider output, and this is the last gate before it.
+                if !valid_tmux_id(window_id, '@') {
+                    return None;
+                }
+                // A tmux window *is* the tab row, and its id is globally unique, so this
+                // needs neither the session nor the whole listing.
+                let output = run_bounded(
+                    binary,
+                    &["display-message", "-p", "-t", window_id, "#{window_name}"],
+                )
+                .await
+                .ok()?;
+                if !output.status_success || output.stdout_truncated {
+                    return None;
+                }
+                sanitize_tab_label(String::from_utf8_lossy(&output.stdout).trim())
+            }
+            AgentRouteProof::HerdrWorkspace {
+                binary,
+                session_name,
+                tab_id,
+                ..
+            } => {
+                let tab_id = tab_id.as_deref()?;
+                if !valid_session_name(session_name) {
+                    return None;
+                }
+                let output = run_bounded(binary, &["--session", session_name, "tab", "list"])
+                    .await
+                    .ok()?;
+                if !output.status_success || output.stdout_truncated {
+                    return None;
+                }
+                // The snapshot's own parser, so a label reaching a lock screen is sanitized
+                // and bounded by the same rule that governs one reaching the tab list.
+                parse_herdr_tab_list(&output.stdout)?
+                    .into_iter()
+                    .find(|tab| tab.id == tab_id)
+                    // That parser falls back to the tab **id** for an unnamed tab, which is
+                    // routing data and says nothing on a lock screen. The workspace is better.
+                    .filter(|tab| tab.label != tab.id)
+                    .map(|tab| tab.label)
+            }
+        }
     }
 
     /// Resolves only from the authenticated local bridge PID. tmux wins when providers are
@@ -599,6 +664,77 @@ mod tests {
         ] {
             assert!(parse_tmux_panes(hostile.as_bytes()).is_empty());
         }
+    }
+
+    /// Both providers name the tab a different way, and the notification says the same word for
+    /// both. The alternative — a proof carrying the label it was minted with — shows the tab's
+    /// old name after a rename, which is exactly the fact the alert exists to get right.
+    #[tokio::test]
+    async fn a_tab_label_is_read_live_from_whichever_provider_owns_the_route() {
+        let temp = tempdir().unwrap();
+        let log = temp.path().join("argv.log");
+
+        let tmux = temp.path().join("tmux");
+        executable(
+            &tmux,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'website-redesign\\n'\nexit 0\n",
+                log.display()
+            ),
+        );
+        let resolver = TerminalRouteResolver::new(WorkspaceConfig::with_binary_dirs(vec![
+            temp.path().to_owned(),
+        ]));
+        let window = AgentRouteProof::Tmux {
+            session_name: "api".into(),
+            binary: tmux,
+            bridge_pid: std::process::id(),
+            session_id: "$1".into(),
+            window_id: "@2".into(),
+            pane_id: "%3".into(),
+            pane_pid: std::process::id(),
+            pane_tty: "/dev/ttys001".into(),
+        };
+        assert_eq!(
+            resolver.tab_label(&window).await.as_deref(),
+            Some("website-redesign")
+        );
+        // The window id addresses the tab directly: no session name, no whole listing to join.
+        let argv = fs::read_to_string(&log).unwrap();
+        assert!(argv.contains("display-message -p -t @2"), "{argv}");
+
+        let herdr = temp.path().join("herdr");
+        executable(
+            &herdr,
+            "#!/bin/sh\nprintf '{\"result\":{\"tabs\":[{\"tab_id\":\"w9:t21\",\"label\":\"version-fixes\"},{\"tab_id\":\"w9:t2S\",\"label\":\"paste-image\"}]}}'\nexit 0\n",
+        );
+        let mut tab = AgentRouteProof::HerdrWorkspace {
+            binary: herdr,
+            bridge_pid: std::process::id(),
+            session_name: "default".into(),
+            pane_id: "w9:p2D".into(),
+            terminal_id: "term_65b23b3c".into(),
+            tab_id: Some("w9:t2S".into()),
+        };
+        assert_eq!(
+            resolver.tab_label(&tab).await.as_deref(),
+            Some("paste-image")
+        );
+
+        // An unnamed tab is reported by its id, which belongs in an argv and not on a lock
+        // screen; the alert falls back to the workspace rather than showing `w9:t2S`.
+        executable(
+            &temp.path().join("herdr"),
+            "#!/bin/sh\nprintf '{\"result\":{\"tabs\":[{\"tab_id\":\"w9:t2S\"}]}}'\nexit 0\n",
+        );
+        assert_eq!(resolver.tab_label(&tab).await, None);
+
+        // A pane whose snapshot row named no tab leaves the alert unannotated rather than
+        // guessing at the session's first one.
+        if let AgentRouteProof::HerdrWorkspace { tab_id, .. } = &mut tab {
+            *tab_id = None;
+        }
+        assert_eq!(resolver.tab_label(&tab).await, None);
     }
 
     #[tokio::test]

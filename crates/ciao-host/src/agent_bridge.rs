@@ -145,7 +145,7 @@ enum EventOutcome {
     End { process_exited: bool },
 }
 
-fn apply_adapter_event(
+async fn apply_adapter_event(
     event: NormalizedAdapterEvent,
     ctx: &mut AdapterEventContext<'_>,
 ) -> Result<EventOutcome> {
@@ -303,12 +303,12 @@ fn apply_adapter_event(
             if let Err(error) = ctx.sessions.note_bridge_attention(session_id, &kind) {
                 tracing::debug!(error = %error, "recording an attention turn failed");
             }
-            let (workspace, title) = ctx
+            let facts = ctx
                 .sessions
                 .notification_facts(session_id)
+                .await
                 .unwrap_or_default();
-            ctx.notifier
-                .notify(session_id, &workspace, title.as_deref(), &kind, unix_now());
+            ctx.notifier.notify(session_id, &facts, &kind, unix_now());
         }
         NormalizedAdapterEvent::Unknown if !ctx.snapshot_open => {
             // Spec 017 §4.2: the visible unsupported card is also tallied, so drift is a list
@@ -454,7 +454,7 @@ pub(crate) async fn handle_agent_bridge(
                     Ok(event) => event,
                     Err(error) => break Err(anyhow!(error)),
                 };
-                match apply_adapter_event(event, &mut context) {
+                match apply_adapter_event(event, &mut context).await {
                     Ok(EventOutcome::Continue) => {}
                     Ok(EventOutcome::End { process_exited: exited }) => {
                         process_exited = exited;
@@ -563,7 +563,7 @@ async fn handle_transient_agent_event(
         snapshot_open: false,
         unknown_sequence: 0,
     };
-    match apply_adapter_event(event, &mut context)? {
+    match apply_adapter_event(event, &mut context).await? {
         EventOutcome::Continue => {}
         // An observed session has no bridge lifecycle to unwind; its end is recorded directly.
         EventOutcome::End { .. } => {

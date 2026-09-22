@@ -1368,17 +1368,14 @@ async fn on_server_request(
                 // ADR 005, same moment as every other integration: the card blocks the turn,
                 // and this is the push that reaches a pocket. Managed and adopted were the two
                 // paths that could raise a card and not say so — this closes the adopted half.
-                let (workspace, title) = runtime
+                let facts = runtime
                     .supervisor
                     .notification_facts(session)
+                    .await
                     .unwrap_or_default();
-                runtime.notifier.notify(
-                    session,
-                    &workspace,
-                    title.as_deref(),
-                    "permission_prompt",
-                    unix_now(),
-                );
+                runtime
+                    .notifier
+                    .notify(session, &facts, "permission_prompt", unix_now());
             } else {
                 // The card could not be raised; refusing beats a request nobody can see.
                 let _ = runtime

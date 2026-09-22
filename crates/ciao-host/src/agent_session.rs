@@ -36,6 +36,7 @@ use crate::{
     },
     agent_route::{AgentRouteProof, AgentTerminalPlan, RouteContinuity, TerminalRouteResolver},
     host_protocol::AgentTabIndex,
+    notify::NotificationFacts,
     process::exists as process_exists,
     storage::{atomic_write_private, validate_private_file},
     workspace::WorkspaceConfig,
@@ -1438,15 +1439,33 @@ impl AgentSessionSupervisor {
         bounded_session_list(descriptors, 0)
     }
 
-    /// What an ADR 005 notification says about a session: its workspace and the conversation's
-    /// current subject. Both are sealed under the pairing key, so neither reaches the relay.
-    pub(crate) fn notification_facts(&self, session_id: &str) -> Option<(String, Option<String>)> {
-        let inner = self.inner.lock();
-        let session = inner.sessions.get(session_id)?;
-        Some((
-            session.workspace_display.clone(),
-            recent_prompt_for(session),
-        ))
+    /// What an ADR 005 notification says about a session: where it is and what it last said. All
+    /// of it is sealed under the pairing key, so none of it reaches the relay.
+    ///
+    /// Async only for the tab, which is a live provider question the notification path is the
+    /// only caller of. The lock is dropped before it, because a provider call must never be made
+    /// with the supervisor held.
+    pub(crate) async fn notification_facts(&self, session_id: &str) -> Option<NotificationFacts> {
+        let (mut facts, proof) = {
+            let inner = self.inner.lock();
+            let session = inner.sessions.get(session_id)?;
+            let facts = NotificationFacts {
+                workspace: session.workspace_display.clone(),
+                tab: None,
+                subject: recent_prompt_for(session),
+                reply: recent_reply_for(session),
+            };
+            let proof = inner
+                .routes
+                .values()
+                .find(|record| record.session_id == session_id)
+                .map(|record| record.proof.clone());
+            (facts, proof)
+        };
+        if let Some(proof) = proof {
+            facts.tab = self.routes.tab_label(&proof).await;
+        }
+        Some(facts)
     }
 
     /// Records that an attached agent is blocked on the person rather than working.
@@ -2603,6 +2622,29 @@ fn recent_prompt_for(session: &LiveSession) -> Option<String> {
     let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
     let bounded = truncate_on_char_boundary(line, MAX_RECENT_PROMPT_BYTES);
     // Validation rejects an empty string, so never advertise one.
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+/// The beginning of what the agent last said, which is what a person reads to decide whether the
+/// interruption is worth picking the phone up for. The prompt above answers "which conversation";
+/// this answers "what happened".
+///
+/// Newlines collapse to spaces rather than taking the first line alone: an agent's reply opens
+/// with a heading or a one-word acknowledgement often enough that the first line is frequently
+/// the least informative part of it. A streaming entry counts — a permission prompt interrupts
+/// mid-answer, and the half already written is exactly the context the alert is for.
+fn recent_reply_for(session: &LiveSession) -> Option<String> {
+    let text = session.history.iter().rev().find_map(|entry| {
+        if entry.kind != "assistant_message" {
+            return None;
+        }
+        match &entry.body {
+            TimelineBody::Text { text } => Some(text.as_str()),
+            _ => None,
+        }
+    })?;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded = truncate_on_char_boundary(&collapsed, MAX_RECENT_PROMPT_BYTES);
     (!bounded.is_empty()).then_some(bounded)
 }
 
@@ -4516,6 +4558,61 @@ mod tests {
             "the newest prompt names the conversation; later lines are not the subject"
         );
         descriptor.validate().unwrap();
+    }
+
+    /// The alert's body is the agent's answer, not the question that provoked it: by the time a
+    /// phone buzzes, the person already knows what they asked.
+    #[tokio::test]
+    async fn a_notification_carries_the_agent_s_answer_and_the_prompt_behind_it() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let (sender, _receiver) = mpsc::channel(4);
+        let registered = supervisor
+            .register(registration("nonce-a"), sender)
+            .await
+            .unwrap();
+
+        // Nothing said yet: the alert falls back to the prompt rather than inventing a line.
+        supervisor
+            .replace_bridge_snapshot(
+                &registered.session_id,
+                vec![prompt_entry("source-a", 1, "Fix the login bug")],
+            )
+            .unwrap();
+        let facts = supervisor
+            .notification_facts(&registered.session_id)
+            .await
+            .unwrap();
+        assert_eq!(facts.workspace, "Fixture workspace");
+        assert_eq!(facts.subject.as_deref(), Some("Fix the login bug"));
+        assert_eq!(facts.reply, None);
+        // No live route in this fixture, so nothing may claim to name a tab.
+        assert_eq!(facts.tab, None);
+
+        supervisor
+            .replace_bridge_snapshot(
+                &registered.session_id,
+                vec![
+                    prompt_entry("source-a", 1, "Fix the login bug"),
+                    entry(
+                        "source-b",
+                        1,
+                        "Reproduced it.\n\nThe session cookie expires early.",
+                    ),
+                    prompt_entry("source-c", 1, "Ship it"),
+                ],
+            )
+            .unwrap();
+        let facts = supervisor
+            .notification_facts(&registered.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            facts.reply.as_deref(),
+            Some("Reproduced it. The session cookie expires early."),
+            "the whole answer runs on one line; its first line alone is usually the least of it"
+        );
+        assert_eq!(facts.subject.as_deref(), Some("Ship it"));
     }
 
     #[test]

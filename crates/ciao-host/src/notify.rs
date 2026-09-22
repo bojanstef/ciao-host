@@ -80,6 +80,20 @@ const MAX_WORKSPACE_CHARACTERS: usize = 64;
 /// The conversation's subject, which is a user prompt and therefore arbitrary text. The wire
 /// bound is already 200 bytes; this is the shorter bound a notification body can actually show.
 const MAX_TITLE_CHARACTERS: usize = 100;
+/// What the agent last said, which is the notification's body now that the reason moved to its
+/// title. Longer than the subject because it is the only line carrying content, and shorter than
+/// anything a lock screen shows in full — the point is enough to recognise the answer, not to
+/// read it in the notification.
+const MAX_REPLY_CHARACTERS: usize = 140;
+/// The multiplexer tab's own name. Already bounded to `MAX_TAB_LABEL_BYTES` where the snapshot
+/// builds it; this is the shorter bound that fits beside a machine name on one subtitle row.
+const MAX_TAB_CHARACTERS: usize = 32;
+/// Plaintext ceiling, enforced after assembly rather than field by field. Every bound above
+/// counts *characters*, and `maximumSealedBytes` on the device counts bytes — so a payload whose
+/// every field is legal and multibyte can still be one the phone refuses to open, which is the
+/// silent failure of showing the relay's generic alert instead of the real one. 700 leaves room
+/// for the 28 bytes the seal adds under the device's 768.
+const MAX_PAYLOAD_BYTES: usize = 700;
 /// Matches `MAX_HOST_DISPLAY_NAME_BYTES`, which the host protocol already enforces.
 const MAX_HOST_CHARACTERS: usize = 64;
 /// The relay's own failure text, logged and nothing else. Short because APNS's reasons are one
@@ -283,14 +297,7 @@ impl Notifier {
     ///
     /// Nothing here leaves this process unsealed. A device paired before the notification key
     /// existed has no key to seal under and gets the relay's generic alert instead.
-    pub fn notify(
-        &self,
-        session_id: &str,
-        workspace: &str,
-        title: Option<&str>,
-        kind: &str,
-        now: u64,
-    ) {
+    pub fn notify(&self, session_id: &str, facts: &NotificationFacts, kind: &str, now: u64) {
         if !self.inner.gate.lock().allow(session_id, now) {
             return;
         }
@@ -298,7 +305,7 @@ impl Notifier {
         if targets.is_empty() {
             return;
         }
-        let plaintext = payload(session_id, workspace, &self.inner.host, title, kind);
+        let plaintext = payload(session_id, facts, &self.inner.host, kind);
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
             for (ticket, key) in targets {
@@ -547,33 +554,62 @@ fn live_activity_retry_delay(failures: u32) -> u64 {
         .min(LIVE_ACTIVITY_MAX_RETRY_SECONDS)
 }
 
-/// What the extension decrypts and shows: which machine, which project, which conversation, and
-/// what it wants. Facts, not sentences — rendering is the device's job, and a host that shipped
-/// lock-screen copy would have to be updated to reword it.
+/// Everything an alert says about one session, assembled by the session owner because only it
+/// can read a conversation's timeline or name the tab a route lands in.
+#[derive(Debug, Default, Clone)]
+pub struct NotificationFacts {
+    /// The project directory's display name.
+    pub workspace: String,
+    /// The multiplexer tab's own name, when a live route can name one. The disambiguating fact
+    /// on a machine running four conversations in one project, where the workspace says the
+    /// same word four times.
+    pub tab: Option<String>,
+    /// The newest prompt's first line. Kept for a phone that predates `reply`.
+    pub subject: Option<String>,
+    /// The beginning of what the agent last said — the line a person actually needs to decide
+    /// whether to pick the phone up.
+    pub reply: Option<String>,
+}
+
+/// What the extension decrypts and shows: which machine, which project, which tab, which
+/// conversation, and what it wants. Facts, not sentences — rendering is the device's job, and a
+/// host that shipped lock-screen copy would have to be updated to reword it.
 ///
 /// All of it is readable only by the paired phone, which is what makes it sayable at all. The
-/// same four fields on the outside of the seal would hand the relay a per-user log of which
-/// project on which machine needed attention and when.
-fn payload(
-    session_id: &str,
-    workspace: &str,
-    host: &str,
-    title: Option<&str>,
-    kind: &str,
-) -> String {
+/// same fields on the outside of the seal would hand the relay a per-user log of which project on
+/// which machine needed attention and when.
+fn payload(session_id: &str, facts: &NotificationFacts, host: &str, kind: &str) -> String {
     let mut payload = serde_json::json!({
         "v": 1,
         "session": session_id,
-        "workspace": bounded(workspace, MAX_WORKSPACE_CHARACTERS),
+        "workspace": bounded(&facts.workspace, MAX_WORKSPACE_CHARACTERS),
         "host": bounded(host, MAX_HOST_CHARACTERS),
         "kind": kind,
     });
     // Omitted rather than empty: a conversation Ciao never saw a prompt for has no subject, and
     // the device renders one line instead of a trailing quotation mark around nothing.
-    if let Some(title) = title.map(|title| bounded(title, MAX_TITLE_CHARACTERS))
-        && !title.is_empty()
-    {
-        payload["title"] = title.into();
+    for (key, value, bound) in [
+        ("tab", facts.tab.as_deref(), MAX_TAB_CHARACTERS),
+        ("title", facts.subject.as_deref(), MAX_TITLE_CHARACTERS),
+        ("reply", facts.reply.as_deref(), MAX_REPLY_CHARACTERS),
+    ] {
+        if let Some(value) = value.map(|value| bounded(value, bound))
+            && !value.is_empty()
+        {
+            payload[key] = value.into();
+        }
+    }
+    // Shed the optional fields, least useful first, until the phone can open what it is sent.
+    // `subject` goes before `reply`: a phone new enough to be near this ceiling prefers the
+    // reply, and one old enough to need the subject cannot make a payload this large.
+    for key in ["title", "reply", "tab"] {
+        if payload.to_string().len() <= MAX_PAYLOAD_BYTES {
+            break;
+        }
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove(key);
     }
     payload.to_string()
 }
@@ -1034,9 +1070,12 @@ mod tests {
         assert_eq!(
             payload(
                 "claude-9f2c1a7e",
-                "ciao",
+                &NotificationFacts {
+                    workspace: "ciao".into(),
+                    subject: Some("seal the notification payload".into()),
+                    ..NotificationFacts::default()
+                },
                 "Alice\u{2019}s Example Mac",
-                Some("seal the notification payload"),
                 "permission_prompt",
             ),
             fixture.plaintext
@@ -1046,7 +1085,15 @@ mod tests {
     #[test]
     fn every_seal_uses_a_fresh_nonce_and_authenticates_its_payload() {
         let key = [7_u8; 32];
-        let plaintext = payload("session-a", "ciao", "host", None, "idle_prompt");
+        let plaintext = payload(
+            "session-a",
+            &NotificationFacts {
+                workspace: "ciao".into(),
+                ..NotificationFacts::default()
+            },
+            "host",
+            "idle_prompt",
+        );
         let first = decode(&seal(&key, plaintext.as_bytes()).unwrap());
         let second = decode(&seal(&key, plaintext.as_bytes()).unwrap());
         // Same key, same plaintext, different bytes: the nonce is not derived from either.
@@ -1104,20 +1151,29 @@ mod tests {
         );
     }
 
+    /// Both bounds a sealed payload must clear, checked together because breaching either one
+    /// fails silently rather than loudly.
+    fn sealed_within_bounds(plaintext: &str) -> bool {
+        let sealed = seal(&[1; 32], plaintext.as_bytes()).unwrap();
+        sealed.len() <= 1024 && decode(&sealed).len() <= 768
+    }
+
     /// Every field in the payload is text a person chose — a directory name, a machine name, a
-    /// prompt — so none of them may be trusted to be short.
+    /// tab name, a prompt, an agent's answer — so none of them may be trusted to be short.
     #[test]
     fn hostile_lengths_cannot_grow_the_payload_without_bound() {
-        let plaintext = payload(
-            "s",
-            &"w".repeat(4096),
-            &"h".repeat(4096),
-            Some(&"t".repeat(4096)),
-            "permission_prompt",
-        );
-        let sealed = seal(&[1; 32], plaintext.as_bytes()).unwrap();
-        // Comfortably inside APNs' 4 KB, and inside the relay's own 1024-character blob bound.
-        assert!(sealed.len() < 768, "{}", sealed.len());
+        let hostile = NotificationFacts {
+            workspace: "w".repeat(4096),
+            tab: Some("b".repeat(4096)),
+            subject: Some("t".repeat(4096)),
+            reply: Some("r".repeat(4096)),
+        };
+        let plaintext = payload("s", &hostile, &"h".repeat(4096), "permission_prompt");
+        // Two ceilings, both on the *sealed* blob and neither of them APNs' 4 KB: the relay's
+        // `SEALED` regex caps the base64url text at 1024 characters, and the device's
+        // `maximumSealedBytes` caps what that decodes to at 768. Breaching either is silent —
+        // the relay refuses the push, or the phone shows the generic alert — so both are fenced.
+        assert!(sealed_within_bounds(&plaintext), "{}", plaintext.len());
 
         // Each field is cut to its own bound and says so, rather than ending mid-word as if the
         // payload had been corrupted. The marker replaces a character instead of extending it.
@@ -1125,7 +1181,9 @@ mod tests {
         for (field, bound) in [
             ("workspace", MAX_WORKSPACE_CHARACTERS),
             ("host", MAX_HOST_CHARACTERS),
+            ("tab", MAX_TAB_CHARACTERS),
             ("title", MAX_TITLE_CHARACTERS),
+            ("reply", MAX_REPLY_CHARACTERS),
         ] {
             let value = cut[field].as_str().unwrap();
             assert_eq!(value.chars().count(), bound, "{field}");
@@ -1134,10 +1192,35 @@ mod tests {
         // A value that fits is left exactly alone.
         assert_eq!(bounded("ciao", MAX_WORKSPACE_CHARACTERS), "ciao");
 
+        // Character bounds are not byte bounds. Every field here is legal and every character is
+        // three bytes, which is the payload the device would have refused to open — and refusing
+        // to open one is invisible, because it shows the relay's generic alert instead.
+        let multibyte = NotificationFacts {
+            workspace: "の".repeat(4096),
+            tab: Some("の".repeat(4096)),
+            subject: Some("の".repeat(4096)),
+            reply: Some("の".repeat(4096)),
+        };
+        let plaintext = payload("s", &multibyte, &"の".repeat(4096), "permission_prompt");
+        assert!(sealed_within_bounds(&plaintext), "{}", plaintext.len());
+        // Shedding stops as soon as it fits, and never sheds what the alert cannot do without.
+        let shed: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
+        assert!(shed["session"].is_string() && shed["kind"].is_string());
+        assert!(shed["workspace"].is_string() && shed["host"].is_string());
+
         // A conversation Ciao never saw a prompt for carries no subject at all, rather than an
         // empty one the device would render as an empty pair of quotation marks.
-        for absent in [None, Some("")] {
-            assert!(!payload("s", "w", "h", absent, "idle_prompt").contains("title"));
+        for absent in [None, Some(String::new())] {
+            let facts = NotificationFacts {
+                workspace: "w".into(),
+                tab: absent.clone(),
+                subject: absent.clone(),
+                reply: absent,
+            };
+            let plaintext = payload("s", &facts, "h", "idle_prompt");
+            for key in ["tab", "title", "reply"] {
+                assert!(!plaintext.contains(key), "{key}");
+            }
         }
     }
 

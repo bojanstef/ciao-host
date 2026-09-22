@@ -616,7 +616,7 @@ pub(crate) fn tmux_window_id(id: &str) -> bool {
 
 /// Spec 021 §4.3: display text ends here. Control characters are stripped, the result is
 /// bounded on a char boundary, and an empty survivor is `None` so callers pick a fallback.
-fn sanitize_tab_label(raw: &str) -> Option<String> {
+pub(crate) fn sanitize_tab_label(raw: &str) -> Option<String> {
     let mut label = String::new();
     for character in raw.chars().filter(|character| !character.is_control()) {
         if label.len() + character.len_utf8() > MAX_TAB_LABEL_BYTES {
