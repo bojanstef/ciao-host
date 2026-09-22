@@ -151,6 +151,12 @@ pub(crate) async fn push_attention(
     session_id: &str,
     kind: &str,
 ) {
+    // Categorical, and the only record that an alert was *attempted*. Without it the sole
+    // evidence a push happened is the relay complaining when one fails, so a silent phone and a
+    // working relay are indistinguishable from no push at all — which is exactly the hour this
+    // rewiring would otherwise have cost the next person. The kind is a validated token; whether
+    // the gate then swallowed it is `notify`'s business and deliberately not claimed here.
+    tracing::info!(session = %session_id, kind = %kind, "agent session wants attention");
     let facts = sessions
         .notification_facts(session_id)
         .await
@@ -329,14 +335,17 @@ async fn apply_adapter_event(
         // blocked on the person, and without it the alert and the session row disagreed about
         // the same moment: the phone buzzed while the row still read `Unknown`.
         NormalizedAdapterEvent::Notification(kind) => {
-            // The kind decides what the turn may claim; the alert below goes out regardless.
-            // Latching every kind made Claude's idle reminder the top-priority "needs input"
-            // on the Lock Screen — see classify_attention_kind for the measured split.
-            match AgentSessionSupervisor::classify_attention_kind(&kind) {
-                AttentionKind::Latches => tracing::info!(
+            // The kind decides what the turn may claim, and whether this is worth an alert at
+            // all. Latching every kind made Claude's idle reminder the top-priority "needs
+            // input" on the Lock Screen — see classify_attention_kind for the measured split.
+            let classification = AgentSessionSupervisor::classify_attention_kind(&kind);
+            match classification {
+                // `push_attention` logs the alert itself; this says only what the kind let the
+                // turn claim, which is the part that is otherwise unobservable.
+                AttentionKind::Latches => tracing::debug!(
                     session = %session_id,
                     kind = %kind,
-                    "agent session wants attention"
+                    "agent notification latched a turn claim"
                 ),
                 AttentionKind::ReportsIdle | AttentionKind::Informational => tracing::debug!(
                     session = %session_id,
@@ -357,7 +366,17 @@ async fn apply_adapter_event(
             if let Err(error) = ctx.sessions.note_bridge_attention(session_id, &kind) {
                 tracing::debug!(error = %error, "recording an attention turn failed");
             }
-            push_attention(ctx.sessions, ctx.notifier, session_id, &kind).await;
+            // `ReportsIdle` says "this conversation went quiet", which is what the turn edge now
+            // says — earlier, and for every adapter rather than only the two with a hook for it.
+            // Two alerts for one silence is one alert too many, and the vendor's arrives second.
+            // Its bookkeeping above still runs: the row still goes idle, it just stops buzzing.
+            //
+            // `Latches` keeps its own alert and must: `note_bridge_attention` writes
+            // `AwaitingInteraction` straight onto the snapshot rather than through
+            // `note_bridge_turn`, so no turn edge is ever observed for a permission prompt.
+            if !matches!(classification, AttentionKind::ReportsIdle) {
+                push_attention(ctx.sessions, ctx.notifier, session_id, &kind).await;
+            }
         }
         NormalizedAdapterEvent::Unknown if !ctx.snapshot_open => {
             // Spec 017 §4.2: the visible unsupported card is also tallied, so drift is a list
