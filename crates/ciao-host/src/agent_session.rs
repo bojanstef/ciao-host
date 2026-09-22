@@ -1479,7 +1479,11 @@ impl AgentSessionSupervisor {
     /// An adapter reporting its own turn boundary. Unlike attention, this replaces whatever the
     /// turn was: the worker sees the edges and Ciao does not, so a stale local guess never wins.
     /// A repeat of the current state emits nothing, so a chatty adapter cannot churn revisions.
-    pub(crate) fn note_bridge_turn(&self, session_id: &str, turn: TurnState) -> Result<()> {
+    ///
+    /// Answers whether the turn actually moved. A notification is owed to a turn *edge*, and an
+    /// adapter re-reporting the state it is already in must not buzz a phone for it — the rate
+    /// gate would usually swallow the repeat, but "usually" is not a fence.
+    pub(crate) fn note_bridge_turn(&self, session_id: &str, turn: TurnState) -> Result<bool> {
         let mut inner = self.inner.lock();
         let session = inner
             .sessions
@@ -1489,7 +1493,7 @@ impl AgentSessionSupervisor {
         // is a no-op for the wire and still the freshest proof that the run is open.
         session.open_run = matches!(turn, TurnState::Running { .. }).then(|| turn.clone());
         if session.snapshot.turn == turn {
-            return Ok(());
+            return Ok(false);
         }
         let base_revision = session.snapshot.revision;
         bump_revision(session);
@@ -1509,7 +1513,7 @@ impl AgentSessionSupervisor {
             v: AGENT_PROTOCOL_VERSION,
             delta,
         });
-        Ok(())
+        Ok(true)
     }
 
     /// What a vendor notification kind means for the turn (Spec 019, amended 2026-08-19).

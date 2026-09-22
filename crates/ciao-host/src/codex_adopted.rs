@@ -1368,14 +1368,13 @@ async fn on_server_request(
                 // ADR 005, same moment as every other integration: the card blocks the turn,
                 // and this is the push that reaches a pocket. Managed and adopted were the two
                 // paths that could raise a card and not say so — this closes the adopted half.
-                let facts = runtime
-                    .supervisor
-                    .notification_facts(session)
-                    .await
-                    .unwrap_or_default();
-                runtime
-                    .notifier
-                    .notify(session, &facts, "permission_prompt", unix_now());
+                crate::agent_bridge::push_attention(
+                    &runtime.supervisor,
+                    &runtime.notifier,
+                    session,
+                    "permission_prompt",
+                )
+                .await;
             } else {
                 // The card could not be raised; refusing beats a request nobody can see.
                 let _ = runtime

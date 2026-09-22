@@ -140,6 +140,53 @@ struct AdapterEventContext<'a> {
     unknown_sequence: u64,
 }
 
+/// The one place an alert is raised. Every source funnels through here so that what a phone is
+/// told does not depend on which vendor the conversation happens to be with.
+///
+/// The gate inside `notify` (one push per session per minute, twelve per ten) is what keeps a
+/// chatty session from becoming a firehose, so no caller carries its own.
+pub(crate) async fn push_attention(
+    sessions: &AgentSessionSupervisor,
+    notifier: &Notifier,
+    session_id: &str,
+    kind: &str,
+) {
+    let facts = sessions
+        .notification_facts(session_id)
+        .await
+        .unwrap_or_default();
+    notifier.notify(session_id, &facts, kind, unix_now());
+}
+
+/// What a normalized turn edge is worth telling someone, or `None` for one that is nobody's
+/// business — a turn that started, or is winding down, is the agent working.
+///
+/// **This is the adapter-neutral notification.** A vendor hook is a bonus, not the mechanism:
+/// Claude Code has one, Codex has one, Pi has none, and before this a Pi session could run all
+/// day without ever reaching a pocket. Every adapter reports turns through one normalized
+/// vocabulary — `NormalizedAdapterEvent::Turn` — so that vocabulary is what alerts are owed to.
+///
+/// `Completed { run_id: None }` is deliberately silent: that is the state a session registers
+/// *into*, not a turn that ran, and treating it as one buzzes a phone for every reconnect.
+fn attention_kind_for_turn(turn: &TurnState) -> Option<&'static str> {
+    match turn {
+        TurnState::Completed { run_id: Some(_) } => Some("idle_prompt"),
+        TurnState::AwaitingInteraction { .. } => Some("permission_prompt"),
+        TurnState::Idle
+        | TurnState::Completed { run_id: None }
+        | TurnState::Running { .. }
+        | TurnState::Stopping { .. }
+        | TurnState::Interrupted { .. } => None,
+        // Interrupted and Failed are both "it stopped without answering", and neither of the
+        // kinds this maps to says that: "Awaiting reply" would claim an answer is waiting. They
+        // stay silent until there is copy for them rather than borrowing the wrong words.
+        TurnState::Failed { .. } => None,
+        // Spec 017: vocabulary this build does not recognize is tallied at its parse site, never
+        // guessed at here. A state Ciao cannot name is not one it can decide to interrupt for.
+        TurnState::Unknown { .. } | TurnState::Unsupported => None,
+    }
+}
+
 enum EventOutcome {
     Continue,
     End { process_exited: bool },
@@ -210,7 +257,14 @@ async fn apply_adapter_event(
                     ctx.registered.process_generation,
                 );
             }
-            ctx.sessions.note_bridge_turn(session_id, turn)?;
+            // The turn edge is the alert, for every adapter alike. Only on an actual edge: an
+            // adapter re-reporting the state it is already in has not done anything.
+            let kind = attention_kind_for_turn(&turn);
+            if ctx.sessions.note_bridge_turn(session_id, turn)?
+                && let Some(kind) = kind
+            {
+                push_attention(ctx.sessions, ctx.notifier, session_id, kind).await;
+            }
         }
         NormalizedAdapterEvent::CommandCapabilities(commands) => {
             ctx.sessions.update_bridge_commands(session_id, commands);
@@ -303,12 +357,7 @@ async fn apply_adapter_event(
             if let Err(error) = ctx.sessions.note_bridge_attention(session_id, &kind) {
                 tracing::debug!(error = %error, "recording an attention turn failed");
             }
-            let facts = ctx
-                .sessions
-                .notification_facts(session_id)
-                .await
-                .unwrap_or_default();
-            ctx.notifier.notify(session_id, &facts, &kind, unix_now());
+            push_attention(ctx.sessions, ctx.notifier, session_id, &kind).await;
         }
         NormalizedAdapterEvent::Unknown if !ctx.snapshot_open => {
             // Spec 017 §4.2: the visible unsupported card is also tallied, so drift is a list
@@ -957,5 +1006,56 @@ mod tests {
         }))
         .unwrap();
         assert!(registry.select(&malformed, None).is_err());
+    }
+
+    /// The alert is owed to the turn, not to a vendor hook — so this table is the whole of which
+    /// moments reach a pocket, for every adapter alike.
+    #[test]
+    fn every_adapter_s_alerts_are_owed_to_the_turn_edge_and_nothing_else() {
+        assert_eq!(
+            attention_kind_for_turn(&TurnState::Completed {
+                run_id: Some("run-1".into())
+            }),
+            Some("idle_prompt"),
+            "a run that ended is a person being waited on"
+        );
+        assert_eq!(
+            attention_kind_for_turn(&TurnState::AwaitingInteraction {
+                run_id: Some("run-1".into())
+            }),
+            Some("permission_prompt")
+        );
+
+        // The one that would have buzzed a phone for nothing. A session registers *into*
+        // `Completed { run_id: None }` — the owner's Pi session reported it 5 seconds before its
+        // first run on 2026-09-22 — and every reconnect would have been an alert.
+        assert_eq!(
+            attention_kind_for_turn(&TurnState::Completed { run_id: None }),
+            None
+        );
+
+        // Working, winding down, or a state this build cannot name: none of them is a person's
+        // business, and an unnameable one is never guessed at (Spec 017).
+        for quiet in [
+            TurnState::Idle,
+            TurnState::Running {
+                run_id: "run-1".into(),
+                activity: "thinking".into(),
+            },
+            TurnState::Stopping {
+                run_id: "run-1".into(),
+            },
+            TurnState::Interrupted { run_id: None },
+            TurnState::Failed {
+                run_id: None,
+                category: "vendor_error".into(),
+            },
+            TurnState::Unknown {
+                reason_code: "future_state".into(),
+            },
+            TurnState::Unsupported,
+        ] {
+            assert_eq!(attention_kind_for_turn(&quiet), None, "{quiet:?}");
+        }
     }
 }

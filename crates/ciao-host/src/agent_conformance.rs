@@ -561,8 +561,15 @@ fn contracts() -> [ParityContract; 4] {
                 CommandName::FollowUp,
                 CommandName::Interrupt,
             ],
-            // GAP(parity): no Notification — a blocked Pi session cannot reach the phone; no
+            // GAP(parity): no Notification — Pi has no vendor hook that says "needs you", and no
             // AppendText — Pi answers arrive as whole entries, never streamed.
+            //
+            // 2026-09-22: this no longer means a Pi session cannot reach the phone, which is what
+            // it used to say. Alerts are owed to the normalized turn edge rather than to a vendor
+            // hook (`agent_bridge::attention_kind_for_turn`), and every adapter here speaks
+            // `Turn`. What Pi still cannot send is the *blocked* half: `interactions` is empty, so
+            // its turn never reaches `AwaitingInteraction` — a Pi session says "awaiting reply"
+            // when a run ends and nothing else. The event vocabulary below is unchanged.
             speaks: &[
                 EventKind::SnapshotStart,
                 EventKind::SnapshotEntry,
