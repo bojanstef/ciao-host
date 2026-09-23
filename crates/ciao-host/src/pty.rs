@@ -520,15 +520,30 @@ impl PtySession {
                 let _ = killer.kill();
             }
         }
+        // Hang up *before* the handles close, not after. A provider's attach client that tears
+        // down against a collapsing stdin types phantom bytes into the pane it is attached to —
+        // the same window `viewer_cleanup` above exists to avoid — and an EOF among them is read
+        // by the session's shell as Ctrl-D. The shell exits 0, its pane goes with it, tmux
+        // destroys the now-empty session, and `exit-empty` reaps the server: a person's terminal
+        // session disappears because Ciao closed a socket. The herdr stray-newline bug was this
+        // same window seen from the other end.
+        //
+        // Measured 2026-09-22 on a 10-core Mac under ordinary load (six busy cores), against
+        // `tmux_session_survives_cleanup_of_a_client_that_was_never_detached`: 5/5 failures with
+        // the old ordering, 0/15 with this one. The pane died with `pane_dead_status=0` and no
+        // signal, which is what says "it exited" rather than "something killed it" — nothing in
+        // the ladder ever signals the pane's group or the server's, and disabling every signal
+        // here did not help, so the write is the cause and the ordering is the whole fix.
+        signal_groups(&groups, Signal::SIGHUP);
+        let hung_up = wait_for_exit_timeout(&mut self.exit_receiver, SIGNAL_WAIT).await?;
+
         self.stop_accepting_and_close_handles().await;
 
-        if let Some(exit) = current_exit(&self.exit_receiver)? {
-            self.finish_tasks().await?;
-            return Ok(Some(exit));
-        }
-
-        signal_groups(&groups, Signal::SIGHUP);
-        if let Some(exit) = wait_for_exit_timeout(&mut self.exit_receiver, SIGNAL_WAIT).await? {
+        let settled = match hung_up {
+            Some(exit) => Some(exit),
+            None => current_exit(&self.exit_receiver)?,
+        };
+        if let Some(exit) = settled {
             self.finish_tasks().await?;
             return Ok(Some(exit));
         }
