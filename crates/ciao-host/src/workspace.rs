@@ -26,8 +26,8 @@ use crate::{
         MAX_TABS_PER_SESSION, PROVIDER_STATE_AVAILABLE, PROVIDER_STATE_ERROR,
         PROVIDER_STATE_NOT_INSTALLED, PROVIDER_STATE_UNSUPPORTED_VERSION, ProviderKind,
         SessionTabEntry, TerminalTarget, TmuxProviderSnapshot, TmuxSessionEntry,
-        WorkspaceProviders, WorkspaceSnapshotResult, valid_session_name, valid_tab_id,
-        valid_tab_status,
+        WorkspaceProviders, WorkspaceSnapshotResult, valid_session_name, valid_tab_agent,
+        valid_tab_id, valid_tab_status,
     },
     pty::{apply_clean_process_environment, is_absolute_executable},
 };
@@ -55,6 +55,10 @@ const PROVIDER_STDERR_CAP: usize = 8 * 1024;
 const HERDR_JSON_MAX_BYTES: usize = 64 * 1024;
 /// Maximum container nesting for the lenient Herdr document: object → array → object → object.
 const HERDR_JSON_MAX_DEPTH: usize = 4;
+/// `herdr pane list` sits one level deeper: each pane nests `agent_session` and `scroll`
+/// objects (measured on herdr 0.9.0), which this never reads but must not refuse the document
+/// over.
+const HERDR_PANE_LIST_MAX_DEPTH: usize = 5;
 const TMUX_MIN_MAJOR: u64 = 3;
 const HERDR_MIN_MAJOR_MINOR: (u64, u64) = (0, 7);
 const UNIT_SEPARATOR: char = '\u{1f}';
@@ -592,6 +596,7 @@ pub(crate) fn parse_tmux_window_list(
                 focused,
                 status: None,
                 agent_session_id: None,
+                agent: None,
                 workspace: None,
             },
         ));
@@ -710,7 +715,7 @@ async fn snapshot_herdr(
     );
     let (sessions, capped) = cap_herdr_sessions(sessions);
     let sessions = if let Some(agents) = tabs {
-        attach_herdr_tabs(&binary, sessions, agents).await
+        attach_herdr_tabs(&binary, &version, sessions, agents).await
     } else {
         sessions
     };
@@ -734,8 +739,15 @@ async fn snapshot_herdr(
 /// Two calls rather than one because `tab list` alone cannot answer this: it carries a
 /// `workspace_id`, which is routing data, and never the workspace's label, which is the only
 /// part a person reads.
+///
+/// Extended 2026-09-23 with a third, `--session <name> pane list`, for the one thing neither
+/// listing says: which agent herdr sees in each tab. Same failure posture — no detection, never
+/// a degraded session — with one addition: an agent name that fails its shape is a field-level
+/// swallow in a document that otherwise parsed, and that is noted, since it is drift and not a
+/// missing API.
 async fn attach_herdr_tabs(
     binary: &Path,
+    version: &str,
     mut sessions: Vec<HerdrSessionEntry>,
     agents: &AgentTabIndex,
 ) -> Vec<HerdrSessionEntry> {
@@ -753,9 +765,11 @@ async fn attach_herdr_tabs(
         handles.push(tokio::spawn(async move {
             let tab_argv = ["--session", name.as_str(), "tab", "list"];
             let workspace_argv = ["--session", name.as_str(), "workspace", "list"];
-            let (tabs, workspaces) = tokio::join!(
+            let pane_argv = ["--session", name.as_str(), "pane", "list"];
+            let (tabs, workspaces, panes) = tokio::join!(
                 run_bounded(&binary, &tab_argv),
                 run_bounded(&binary, &workspace_argv),
+                run_bounded(&binary, &pane_argv),
             );
             let tabs = match tabs {
                 Ok(output) if output.status_success && !output.stdout_truncated => {
@@ -769,11 +783,32 @@ async fn attach_herdr_tabs(
                 }
                 _ => None,
             };
-            tabs.map(|tabs| resolve_workspaces(tabs, workspaces.unwrap_or_default()))
+            let (detected, refused) = match panes {
+                Ok(output) if output.status_success && !output.stdout_truncated => {
+                    parse_herdr_pane_agents(&output.stdout).unwrap_or_default()
+                }
+                _ => Default::default(),
+            };
+            let tabs = tabs.map(|tabs| {
+                let mut tabs = resolve_workspaces(tabs, workspaces.unwrap_or_default());
+                for tab in &mut tabs {
+                    tab.agent = detected.get(&tab.id).cloned();
+                }
+                tabs
+            });
+            (tabs, refused)
         }));
     }
     for (&index, handle) in queried.iter().zip(handles) {
-        if let Ok(tabs) = handle.await {
+        if let Ok((tabs, refused)) = handle.await {
+            crate::drift::note_by(
+                "herdr",
+                "pane_list",
+                "invalid",
+                "agent",
+                Some(version),
+                refused,
+            );
             sessions[index].tabs = tabs.and_then(normalize_tabs).map(|tabs| {
                 annotate_agents(ProviderKind::Herdr, &sessions[index].name, tabs, agents)
             });
@@ -852,6 +887,75 @@ pub(crate) fn parse_herdr_workspace_labels(
     Some(labels)
 }
 
+/// The one field this reads from `herdr pane list`: which agent herdr sees in each pane, folded
+/// onto its tab — the focused pane's when a focused pane has one, otherwise the first listed.
+/// Same lenient-but-bounded posture as the tab listing. A pane with no agent spells it `null`
+/// or leaves the key out, and every other pane field is deliberately ignored, so the only
+/// input swallowed here is an agent *name* that fails its shape: those are counted and
+/// returned for the drift ledger (Spec 017) rather than skipped.
+///
+/// ponytail: bounded by the shared 64 KB provider stdout cap, ~110 panes at herdr 0.9.0's
+/// ~585 B per pane. A larger session truncates, parses to `None`, and lists exactly as it did
+/// before detection existed; give `run_bounded` a per-call cap if that session turns up.
+pub(crate) fn parse_herdr_pane_agents(
+    stdout: &[u8],
+) -> Option<(std::collections::HashMap<String, String>, u64)> {
+    if stdout.len() > HERDR_JSON_MAX_BYTES {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(stdout).ok()?;
+    if container_depth(&value) > HERDR_PANE_LIST_MAX_DEPTH {
+        return None;
+    }
+    let panes = value
+        .as_object()?
+        .get("result")?
+        .as_object()?
+        .get("panes")?
+        .as_array()?;
+    let mut agents: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
+    let mut refused = 0;
+    for pane in panes {
+        let Some(pane) = pane.as_object() else {
+            continue;
+        };
+        let Some(tab) = pane
+            .get("tab_id")
+            .and_then(Value::as_str)
+            .filter(|id| valid_tab_id(id))
+        else {
+            continue;
+        };
+        let agent = match pane.get("agent") {
+            None | Some(Value::Null) => continue,
+            Some(agent) => match agent.as_str().filter(|agent| valid_tab_agent(agent)) {
+                Some(agent) => agent,
+                None => {
+                    refused += 1;
+                    continue;
+                }
+            },
+        };
+        let focused = pane
+            .get("focused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let keep = match agents.get(tab) {
+            None => true,
+            Some((_, held_focused)) => focused && !held_focused,
+        };
+        if keep {
+            agents.insert(tab.to_owned(), (agent.to_owned(), focused));
+        }
+    }
+    let agents = agents
+        .into_iter()
+        .map(|(tab, (agent, _))| (tab, agent))
+        .collect();
+    Some((agents, refused))
+}
+
 /// Lenient-but-bounded decoding of `herdr tab list`, same posture as `parse_herdr_list`: the
 /// document is size- and depth-capped, unknown fields are ignored, a violating tab is dropped
 /// alone, and the error envelope (`server_not_running` and friends) is simply no tabs.
@@ -896,6 +1000,8 @@ pub(crate) fn parse_herdr_tab_list(stdout: &[u8]) -> Option<Vec<SessionTabEntry>
             focused: tab.get("focused").and_then(Value::as_bool).unwrap_or(false),
             status,
             agent_session_id: None,
+            // Filled from `pane list` by `attach_herdr_tabs`, the only caller.
+            agent: None,
             // The **id** at this point, not the label. `attach_herdr_tabs` is the only caller
             // and swaps it for the workspace's label, dropping any id the workspace listing did
             // not name — so an unresolved id can never reach the wire.
@@ -2443,6 +2549,41 @@ mod tests {
         assert_eq!(parse_herdr_tab_list(deep), None);
     }
 
+    /// Which agent herdr sees in each tab: the focused pane's where a focused pane has one
+    /// (`wX:t19` holds an unfocused Pi and a focused Claude), else the first listed (`wX:t8`
+    /// holds Codex then Pi). A pane with no agent — key absent or `null` — names nothing; a
+    /// malformed name is refused *and counted*, because that count is the drift ledger's; a
+    /// malformed tab id is dropped alone. Real 0.9.0 panes nest objects this never reads, so
+    /// that depth must parse, and the error envelope is simply no detection.
+    #[test]
+    fn herdr_pane_agents_fold_onto_tabs_and_count_what_they_refuse() {
+        let fixture = tabs_fixture();
+        let stdout = fixture
+            .get("herdr_pane_list_stdout")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        let (agents, refused) = parse_herdr_pane_agents(stdout.as_bytes()).unwrap();
+        let mut named: Vec<(&str, &str)> = agents
+            .iter()
+            .map(|(tab, agent)| (tab.as_str(), agent.as_str()))
+            .collect();
+        named.sort();
+        assert_eq!(named, vec![("wX:t19", "claude"), ("wX:t8", "codex")]);
+        assert_eq!(refused, 1, "only the malformed agent name is drift");
+
+        let error = fixture
+            .get("herdr_pane_list_error_stdout")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(parse_herdr_pane_agents(error.as_bytes()), None);
+        let oversized = vec![b' '; HERDR_JSON_MAX_BYTES + 1];
+        assert_eq!(parse_herdr_pane_agents(&oversized), None);
+        let deeper = br#"{"result":{"panes":[{"agent_session":{"value":{"too":"far"}}}]}}"#;
+        assert_eq!(parse_herdr_pane_agents(deeper), None);
+    }
+
     #[test]
     fn herdr_workspace_labels_resolve_onto_tabs_and_collapse_when_they_say_nothing() {
         let fixture = tabs_fixture();
@@ -2530,6 +2671,7 @@ mod tests {
             focused,
             status: None,
             agent_session_id: None,
+            agent: None,
             workspace: None,
         };
         let overfull: Vec<SessionTabEntry> = (0..MAX_TABS_PER_SESSION + 3)
@@ -2860,6 +3002,16 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        let boxes_panes = directory.path().join("boxes-panes.json");
+        fs::write(
+            &boxes_panes,
+            fixture
+                .get("herdr_pane_list_stdout")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
         write_stub(
             directory.path(),
             "herdr",
@@ -2867,10 +3019,12 @@ mod tests {
                 "if [ \"$1\" = \"--version\" ]; then echo 'herdr 0.8.0'; \
                  elif [ \"$1\" = \"--session\" ]; then echo \"$2 $3\" >> {}; \
                  if [ \"$2\" != \"boxes\" ]; then exit 1; \
-                 elif [ \"$3\" = \"workspace\" ]; then cat {}; else cat {}; fi; \
+                 elif [ \"$3\" = \"workspace\" ]; then cat {}; \
+                 elif [ \"$3\" = \"pane\" ]; then cat {}; else cat {}; fi; \
                  else cat {}; fi",
                 queries.display(),
                 boxes_workspaces.display(),
+                boxes_panes.display(),
                 boxes_tabs.display(),
                 herdr_sessions.display()
             ),
@@ -2905,9 +3059,19 @@ mod tests {
         assert_eq!(herdr[2].tabs, None);
         // tmux has no such level and must never grow one.
         assert!(api_tabs.iter().all(|tab| tab.workspace.is_none()));
+        // herdr's own detection lands on the tab it was seen in, and tmux, which detects
+        // nothing, carries none.
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|tab| tab.agent.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, Some("claude"), Some("codex")]
+        );
+        assert!(api_tabs.iter().all(|tab| tab.agent.is_none()));
 
         // Only the running sessions were ever asked; the stopped one has no socket to answer.
-        // Each running one is asked for both listings, because one call cannot answer both.
+        // Each running one is asked for every listing, because no one call answers them all.
         let mut asked: Vec<String> = fs::read_to_string(&queries)
             .unwrap()
             .lines()
@@ -2917,8 +3081,10 @@ mod tests {
         assert_eq!(
             asked,
             vec![
+                "boxes pane",
                 "boxes tab",
                 "boxes workspace",
+                "default pane",
                 "default tab",
                 "default workspace"
             ]

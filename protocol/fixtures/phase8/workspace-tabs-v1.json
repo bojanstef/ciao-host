@@ -1,6 +1,6 @@
 {
   "format": "ciao-phase8-workspace-tabs-v1",
-  "comment": "Synthetic provider examples retaining the observed Herdr 0.8.0 and tmux 3.7b schema shapes. Workspace labels have been anonymized for publication. Covers one annotated tab per provider, unannotated tabs, workspace grouping, spaced and empty window names, malformed entries and errors.",
+  "comment": "Synthetic provider examples retaining the observed Herdr 0.8.0 and tmux 3.7b schema shapes (pane list: Herdr 0.9.0). Workspace labels have been anonymized for publication. Covers one annotated tab per provider, unannotated tabs, provider-detected agents with and without a Ciao session, workspace grouping, spaced and empty window names, malformed entries and errors.",
   "snapshot_response": {
     "v": 1,
     "type": "response",
@@ -71,6 +71,7 @@
                   "focused": true,
                   "status": "working",
                   "agent_session_id": "session-b",
+                  "agent": "claude",
                   "workspace": "iroh"
                 },
                 {
@@ -78,6 +79,7 @@
                   "label": "example-site",
                   "focused": false,
                   "status": "unknown",
+                  "agent": "codex",
                   "workspace": "iroh"
                 }
               ]
@@ -199,5 +201,7 @@
   "herdr_tab_list_error_stdout": "{\"id\":\"cli:tab:list\",\"error\":{\"code\":\"server_not_running\",\"message\":\"no herdr server is running at /home/user/.config/herdr/sessions/x/herdr.sock; run `herdr session attach x` to start or attach it\"}}",
   "tmux_window_list_stdout": "@1 0 1 api vim\n@2 1 2 api two words here\n@5 0 7 api \n@9 1 1 lab sleep\n@7 0 1 ghost zsh\nnot a window line\n",
   "herdr_workspace_list_stdout": "{\"id\":\"cli:workspace:list\",\"result\":{\"type\":\"workspace_list\",\"workspaces\":[{\"active_tab_id\":\"wV:tC\",\"agent_status\":\"idle\",\"focused\":false,\"label\":\"example-api\",\"number\":1,\"pane_count\":1,\"tab_count\":1,\"workspace_id\":\"wV\"},{\"active_tab_id\":\"wX:t19\",\"agent_status\":\"working\",\"focused\":true,\"label\":\"  iroh\\u0007  \",\"number\":2,\"pane_count\":2,\"tab_count\":2,\"workspace_id\":\"wX\"},{\"active_tab_id\":\"wZ:t1\",\"agent_status\":\"idle\",\"focused\":false,\"label\":\"unused\",\"number\":3,\"pane_count\":1,\"tab_count\":1,\"workspace_id\":\"wZ\"},{\"label\":\"spaced id\",\"number\":4,\"workspace_id\":\"has space\"},{\"label\":\"\",\"number\":5,\"workspace_id\":\"wQ\"}]}}",
-  "herdr_workspace_list_error_stdout": "{\"id\":\"cli:workspace:list\",\"error\":{\"code\":\"server_not_running\",\"message\":\"no herdr server is running at /home/user/.config/herdr/sessions/x/herdr.sock\"}}"
+  "herdr_workspace_list_error_stdout": "{\"id\":\"cli:workspace:list\",\"error\":{\"code\":\"server_not_running\",\"message\":\"no herdr server is running at /home/user/.config/herdr/sessions/x/herdr.sock\"}}",
+  "herdr_pane_list_stdout": "{\"id\":\"cli:pane:list\",\"result\":{\"type\":\"pane_list\",\"panes\":[{\"agent_status\":\"idle\",\"cwd\":\"/home/user/example-api\",\"focused\":false,\"pane_id\":\"wV:p1\",\"tab_id\":\"wV:tC\",\"workspace_id\":\"wV\"},{\"agent\":null,\"agent_status\":\"idle\",\"focused\":false,\"pane_id\":\"wX:p2\",\"tab_id\":\"wX:t19\",\"workspace_id\":\"wX\"},{\"agent\":\"pi\",\"agent_status\":\"idle\",\"focused\":false,\"pane_id\":\"wX:p3\",\"tab_id\":\"wX:t19\",\"workspace_id\":\"wX\"},{\"agent\":\"claude\",\"agent_session\":{\"id\":\"opaque\"},\"agent_status\":\"working\",\"focused\":true,\"pane_id\":\"wX:p4\",\"tab_id\":\"wX:t19\",\"workspace_id\":\"wX\"},{\"agent\":\"codex\",\"agent_status\":\"unknown\",\"focused\":false,\"pane_id\":\"wX:p5\",\"tab_id\":\"wX:t8\",\"workspace_id\":\"wX\"},{\"agent\":\"pi\",\"agent_status\":\"idle\",\"focused\":false,\"pane_id\":\"wX:p6\",\"tab_id\":\"wX:t8\",\"workspace_id\":\"wX\"},{\"agent\":\"Claude Code!\",\"agent_status\":\"idle\",\"focused\":false,\"pane_id\":\"wY:p7\",\"tab_id\":\"wY:t1\",\"workspace_id\":\"wY\"},{\"agent\":\"claude\",\"focused\":false,\"pane_id\":\"wY:p8\",\"tab_id\":\"has space\",\"workspace_id\":\"wY\"}]}}",
+  "herdr_pane_list_error_stdout": "{\"id\":\"cli:pane:list\",\"error\":{\"code\":\"server_not_running\",\"message\":\"no herdr server is running at /home/user/.config/herdr/sessions/x/herdr.sock\"}}"
 }
