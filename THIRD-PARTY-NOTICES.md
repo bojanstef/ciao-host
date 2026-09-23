@@ -10,6 +10,8 @@ it does not imply that every entry is linked on every platform.
 - Iroh 1.0.2: MIT OR Apache-2.0, plus BSD-3-Clause notices for Tailscale-derived
   socket code. All three license files are in `vendor/iroh/`.
 - noq-proto 1.0.1: MIT OR Apache-2.0; license files are in `vendor/noq-proto/`.
+- portable-pty 0.9.0: MIT; the license file is in `vendor/portable-pty/`. Its writer no
+  longer types a newline and EOT into the terminal when dropped.
 - Each `CIAO-PATCH.md` records the local change and when to remove it.
 
 Registry packages are fetched by Cargo, not vendored here. Preserve their copyright

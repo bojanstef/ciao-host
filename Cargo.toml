@@ -47,3 +47,5 @@ unsafe_code = "forbid"
 iroh = { path = "vendor/iroh" }
 # noq-proto 1.0.1 (the version iroh 1.0.2 uses) plus PathStats::pto_count; see vendor/noq-proto/CIAO-PATCH.md.
 noq-proto = { path = "vendor/noq-proto" }
+# portable-pty 0.9.0 minus the `\n` + EOT its writer types into the terminal on drop; see vendor/portable-pty/CIAO-PATCH.md.
+portable-pty = { path = "vendor/portable-pty" }

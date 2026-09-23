@@ -520,20 +520,14 @@ impl PtySession {
                 let _ = killer.kill();
             }
         }
-        // Hang up *before* the handles close, not after. A provider's attach client that tears
-        // down against a collapsing stdin types phantom bytes into the pane it is attached to —
-        // the same window `viewer_cleanup` above exists to avoid — and an EOF among them is read
-        // by the session's shell as Ctrl-D. The shell exits 0, its pane goes with it, tmux
-        // destroys the now-empty session, and `exit-empty` reaps the server: a person's terminal
-        // session disappears because Ciao closed a socket. The herdr stray-newline bug was this
-        // same window seen from the other end.
-        //
-        // Measured 2026-09-22 on a 10-core Mac under ordinary load (six busy cores), against
-        // `tmux_session_survives_cleanup_of_a_client_that_was_never_detached`: 5/5 failures with
-        // the old ordering, 0/15 with this one. The pane died with `pane_dead_status=0` and no
-        // signal, which is what says "it exited" rather than "something killed it" — nothing in
-        // the ladder ever signals the pane's group or the server's, and disabling every signal
-        // here did not help, so the write is the cause and the ordering is the whole fix.
+        // Hang up *before* the handles close, not after. Closing the handles is what drops the
+        // writer, and until 2026-09-23 the writer typed `\n` + EOT into the terminal on drop (see
+        // its construction in `spawn`); a client still reading its stdin forwarded the pair to the
+        // focused pane as Ctrl-J, Ctrl-D and a shell there exited, taking the tmux session with
+        // it. The writer writes nothing now, so this ordering is no longer load-bearing — it is
+        // simply what a graceful teardown is: the child is asked to leave while its terminal is
+        // still intact. Kept, and measured before the writer fix: 5/5 failures the other way
+        // round, 0/20 this way, six busy cores on ten.
         signal_groups(&groups, Signal::SIGHUP);
         let hung_up = wait_for_exit_timeout(&mut self.exit_receiver, SIGNAL_WAIT).await?;
 
@@ -664,6 +658,10 @@ fn spawn_pty_blocking(
         .master
         .try_clone_reader()
         .map_err(|_| PtyError::OpenFailed)?;
+    // The vendored writer (vendor/portable-pty, CIAO-PATCH.md): upstream's types `\n` + EOT into
+    // the terminal when it is dropped, which every cleanup does — a client in raw mode forwarded
+    // the pair to the focused pane as Ctrl-J, Ctrl-D and a shell there exited, taking its tmux
+    // session with it. `cleanup_types_nothing_into_the_terminal` fences it.
     let writer = pair
         .master
         .take_writer()
@@ -1624,6 +1622,45 @@ mod tests {
             survived,
             "the tmux session died with an undetached Ciao client, so a reattach has nothing \
              to attach to"
+        );
+    }
+
+    /// Tearing a session down must type nothing into its terminal. Upstream `portable-pty`'s
+    /// writer sends `\n` followed by the tty's EOF character when it is dropped — a Ctrl-J, Ctrl-D
+    /// typed at whatever is attached — and every cleanup dropped that writer. A tmux client in raw
+    /// mode forwarded the pair to the focused pane, whose shell read the EOF as "exit" and took
+    /// the session with it (2026-09-22/23); the herdr composer newline of 2026-07-30 was the same
+    /// two bytes, kitty-encoded by herdr on the way through. The recorder ignores the graceful
+    /// rungs (so the handles close while it is still reading), sits in raw mode (so an EOF
+    /// character is a byte, not end-of-file), and writes each byte straight through (`dd bs=1`, no
+    /// stdio buffer). The ladder's SIGKILL ends it. Red against the registry crate: `[10, 4]`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_types_nothing_into_the_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().join("typed.bin");
+        let script = format!(
+            "trap '' HUP TERM; stty raw -echo; exec dd bs=1 of='{}' 2>/dev/null",
+            capture.display()
+        );
+        let mut session = test_session(&script).await;
+        // `dd` creates its output file on start, after `stty` has run: that is the ready signal.
+        let started = Instant::now();
+        while !capture.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the recorder never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        session
+            .cleanup(CleanupReason::ConnectionLost)
+            .await
+            .unwrap();
+        let typed = std::fs::read(&capture).unwrap();
+        assert!(
+            typed.is_empty(),
+            "teardown typed {typed:?} into the terminal (0x0a 0x04 is portable-pty's EOT on drop)"
         );
     }
 
