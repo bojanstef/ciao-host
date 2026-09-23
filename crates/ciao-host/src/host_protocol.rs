@@ -92,6 +92,7 @@ pub const MAX_TABS_PER_SESSION: usize = 128;
 pub const MAX_TAB_ID_BYTES: usize = 64;
 pub const MAX_TAB_LABEL_BYTES: usize = 64;
 pub const MAX_TAB_STATUS_BYTES: usize = 16;
+pub const MAX_TAB_AGENT_BYTES: usize = 32;
 pub const MAX_SESSION_NAME_BYTES: usize = 64;
 /// The hello advertises 16 as of `port.forward.v1`, so **the list is full**. A seventeenth is a
 /// wire break in both directions — the app validates this same bound, so an over-long list fails
@@ -196,6 +197,19 @@ pub fn valid_tab_status(status: &str) -> bool {
         && status
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+}
+
+/// `agent` is the provider's own name for what it detected in a tab (`claude`, `codex`, `pi`):
+/// an open set the app draws by name, shape-pinned like `status` — a lowercase word, digits and
+/// joiners allowed after the first letter — so a new agent is a new word, never new structure.
+pub fn valid_tab_agent(agent: &str) -> bool {
+    let bytes = agent.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_TAB_AGENT_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1194,6 +1208,17 @@ pub struct SessionTabEntry {
     /// vendor ID, path, or route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+    /// The agent the *provider* sees running in this tab — herdr's own detection, read off
+    /// `pane list` — whether or not Ciao has heard from it. `agent_session_id` needs the agent
+    /// to have registered with this daemon, and an attached agent registers only on its next
+    /// hook event: after a daemon restart every idle one is invisible until it is spoken to.
+    /// This is the provider's word for what is there, so the phone can say "Claude · idle"
+    /// instead of drawing a session that seems empty. A name, never a vendor session ID.
+    ///
+    /// Absent on tmux (it detects nothing), on a tab with no agent pane, and from any host
+    /// predating this — the same ignorable-garnish growth `agent_session_id` took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// The herdr workspace this tab lives in, as its **label** and never its id — the id is
     /// already the tab id's prefix, and a group header reading `w9` names nothing.
     ///
@@ -1352,6 +1377,7 @@ fn validate_session_tabs(tabs: &[SessionTabEntry]) -> Result<(), HostProtocolErr
         if !valid_tab_id(&tab.id)
             || !valid_tab_label(&tab.label)
             || !tab.status.as_deref().is_none_or(valid_tab_status)
+            || !tab.agent.as_deref().is_none_or(valid_tab_agent)
             || !tab.workspace.as_deref().is_none_or(valid_tab_label)
         {
             return Err(HostProtocolError::InvalidControlValue);
@@ -3754,6 +3780,20 @@ mod tests {
             "an unannotated tab must not grow the key"
         );
 
+        // The provider's own detection, independent of the join above: a registered agent's
+        // tab carries both, an unregistered one only the name, a plain tab neither — and tmux,
+        // which detects nothing, never the key.
+        assert_eq!(tabs[1].agent.as_deref(), Some("claude"));
+        assert_eq!(tabs[2].agent.as_deref(), Some("codex"));
+        assert_eq!(tabs[2].agent_session_id, None);
+        assert_eq!(tabs[0].agent, None);
+        assert!(
+            !serde_json::to_string(&tabs[0])
+                .unwrap()
+                .contains("\"agent\""),
+            "a tab with no agent must not grow the key"
+        );
+
         let (encoded, kept) = encode_snapshot_response_bounded(response.clone()).unwrap();
         assert_eq!(kept, response, "nothing was dropped to fit");
         let reparsed = decode_snapshot_response(&encoded[4..]).unwrap();
@@ -3836,6 +3876,23 @@ mod tests {
             assert!(!valid_tab_status(status), "{status:?}");
         }
         assert!(!valid_tab_status(&"s".repeat(MAX_TAB_STATUS_BYTES + 1)));
+
+        for agent in ["claude", "codex", "pi", "mimo-code", "open_code", "gpt5"] {
+            assert!(valid_tab_agent(agent), "{agent}");
+        }
+        for agent in [
+            "",
+            "Claude",
+            "claude code",
+            "5gpt",
+            "-pi",
+            "claude;rm",
+            "cl\u{e9}",
+        ] {
+            assert!(!valid_tab_agent(agent), "{agent:?}");
+        }
+        assert!(valid_tab_agent(&"a".repeat(MAX_TAB_AGENT_BYTES)));
+        assert!(!valid_tab_agent(&"a".repeat(MAX_TAB_AGENT_BYTES + 1)));
     }
 
     #[test]
@@ -3870,6 +3927,7 @@ mod tests {
         assert!(mutate(&|tabs| tabs[0].id = "has space".into()).is_err());
         assert!(mutate(&|tabs| tabs[0].label = "\u{7}".into()).is_err());
         assert!(mutate(&|tabs| tabs[0].status = Some("Working".into())).is_err());
+        assert!(mutate(&|tabs| tabs[0].agent = Some("Claude Code".into())).is_err());
         good.result.validate().unwrap();
     }
 
@@ -3928,6 +3986,7 @@ mod tests {
                         focused: index == 0,
                         status: Some("working".into()),
                         agent_session_id: None,
+                        agent: Some("a".repeat(MAX_TAB_AGENT_BYTES)),
                         workspace: Some("w".repeat(MAX_TAB_LABEL_BYTES)),
                     })
                     .collect(),
@@ -3982,6 +4041,7 @@ mod tests {
                         focused: index == 0,
                         status: Some("working".into()),
                         agent_session_id: None,
+                        agent: Some("a".repeat(MAX_TAB_AGENT_BYTES)),
                         workspace: Some("w".repeat(MAX_TAB_LABEL_BYTES)),
                     })
                     .collect(),
