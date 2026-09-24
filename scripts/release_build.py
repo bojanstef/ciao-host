@@ -214,6 +214,46 @@ def build_binary(runner, root, target, environ=os.environ):
     return binary
 
 
+NOTARY_KEYS = ("CIAO_NOTARY_KEY_PATH", "CIAO_NOTARY_KEY_ID", "CIAO_NOTARY_ISSUER")
+NOTARY_STATUS = re.compile(rb'"status"\s*:\s*"([A-Za-z ]+)"')
+NOTARY_ID = re.compile(rb'"id"\s*:\s*"([0-9a-fA-F-]{36})"')
+
+
+def notarize(runner, binary, target, environ=os.environ, emit=print):
+    """Developer ID signature with the hardened runtime, then Apple's notary service, for the macOS
+    binary only. Without CIAO_DEVELOPER_ID the binary keeps the linker's ad-hoc signature and the job
+    log says so; with it, every later step is required. No ticket is stapled: a bare Mach-O cannot
+    carry one, so Gatekeeper looks it up online. Returns whether the binary was notarized."""
+    if not target.endswith("-apple-darwin"):
+        return False
+    identity = environ.get("CIAO_DEVELOPER_ID", "").strip()
+    if not identity:
+        emit("Not notarized: CIAO_DEVELOPER_ID is unset, so the binary keeps its ad-hoc signature")
+        return False
+    key = {name: environ.get(name, "").strip() for name in NOTARY_KEYS}
+    if not all(key.values()):
+        raise Refused("notary_credentials_required")
+    code, _ = runner(["codesign", "--force", "--options", "runtime", "--timestamp", "--sign", identity, str(binary)],
+                     timeout=300)
+    if code:
+        raise Refused("codesign_failed")
+    upload = binary.parent / "ciao-notary.zip"
+    upload.unlink(missing_ok=True)
+    code, _ = runner(["ditto", "-c", "-k", "--keepParent", str(binary), str(upload)], timeout=300)
+    if code:
+        raise Refused("notary_upload_unpackable")
+    code, out = runner(["xcrun", "notarytool", "submit", str(upload), "--key", key["CIAO_NOTARY_KEY_PATH"],
+                        "--key-id", key["CIAO_NOTARY_KEY_ID"], "--issuer", key["CIAO_NOTARY_ISSUER"],
+                        "--wait", "--timeout", "30m", "--output-format", "json"], timeout=2400)
+    status = NOTARY_STATUS.findall(out or b"")
+    if code or status[-1:] != [b"Accepted"]:
+        # The submission id is safe to log, and `xcrun notarytool log <id>` says what Apple refused.
+        submission = NOTARY_ID.findall(out or b"")
+        raise Refused("notarization_not_accepted" + (f": {submission[-1].decode()}" if submission else ""))
+    emit("Signed with Developer ID (hardened runtime) and notarized")
+    return True
+
+
 def pack(runner, root, out, environ=os.environ, emit=print):
     root, out = Path(root), Path(out)
     target = detected_host_target()
@@ -222,6 +262,7 @@ def pack(runner, root, out, environ=os.environ, emit=print):
     head_and_clean(runner, root)
     version = cargo_version(root)
     binary = build_binary(runner, root, target, environ)
+    notarize(runner, binary, target, environ, emit)
     archive = deterministic_tar(archive_members(binary.read_bytes(), version, target, root))
     name = f"ciao-{version}-{target}.tar"
     out.mkdir(parents=True, exist_ok=True)
