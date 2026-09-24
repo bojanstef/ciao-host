@@ -395,11 +395,11 @@ function toolBody(name, status, input, result) {
 				...(boundedResult ? { result_preview: boundedResult.text } : {}),
 			},
 		},
+		// The size of both documents behind the previews, as the host and Pi report it.
 		truncation: truncation(
 			truncated,
 			"preview_bounded",
-			(boundedInput?.truncated ? boundedInput.originalBytes : 0) +
-				(boundedResult?.truncated ? boundedResult.originalBytes : 0),
+			(boundedInput?.originalBytes ?? 0) + (boundedResult?.originalBytes ?? 0),
 		),
 	};
 }

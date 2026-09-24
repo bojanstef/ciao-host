@@ -1226,11 +1226,13 @@ fn live_item_entry(
             } else {
                 (None, false)
             };
-            let mut truncation = no_truncation();
-            if input_truncated || result_truncated {
-                truncation.truncated = true;
-                truncation.reason_code = Some("preview_bounded".into());
-            }
+            let truncation = crate::hook_common::preview_truncation(
+                input_truncated || result_truncated,
+                &[
+                    item.get("command").or_else(|| item.get("query")),
+                    complete.then(|| item.get("aggregatedOutput")).flatten(),
+                ],
+            );
             (
                 "tool",
                 TimelineBody::Tool {

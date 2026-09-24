@@ -23,16 +23,17 @@ use crate::{
     agent_adapter::{AttachedHookRegister, WireTimelineEntry},
     agent_protocol::{
         MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
-        TimelineBody, ToolTimelineBody, Truncation, TurnState, classify_vendor_version,
-        valid_opaque_id, valid_token,
+        TimelineBody, ToolTimelineBody, TurnState, classify_vendor_version, valid_opaque_id,
+        valid_token,
     },
     codex_adapter::{
         CODEX_DIGEST_DOMAIN, CODEX_HOOK_PROTOCOL_VERSION, CodexHookEventFrame,
         PINNED_CODEX_VERSION, codex_run_id,
     },
     hook_common::{
-        HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, keyed_digest, no_truncation,
-        object, read_bounded_stdin, required_string, trace_outcome, unix_now, workspace_display,
+        HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, keyed_digest, object,
+        preview_truncation, read_bounded_stdin, required_string, trace_outcome, unix_now,
+        workspace_display,
     },
     process::{command as process_command, parent as process_parent},
     storage::CiaoPaths,
@@ -462,15 +463,10 @@ fn tool_event(
         bounded_preview(object.get("tool_input"), MAX_TOOL_INPUT_PREVIEW_BYTES);
     let (result_preview, result_clipped) =
         bounded_preview(object.get("tool_response"), MAX_TOOL_RESULT_PREVIEW_BYTES);
-    let truncation = if input_clipped || result_clipped {
-        Truncation {
-            truncated: true,
-            reason_code: Some("preview_bounded".into()),
-            original_bytes: None,
-        }
-    } else {
-        no_truncation()
-    };
+    let truncation = preview_truncation(
+        input_clipped || result_clipped,
+        &[object.get("tool_input"), object.get("tool_response")],
+    );
     Ok(CodexHookEventFrame::UpsertEntry {
         v: CODEX_HOOK_PROTOCOL_VERSION,
         entry: Box::new(WireTimelineEntry {

@@ -279,15 +279,7 @@ fn map_item(
                         result_preview: None,
                     },
                 },
-                if clipped {
-                    crate::agent_protocol::Truncation {
-                        truncated: true,
-                        reason_code: Some("preview_bounded".into()),
-                        original_bytes: None,
-                    }
-                } else {
-                    no_truncation()
-                },
+                crate::hook_common::preview_truncation(clipped, &[Some(item)]),
             )
         }
         // Reasoning, plans, review-mode markers, compaction, and anything Codex adds after this
@@ -479,7 +471,16 @@ pub(crate) mod tests {
                 .unwrap()
                 .ends_with("095")
         );
-        for text in [format!("{}é", "a".repeat(2047)), "\"\\\n".repeat(2000)] {
+        // Over the result budget as a whole, so the string cap engages: once on a character
+        // boundary (the cap lands inside the é) and once through escape-heavy text.
+        for text in [
+            format!(
+                "{}é{}",
+                "a".repeat(2047),
+                "b".repeat(MAX_TOOL_RESULT_PREVIEW_BYTES)
+            ),
+            "\"\\\n".repeat(12_000),
+        ] {
             let (tool, truncation) = function_output(&json!({"output":text}), true).unwrap();
             assert!(truncation.truncated);
             let preview = tool.result_preview.unwrap();

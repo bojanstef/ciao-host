@@ -41,10 +41,9 @@ pub(crate) const HOOK_IPC_STEP_TIMEOUT: Duration = Duration::from_millis(600);
 /// a command line or a path, small enough that a document holding dozens of strings still fits
 /// its envelope — this is the fallback cap `bounded_preview` can always retreat to.
 pub(crate) const MAX_PREVIEW_STRING_BYTES: usize = 512;
-/// The per-string cap `bounded_preview` tries first. At 512 bytes a Write's content or a
-/// command's output was cut to a stub mid-sentence; four times that keeps a readable hunk of
-/// it whenever the document as a whole fits its envelope, which is the common case — a tool
-/// call holds a handful of strings, not thousands.
+/// The per-string cap `bounded_preview` retreats to first, for a document too large to send
+/// whole. At 512 bytes a Write's content or a command's output was cut to a stub mid-sentence;
+/// four times that keeps a readable hunk of each string.
 pub(crate) const GENEROUS_PREVIEW_STRING_BYTES: usize = 2048;
 
 pub(crate) fn read_bounded_stdin(maximum_bytes: usize) -> Result<Vec<u8>> {
@@ -181,13 +180,21 @@ pub(crate) fn no_truncation() -> Truncation {
 /// is the "Bash / Edit / Bash" wall this exists to remove. Returns whether anything was cut so
 /// the entry can say so.
 ///
-/// Two passes, generous first: the tight pass only exists for documents so string-dense that
-/// the generous one overflows the envelope, and because it is exactly the old single pass, no
-/// input that used to yield a preview can lose one to the generosity.
+/// Three passes: whole, then generous caps, then tight ones. A document that fits its budget is
+/// sent as it is — measured on this Mac, 28% of tool results were cut to 2 KiB strings while
+/// 97.6% fit their 32 KiB budget whole. The tight pass exists only for documents so
+/// string-dense that the generous one overflows, and because it is exactly the original single
+/// pass, no input that ever yielded a preview can lose one.
 pub(crate) fn bounded_preview(value: Option<&Value>, limit: usize) -> (Option<String>, bool) {
     let Some(value) = value else {
         return (None, false);
     };
+    let Ok(whole) = serde_json::to_string(value) else {
+        return (None, false);
+    };
+    if whole.len() <= limit {
+        return (Some(whole), false);
+    }
     for cap in [GENEROUS_PREVIEW_STRING_BYTES, MAX_PREVIEW_STRING_BYTES] {
         let mut clipped = false;
         let capped = cap_strings(value, cap, &mut clipped);
@@ -201,6 +208,21 @@ pub(crate) fn bounded_preview(value: Option<&Value>, limit: usize) -> (Option<St
     // Capping every string can still leave a document over the bound if it holds thousands of
     // them. Omitting beats sending something the reader cannot parse.
     (None, true)
+}
+
+/// How a tool entry says its previews were cut: `preview_bounded`, with the serialized size of
+/// the documents behind them so the phone can say how much there was. The Pi extension and the
+/// managed worker name their cuts the same way.
+pub(crate) fn preview_truncation(clipped: bool, documents: &[Option<&Value>]) -> Truncation {
+    if !clipped {
+        return no_truncation();
+    }
+    let original: usize = documents.iter().flatten().map(encoded_frame_len).sum();
+    Truncation {
+        truncated: true,
+        reason_code: Some("preview_bounded".into()),
+        original_bytes: Some(original as u64),
+    }
 }
 
 fn cap_strings(value: &Value, cap: usize, clipped: &mut bool) -> Value {
@@ -828,10 +850,11 @@ mod tests {
 
     #[test]
     fn an_oversized_argument_is_capped_but_still_parses_as_json() {
+        // Over the 16 KiB budget as a whole, so the string caps engage.
         let (preview, clipped) = bounded_preview(
             Some(&json!({
                 "file_path": "/tmp/generated.swift",
-                "content": "x".repeat(GENEROUS_PREVIEW_STRING_BYTES * 4),
+                "content": "x".repeat(GENEROUS_PREVIEW_STRING_BYTES * 10),
             })),
             16 * 1024,
         );
@@ -855,6 +878,33 @@ mod tests {
             serde_json::from_str(&preview.expect("the document fits")).expect("parses");
         assert_eq!(parsed["content"].as_str().unwrap(), content);
         assert!(!clipped);
+    }
+
+    /// The measured complaint: 28% of tool results were cut to 2 KiB strings although 97.6%
+    /// fit their 32 KiB budget whole. A document that fits is sent as it is.
+    #[test]
+    fn a_document_that_fits_its_budget_is_sent_whole() {
+        let content = "w".repeat(GENEROUS_PREVIEW_STRING_BYTES * 5);
+        let document = json!({ "file_path": "/tmp/generated.swift", "content": content });
+        let (preview, clipped) = bounded_preview(Some(&document), 16 * 1024);
+        let parsed: Value =
+            serde_json::from_str(&preview.expect("the document fits")).expect("parses");
+        assert_eq!(parsed["content"].as_str().unwrap(), content);
+        assert!(!clipped);
+        assert_eq!(
+            preview_truncation(clipped, &[Some(&document)]),
+            no_truncation()
+        );
+
+        // Over budget, the cut is named with the size of what was there.
+        let (_, clipped) = bounded_preview(Some(&document), 4 * 1024);
+        assert!(clipped);
+        let truncation = preview_truncation(clipped, &[Some(&document), None]);
+        assert_eq!(truncation.reason_code.as_deref(), Some("preview_bounded"));
+        assert_eq!(
+            truncation.original_bytes,
+            Some(serde_json::to_string(&document).unwrap().len() as u64)
+        );
     }
 
     #[test]

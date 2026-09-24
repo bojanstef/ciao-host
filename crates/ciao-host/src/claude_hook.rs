@@ -27,15 +27,15 @@ use crate::{
     agent_adapter::{AttachedHookRegister, WireTextDelta, WireTimelineEntry},
     agent_protocol::{
         MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
-        TimelineBody, ToolTimelineBody, Truncation, TurnState, classify_vendor_version,
-        valid_opaque_id, valid_token,
+        TimelineBody, ToolTimelineBody, TurnState, classify_vendor_version, valid_opaque_id,
+        valid_token,
     },
     claude_adapter::{CLAUDE_HOOK_PROTOCOL_VERSION, ClaudeHookEventFrame, PINNED_CLAUDE_VERSION},
     claude_integration::parse_claude_version_output,
     hook_common::{
         HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, keyed_digest, no_truncation,
-        object, read_bounded_stdin, required_bool, required_string, required_u64, trace_outcome,
-        unix_now, workspace_display,
+        object, preview_truncation, read_bounded_stdin, required_bool, required_string,
+        required_u64, trace_outcome, unix_now, workspace_display,
     },
     storage::{CiaoPaths, atomic_write_private, validate_private_file},
 };
@@ -567,15 +567,10 @@ fn tool_event(
         bounded_preview(object.get("tool_input"), MAX_TOOL_INPUT_PREVIEW_BYTES);
     let (result_preview, result_clipped) =
         bounded_preview(object.get("tool_response"), MAX_TOOL_RESULT_PREVIEW_BYTES);
-    let truncation = if input_clipped || result_clipped {
-        Truncation {
-            truncated: true,
-            reason_code: Some("preview_bounded".into()),
-            original_bytes: None,
-        }
-    } else {
-        no_truncation()
-    };
+    let truncation = preview_truncation(
+        input_clipped || result_clipped,
+        &[object.get("tool_input"), object.get("tool_response")],
+    );
     Ok(ClaudeHookEventFrame::UpsertEntry {
         v: CLAUDE_HOOK_PROTOCOL_VERSION,
         entry: WireTimelineEntry {
@@ -827,9 +822,10 @@ mod tests {
         let mut event = common("PreToolUse");
         event["tool_name"] = json!("Write");
         event["tool_use_id"] = json!("fixture-tool-use-id");
+        // Over the 16 KiB input budget as a whole; one that fits is sent whole.
         event["tool_input"] = json!({
             "file_path": "/tmp/generated.swift",
-            "content": "x".repeat(GENEROUS_PREVIEW_STRING_BYTES * 4),
+            "content": "x".repeat(GENEROUS_PREVIEW_STRING_BYTES * 10),
         });
         let mapped = map_hook_input(&event, &facts()).unwrap().unwrap();
         let ClaudeHookEventFrame::UpsertEntry { entry, .. } = mapped.event else {
