@@ -621,3 +621,83 @@ describe("whole messages, sized for the daemon they reach", () => {
 		}
 	});
 });
+
+/// A stand-in daemon on a Unix socket that can go away and come back on the same path, the way a
+/// `ciao update` or `ciao setup` restart does. It grants the bridge bound to any register that
+/// asks, as a current daemon does.
+async function restartableDaemon(socketPath: string) {
+	const registrations: Record<string, unknown>[] = [];
+	const snapshotEnds: Record<string, unknown>[] = [];
+	const sockets = new Set<net.Socket>();
+	let server: net.Server | undefined;
+	const start = async () => {
+		server = net.createServer((socket) => {
+			sockets.add(socket);
+			socket.on("close", () => sockets.delete(socket));
+			socket.on(
+				"data",
+				decodeFrames((frame) => {
+					if (frame.type === "snapshot_end") snapshotEnds.push(frame);
+					if (frame.type !== "register") return;
+					registrations.push(frame);
+					socket.write(
+						encodeBridgeFrame({
+							v: 1,
+							type: "registered",
+							session_id: "0123456789abcdef0123456789abcdef",
+							process_generation: registrations.length,
+							snapshot_epoch: 1,
+							...("frame_bytes" in frame ? { frame_bytes: 2 * 1024 * 1024 } : {}),
+						}),
+					);
+				}),
+			);
+		});
+		await new Promise<void>((resolve, reject) => {
+			server!.once("error", reject);
+			server!.listen(socketPath, resolve);
+		});
+	};
+	const stop = async () => {
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server?.close(() => resolve()));
+	};
+	await start();
+	return { registrations, snapshotEnds, start, stop };
+}
+
+function piContext(branch: unknown[] = []) {
+	return {
+		mode: "tui",
+		cwd: "/synthetic/workspace",
+		isIdle: () => true,
+		sessionManager: {
+			getSessionId: () => "synthetic-restart",
+			getBranch: () => branch,
+		},
+	} as any;
+}
+
+test("a daemon restart does not cost the extension its grant", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-pi-restart-"));
+	const socketPath = path.join(root, "agent.sock");
+	const daemon = await restartableDaemon(socketPath);
+	const bridge = new CiaoAgentBridge({} as any, socketPath);
+	resources.push(async () => {
+		bridge.stop(true);
+		await daemon.stop();
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+	bridge.start(piContext());
+	await eventually(() => bridge.status() === "connected");
+	expect(daemon.registrations[0].frame_bytes).toBe(2 * 1024 * 1024);
+
+	// The daemon goes away. Every reconnect attempt while it is gone fails before a socket ever
+	// connects — that is not a daemon refusing the ask, and must not be read as one.
+	await daemon.stop();
+	await eventually(() => bridge.status() === "connecting");
+	await Bun.sleep(450);
+	await daemon.start();
+	await eventually(() => daemon.registrations.length >= 2, 5_000);
+	expect(daemon.registrations[1].frame_bytes).toBe(2 * 1024 * 1024);
+});

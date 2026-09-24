@@ -784,11 +784,12 @@ export class CiaoAgentBridge {
 	/// daemon reads.
 	private frameBytes = MAX_FRAME_BYTES;
 	/// Whether the next `register` asks for the larger bound. A daemon from before the grant
-	/// refuses an unknown register field and closes without a word, so a connection that asked
-	/// and never registered is followed by one that does not ask — and a connection that did not
-	/// ask and failed is followed by one that does, so an upgraded daemon is noticed.
+	/// refuses an unknown register field and closes without a word, so a socket that connected,
+	/// asked, and never registered is followed by one that does not ask — and one that connected
+	/// without asking and failed is followed by one that does, so an upgraded daemon is noticed.
+	/// A socket that never connected says nothing about the daemon: a restart refuses every
+	/// attempt until it listens again, and reading those as refusals cost the grant for good.
 	private askForGrant = true;
-	private askedThisConnection = false;
 	private connectionSerial = 0;
 	private reconnectAttempt = 0;
 	private reconnectTimer?: NodeJS.Timeout;
@@ -955,6 +956,9 @@ export class CiaoAgentBridge {
 		const serial = ++this.connectionSerial;
 		const socket = net.createConnection({ path: this.socketPath });
 		this.socket = socket;
+		// Set only once a daemon is on the other end: whether this socket asked, and so whether
+		// its closing before `registered` can be a refusal of the ask.
+		let asked: boolean | undefined;
 		this.decoder = new FrameDecoder();
 		socket.unref();
 		socket.setTimeout(5_000, () => socket.destroy());
@@ -964,7 +968,7 @@ export class CiaoAgentBridge {
 			this.reconnectAttempt = 0;
 			this.registered = false;
 			this.frameBytes = MAX_FRAME_BYTES;
-			this.askedThisConnection = this.askForGrant;
+			asked = this.askForGrant;
 			this.lastCapabilities = undefined;
 			this.enqueue({
 				v: BRIDGE_VERSION,
@@ -977,7 +981,7 @@ export class CiaoAgentBridge {
 				process_id: process.pid,
 				workspace_display: workspaceDisplay(this.context?.cwd ?? ""),
 				commands: this.commands(),
-				...(this.askedThisConnection ? { frame_bytes: MAX_BRIDGE_FRAME_BYTES } : {}),
+				...(asked ? { frame_bytes: MAX_BRIDGE_FRAME_BYTES } : {}),
 			});
 		});
 		socket.on("data", (chunk: Buffer) => {
@@ -993,7 +997,7 @@ export class CiaoAgentBridge {
 		});
 		socket.once("close", () => {
 			if (serial !== this.connectionSerial) return;
-			if (!this.registered) this.askForGrant = !this.askedThisConnection;
+			if (!this.registered && asked !== undefined) this.askForGrant = !asked;
 			this.socket = undefined;
 			this.registered = false;
 			this.clearWrites();
