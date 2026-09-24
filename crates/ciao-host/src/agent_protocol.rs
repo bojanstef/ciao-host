@@ -855,9 +855,16 @@ pub enum TimelineBody {
 }
 
 impl TimelineBody {
+    /// The phone's bound: a text body on the wire is at most the head.
     pub fn validate(&self) -> Result<(), AgentProtocolError> {
+        self.validate_within(MAX_TIMELINE_TEXT_BYTES)
+    }
+
+    /// The same checks with a caller-named text bound — [`MAX_RETAINED_TEXT_BYTES`] for what an
+    /// adapter hands the host, which keeps the whole body and cuts only the wire copy.
+    pub fn validate_within(&self, text_bytes: usize) -> Result<(), AgentProtocolError> {
         match self {
-            Self::Text { text } if text.len() <= MAX_TIMELINE_TEXT_BYTES => Ok(()),
+            Self::Text { text } if text.len() <= text_bytes => Ok(()),
             Self::Text { .. } => Err(AgentProtocolError::InvalidValue),
             Self::Tool { tool } => tool.validate(),
             Self::Unsupported { reason_code } => valid_token(reason_code),
@@ -2362,6 +2369,255 @@ pub enum AgentServerFrame {
     Unknown,
 }
 
+/// The encoded size of one frame body — the number [`MAX_AGENT_FRAME_BYTES`] bounds — without
+/// keeping the encoding.
+pub fn encoded_frame_len<T: Serialize>(value: &T) -> usize {
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_or(usize::MAX, |()| count.0)
+}
+
+/// The wire form of a host-held timeline entry inside one particular frame.
+///
+/// The host keeps up to [`MAX_RETAINED_TEXT_BYTES`] of a text entry and the wire carries a
+/// head: at most [`MAX_TIMELINE_TEXT_BYTES`], cut further on a character boundary until the
+/// *encoded* frame, as `frame_len` measures it, fits [`MAX_AGENT_FRAME_BYTES`]. A control
+/// character encodes to six bytes, so a 48 KiB head of them is ~290 KiB on the wire; before this
+/// measured the frame, an entry like that failed `write_agent_frame` and ended the subscription
+/// carrying it. A cut head says `body_available`, because the host still holds all of it.
+///
+/// A tool entry has no body to fetch, so its previews give way instead — the result first,
+/// then the input — under `preview_bounded`. Anything else is returned as it stands: nothing in
+/// it can shrink, and its envelope is the caller's to fit.
+///
+/// This is the one place a wire entry is sized; every frame that carries an entry — the live
+/// delta, the snapshot, a page — goes through it.
+pub fn fit_entry_to_frame(
+    entry: &TimelineEntry,
+    mut frame_len: impl FnMut(&TimelineEntry) -> usize,
+) -> TimelineEntry {
+    let whole = match &entry.body {
+        TimelineBody::Text { text } => text.len(),
+        _ => 0,
+    };
+    let mut wire = entry.clone();
+    if whole > MAX_TIMELINE_TEXT_BYTES {
+        cut_to_head(&mut wire, whole, MAX_TIMELINE_TEXT_BYTES);
+    }
+    loop {
+        let size = frame_len(&wire);
+        if size <= MAX_AGENT_FRAME_BYTES {
+            return wire;
+        }
+        match &mut wire.body {
+            TimelineBody::Text { text } if !text.is_empty() => {
+                // Everything but the text is fixed while the text shrinks, so the budget the
+                // text may encode into is exact: keep the longest prefix that encodes within
+                // it. The first cut can add a truncation, so the loop measures once more.
+                let envelope = size.saturating_sub(json_string_len(text));
+                let keep = json_prefix_within(text, MAX_AGENT_FRAME_BYTES.saturating_sub(envelope));
+                cut_to_head(&mut wire, whole, keep);
+            }
+            TimelineBody::Tool { tool }
+                if tool.result_preview.is_some() || tool.input_preview.is_some() =>
+            {
+                if tool.result_preview.take().is_none() {
+                    tool.input_preview = None;
+                }
+                if !wire.truncation.truncated {
+                    wire.truncation = Truncation {
+                        truncated: true,
+                        reason_code: Some("preview_bounded".into()),
+                        original_bytes: None,
+                    };
+                }
+            }
+            _ => return wire,
+        }
+    }
+}
+
+/// How many bytes `text` occupies inside a serde_json string: two for the short escapes, six
+/// for any other control character, and the UTF-8 bytes themselves for everything else — the
+/// arithmetic that makes a 48 KiB head of control characters a ~290 KiB frame.
+fn json_escaped_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        character if (character as u32) < 0x20 => 6,
+        character => character.len_utf8(),
+    }
+}
+
+fn json_string_len(text: &str) -> usize {
+    text.chars().map(json_escaped_len).sum()
+}
+
+/// The longest prefix of `text`, in bytes and on a character boundary, whose JSON encoding
+/// fits `budget` bytes.
+fn json_prefix_within(text: &str, budget: usize) -> usize {
+    let mut encoded = 0;
+    for (index, character) in text.char_indices() {
+        encoded += json_escaped_len(character);
+        if encoded > budget {
+            return index;
+        }
+    }
+    text.len()
+}
+
+fn cut_to_head(wire: &mut TimelineEntry, whole: usize, limit: usize) {
+    let TimelineBody::Text { text } = &mut wire.body else {
+        return;
+    };
+    let mut boundary = limit.min(text.len());
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    wire.truncation = Truncation {
+        truncated: true,
+        reason_code: Some(TRUNCATION_BODY_AVAILABLE.into()),
+        original_bytes: Some(whole as u64),
+    };
+}
+
+/// [`fit_entry_to_frame`] for an entry that must be able to travel on its own: the largest
+/// single-entry envelope there is, a live delta with maximal identifiers, stands in for the
+/// real one. Snapshots and pages size their entries with this, so any entry they hold is one a
+/// page could still carry alone.
+pub fn fit_entry_alone(entry: &TimelineEntry) -> TimelineEntry {
+    // No byte of text encodes to more than six, and the envelope plus every non-text field is
+    // well under the slack — so a small entry fits without being measured. This runs for every
+    // window entry on every live append; measuring only the few that could overflow keeps it
+    // cheap.
+    const ENVELOPE_SLACK: usize = 4 * 1024;
+    if entry.decoded_bytes().saturating_mul(6) + ENVELOPE_SLACK <= MAX_AGENT_FRAME_BYTES {
+        return entry.clone();
+    }
+    fit_entry_to_frame(entry, |candidate| {
+        encoded_frame_len(&AgentServerFrame::SessionDelta {
+            v: AGENT_PROTOCOL_VERSION,
+            delta: AgentSessionDelta {
+                v: AGENT_PROTOCOL_VERSION,
+                session_id: "s".repeat(MAX_OPAQUE_ID_BYTES),
+                snapshot_epoch: u64::MAX,
+                process_generation: u64::MAX,
+                base_revision: u64::MAX,
+                revision: u64::MAX,
+                changes: vec![AgentDeltaChange::UpsertEntry {
+                    entry: candidate.clone(),
+                }],
+            },
+        })
+    })
+}
+
+/// A snapshot that encodes within [`MAX_AGENT_FRAME_BYTES`]: every entry at its wire size, then
+/// the oldest dropped — and said to be, through `has_older` — until the frame fits. The newest
+/// entry is never dropped for size alone: if it is the last one standing it is cut to a head
+/// against the snapshot itself, because a conversation whose newest message vanished from the
+/// screen reads as broken where a shorter head with more available does not.
+pub fn fit_snapshot_to_frame(mut snapshot: AgentSessionSnapshot) -> AgentSessionSnapshot {
+    let frame_len = |snapshot: &AgentSessionSnapshot| {
+        encoded_frame_len(&AgentServerFrame::SessionSnapshot {
+            v: AGENT_PROTOCOL_VERSION,
+            snapshot: Box::new(snapshot.clone()),
+        })
+    };
+    for entry in &mut snapshot.timeline_window.entries {
+        *entry = fit_entry_alone(entry);
+    }
+    while frame_len(&snapshot) > MAX_AGENT_FRAME_BYTES {
+        let window = &mut snapshot.timeline_window;
+        if window.entries.len() <= 1 {
+            let Some(newest) = window.entries.pop() else {
+                break;
+            };
+            let mut without = snapshot.clone();
+            let fitted = fit_entry_to_frame(&newest, |candidate| {
+                without.timeline_window.entries = vec![candidate.clone()];
+                frame_len(&without)
+            });
+            snapshot.timeline_window.entries.push(fitted);
+            break;
+        }
+        window.entries.remove(0);
+        window.has_older = true;
+        window.truncated = true;
+        window.oldest_sequence = window.entries.first().map(|entry| entry.sequence);
+    }
+    snapshot
+}
+
+/// The frames that answer `agent.timeline.entry`: a start, the body in contiguous chunks, and
+/// an end. Each chunk is at most [`MAX_ENTRY_BODY_CHUNK_BYTES`] and is cut shorter, always
+/// between characters, until its *encoded* frame fits [`MAX_AGENT_FRAME_BYTES`] — the same
+/// escape arithmetic as [`fit_entry_to_frame`], applied to a body instead of a head.
+#[allow(clippy::too_many_arguments)] // one frame's worth of named fields; a struct would restate it
+pub fn entry_body_frames(
+    session_id: &str,
+    snapshot_epoch: u64,
+    process_generation: u64,
+    entry_id: &str,
+    entry_revision: u64,
+    truncation: Truncation,
+    body: &str,
+) -> Vec<AgentServerFrame> {
+    let mut frames = vec![AgentServerFrame::TimelineEntryStart {
+        v: AGENT_PROTOCOL_VERSION,
+        session_id: session_id.to_owned(),
+        snapshot_epoch,
+        process_generation,
+        entry_id: entry_id.to_owned(),
+        entry_revision,
+        total_bytes: u32::try_from(body.len()).unwrap_or(u32::MAX),
+        truncation,
+    }];
+    let mut offset = 0;
+    while offset < body.len() {
+        // A chunk is never empty: one whole character is the floor, and one character always
+        // fits — its escape is at most six bytes.
+        let one_character = offset + body[offset..].chars().next().map_or(1, char::len_utf8);
+        let mut end = (offset + MAX_ENTRY_BODY_CHUNK_BYTES).min(body.len());
+        loop {
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            end = end.max(one_character);
+            let frame = AgentServerFrame::TimelineEntryChunk {
+                v: AGENT_PROTOCOL_VERSION,
+                entry_id: entry_id.to_owned(),
+                offset: u32::try_from(offset).unwrap_or(u32::MAX),
+                text: body[offset..end].to_owned(),
+            };
+            let size = encoded_frame_len(&frame);
+            if size <= MAX_AGENT_FRAME_BYTES || end == one_character {
+                frames.push(frame);
+                break;
+            }
+            let chunk = &body[offset..end];
+            let envelope = size.saturating_sub(json_string_len(chunk));
+            end =
+                offset + json_prefix_within(chunk, MAX_AGENT_FRAME_BYTES.saturating_sub(envelope));
+        }
+        offset = end;
+    }
+    frames.push(AgentServerFrame::TimelineEntryEnd {
+        v: AGENT_PROTOCOL_VERSION,
+        entry_id: entry_id.to_owned(),
+    });
+    frames
+}
+
 pub fn encode_agent_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, AgentProtocolError> {
     let body = serde_json::to_vec(value).map_err(|_| AgentProtocolError::MalformedJson)?;
     if body.is_empty() {
@@ -3429,6 +3685,146 @@ mod tests {
         let mut snapshot_with_entry = base;
         snapshot_with_entry.operation = "agent.session.snapshot".into();
         assert!(snapshot_with_entry.validate().is_err());
+    }
+
+    /// The head and chunk sizing trusts this arithmetic instead of re-encoding on every cut, so
+    /// it has to agree with serde_json character for character.
+    #[test]
+    fn escape_arithmetic_matches_the_encoder() {
+        let characters = (0_u32..0x80).filter_map(char::from_u32).chain([
+            '\u{e9}',
+            '\u{2028}',
+            '\u{fffd}',
+            '\u{1f980}',
+        ]);
+        for character in characters {
+            let text = character.to_string();
+            assert_eq!(
+                json_string_len(&text),
+                serde_json::to_string(&text).unwrap().len() - 2,
+                "{:#x}",
+                character as u32
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_text_entry_travels_as_a_head_and_a_tool_entry_sheds_previews() {
+        let delta_len = |entry: &TimelineEntry| {
+            encoded_frame_len(&AgentServerFrame::TimelinePageEntry {
+                v: AGENT_PROTOCOL_VERSION,
+                page_id: "0".repeat(32),
+                entry: entry.clone(),
+            })
+        };
+        let mut long: TimelineEntry =
+            serde_json::from_value(fixture()["body_available_entry"].clone()).unwrap();
+        let body = "caf\u{e9} \u{1f980} ".repeat(20_000);
+        long.body = TimelineBody::Text { text: body.clone() };
+        long.truncation = Truncation {
+            truncated: false,
+            reason_code: None,
+            original_bytes: None,
+        };
+        let wire = fit_entry_to_frame(&long, delta_len);
+        wire.validate().unwrap();
+        let TimelineBody::Text { text } = &wire.body else {
+            panic!("still text");
+        };
+        assert!(body.starts_with(text.as_str()) && text.len() <= MAX_TIMELINE_TEXT_BYTES);
+        assert!(
+            text.len() > MAX_TIMELINE_TEXT_BYTES - 16,
+            "a plain head is not cut short"
+        );
+        assert_eq!(wire.truncation.original_bytes, Some(body.len() as u64));
+
+        // Control characters encode six to one; the head shrinks until the frame fits, and it
+        // is as long as that allows rather than cut to nothing.
+        long.body = TimelineBody::Text {
+            text: "\u{1}".repeat(MAX_TIMELINE_TEXT_BYTES),
+        };
+        let wire = fit_entry_to_frame(&long, delta_len);
+        assert!(delta_len(&wire) <= MAX_AGENT_FRAME_BYTES);
+        let TimelineBody::Text { text } = &wire.body else {
+            panic!("still text");
+        };
+        assert!(text.len() * 6 > MAX_AGENT_FRAME_BYTES - 1024);
+        wire.validate().unwrap();
+
+        // A small entry passes through untouched.
+        long.body = TimelineBody::Text {
+            text: "Synthetic.".into(),
+        };
+        assert_eq!(fit_entry_to_frame(&long, delta_len), long);
+
+        let mut tool = long.clone();
+        tool.kind = "tool".into();
+        tool.body = TimelineBody::Tool {
+            tool: ToolTimelineBody {
+                name: "Bash".into(),
+                status: "completed".into(),
+                input_preview: Some("\u{1}".repeat(MAX_TOOL_INPUT_PREVIEW_BYTES)),
+                result_preview: Some("\u{1}".repeat(MAX_TOOL_RESULT_PREVIEW_BYTES)),
+            },
+        };
+        let wire = fit_entry_to_frame(&tool, delta_len);
+        assert!(delta_len(&wire) <= MAX_AGENT_FRAME_BYTES);
+        assert_eq!(
+            wire.truncation.reason_code.as_deref(),
+            Some("preview_bounded")
+        );
+        wire.validate().unwrap();
+    }
+
+    #[test]
+    fn a_body_is_chunked_between_characters_and_every_chunk_frame_fits() {
+        let request = EntryBodyRequest {
+            session_id: "session-a".into(),
+            snapshot_epoch: 3,
+            process_generation: 7,
+            entry_id: "entry-long".into(),
+            held_revision: 4,
+        };
+        for body in [
+            "caf\u{e9} \u{1f980} na\u{ef}ve ".repeat(40_000),
+            "\u{1}".repeat(100_000),
+            format!(
+                "{}{}",
+                "a".repeat(MAX_ENTRY_BODY_CHUNK_BYTES - 1),
+                "\u{1f980}".repeat(10)
+            ),
+            String::new(),
+        ] {
+            let frames = entry_body_frames(
+                "session-a",
+                3,
+                7,
+                "entry-long",
+                4,
+                Truncation {
+                    truncated: false,
+                    reason_code: None,
+                    original_bytes: None,
+                },
+                &body,
+            );
+            let mut assembly = EntryBodyAssembly::default();
+            let mut assembled = None;
+            for frame in &frames {
+                assert!(encoded_frame_len(frame) <= MAX_AGENT_FRAME_BYTES);
+                assembled = assembly.accept(&request, frame).unwrap();
+            }
+            assert_eq!(assembled.as_deref(), Some(body.as_str()));
+            // Escapes shrink chunks, but never to a crawl: a chunk carries as much as fits.
+            let chunks = frames.len() - 2;
+            let escaped = json_string_len(&body);
+            assert!(
+                chunks
+                    <= escaped / (MAX_AGENT_FRAME_BYTES - 1024)
+                        + body.len() / MAX_ENTRY_BODY_CHUNK_BYTES
+                        + 1
+            );
+        }
     }
 
     #[tokio::test]

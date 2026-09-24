@@ -27,12 +27,12 @@ use crate::{
         AGENT_PROTOCOL_VERSION, AgentAdapterMetadata, AgentCapabilities, AgentCommand,
         AgentDeltaChange, AgentModelOption, AgentProtocolError, AgentServerFrame,
         AgentSessionDelta, AgentSessionDescriptor, AgentSessionList, AgentSessionSnapshot,
-        CommandCapabilities, CommandReceipt, DriftNote, MAX_AGENT_FRAME_BYTES,
-        MAX_COMMAND_RECEIPTS, MAX_LIVE_TEXT_DELTA_BYTES, MAX_PENDING_INTERACTIONS,
-        MAX_RECENT_PROMPT_BYTES, MAX_TIMELINE_PAGE_BYTES, MAX_TIMELINE_PAGE_ENTRIES,
-        MAX_TIMELINE_TEXT_BYTES, Observation, PendingInteraction, TerminalFallback, TimelineBody,
-        TimelineEntry, TimelinePage, TimelineWindow, Truncation, TurnState, bounded_session_list,
-        valid_opaque_id, valid_token,
+        CommandCapabilities, CommandReceipt, DriftNote, MAX_COMMAND_RECEIPTS,
+        MAX_PENDING_INTERACTIONS, MAX_RECENT_PROMPT_BYTES, MAX_RETAINED_TEXT_BYTES,
+        MAX_TIMELINE_PAGE_BYTES, MAX_TIMELINE_PAGE_ENTRIES, Observation, PendingInteraction,
+        TRUNCATION_BODY_AVAILABLE, TerminalFallback, TimelineBody, TimelineEntry, TimelinePage,
+        TimelineWindow, Truncation, TurnState, bounded_session_list, encoded_frame_len,
+        fit_entry_alone, fit_entry_to_frame, fit_snapshot_to_frame, valid_opaque_id, valid_token,
     },
     agent_route::{AgentRouteProof, AgentTerminalPlan, RouteContinuity, TerminalRouteResolver},
     host_protocol::AgentTabIndex,
@@ -158,12 +158,16 @@ pub(crate) struct NormalizedTimelineEntry {
 }
 
 impl NormalizedTimelineEntry {
+    /// What an adapter may hand the host: the whole body up to [`MAX_RETAINED_TEXT_BYTES`], not
+    /// the wire head, because the host keeps it and cuts only the copy it sends. `body_available`
+    /// is the host's claim to make, never an adapter's.
     pub(crate) fn validate(&self) -> Result<(), AgentProtocolError> {
         valid_source_id(&self.source_id)?;
         valid_token(&self.state)?;
         valid_token(&self.kind)?;
-        self.body.validate()?;
+        self.body.validate_within(MAX_RETAINED_TEXT_BYTES)?;
         self.truncation.validate()?;
+        refuse_adapter_body_available(&self.truncation)?;
         if self.source_revision == 0 || self.timestamp == 0 {
             return Err(AgentProtocolError::InvalidValue);
         }
@@ -183,18 +187,31 @@ pub(crate) struct NormalizedTextDelta {
 }
 
 impl NormalizedTextDelta {
+    /// A delta is bounded by the body it grows rather than by the old live-delta size: an
+    /// adapter that learned the bridge takes larger frames may hand over a display chunk whole,
+    /// and one that did not still sends
+    /// [`MAX_LIVE_TEXT_DELTA_BYTES`](crate::agent_protocol::MAX_LIVE_TEXT_DELTA_BYTES) at most.
+    /// The bridge frame bound is what actually limits it.
     pub(crate) fn validate(&self) -> Result<(), AgentProtocolError> {
         valid_source_id(&self.source_id)?;
         valid_token(&self.kind)?;
         self.truncation.validate()?;
+        refuse_adapter_body_available(&self.truncation)?;
         if self.source_revision == 0
             || self.timestamp == 0
-            || self.delta.len() > MAX_LIVE_TEXT_DELTA_BYTES
+            || self.delta.len() > MAX_RETAINED_TEXT_BYTES
         {
             return Err(AgentProtocolError::InvalidValue);
         }
         Ok(())
     }
+}
+
+fn refuse_adapter_body_available(truncation: &Truncation) -> Result<(), AgentProtocolError> {
+    if truncation.reason_code.as_deref() == Some(TRUNCATION_BODY_AVAILABLE) {
+        return Err(AgentProtocolError::InvalidValue);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1064,21 +1081,10 @@ impl AgentSessionSupervisor {
         let base_revision = session.snapshot.revision;
         bump_revision(session);
         refresh_snapshot_window(session);
-        let mut changes = vec![AgentDeltaChange::UpsertEntry { entry: canonical }];
-        changes.extend(clear_hook_attention(session));
-        let delta = AgentSessionDelta {
-            v: AGENT_PROTOCOL_VERSION,
-            session_id: session.snapshot.session_id.clone(),
-            snapshot_epoch: session.snapshot.snapshot_epoch,
-            process_generation: session.snapshot.process_generation,
-            base_revision,
-            revision: session.snapshot.revision,
-            changes,
-        };
-        let _ = session.updates.send(AgentServerFrame::SessionDelta {
-            v: AGENT_PROTOCOL_VERSION,
-            delta,
-        });
+        let attention = clear_hook_attention(session);
+        let _ = session
+            .updates
+            .send(entry_delta(session, base_revision, &canonical, attention));
         Ok(())
     }
 
@@ -1247,7 +1253,9 @@ impl AgentSessionSupervisor {
                 .unwrap_or(text.len())
                 .saturating_add(delta.delta.len());
             text.push_str(&delta.delta);
-            let overflowed = truncate_utf8(text, MAX_TIMELINE_TEXT_BYTES);
+            // The host keeps the whole message up to the retained bound; only the wire copy is
+            // cut to a head. Past this bound the text really is gone, and says so.
+            let overflowed = truncate_utf8(text, MAX_RETAINED_TEXT_BYTES);
             if !existing.truncation.truncated {
                 if gap {
                     existing.truncation = Truncation {
@@ -1315,21 +1323,10 @@ impl AgentSessionSupervisor {
         let base_revision = session.snapshot.revision;
         bump_revision(session);
         refresh_snapshot_window(session);
-        let mut changes = vec![AgentDeltaChange::UpsertEntry { entry: canonical }];
-        changes.extend(clear_hook_attention(session));
-        let delta = AgentSessionDelta {
-            v: AGENT_PROTOCOL_VERSION,
-            session_id: session.snapshot.session_id.clone(),
-            snapshot_epoch: session.snapshot.snapshot_epoch,
-            process_generation: session.snapshot.process_generation,
-            base_revision,
-            revision: session.snapshot.revision,
-            changes,
-        };
-        let _ = session.updates.send(AgentServerFrame::SessionDelta {
-            v: AGENT_PROTOCOL_VERSION,
-            delta,
-        });
+        let attention = clear_hook_attention(session);
+        let _ = session
+            .updates
+            .send(entry_delta(session, base_revision, &canonical, attention));
         Ok(())
     }
 
@@ -1639,7 +1636,7 @@ impl AgentSessionSupervisor {
             .filter(|entry| entry.sequence < before_sequence)
             .rev()
             .take(limit)
-            .cloned()
+            .map(fit_entry_alone)
             .collect();
         let mut entries: Vec<_> = candidates.into_iter().rev().collect();
         while page_bytes(&entries) > MAX_TIMELINE_PAGE_BYTES {
@@ -1671,6 +1668,34 @@ impl AgentSessionSupervisor {
             has_older,
             next_before_sequence: next,
         })
+    }
+
+    /// The whole retained body of one text entry, as the frames that answer
+    /// `agent.timeline.entry`. `None` for a session or entry this host does not hold — evicted,
+    /// never seen, or not text — which the caller refuses as `entry_unavailable`.
+    pub(crate) fn entry_body_frames(
+        &self,
+        session_id: &str,
+        entry_id: &str,
+    ) -> Option<Vec<AgentServerFrame>> {
+        let inner = self.inner.lock();
+        let session = inner.sessions.get(session_id)?;
+        let entry = session
+            .history
+            .iter()
+            .find(|entry| entry.entry_id == entry_id)?;
+        let TimelineBody::Text { text } = &entry.body else {
+            return None;
+        };
+        Some(crate::agent_protocol::entry_body_frames(
+            session_id,
+            session.snapshot.snapshot_epoch,
+            session.snapshot.process_generation,
+            entry_id,
+            entry.entry_revision,
+            entry.truncation.clone(),
+            text,
+        ))
     }
 
     pub(crate) fn subscribe(
@@ -2424,12 +2449,13 @@ fn enforce_history_bound(session: &mut LiveSession) {
 }
 
 fn refresh_snapshot_window(session: &mut LiveSession) {
+    // The snapshot is the phone's copy, so it holds wire entries: heads, not retained bodies.
     let mut entries: Vec<_> = session
         .history
         .iter()
         .rev()
         .take(MAX_TIMELINE_PAGE_ENTRIES)
-        .cloned()
+        .map(fit_entry_alone)
         .collect();
     entries.reverse();
     session.snapshot.timeline_window = TimelineWindow {
@@ -2443,27 +2469,37 @@ fn refresh_snapshot_window(session: &mut LiveSession) {
 }
 
 fn snapshot_for_wire(session: &LiveSession) -> AgentSessionSnapshot {
-    let mut snapshot = session.snapshot.clone();
-    while serde_json::to_vec(&AgentServerFrame::SessionSnapshot {
-        v: AGENT_PROTOCOL_VERSION,
-        snapshot: Box::new(snapshot.clone()),
-    })
-    .map_or(usize::MAX, |bytes| bytes.len())
-        > MAX_AGENT_FRAME_BYTES
-    {
-        if snapshot.timeline_window.entries.is_empty() {
-            break;
+    fit_snapshot_to_frame(session.snapshot.clone())
+}
+
+/// The live delta that publishes one entry, its wire copy sized against this very frame —
+/// including whatever else rides in it — so no append or upsert can build a frame the phone's
+/// reader refuses.
+fn entry_delta(
+    session: &LiveSession,
+    base_revision: u64,
+    entry: &TimelineEntry,
+    also: Option<AgentDeltaChange>,
+) -> AgentServerFrame {
+    let frame = |entry: TimelineEntry| {
+        let mut changes = vec![AgentDeltaChange::UpsertEntry { entry }];
+        changes.extend(also.clone());
+        AgentServerFrame::SessionDelta {
+            v: AGENT_PROTOCOL_VERSION,
+            delta: AgentSessionDelta {
+                v: AGENT_PROTOCOL_VERSION,
+                session_id: session.snapshot.session_id.clone(),
+                snapshot_epoch: session.snapshot.snapshot_epoch,
+                process_generation: session.snapshot.process_generation,
+                base_revision,
+                revision: session.snapshot.revision,
+                changes,
+            },
         }
-        snapshot.timeline_window.entries.remove(0);
-        snapshot.timeline_window.has_older = true;
-        snapshot.timeline_window.truncated = true;
-        snapshot.timeline_window.oldest_sequence = snapshot
-            .timeline_window
-            .entries
-            .first()
-            .map(|entry| entry.sequence);
-    }
-    snapshot
+    };
+    frame(fit_entry_to_frame(entry, |candidate| {
+        encoded_frame_len(&frame(candidate.clone()))
+    }))
 }
 
 /// The takeover verb an attached row offers, decided in the one place vendor knowledge
@@ -2647,7 +2683,10 @@ fn recent_reply_for(session: &LiveSession) -> Option<String> {
             _ => None,
         }
     })?;
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The host keeps up to a megabyte of a reply and the alert needs its first sentence, so
+    // collapse a bounded prefix rather than every word of the body.
+    let head = &text[..text.floor_char_boundary(8 * 1024)];
+    let collapsed = head.split_whitespace().collect::<Vec<_>>().join(" ");
     let bounded = truncate_on_char_boundary(&collapsed, MAX_RECENT_PROMPT_BYTES);
     (!bounded.is_empty()).then_some(bounded)
 }
@@ -3108,7 +3147,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::agent_protocol::{AgentCommandKind, InteractionCapabilities, ResponseSchema};
+    use crate::agent_protocol::{
+        AgentCommandKind, InteractionCapabilities, MAX_LIVE_TEXT_DELTA_BYTES,
+        MAX_TIMELINE_TEXT_BYTES, ResponseSchema,
+    };
 
     use super::*;
 
@@ -4446,6 +4488,272 @@ mod tests {
                 .as_deref(),
             Some("adapter_delta_gap")
         );
+    }
+
+    /// The latent frame defect: 48 KiB of text was legal on the wire, but a control character
+    /// encodes to six bytes and nothing measured the frame, so `write_agent_frame` failed and
+    /// ended the subscription carrying it. Every frame the host builds for an entry — the live
+    /// delta from an upsert or an append, the snapshot, a page — must encode within the phone's
+    /// bound, and the entry must still be there rather than silently dropped.
+    #[tokio::test]
+    async fn an_escape_heavy_entry_still_encodes_into_every_frame_that_carries_it() {
+        use crate::agent_protocol::encode_agent_frame;
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let (sender, _receiver) = mpsc::channel(4);
+        let registered = supervisor
+            .register(registration("nonce-escape"), sender)
+            .await
+            .unwrap();
+        let mut updates = supervisor.subscribe(&registered.session_id).unwrap();
+        let hostile = "\u{1}".repeat(MAX_TIMELINE_TEXT_BYTES);
+        supervisor
+            .upsert_bridge_entry(&registered.session_id, entry("escape", 2, &hostile))
+            .unwrap();
+        let upserted = updates.try_recv().unwrap();
+        encode_agent_frame(&upserted).expect("an upsert delta fits the phone's frame");
+
+        for (revision, chunk) in hostile
+            .as_bytes()
+            .chunks(MAX_LIVE_TEXT_DELTA_BYTES)
+            .enumerate()
+        {
+            let chunk = std::str::from_utf8(chunk).unwrap();
+            supervisor
+                .append_bridge_text(
+                    &registered.session_id,
+                    text_delta("escape-stream", revision as u64 + 1, chunk, false),
+                )
+                .unwrap();
+            let appended = updates.try_recv().unwrap();
+            encode_agent_frame(&appended).expect("an append delta fits the phone's frame");
+        }
+
+        // Each head is sized to fill a frame of its own, so the snapshot keeps the newest and
+        // says older ones are a page away; the page then carries both.
+        let snapshot = supervisor.snapshot(&registered.session_id).unwrap();
+        let newest = snapshot
+            .timeline_window
+            .entries
+            .last()
+            .expect("the newest entry is cut to a head, never dropped from the window");
+        assert_eq!(newest.sequence, 2);
+        assert!(snapshot.timeline_window.has_older);
+        encode_agent_frame(&AgentServerFrame::SessionSnapshot {
+            v: AGENT_PROTOCOL_VERSION,
+            snapshot: Box::new(snapshot),
+        })
+        .expect("the snapshot fits the phone's frame");
+        let page = supervisor
+            .page(&registered.session_id, u64::MAX, MAX_TIMELINE_PAGE_ENTRIES)
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        for entry in page.entries {
+            encode_agent_frame(&AgentServerFrame::TimelinePageEntry {
+                v: AGENT_PROTOCOL_VERSION,
+                page_id: "0".repeat(32),
+                entry,
+            })
+            .expect("a page entry fits the phone's frame");
+        }
+    }
+
+    /// Reassembles `agent.timeline.entry` frames the way a phone must: contiguous UTF-8 byte
+    /// offsets, every frame within the phone's bound, and exactly the advertised total.
+    fn reassemble(frames: &[AgentServerFrame]) -> (Truncation, String) {
+        use crate::agent_protocol::{MAX_ENTRY_BODY_CHUNK_BYTES, encode_agent_frame};
+        let mut total = None;
+        let mut retained = None;
+        let mut body = String::new();
+        for frame in frames {
+            encode_agent_frame(frame).expect("every body frame fits the phone's frame");
+            match frame {
+                AgentServerFrame::TimelineEntryStart {
+                    total_bytes,
+                    truncation,
+                    ..
+                } => {
+                    total = Some(*total_bytes as usize);
+                    retained = Some(truncation.clone());
+                }
+                AgentServerFrame::TimelineEntryChunk { offset, text, .. } => {
+                    assert_eq!(*offset as usize, body.len());
+                    assert!(!text.is_empty() && text.len() <= MAX_ENTRY_BODY_CHUNK_BYTES);
+                    body.push_str(text);
+                }
+                AgentServerFrame::TimelineEntryEnd { .. } => {}
+                other => panic!("unexpected body frame {other:?}"),
+            }
+        }
+        assert_eq!(Some(body.len()), total);
+        (retained.unwrap(), body)
+    }
+
+    /// The owner's complaint: a long reply read "Content truncated at a safety bound". The host
+    /// now keeps the whole reply, the phone gets a head that says so, and the fetch hands back
+    /// every byte — including across the multibyte characters a byte split would cut.
+    #[tokio::test]
+    async fn a_reply_past_the_head_keeps_its_whole_body_and_serves_it_byte_for_byte() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-long"))
+            .await
+            .unwrap();
+        let mut updates = supervisor.subscribe(&registered.session_id).unwrap();
+        let reply =
+            "Synthetic reply with caf\u{e9}, \u{1f980} and na\u{ef}ve words. ".repeat(4_000);
+        assert!(reply.len() > 3 * MAX_TIMELINE_TEXT_BYTES);
+        let mut sent = 0;
+        let mut revision = 0;
+        while sent < reply.len() {
+            let mut end = (sent + MAX_LIVE_TEXT_DELTA_BYTES).min(reply.len());
+            while !reply.is_char_boundary(end) {
+                end -= 1;
+            }
+            revision += 1;
+            supervisor
+                .append_bridge_text(
+                    &registered.session_id,
+                    text_delta("long", revision, &reply[sent..end], end == reply.len()),
+                )
+                .unwrap();
+            sent = end;
+        }
+        let mut last = None;
+        while let Ok(frame) = updates.try_recv() {
+            last = Some(frame);
+        }
+        let Some(AgentServerFrame::SessionDelta { delta, .. }) = last else {
+            panic!("the last append published a delta");
+        };
+        let AgentDeltaChange::UpsertEntry { entry: wire } = &delta.changes[0] else {
+            panic!("an append publishes its entry");
+        };
+        let TimelineBody::Text { text: head } = &wire.body else {
+            panic!("the reply stays text");
+        };
+        assert!(head.len() <= MAX_TIMELINE_TEXT_BYTES);
+        assert!(reply.starts_with(head.as_str()));
+        assert_eq!(
+            wire.truncation.reason_code.as_deref(),
+            Some(TRUNCATION_BODY_AVAILABLE)
+        );
+        assert_eq!(wire.truncation.original_bytes, Some(reply.len() as u64));
+        wire.validate().unwrap();
+
+        let snapshot = supervisor.snapshot(&registered.session_id).unwrap();
+        snapshot.validate().unwrap();
+        assert_eq!(snapshot.timeline_window.entries[0], *wire);
+
+        let frames = supervisor
+            .entry_body_frames(&registered.session_id, &wire.entry_id)
+            .unwrap();
+        assert!(frames.len() > 4, "a long body travels in several chunks");
+        let (retained, body) = reassemble(&frames);
+        assert_eq!(body, reply);
+        assert!(!retained.truncated, "nothing of this reply was lost");
+        assert!(
+            supervisor
+                .entry_body_frames(&registered.session_id, "entry-never-held")
+                .is_none()
+        );
+    }
+
+    /// The fetch is not only for long text: an escape-heavy head was cut for the frame's sake,
+    /// and its body comes back in chunks sized by their encoding.
+    #[tokio::test]
+    async fn an_escape_heavy_body_is_served_in_chunks_sized_by_their_encoding() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let (sender, _receiver) = mpsc::channel(4);
+        let registered = supervisor
+            .register(registration("nonce-escape-body"), sender)
+            .await
+            .unwrap();
+        let hostile = "\u{1}".repeat(MAX_TIMELINE_TEXT_BYTES);
+        supervisor
+            .upsert_bridge_entry(&registered.session_id, entry("escape", 2, &hostile))
+            .unwrap();
+        let wire = supervisor
+            .snapshot(&registered.session_id)
+            .unwrap()
+            .timeline_window
+            .entries
+            .pop()
+            .unwrap();
+        assert_eq!(
+            wire.truncation.reason_code.as_deref(),
+            Some(TRUNCATION_BODY_AVAILABLE)
+        );
+        let (_, body) = reassemble(
+            &supervisor
+                .entry_body_frames(&registered.session_id, &wire.entry_id)
+                .unwrap(),
+        );
+        assert_eq!(body, hostile);
+    }
+
+    /// Past the retained bound the text is really gone, and the phone is told so twice over:
+    /// the head still offers the body the host kept, and that body carries the loss.
+    #[tokio::test]
+    async fn past_the_retained_bound_the_loss_is_named_where_the_body_is() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-huge"))
+            .await
+            .unwrap();
+        let chunk = "y".repeat(MAX_LIVE_TEXT_DELTA_BYTES);
+        let deltas = MAX_RETAINED_TEXT_BYTES / chunk.len() + 2;
+        for revision in 1..=deltas as u64 {
+            supervisor
+                .append_bridge_text(
+                    &registered.session_id,
+                    text_delta("huge", revision, &chunk, false),
+                )
+                .unwrap();
+        }
+        let wire = supervisor
+            .snapshot(&registered.session_id)
+            .unwrap()
+            .timeline_window
+            .entries
+            .pop()
+            .unwrap();
+        assert_eq!(
+            wire.truncation.original_bytes,
+            Some(MAX_RETAINED_TEXT_BYTES as u64)
+        );
+        let (retained, body) = reassemble(
+            &supervisor
+                .entry_body_frames(&registered.session_id, &wire.entry_id)
+                .unwrap(),
+        );
+        assert_eq!(body.len(), MAX_RETAINED_TEXT_BYTES);
+        assert_eq!(retained.reason_code.as_deref(), Some("adapter_bound"));
+        assert_eq!(retained.original_bytes, Some((deltas * chunk.len()) as u64));
+    }
+
+    /// `body_available` is the host's word about what it holds. An adapter saying it would make
+    /// the host promise a body it never received.
+    #[test]
+    fn an_adapter_cannot_claim_a_body_is_available() {
+        let mut claimed = entry("claimed", 1, "Synthetic head.");
+        claimed.truncation = Truncation {
+            truncated: true,
+            reason_code: Some(TRUNCATION_BODY_AVAILABLE.into()),
+            original_bytes: Some(99),
+        };
+        assert!(claimed.validate().is_err());
+        let mut delta = text_delta("claimed", 1, "Synthetic head.", false);
+        delta.truncation = claimed.truncation.clone();
+        assert!(delta.validate().is_err());
+        // A whole retained body is legal from an adapter; one byte more is not.
+        let whole = entry("whole", 1, &"z".repeat(MAX_RETAINED_TEXT_BYTES));
+        whole.validate().unwrap();
+        let over = entry("over", 1, &"z".repeat(MAX_RETAINED_TEXT_BYTES + 1));
+        assert!(over.validate().is_err());
     }
 
     #[tokio::test]
