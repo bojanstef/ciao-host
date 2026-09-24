@@ -179,7 +179,25 @@ pub(crate) fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some((major, minor, patch))
 }
 pub const MAX_INTERACTION_TEXT_BYTES: usize = 32 * 1024;
+/// The **wire head** of a text entry (Spec 005 §12, amended 2026-09-23). It exists so one entry
+/// fits one [`MAX_AGENT_FRAME_BYTES`] frame, and it is no longer how much of a message Ciao
+/// keeps: a host holding more than this sends the head with [`TRUNCATION_BODY_AVAILABLE`] and
+/// serves the rest through `agent.timeline.entry`.
 pub const MAX_TIMELINE_TEXT_BYTES: usize = 48 * 1024;
+/// The most text the host keeps, and will serve, for one timeline entry. Beyond it the host
+/// really does cut, and says so with an ordinary truncation reason. A megabyte is past any
+/// message a person reads on a phone and small enough that the per-session 4 MiB host history
+/// bound still holds several of them.
+pub const MAX_RETAINED_TEXT_BYTES: usize = 1024 * 1024;
+/// Decoded bytes one `timeline_entry_chunk` may carry. The host also sizes each chunk so its
+/// *encoded* frame fits [`MAX_AGENT_FRAME_BYTES`]: an escape-heavy body travels in smaller
+/// chunks, never in a bigger frame.
+pub const MAX_ENTRY_BODY_CHUNK_BYTES: usize = 32 * 1024;
+/// A truncation reason that is not a loss: the wire carries a head of at most
+/// [`MAX_TIMELINE_TEXT_BYTES`], `original_bytes` names the size of the whole body, and the host
+/// serves that body on request. An app that predates it sees an unknown reason and a bounded
+/// head — exactly what it showed before — so it needs no capability bit: the entry advertises it.
+pub const TRUNCATION_BODY_AVAILABLE: &str = "body_available";
 pub const MAX_TIMELINE_ENTRIES_IN_SNAPSHOT: usize = 64;
 pub const MAX_WORKSPACE_LIST_ENTRIES: usize = 64;
 pub const MAX_WORKSPACE_LIST_BYTES: usize = 64 * 1024;
@@ -907,6 +925,21 @@ impl TimelineEntry {
         valid_token(&self.kind)?;
         self.body.validate()?;
         self.truncation.validate()?;
+        // `body_available` is a promise the host must be able to keep: a text head strictly
+        // shorter than the body it names, and a body no larger than the host retains.
+        if self.truncation.reason_code.as_deref() == Some(TRUNCATION_BODY_AVAILABLE) {
+            let TimelineBody::Text { text } = &self.body else {
+                return Err(AgentProtocolError::InvalidValue);
+            };
+            let whole = self
+                .truncation
+                .original_bytes
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or(AgentProtocolError::InvalidValue)?;
+            if whole <= text.len() || whole > MAX_RETAINED_TEXT_BYTES {
+                return Err(AgentProtocolError::InvalidValue);
+            }
+        }
         Ok(())
     }
 
@@ -1853,6 +1886,10 @@ pub struct AgentStreamOpen {
     pub lifecycle_command_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_generation: Option<u64>,
+    /// `agent.timeline.entry` only: which entry's retained body to send. Absent from every
+    /// other operation, and so from every open an older app writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
 }
 
 impl AgentStreamOpen {
@@ -1875,7 +1912,8 @@ impl AgentStreamOpen {
             valid_token(capability)?;
         }
         // (session_id, before_sequence, page_limit, workspace_id, lifecycle_command_id,
-        //  expected_generation) — exactly the parameters each operation requires, nothing else.
+        //  expected_generation, entry_id) — exactly the parameters each operation requires,
+        //  nothing else.
         let shape = (
             self.session_id.is_some(),
             self.before_sequence.is_some(),
@@ -1883,22 +1921,28 @@ impl AgentStreamOpen {
             self.workspace_id.is_some(),
             self.lifecycle_command_id.is_some(),
             self.expected_generation.is_some(),
+            self.entry_id.is_some(),
         );
         let valid_shape = match self.operation.as_str() {
             "agent.sessions.list" | "agent.workspaces.list" => {
-                shape == (false, false, false, false, false, false)
+                shape == (false, false, false, false, false, false, false)
             }
             "agent.session.snapshot" | "agent.session.subscribe" | "agent.command.submit" => {
-                shape == (true, false, false, false, false, false)
+                shape == (true, false, false, false, false, false, false)
             }
             "agent.timeline.page" => {
-                shape == (true, true, true, false, false, false)
+                shape == (true, true, true, false, false, false, false)
                     && !self.page_limit.is_none_or(|limit| {
                         limit == 0 || usize::from(limit) > MAX_TIMELINE_PAGE_ENTRIES
                     })
             }
-            "agent.managed.start" => shape == (false, false, false, true, true, false),
-            "agent.managed.stop" => shape == (true, false, false, false, true, true),
+            // Which session and which entry, nothing else. The staleness guards — epoch,
+            // generation, entry revision — ride the `timeline_entry_start` answer, exactly as
+            // the page's ride `timeline_page_start`: the host serves what it holds now and the
+            // phone decides whether that still matches what it is showing.
+            "agent.timeline.entry" => shape == (true, false, false, false, false, false, true),
+            "agent.managed.start" => shape == (false, false, false, true, true, false, false),
+            "agent.managed.stop" => shape == (true, false, false, false, true, true, false),
             // Promote takes the same parameters as resume: which session, and the command to
             // correlate it by. Omitting it here rejected every takeover from a phone as a
             // malformed handshake, while the CLI's IPC route — which never sees this — worked.
@@ -1912,10 +1956,10 @@ impl AgentStreamOpen {
             "agent.managed.resume"
             | "agent.managed.promote"
             | "agent.managed.release"
-            | "agent.managed.forget" => shape == (true, false, false, false, true, false),
+            | "agent.managed.forget" => shape == (true, false, false, false, true, false, false),
             // Pick-up takes promote's parameters for promote's reason: which conversation,
             // and the command to correlate the outcome by (Spec 013 §7).
-            "agent.adopted.pickup" => shape == (true, false, false, false, true, false),
+            "agent.adopted.pickup" => shape == (true, false, false, false, true, false, false),
             _ => return Err(AgentProtocolError::UnexpectedMessage),
         };
         if !valid_shape {
@@ -1945,6 +1989,9 @@ impl AgentStreamOpen {
         }
         if let Some(command_id) = &self.lifecycle_command_id {
             valid_opaque_id(command_id)?;
+        }
+        if let Some(entry_id) = &self.entry_id {
+            valid_opaque_id(entry_id)?;
         }
         if self.expected_generation == Some(0) {
             return Err(AgentProtocolError::InvalidValue);
@@ -2241,6 +2288,37 @@ pub enum AgentServerFrame {
     TimelinePageEnd {
         v: u8,
         page_id: String,
+    },
+    /// The answer to `agent.timeline.entry`: the whole retained body of one text entry, as a
+    /// start, contiguous UTF-8 chunks, and an end. The identity fields are the guards — the
+    /// phone applies the body only while its snapshot still has this epoch and generation and
+    /// its copy of the entry is at or below `entry_revision`.
+    TimelineEntryStart {
+        v: u8,
+        session_id: String,
+        snapshot_epoch: u64,
+        process_generation: u64,
+        entry_id: String,
+        entry_revision: u64,
+        /// UTF-8 bytes of the whole body; the chunks sum to exactly this.
+        total_bytes: u32,
+        /// What the retained body itself lost, which is the entry's truncation once the body
+        /// replaces the head. Never `body_available`: that reason names this very answer.
+        truncation: Truncation,
+    },
+    TimelineEntryChunk {
+        v: u8,
+        entry_id: String,
+        /// UTF-8 byte offset of `text` within the body — the running sum of every earlier
+        /// chunk's UTF-8 length, never a character or UTF-16 count.
+        offset: u32,
+        /// At most [`MAX_ENTRY_BODY_CHUNK_BYTES`], and never empty. A JSON string cannot split a
+        /// character, so every chunk is whole characters by construction.
+        text: String,
+    },
+    TimelineEntryEnd {
+        v: u8,
+        entry_id: String,
     },
     SessionDelta {
         v: u8,
@@ -3076,6 +3154,9 @@ mod tests {
             ("model_id_bytes", MAX_MODEL_ID_BYTES),
             ("model_display_name_bytes", MAX_MODEL_DISPLAY_NAME_BYTES),
             ("effort_levels_per_model", MAX_EFFORT_LEVELS_PER_MODEL),
+            ("timeline_text_bytes", MAX_TIMELINE_TEXT_BYTES),
+            ("retained_text_bytes", MAX_RETAINED_TEXT_BYTES),
+            ("entry_body_chunk_bytes", MAX_ENTRY_BODY_CHUNK_BYTES),
         ] {
             assert_eq!(bounds[name].as_u64().unwrap(), actual as u64, "{name}");
         }
@@ -3100,6 +3181,254 @@ mod tests {
         assert!(valid_token(&"x".repeat(MAX_TOKEN_BYTES + 1)).is_err());
         assert!(valid_opaque_id(&"x".repeat(MAX_OPAQUE_ID_BYTES)).is_ok());
         assert!(valid_opaque_id(&"x".repeat(MAX_OPAQUE_ID_BYTES + 1)).is_err());
+    }
+
+    /// Who the phone thinks it is asking about when it opens `agent.timeline.entry`.
+    struct EntryBodyRequest {
+        session_id: String,
+        snapshot_epoch: u64,
+        process_generation: u64,
+        entry_id: String,
+        /// The revision of the entry the phone is showing; an older answer is stale.
+        held_revision: u64,
+    }
+
+    /// The phone's half of `agent.timeline.entry`, written once here so the shared fixtures
+    /// prove the contract instead of one codec round-tripping itself. The app owns the
+    /// production reassembly; this is the reference its tests must agree with, case for case.
+    #[derive(Default)]
+    struct EntryBodyAssembly {
+        total: Option<usize>,
+        body: String,
+        done: bool,
+    }
+
+    impl EntryBodyAssembly {
+        /// `Ok(Some(body))` once the end frame lands; the error is the fixture's `expect` token.
+        fn accept(
+            &mut self,
+            request: &EntryBodyRequest,
+            frame: &AgentServerFrame,
+        ) -> Result<Option<String>, &'static str> {
+            if self.done {
+                return Err("entry_body_order");
+            }
+            match frame {
+                AgentServerFrame::TimelineEntryStart {
+                    v,
+                    session_id,
+                    snapshot_epoch,
+                    process_generation,
+                    entry_id,
+                    entry_revision,
+                    total_bytes,
+                    truncation,
+                } => {
+                    if self.total.is_some() || *v != AGENT_PROTOCOL_VERSION {
+                        return Err("entry_body_order");
+                    }
+                    if *session_id != request.session_id
+                        || *snapshot_epoch != request.snapshot_epoch
+                        || *process_generation != request.process_generation
+                        || *entry_id != request.entry_id
+                    {
+                        return Err("entry_body_identity");
+                    }
+                    if *entry_revision < request.held_revision {
+                        return Err("entry_body_stale");
+                    }
+                    let total = *total_bytes as usize;
+                    if total > MAX_RETAINED_TEXT_BYTES {
+                        return Err("entry_body_over_bound");
+                    }
+                    if truncation.validate().is_err()
+                        || truncation.reason_code.as_deref() == Some(TRUNCATION_BODY_AVAILABLE)
+                    {
+                        return Err("entry_body_identity");
+                    }
+                    self.total = Some(total);
+                    Ok(None)
+                }
+                AgentServerFrame::TimelineEntryChunk {
+                    entry_id,
+                    offset,
+                    text,
+                    ..
+                } => {
+                    let total = self.total.ok_or("entry_body_order")?;
+                    if *entry_id != request.entry_id {
+                        return Err("entry_body_identity");
+                    }
+                    // UTF-8 bytes, not characters: `body.len()` is the only running count.
+                    if *offset as usize != self.body.len() {
+                        return Err("entry_body_gap");
+                    }
+                    if text.is_empty() {
+                        return Err("entry_body_empty_chunk");
+                    }
+                    if text.len() > MAX_ENTRY_BODY_CHUNK_BYTES {
+                        return Err("entry_body_chunk_too_large");
+                    }
+                    if self.body.len() + text.len() > total {
+                        return Err("entry_body_total_mismatch");
+                    }
+                    self.body.push_str(text);
+                    Ok(None)
+                }
+                AgentServerFrame::TimelineEntryEnd { entry_id, .. } => {
+                    let total = self.total.ok_or("entry_body_order")?;
+                    if *entry_id != request.entry_id {
+                        return Err("entry_body_identity");
+                    }
+                    if self.body.len() != total {
+                        return Err("entry_body_total_mismatch");
+                    }
+                    self.done = true;
+                    Ok(Some(std::mem::take(&mut self.body)))
+                }
+                _ => Err("entry_body_order"),
+            }
+        }
+    }
+
+    fn entry_body_request(identity: &Value, held_revision: u64) -> EntryBodyRequest {
+        EntryBodyRequest {
+            session_id: identity["session_id"].as_str().unwrap().into(),
+            snapshot_epoch: identity["snapshot_epoch"].as_u64().unwrap(),
+            process_generation: identity["process_generation"].as_u64().unwrap(),
+            entry_id: identity["entry_id"].as_str().unwrap().into(),
+            held_revision,
+        }
+    }
+
+    #[test]
+    fn a_retained_body_reassembles_from_the_shared_fixture_by_utf8_offset() {
+        let value = fixture();
+        let head: TimelineEntry =
+            serde_json::from_value(value["body_available_entry"].clone()).unwrap();
+        head.validate().unwrap();
+        let exchange = &value["entry_fetch"];
+        let open: AgentStreamOpen = serde_json::from_value(exchange["open"].clone()).unwrap();
+        open.validate().unwrap();
+        assert_eq!(open.entry_id.as_deref(), Some(head.entry_id.as_str()));
+
+        let body = exchange["body"].as_str().unwrap();
+        // The fixture is only worth something if a byte split would have cut a character and
+        // the chunk offsets differ from a character count — the two mistakes a UTF-16 client
+        // makes.
+        let naive = exchange["naive_split_offset"].as_u64().unwrap() as usize;
+        assert!(!body.is_char_boundary(naive));
+        let TimelineBody::Text { text: head_text } = &head.body else {
+            panic!("the advertised entry is text");
+        };
+        assert!(body.starts_with(head_text.as_str()));
+        assert_eq!(head.truncation.original_bytes, Some(body.len() as u64));
+
+        let frames: Vec<AgentServerFrame> =
+            serde_json::from_value(exchange["frames"].clone()).unwrap();
+        let AgentServerFrame::TimelineEntryChunk { offset, text, .. } = &frames[2] else {
+            panic!("the second chunk is the third frame");
+        };
+        assert_ne!(*offset as usize, text.chars().count());
+        let request = EntryBodyRequest {
+            session_id: open.session_id.clone().unwrap(),
+            snapshot_epoch: snapshot().snapshot_epoch,
+            process_generation: snapshot().process_generation,
+            entry_id: head.entry_id.clone(),
+            held_revision: head.entry_revision,
+        };
+        let mut assembly = EntryBodyAssembly::default();
+        let mut assembled = None;
+        for frame in &frames {
+            // Every frame the host sends here fits the phone's frame bound.
+            assert!(encode_agent_frame(frame).is_ok());
+            assembled = assembly.accept(&request, frame).unwrap();
+        }
+        assert_eq!(assembled.as_deref(), Some(body));
+    }
+
+    #[test]
+    fn hostile_entry_bodies_fail_as_declared() {
+        let hostile = hostile_fixture();
+        let block = &hostile["entry_body"];
+        let request =
+            entry_body_request(&block["identity"], block["held_revision"].as_u64().unwrap());
+        let cases = block["cases"].as_array().unwrap();
+        assert!(cases.len() >= 10);
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let frames: Vec<AgentServerFrame> =
+                serde_json::from_value(case["frames"].clone()).unwrap();
+            let mut assembly = EntryBodyAssembly::default();
+            let outcome = frames
+                .iter()
+                .map(|frame| assembly.accept(&request, frame))
+                .find_map(Result::err);
+            assert_eq!(outcome, case["expect"].as_str(), "{name}");
+        }
+    }
+
+    #[test]
+    fn body_available_is_a_promise_the_entry_must_be_able_to_keep() {
+        let entry: TimelineEntry =
+            serde_json::from_value(fixture()["body_available_entry"].clone()).unwrap();
+        entry.validate().unwrap();
+        let with = |text: &str, original: Option<u64>| {
+            let mut candidate = entry.clone();
+            candidate.body = TimelineBody::Text { text: text.into() };
+            candidate.truncation.original_bytes = original;
+            candidate
+        };
+        // The head must be strictly shorter than the body it names.
+        assert!(with("abcd", Some(4)).validate().is_err());
+        assert!(with("abcd", Some(5)).validate().is_ok());
+        // The size is required, and bounded by what a host retains.
+        assert!(with("abcd", None).validate().is_err());
+        assert!(
+            with("abcd", Some(MAX_RETAINED_TEXT_BYTES as u64))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            with("abcd", Some(MAX_RETAINED_TEXT_BYTES as u64 + 1))
+                .validate()
+                .is_err()
+        );
+        // Only text has a body to fetch.
+        let mut tool = entry.clone();
+        tool.body = TimelineBody::Tool {
+            tool: ToolTimelineBody {
+                name: "Bash".into(),
+                status: "completed".into(),
+                input_preview: None,
+                result_preview: None,
+            },
+        };
+        assert!(tool.validate().is_err());
+    }
+
+    #[test]
+    fn an_entry_fetch_names_its_session_and_entry_and_nothing_else() {
+        let base: AgentStreamOpen =
+            serde_json::from_value(fixture()["entry_fetch"]["open"].clone()).unwrap();
+        base.validate().unwrap();
+        let mut missing_entry = base.clone();
+        missing_entry.entry_id = None;
+        assert!(missing_entry.validate().is_err());
+        let mut missing_session = base.clone();
+        missing_session.session_id = None;
+        assert!(missing_session.validate().is_err());
+        let mut paged = base.clone();
+        paged.before_sequence = Some(9);
+        assert!(paged.validate().is_err());
+        let mut hostile_id = base.clone();
+        hostile_id.entry_id = Some("entry with spaces".into());
+        assert!(hostile_id.validate().is_err());
+        // Every other operation refuses the new parameter, so it cannot leak into a shape
+        // that never declared it.
+        let mut snapshot_with_entry = base;
+        snapshot_with_entry.operation = "agent.session.snapshot".into();
+        assert!(snapshot_with_entry.validate().is_err());
     }
 
     #[tokio::test]
@@ -3616,6 +3945,7 @@ mod tests {
                 workspace_id: None,
                 lifecycle_command_id: command.map(str::to_owned),
                 expected_generation: None,
+                entry_id: None,
             }
         };
         let both = vec![

@@ -6077,6 +6077,7 @@ mod tests {
             workspace_id: None,
             lifecycle_command_id: None,
             expected_generation: None,
+            entry_id: None,
         };
 
         let (mut list_send, mut list_recv) = connection.open_bi().await.unwrap();
