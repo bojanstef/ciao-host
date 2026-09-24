@@ -361,11 +361,19 @@ pub(crate) fn function_output(
         crate::drift::note("codex", "function_call_output", kind, name, None);
     };
     let mut clipped = false;
-    let (preview, bounded) = match item.get("output") {
+    // What a cut preview names as its original size: the encoded document it stands for — the
+    // output string, or every text block the preview selects from.
+    let (preview, bounded, original_bytes) = match item.get("output") {
         Some(value @ Value::String(_)) => {
-            bounded_preview(Some(value), MAX_TOOL_RESULT_PREVIEW_BYTES)
+            let (preview, bounded) = bounded_preview(Some(value), MAX_TOOL_RESULT_PREVIEW_BYTES);
+            (
+                preview,
+                bounded,
+                crate::agent_protocol::encoded_frame_len(value),
+            )
         }
         Some(Value::Array(blocks)) => {
+            let mut texts: Vec<&str> = Vec::new();
             let mut selected = Vec::new();
             let mut found = false;
             let mut omitted = false;
@@ -378,6 +386,7 @@ pub(crate) fn function_output(
                             continue;
                         };
                         found = true;
+                        texts.push(text);
                         if omitted {
                             continue;
                         }
@@ -410,11 +419,13 @@ pub(crate) fn function_output(
             if !found {
                 return None;
             }
-            if omitted {
+            let original_bytes = crate::agent_protocol::encoded_frame_len(&texts);
+            let (preview, bounded) = if omitted {
                 (None, true)
             } else {
                 bounded_preview(Some(&Value::Array(selected)), MAX_TOOL_RESULT_PREVIEW_BYTES)
-            }
+            };
+            (preview, bounded, original_bytes)
         }
         _ => {
             note("malformed_field", "output");
@@ -425,6 +436,7 @@ pub(crate) fn function_output(
     if complete && (clipped || bounded) {
         truncation.truncated = true;
         truncation.reason_code = Some("preview_bounded".into());
+        truncation.original_bytes = Some(original_bytes as u64);
     }
     Some((
         ToolTimelineBody {
@@ -517,6 +529,12 @@ pub(crate) mod tests {
         ] {
             let (tool, truncation) = function_output(&json!({"output":text}), true).unwrap();
             assert!(truncation.truncated);
+            // A cut names how large the output was, as every other tool preview does: the
+            // encoded document the preview stands for.
+            assert_eq!(
+                truncation.original_bytes,
+                Some(serde_json::to_string(&text).unwrap().len() as u64)
+            );
             let preview = tool.result_preview.unwrap();
             assert!(preview.len() <= MAX_TOOL_RESULT_PREVIEW_BYTES);
             serde_json::from_str::<Value>(&preview).unwrap();
@@ -526,6 +544,13 @@ pub(crate) mod tests {
         let (tool, truncation) = function_output(&json!({"output":blocks}), true).unwrap();
         assert!(tool.result_preview.is_none());
         assert_eq!(truncation.reason_code.as_deref(), Some("preview_bounded"));
+        // For blocks, the document is the text the preview selects from — the thousand text
+        // blocks — not the vendor's envelope around them.
+        let texts = vec!["a".repeat(240); 1000];
+        assert_eq!(
+            truncation.original_bytes,
+            Some(serde_json::to_string(&texts).unwrap().len() as u64)
+        );
         let ledger = crate::drift::snapshot();
         assert!(
             ledger.vendors["codex"]
