@@ -66,15 +66,27 @@ export function detectPiCommandSurface(
 		idle,
 	};
 }
+/// Every daemon reads a frame this size, and this is all a daemon from before the bridge grant
+/// reads: anything larger is refused and the connection dropped, silently.
 const MAX_FRAME_BYTES = 64 * 1024;
+/// What this extension asks the daemon to read (`MAX_BRIDGE_FRAME_BYTES` host-side). It sends
+/// frames this large only after `registered` grants them.
+const MAX_BRIDGE_FRAME_BYTES = 2 * 1024 * 1024;
 // The socket writer is bounded independently from the host's per-phone 1 MiB Agent queue.
 // It must accommodate one legal 4 MiB reconciliation snapshot plus bounded JSON overhead.
 const MAX_PENDING_BYTES = 8 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_ENTRIES = 4096;
+/// A message's text as a daemon that granted nothing larger validates it.
 const MAX_TEXT_BYTES = 48 * 1024;
+/// A message's text as a granting daemon keeps it (`MAX_RETAINED_TEXT_BYTES` host-side): whole,
+/// with only the phone's copy cut to a head the phone can fetch past.
+const MAX_RETAINED_TEXT_BYTES = 1024 * 1024;
 const MAX_INPUT_PREVIEW_BYTES = 16 * 1024;
 const MAX_RESULT_PREVIEW_BYTES = 32 * 1024;
+/// The per-string caps a JSON preview retreats to when the whole document does not fit its
+/// budget — `GENEROUS_PREVIEW_STRING_BYTES` and `MAX_PREVIEW_STRING_BYTES` host-side.
+const PREVIEW_STRING_CAPS = [2048, 512];
 const MAX_PROMPT_BYTES = 32 * 1024;
 const MAX_RECEIPTS = 128;
 const LIVE_EMISSION_INTERVAL_MS = 50;
@@ -248,13 +260,15 @@ function noTruncation(): Truncation {
 	return { truncated: false };
 }
 
-function truncation(previews: Preview[]): Truncation {
+/// `adapter_bound` for prose that was cut, `preview_bounded` for a tool preview — the tokens the
+/// host's own adapters use, so the phone reads one vocabulary whichever agent is running.
+function truncation(previews: Preview[], reasonCode: "adapter_bound" | "preview_bounded"): Truncation {
 	const truncated = previews.some((preview) => preview.truncated);
 	if (!truncated) return noTruncation();
 	const knownBytes = previews.reduce((total, preview) => total + (preview.originalBytes ?? 0), 0);
 	return {
 		truncated: true,
-		reason_code: "adapter_bound",
+		reason_code: reasonCode,
 		...(knownBytes > 0 ? { original_bytes: knownBytes } : {}),
 	};
 }
@@ -336,17 +350,134 @@ function jsonPreview(value: unknown, maximumBytes: number): Preview {
 	};
 
 	try {
-		const encoded = JSON.stringify(copy(value, 0));
-		if (typeof encoded !== "string") return { truncated: structurallyTruncated };
-		const bounded = truncateUtf8(encoded, maximumBytes);
-		return {
-			text: bounded.text,
-			truncated: structurallyTruncated || bounded.truncated,
-			originalBytes: bounded.originalBytes,
-		};
+		const copied = copy(value, 0);
+		const whole = JSON.stringify(copied);
+		if (typeof whole !== "string") return { truncated: structurallyTruncated };
+		const originalBytes = utf8Bytes(whole);
+		// Whole first: a document that fits its budget is sent as it is. Only one that does not
+		// has its strings capped, generous before tight — and never a byte cut through the
+		// serialized text, which leaves a document the phone cannot parse to name the step. The
+		// host's `bounded_preview` makes the same three attempts.
+		if (originalBytes <= maximumBytes) {
+			return { text: whole, truncated: structurallyTruncated, originalBytes };
+		}
+		for (const cap of PREVIEW_STRING_CAPS) {
+			const encoded = JSON.stringify(capStrings(copied, cap));
+			if (utf8Bytes(encoded) <= maximumBytes) return { text: encoded, truncated: true, originalBytes };
+		}
+		// Thousands of short strings can overflow even at the tight cap. Omitting beats sending
+		// something the reader cannot parse.
+		return { truncated: true, originalBytes };
 	} catch {
 		return { text: "[unsupported]", truncated: true };
 	}
+}
+
+/// Every string in a plain JSON value cut to `cap` UTF-8 bytes, on a character boundary.
+function capStrings(value: unknown, cap: number): unknown {
+	if (typeof value === "string") return truncateUtf8(value, cap).text ?? "";
+	if (Array.isArray(value)) return value.map((item) => capStrings(item, cap));
+	if (value !== null && typeof value === "object") {
+		const result: Record<string, unknown> = Object.create(null);
+		for (const [key, field] of Object.entries(value)) result[key] = capStrings(field, cap);
+		return result;
+	}
+	return value;
+}
+
+/// Bytes one character occupies inside a JSON string, as `JSON.stringify` writes it: two for
+/// the short escapes, six for any other control character or a lone surrogate, and the UTF-8
+/// bytes of anything else. Mirrors the host's `json_escaped_len`.
+function jsonEscapedBytes(character: string): number {
+	const point = character.codePointAt(0) ?? 0;
+	if (character === '"' || character === "\\" || "\b\f\n\r\t".includes(character)) return 2;
+	if (point < 0x20 || (point >= 0xd800 && point <= 0xdfff)) return 6;
+	return utf8Bytes(character);
+}
+
+/// The longest prefix of `text`, in whole characters, whose JSON encoding fits `budget` bytes.
+function jsonPrefixWithin(text: string, budget: number): string {
+	let encoded = 0;
+	let end = 0;
+	for (const character of text) {
+		encoded += jsonEscapedBytes(character);
+		if (encoded > budget) break;
+		end += character.length;
+	}
+	return text.slice(0, end);
+}
+
+/// An entry frame this bridge's daemon will read: text cut to what that daemon keeps (a named
+/// loss, never a silent one), then — for the rare escape-heavy body — to what fits the frame;
+/// a tool sheds its previews instead, result first. Fitting here, rather than refusing, is what
+/// keeps one hostile message from failing the frame, closing the socket, and failing again on
+/// every reconnect's snapshot.
+export function fitEntryFrame(
+	type: "snapshot_entry" | "upsert_entry",
+	entry: BridgeEntry,
+	frameBytes = MAX_FRAME_BYTES,
+): WireObject {
+	const textBytes = textBytesFor(frameBytes);
+	let fitted: BridgeEntry = entry;
+	if (fitted.body.type === "text" && utf8Bytes(fitted.body.text) > textBytes) {
+		const cut = truncateUtf8(fitted.body.text, textBytes);
+		fitted = {
+			...fitted,
+			body: { type: "text", text: cut.text ?? "" },
+			truncation: namedCut(fitted.truncation, cut.originalBytes),
+		};
+	}
+	for (;;) {
+		const frame = { v: BRIDGE_VERSION, type, entry: fitted };
+		const size = utf8Bytes(JSON.stringify(frame));
+		if (size <= frameBytes) return frame;
+		const body = fitted.body;
+		if (body.type === "text" && body.text.length > 0) {
+			// Everything but the text is fixed while it shrinks, so its budget is exact.
+			const budget = frameBytes - (size - jsonTextBytes(body.text));
+			const prefix = jsonPrefixWithin(body.text, Math.max(0, budget));
+			const whole = entry.body.type === "text" ? utf8Bytes(entry.body.text) : 0;
+			fitted = {
+				...fitted,
+				body: { type: "text", text: prefix.length < body.text.length ? prefix : "" },
+				truncation: namedCut(fitted.truncation, whole),
+			};
+			continue;
+		}
+		if (body.type === "tool" && (body.tool.result_preview !== undefined || body.tool.input_preview !== undefined)) {
+			const tool = { ...body.tool };
+			if (tool.result_preview !== undefined) delete tool.result_preview;
+			else delete tool.input_preview;
+			fitted = {
+				...fitted,
+				body: { type: "tool", tool },
+				truncation: fitted.truncation.truncated ? fitted.truncation : { truncated: true, reason_code: "preview_bounded" },
+			};
+			continue;
+		}
+		return frame;
+	}
+}
+
+/// The most of one message a daemon receives: whole bodies once it granted a larger frame, the
+/// phone's head before that.
+function textBytesFor(frameBytes: number): number {
+	return frameBytes > MAX_FRAME_BYTES ? MAX_RETAINED_TEXT_BYTES : MAX_TEXT_BYTES;
+}
+
+function jsonTextBytes(text: string): number {
+	let bytes = 0;
+	for (const character of text) bytes += jsonEscapedBytes(character);
+	return bytes;
+}
+
+function namedCut(previous: Truncation, originalBytes: number | undefined): Truncation {
+	const known = Math.max(previous.original_bytes ?? 0, originalBytes ?? 0);
+	return {
+		truncated: true,
+		reason_code: "adapter_bound",
+		...(known > 0 ? { original_bytes: known } : {}),
+	};
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -372,7 +503,9 @@ function textEntry(
 	timestamp: unknown,
 	state: BridgeEntry["state"] = "complete",
 ): BridgeEntry | undefined {
-	const preview = textPreview(content, MAX_TEXT_BYTES);
+	// The whole message, up to what a granting daemon keeps; `fitEntryFrame` cuts it further for
+	// a daemon that granted nothing larger, when it is sent.
+	const preview = textPreview(content, MAX_RETAINED_TEXT_BYTES);
 	if (preview.text === undefined || preview.text.length === 0) return undefined;
 	return {
 		source_id: sourceID("message", identity),
@@ -381,7 +514,7 @@ function textEntry(
 		state,
 		kind,
 		body: { type: "text", text: preview.text },
-		truncation: truncation([preview]),
+		truncation: truncation([preview], "adapter_bound"),
 	};
 }
 
@@ -407,7 +540,7 @@ function toolEntry(identity: string, tool: ToolState): BridgeEntry {
 				...(result.text === undefined ? {} : { result_preview: result.text }),
 			},
 		},
-		truncation: truncation([input, result]),
+		truncation: truncation([input, result], "preview_bounded"),
 	};
 }
 
@@ -484,6 +617,17 @@ function entryTimestamp(entry: Record<string, unknown>): number {
 
 /** Maps only documented displayable session records. Non-display metadata is omitted. */
 export function mapSessionBranch(entries: readonly SessionEntry[]): BridgeEntry[] {
+	return mapSessionHistory(entries, MAX_RETAINED_TEXT_BYTES).entries;
+}
+
+/// The branch as a snapshot within its bound, and whether that is the whole branch. `textBytes`
+/// is the most of one message the daemon will receive, which is what the bound has to count: a
+/// daemon that granted nothing larger gets 48 KiB heads, so counting whole bodies against it
+/// would drop messages it could have held.
+export function mapSessionHistory(
+	entries: readonly SessionEntry[],
+	textBytes: number,
+): { entries: BridgeEntry[]; complete: boolean } {
 	const mapped: BridgeEntry[] = [];
 	const tools = new Map<string, BridgeEntry>();
 	for (const raw of entries as readonly unknown[]) {
@@ -550,11 +694,11 @@ export function mapSessionBranch(entries: readonly SessionEntry[]): BridgeEntry[
 	// Tool-result records replace the matching call record rather than adding token/result rows.
 	mapped.push(...tools.values());
 	mapped.sort((left, right) => left.timestamp - right.timestamp || left.source_id.localeCompare(right.source_id));
-	return boundSnapshot(mapped);
+	return boundSnapshot(mapped, textBytes);
 }
 
-function entryContentBytes(entry: BridgeEntry): number {
-	if (entry.body.type === "text") return utf8Bytes(entry.body.text);
+function entryContentBytes(entry: BridgeEntry, textBytes: number): number {
+	if (entry.body.type === "text") return Math.min(utf8Bytes(entry.body.text), textBytes);
 	if (entry.body.type === "tool") {
 		return (
 			utf8Bytes(entry.body.tool.name) +
@@ -566,16 +710,19 @@ function entryContentBytes(entry: BridgeEntry): number {
 	return utf8Bytes(entry.body.reason_code);
 }
 
-function boundSnapshot(entries: BridgeEntry[]): BridgeEntry[] {
+/// The newest entries that fit the snapshot bound. `complete` is false when the oldest were left
+/// out, which the host must hear: it advertises `full` history only when it holds the
+/// conversation from its first message.
+function boundSnapshot(entries: BridgeEntry[], textBytes: number): { entries: BridgeEntry[]; complete: boolean } {
 	let total = 0;
 	const kept: BridgeEntry[] = [];
 	for (let index = entries.length - 1; index >= 0 && kept.length < MAX_SNAPSHOT_ENTRIES; index -= 1) {
-		const bytes = entryContentBytes(entries[index]);
+		const bytes = entryContentBytes(entries[index], textBytes);
 		if (total + bytes > MAX_SNAPSHOT_BYTES) break;
 		total += bytes;
 		kept.push(entries[index]);
 	}
-	return kept.reverse();
+	return { entries: kept.reverse(), complete: kept.length === entries.length };
 }
 
 function workspaceDisplay(cwd: string): string {
@@ -615,9 +762,9 @@ function decodeCommand(value: unknown): BridgeCommand | undefined {
 	return value as unknown as BridgeCommand;
 }
 
-export function encodeBridgeFrame(value: unknown): Buffer {
+export function encodeBridgeFrame(value: unknown, maximumBytes = MAX_FRAME_BYTES): Buffer {
 	const body = Buffer.from(JSON.stringify(value), "utf8");
-	if (body.length === 0 || body.length > MAX_FRAME_BYTES) throw new Error("bridge_frame_bound");
+	if (body.length === 0 || body.length > maximumBytes) throw new Error("bridge_frame_bound");
 	const frame = Buffer.allocUnsafe(body.length + 4);
 	frame.writeUInt32BE(body.length, 0);
 	body.copy(frame, 4);
@@ -653,6 +800,16 @@ export class CiaoAgentBridge {
 	private sessionIdentity?: string;
 	private stopped = true;
 	private registered = false;
+	/// The largest frame this connection's daemon granted. Until it grants more, the bound every
+	/// daemon reads.
+	private frameBytes = MAX_FRAME_BYTES;
+	/// Whether the next `register` asks for the larger bound. A daemon from before the grant
+	/// refuses an unknown register field and closes without a word, so a socket that connected,
+	/// asked, and never registered is followed by one that does not ask — and one that connected
+	/// without asking and failed is followed by one that does, so an upgraded daemon is noticed.
+	/// A socket that never connected says nothing about the daemon: a restart refuses every
+	/// attempt until it listens again, and reading those as refusals cost the grant for good.
+	private askForGrant = true;
 	private connectionSerial = 0;
 	private reconnectAttempt = 0;
 	private reconnectTimer?: NodeJS.Timeout;
@@ -819,6 +976,9 @@ export class CiaoAgentBridge {
 		const serial = ++this.connectionSerial;
 		const socket = net.createConnection({ path: this.socketPath });
 		this.socket = socket;
+		// Set only once a daemon is on the other end: whether this socket asked, and so whether
+		// its closing before `registered` can be a refusal of the ask.
+		let asked: boolean | undefined;
 		this.decoder = new FrameDecoder();
 		socket.unref();
 		socket.setTimeout(5_000, () => socket.destroy());
@@ -827,6 +987,8 @@ export class CiaoAgentBridge {
 			socket.setTimeout(0);
 			this.reconnectAttempt = 0;
 			this.registered = false;
+			this.frameBytes = MAX_FRAME_BYTES;
+			asked = this.askForGrant;
 			this.lastCapabilities = undefined;
 			this.enqueue({
 				v: BRIDGE_VERSION,
@@ -839,6 +1001,7 @@ export class CiaoAgentBridge {
 				process_id: process.pid,
 				workspace_display: workspaceDisplay(this.context?.cwd ?? ""),
 				commands: this.commands(),
+				...(asked ? { frame_bytes: MAX_BRIDGE_FRAME_BYTES } : {}),
 			});
 		});
 		socket.on("data", (chunk: Buffer) => {
@@ -854,6 +1017,7 @@ export class CiaoAgentBridge {
 		});
 		socket.once("close", () => {
 			if (serial !== this.connectionSerial) return;
+			if (!this.registered && asked !== undefined) this.askForGrant = !asked;
 			this.socket = undefined;
 			this.registered = false;
 			this.clearWrites();
@@ -879,15 +1043,28 @@ export class CiaoAgentBridge {
 			return;
 		}
 		if (value.type === "registered") {
+			const granted = "frame_bytes" in value;
 			if (
-				!strictKeys(value, ["v", "type", "session_id", "process_generation", "snapshot_epoch"]) ||
+				!strictKeys(value, [
+					"v",
+					"type",
+					"session_id",
+					"process_generation",
+					"snapshot_epoch",
+					...(granted ? ["frame_bytes"] : []),
+				]) ||
 				!validOpaqueID(value.session_id) ||
 				typeof value.process_generation !== "number" ||
-				typeof value.snapshot_epoch !== "number"
+				typeof value.snapshot_epoch !== "number" ||
+				(granted && (typeof value.frame_bytes !== "number" || !Number.isSafeInteger(value.frame_bytes)))
 			) {
 				this.socket?.destroy();
 				return;
 			}
+			this.frameBytes = granted
+				? Math.min(MAX_BRIDGE_FRAME_BYTES, Math.max(MAX_FRAME_BYTES, value.frame_bytes as number))
+				: MAX_FRAME_BYTES;
+			this.askForGrant = true;
 			this.registered = true;
 			this.sendSnapshot();
 			this.publishCapabilities();
@@ -913,18 +1090,24 @@ export class CiaoAgentBridge {
 		if (!this.registered || !this.context) return;
 		this.revisions.clear();
 		this.enqueue({ v: BRIDGE_VERSION, type: "snapshot_start" });
-		for (const entry of mapSessionBranch(this.context.sessionManager.getBranch())) {
-			const versioned = this.version(entry);
-			this.enqueue({ v: BRIDGE_VERSION, type: "snapshot_entry", entry: versioned });
+		const history = mapSessionHistory(this.context.sessionManager.getBranch(), textBytesFor(this.frameBytes));
+		for (const entry of history.entries) {
+			this.enqueue(fitEntryFrame("snapshot_entry", this.version(entry), this.frameBytes));
 		}
-		this.enqueue({ v: BRIDGE_VERSION, type: "snapshot_end" });
+		// Whether the host now holds the branch from its first message. Only a daemon that granted
+		// a larger frame reads the field; an older one's decoder refuses any key it does not know.
+		this.enqueue({
+			v: BRIDGE_VERSION,
+			type: "snapshot_end",
+			...(this.frameBytes > MAX_FRAME_BYTES ? { history_complete: history.complete } : {}),
+		});
 	}
 
 	private publishEntry(entry: BridgeEntry, coalesce: boolean): void {
 		if (!this.registered) return;
 		if (!coalesce) {
 			this.flushCoalesced(entry.source_id);
-			this.enqueue({ v: BRIDGE_VERSION, type: "upsert_entry", entry: this.version(entry) });
+			this.enqueue(fitEntryFrame("upsert_entry", this.version(entry), this.frameBytes));
 			return;
 		}
 		this.coalescedEntries.set(entry.source_id, entry);
@@ -944,7 +1127,7 @@ export class CiaoAgentBridge {
 		const entry = this.coalescedEntries.get(sourceId);
 		if (!entry || !this.registered) return;
 		this.coalescedEntries.delete(sourceId);
-		this.enqueue({ v: BRIDGE_VERSION, type: "upsert_entry", entry: this.version(entry) });
+		this.enqueue(fitEntryFrame("upsert_entry", this.version(entry), this.frameBytes));
 	}
 
 	private version(entry: BridgeEntry): BridgeEntry {
@@ -1118,7 +1301,7 @@ export class CiaoAgentBridge {
 		if (!socket || socket.destroyed) return;
 		let bytes: Buffer;
 		try {
-			bytes = encodeBridgeFrame(value);
+			bytes = encodeBridgeFrame(value, this.frameBytes);
 		} catch {
 			socket.destroy();
 			return;

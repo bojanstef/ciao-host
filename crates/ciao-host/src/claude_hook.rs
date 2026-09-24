@@ -26,16 +26,16 @@ use tokio::time::timeout;
 use crate::{
     agent_adapter::{AttachedHookRegister, WireTextDelta, WireTimelineEntry},
     agent_protocol::{
-        MAX_LIVE_TEXT_DELTA_BYTES, MAX_TIMELINE_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES,
-        MAX_TOOL_RESULT_PREVIEW_BYTES, TimelineBody, ToolTimelineBody, Truncation, TurnState,
-        classify_vendor_version, valid_opaque_id, valid_token,
+        MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
+        TimelineBody, ToolTimelineBody, TurnState, classify_vendor_version, valid_opaque_id,
+        valid_token,
     },
     claude_adapter::{CLAUDE_HOOK_PROTOCOL_VERSION, ClaudeHookEventFrame, PINNED_CLAUDE_VERSION},
     claude_integration::parse_claude_version_output,
     hook_common::{
         HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, keyed_digest, no_truncation,
-        object, read_bounded_stdin, required_bool, required_string, required_u64, trace_outcome,
-        unix_now, workspace_display,
+        object, preview_truncation, read_bounded_stdin, required_bool, required_string,
+        required_u64, trace_outcome, unix_now, workspace_display,
     },
     storage::{CiaoPaths, atomic_write_private, validate_private_file},
 };
@@ -343,7 +343,7 @@ const SYNTHETIC_PROMPT_ENVELOPES: [&str; 8] = [
 ///
 /// ponytail: prefix match. A person who pastes one of these verbatim loses one timeline row and
 /// nothing else — the prompt still reaches Claude untouched.
-fn is_synthetic_prompt(prompt: &str) -> bool {
+pub(crate) fn is_synthetic_prompt(prompt: &str) -> bool {
     let trimmed = prompt.trim_start();
     SYNTHETIC_PROMPT_ENVELOPES
         .iter()
@@ -421,7 +421,9 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                             run_id: run_id(prompt_id),
                             activity: "responding".into(),
                         });
-                        let (text, truncation) = bounded_text(prompt, MAX_TIMELINE_TEXT_BYTES);
+                        // The whole prompt: the daemon keeps it and sends the phone a head. A
+                        // daemon too old to take it gets it cut at delivery instead.
+                        let (text, truncation) = bounded_text(prompt, MAX_RETAINED_TEXT_BYTES);
                         ClaudeHookEventFrame::UpsertEntry {
                             v: CLAUDE_HOOK_PROTOCOL_VERSION,
                             entry: WireTimelineEntry {
@@ -441,7 +443,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                     let index = required_u64(object, "index")?;
                     let final_chunk = required_bool(object, "final")?;
                     let (delta, truncation) =
-                        bounded_text(required_string(object, "delta")?, MAX_LIVE_TEXT_DELTA_BYTES);
+                        bounded_text(required_string(object, "delta")?, MAX_RETAINED_TEXT_BYTES);
                     ClaudeHookEventFrame::AppendText {
                         v: CLAUDE_HOOK_PROTOCOL_VERSION,
                         delta: WireTextDelta {
@@ -539,7 +541,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
 /// `UserPromptSubmit` and the `Stop` that closes it carry the same one, so both edges of a turn
 /// name the same run without the host holding any correlation state. The vendor's ID never
 /// leaves this process.
-fn run_id(prompt_id: &str) -> String {
+pub(crate) fn run_id(prompt_id: &str) -> String {
     // `opaque_digest` already namespaces what it returns — prefixing it again here produced
     // `claude.turn.claude.turn.<digest>`, which the live walk printed into the daemon log.
     // Harmless, since a run ID is opaque and only ever compared for equality, and both edges
@@ -565,15 +567,10 @@ fn tool_event(
         bounded_preview(object.get("tool_input"), MAX_TOOL_INPUT_PREVIEW_BYTES);
     let (result_preview, result_clipped) =
         bounded_preview(object.get("tool_response"), MAX_TOOL_RESULT_PREVIEW_BYTES);
-    let truncation = if input_clipped || result_clipped {
-        Truncation {
-            truncated: true,
-            reason_code: Some("preview_bounded".into()),
-            original_bytes: None,
-        }
-    } else {
-        no_truncation()
-    };
+    let truncation = preview_truncation(
+        input_clipped || result_clipped,
+        &[object.get("tool_input"), object.get("tool_response")],
+    );
     Ok(ClaudeHookEventFrame::UpsertEntry {
         v: CLAUDE_HOOK_PROTOCOL_VERSION,
         entry: WireTimelineEntry {
@@ -599,7 +596,10 @@ fn tool_event(
     })
 }
 
-fn opaque_digest(namespace: &str, value: &str) -> String {
+/// The attached hook's source-ID spelling. `claude_history` digests transcript keys through it
+/// too, which is what lets a history row and a live hook row for one prompt or tool land on
+/// the same timeline entry.
+pub(crate) fn opaque_digest(namespace: &str, value: &str) -> String {
     format!(
         "claude.{namespace}.{}",
         keyed_digest(CLAUDE_DIGEST_DOMAIN, namespace, value)
@@ -614,7 +614,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::hook_common::GENEROUS_PREVIEW_STRING_BYTES;
+    use crate::{
+        agent_protocol::MAX_LIVE_TEXT_DELTA_BYTES, hook_common::GENEROUS_PREVIEW_STRING_BYTES,
+    };
 
     fn facts() -> HookRuntimeFacts {
         HookRuntimeFacts {
@@ -680,6 +682,38 @@ mod tests {
         assert_eq!(delta.source_revision, 1);
         assert!(delta.final_chunk);
         assert!(!delta.source_id.contains("fixture-message-id"));
+    }
+
+    /// A prompt or a display chunk longer than the phone's head is mapped whole: the daemon
+    /// keeps it, and `deliver` cuts it only for a daemon too old to take it.
+    #[test]
+    fn a_long_prompt_and_a_long_display_chunk_are_mapped_whole() {
+        let long = "Synthetic long prompt, caf\u{e9}. ".repeat(4_000);
+        assert!(long.len() > 2 * crate::agent_protocol::MAX_TIMELINE_TEXT_BYTES);
+        let mut user = common("UserPromptSubmit");
+        user["prompt_id"] = json!("fixture-prompt-id");
+        user["prompt"] = json!(long);
+        let ClaudeHookEventFrame::UpsertEntry { entry, .. } =
+            map_hook_input(&user, &facts()).unwrap().unwrap().event
+        else {
+            panic!("expected user entry");
+        };
+        assert_eq!(entry.body, TimelineBody::Text { text: long.clone() });
+        assert!(!entry.truncation.truncated);
+
+        let mut display = common("MessageDisplay");
+        display["message_id"] = json!("fixture-message-id");
+        display["index"] = json!(0);
+        display["final"] = json!(false);
+        display["delta"] = json!(long);
+        let ClaudeHookEventFrame::AppendText { delta, .. } =
+            map_hook_input(&display, &facts()).unwrap().unwrap().event
+        else {
+            panic!("expected display delta");
+        };
+        assert!(delta.delta.len() > MAX_LIVE_TEXT_DELTA_BYTES);
+        assert_eq!(delta.delta, long);
+        assert!(!delta.truncation.truncated);
     }
 
     /// A hook event name outside this build's vocabulary degrades to the same heartbeat it
@@ -791,9 +825,10 @@ mod tests {
         let mut event = common("PreToolUse");
         event["tool_name"] = json!("Write");
         event["tool_use_id"] = json!("fixture-tool-use-id");
+        // Over the 16 KiB input budget as a whole; one that fits is sent whole.
         event["tool_input"] = json!({
             "file_path": "/tmp/generated.swift",
-            "content": "x".repeat(GENEROUS_PREVIEW_STRING_BYTES * 4),
+            "content": "x".repeat(GENEROUS_PREVIEW_STRING_BYTES * 10),
         });
         let mapped = map_hook_input(&event, &facts()).unwrap().unwrap();
         let ClaudeHookEventFrame::UpsertEntry { entry, .. } = mapped.event else {

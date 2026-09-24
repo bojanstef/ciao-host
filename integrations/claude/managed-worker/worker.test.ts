@@ -207,7 +207,7 @@ async function startWorker(
 	models?: unknown[],
 	extraEnv?: Record<string, string>,
 	hold?: boolean,
-	bridge: { eofOnRegister?: boolean; runtime?: string } = {},
+	bridge: { eofOnRegister?: boolean; runtime?: string; grant?: number } = {},
 ): Promise<Harness> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-managed-worker-"));
 	const socketPath = path.join(root, "agent.sock");
@@ -227,6 +227,9 @@ async function startWorker(
 						session_id: SESSION_ID,
 						process_generation: 1,
 						snapshot_epoch: 1,
+						// A current daemon grants its bridge bound; without it this plays one from
+						// before the grant.
+						...(bridge.grant ? { frame_bytes: bridge.grant } : {}),
 					});
 					if (bridge.eofOnRegister) {
 						// Send the acknowledgement and EOF together, but never drain the snapshot.
@@ -453,14 +456,61 @@ test("JSON expansion cannot silently overflow or punch a hole in history frames"
 	await eventually(() => frames.some((frame) => frame.type === "snapshot_end"));
 
 	const registration = frames.find((frame) => frame.type === "register") as Record<string, any>;
-	expect(registration.history_complete).toBe(false);
-	const entries = frames
-		.filter((frame) => frame.type === "snapshot_entry")
-		.map((frame) => (frame as any).entry);
-	// The fallback is a contiguous newest tail, so the boundary stays truthful rather than
-	// pretending an omitted middle row was merely older than everything visible.
-	expect(entries.map((entry) => entry.source_id)).toEqual(["user-after-escaped-frame"]);
-	expect(entries[0].body.text).toBe("Newest safe entry.");
+	// Nothing is missing, so the history is complete: the escape-heavy row is cut to what its
+	// frame holds and says so, instead of taking every older row down with it.
+	expect(registration.history_complete).toBe(true);
+	const snapshot = frames.filter((frame) => frame.type === "snapshot_entry") as any[];
+	expect(snapshot.map((frame) => frame.entry.source_id)).toEqual([
+		"user-before-escaped-frame",
+		"user-escaped-frame",
+		"user-after-escaped-frame",
+	]);
+	const escaped = snapshot[1];
+	expect(Buffer.byteLength(JSON.stringify(escaped))).toBeLessThanOrEqual(64 * 1024);
+	expect(escaped.entry.body.text.length).toBeGreaterThan(0);
+	expect(escaped.entry.truncation).toEqual({
+		truncated: true,
+		reason_code: "adapter_bound",
+		original_bytes: 16 * 1024,
+	});
+	expect(snapshot[2].entry.body.text).toBe("Newest safe entry.");
+});
+
+/// Resumed history is mapped before `registered` says which daemon this is. A daemon that keeps
+/// whole messages gets them whole, exactly as it does live; one that granted nothing larger
+/// gets the head it validates, with the loss named.
+test("resumed history is whole for a granting daemon and a named head for one that is not", async () => {
+	const long = "h".repeat(100 * 1024);
+	const history = (): HistoryFixture => ({
+		sessionID: "11111111-2222-4333-8444-555555555555",
+		fileSize: 256 * 1024,
+		messages: [
+			{
+				type: "assistant",
+				uuid: "long-reply",
+				message: { role: "assistant", id: "msg-long", content: [{ type: "text", text: long }] },
+			},
+		],
+	});
+	const granting = await startWorker([], undefined, history(), undefined, undefined, false, {
+		grant: 2 * 1024 * 1024,
+	});
+	await eventually(() => granting.frames.some((frame) => frame.type === "snapshot_end"));
+	const whole = granting.frames.find((frame) => frame.type === "snapshot_entry") as any;
+	expect(whole.entry.body.text).toBe(long);
+	expect(whole.entry.truncation).toEqual({ truncated: false });
+
+	const older = await startWorker([], undefined, history());
+	await eventually(() => older.frames.some((frame) => frame.type === "snapshot_end"));
+	const head = older.frames.find((frame) => frame.type === "snapshot_entry") as any;
+	expect(head.entry.body.text).toBe(long.slice(0, 48 * 1024));
+	expect(head.entry.truncation).toEqual({
+		truncated: true,
+		reason_code: "adapter_bound",
+		original_bytes: 100 * 1024,
+	});
+	const registration = older.frames.find((frame) => frame.type === "register") as any;
+	expect(registration.history_complete).toBe(true);
 });
 
 test(
@@ -521,6 +571,83 @@ test("canonical history keeps its newest entries inside the independent byte bou
 	expect(encodedBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
 	expect(entries[0].source_id).not.toBe("user-byte-bound-user-0");
 	expect(entries.at(-1).source_id).toBe("user-byte-bound-user-259");
+});
+
+/// The host maps the same Claude transcript itself — for an attached session, and for a managed
+/// one whose transcript is past this worker's reader bound — and the two must draw one
+/// conversation identically. The shared fixture is the contract; the host's claude_history
+/// tests read the same file. The reader filter here is the pinned SDK's documented one for a
+/// linear chain: user and assistant records that are neither meta, sidechain nor team traffic,
+/// projected to its SessionMessage shape.
+/// The fixture writes long strings compactly; the host's harness expands them identically.
+function expandFixture(value: any): any {
+	if (Array.isArray(value)) return value.map(expandFixture);
+	if (value !== null && typeof value === "object") {
+		if (Array.isArray(value.$repeat)) return String(value.$repeat[0]).repeat(value.$repeat[1]);
+		if (Array.isArray(value.$concat)) return value.$concat.map(expandFixture).join("");
+		return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, expandFixture(field)]));
+	}
+	return value;
+}
+
+test("canonical history matches the shared Claude transcript fixture", async () => {
+	const fixture = expandFixture(
+		JSON.parse(
+			fs.readFileSync(
+				path.join(import.meta.dir, "../../../protocol/fixtures/phase5/claude-history-v1.json"),
+				"utf8",
+			),
+		),
+	);
+	const messages = fixture.records
+		.filter(
+			(record: any) =>
+				(record.type === "user" || record.type === "assistant") &&
+				typeof record.uuid === "string" &&
+				!record.isMeta &&
+				!record.isSidechain &&
+				!record.teamName,
+		)
+		.map((record: any) => ({
+			type: record.type,
+			uuid: record.uuid,
+			session_id: record.sessionId,
+			message: record.message,
+			parent_tool_use_id: null,
+			parent_agent_id: null,
+			timestamp: record.timestamp,
+		}));
+	// A granting daemon, so what arrives is the mapping itself rather than a head cut for an
+	// older one: the fixture pins the mapping.
+	const { frames } = await startWorker(
+		[],
+		undefined,
+		{
+			sessionID: "11111111-2222-4333-8444-555555555555",
+			fileSize: 256 * 1024,
+			createdAt: fixture.created_at_ms,
+			messages,
+		},
+		undefined,
+		undefined,
+		false,
+		{ grant: 2 * 1024 * 1024 },
+	);
+	await eventually(() => frames.some((frame) => frame.type === "snapshot_end"));
+
+	const registration = frames.find((frame) => frame.type === "register") as Record<string, any>;
+	expect(registration.history_complete).toBe(true);
+	const entries = frames
+		.filter((frame) => frame.type === "snapshot_entry")
+		.map((frame) => (frame as any).entry);
+	expect(entries).toEqual(
+		fixture.expected.map(({ managed_source, attached_source, ...entry }: any) => ({
+			source_id: managed_source,
+			...entry,
+		})),
+	);
+	expect(JSON.stringify(entries)).not.toContain("never forwarded");
+	expect(JSON.stringify(entries)).not.toContain("Omitted synthetic reasoning");
 });
 
 test("a message type outside the SDK's union is reported as drift, once, and skipped", async () => {
@@ -1441,12 +1568,107 @@ test("a finished message between the delta and timeline bounds arrives whole", a
 	]);
 	expect(finished[0].entry.body.text).toBe(midText);
 	expect(finished[0].entry.truncation).toEqual({ truncated: false });
-	// Past the host's own render bound the worker still truncates, and says so.
+	// A daemon from before the bridge grant validates nothing past the phone's head, so for it
+	// the worker still cuts — and names the cut in the host's own vocabulary, with the size.
 	expect(finished[1].entry.body.text.length).toBe(48 * 1024);
 	expect(finished[1].entry.truncation).toEqual({
 		truncated: true,
-		reason_code: "content_bound",
+		reason_code: "adapter_bound",
+		original_bytes: 50 * 1024,
 	});
+});
+
+test("a daemon that grants its bridge bound gets every finished message whole", async () => {
+	const overText = "o".repeat(300 * 1024);
+	const { frames } = await startWorker(
+		[
+			{ type: "user", isReplay: true, uuid: "u1", message: { content: "p".repeat(70 * 1024) } },
+			{
+				type: "assistant",
+				uuid: "a2",
+				message: { id: "m2", content: [{ type: "text", text: overText }] },
+			},
+			{ type: "result", subtype: "success" },
+		],
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		false,
+		{ grant: 2 * 1024 * 1024 },
+	);
+	await eventually(() =>
+		frames.some((frame) => frame.type === "turn" && frame.state === "completed"),
+	);
+	const entries = frames.filter((frame) => frame.type === "upsert_entry") as any[];
+	const user = entries.find((frame) => frame.entry.kind === "user_message");
+	expect(user.entry.body.text).toBe("p".repeat(70 * 1024));
+	const reply = entries.find((frame) => frame.entry.kind === "assistant_message");
+	expect(reply.entry.body.text).toBe(overText);
+	expect(reply.entry.truncation).toEqual({ truncated: false });
+});
+
+test("an escape-heavy reply is cut to what the frame holds instead of vanishing", async () => {
+	const hostile = "\u0001".repeat(40 * 1024);
+	const { frames } = await startWorker([
+		{ type: "user", isReplay: true, uuid: "u1", message: { content: "go" } },
+		{
+			type: "assistant",
+			uuid: "a1",
+			message: { id: "m1", content: [{ type: "text", text: hostile }] },
+		},
+		{ type: "result", subtype: "success" },
+	]);
+	await eventually(() =>
+		frames.some((frame) => frame.type === "turn" && frame.state === "completed"),
+	);
+	const reply = frames.find(
+		(frame) => frame.type === "upsert_entry" && (frame as any).entry.kind === "assistant_message",
+	) as any;
+	// It used to be dropped whole: its encoding outgrew the frame and writeFrame refused it.
+	expect(reply).toBeDefined();
+	expect(Buffer.byteLength(JSON.stringify(reply))).toBeLessThanOrEqual(64 * 1024);
+	expect(reply.entry.body.text.length * 6).toBeGreaterThan(64 * 1024 - 1024);
+	expect(reply.entry.truncation).toEqual({
+		truncated: true,
+		reason_code: "adapter_bound",
+		original_bytes: 40 * 1024,
+	});
+});
+
+test("a tool argument that fits its budget is whole, and a larger one still parses", async () => {
+	const content = "y".repeat(3 * 1024);
+	const huge = "z".repeat(40 * 1024);
+	const { frames } = await startWorker([
+		{ type: "user", isReplay: true, uuid: "u1", message: { content: "write" } },
+		{
+			type: "assistant",
+			uuid: "a1",
+			message: {
+				id: "m1",
+				content: [
+					{ type: "tool_use", id: "tool-fits", name: "Write", input: { file_path: "/tmp/a", content } },
+					{ type: "tool_use", id: "tool-big", name: "Write", input: { file_path: "/tmp/b", content: huge } },
+				],
+			},
+		},
+		{ type: "result", subtype: "success" },
+	]);
+	await eventually(() =>
+		frames.some((frame) => frame.type === "turn" && frame.state === "completed"),
+	);
+	const tools = frames.filter(
+		(frame) => frame.type === "upsert_entry" && (frame as any).entry.kind === "tool",
+	) as any[];
+	const fits = tools.find((frame) => frame.entry.source_id === "tool-tool-fits");
+	expect(JSON.parse(fits.entry.body.tool.input_preview).content).toBe(content);
+	expect(fits.entry.truncation).toEqual({ truncated: false });
+	const big = tools.find((frame) => frame.entry.source_id === "tool-tool-big");
+	const parsed = JSON.parse(big.entry.body.tool.input_preview);
+	expect(parsed.file_path).toBe("/tmp/b");
+	expect(Buffer.byteLength(parsed.content)).toBeLessThanOrEqual(2048);
+	expect(big.entry.truncation.reason_code).toBe("preview_bounded");
+	expect(big.entry.truncation.original_bytes).toBeGreaterThan(40 * 1024);
 });
 
 // Node is the production interpreter; Bun is the CI runner and the historical test interpreter.

@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 
 use crate::{
     agent_protocol::{
-        MAX_TIMELINE_ENTRIES_IN_SNAPSHOT, MAX_TIMELINE_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES,
-        MAX_TOOL_RESULT_PREVIEW_BYTES, TimelineBody, ToolTimelineBody,
+        MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
+        TimelineBody, ToolTimelineBody,
     },
     agent_session::{AgentSessionSupervisor, NormalizedTimelineEntry},
     codex_adapter::codex_run_id,
@@ -29,9 +29,24 @@ use crate::{
 };
 
 const CODEX_HISTORY_DOMAIN: &[u8] = b"ciao-codex-history-v1\0";
-/// Ceiling on how much of a long conversation is carried into the timeline. The newest items
-/// are kept, because those are what the person is reading when they pick up their phone.
-const MAX_HISTORY_ENTRIES: usize = MAX_TIMELINE_ENTRIES_IN_SNAPSHOT;
+/// Ceiling on how much of a long conversation is carried into the timeline: the host's own
+/// per-session bound, which the pager already serves from. It used to be one snapshot window
+/// (64), so a long conversation opened on its last few exchanges with nothing to page back to
+/// and nothing saying so. The newest items are kept, because those are what the person is
+/// reading when they pick up their phone.
+const MAX_HISTORY_ENTRIES: usize = 4096;
+
+/// A thread's history, newest part within the bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadHistory {
+    pub(crate) entries: Vec<NormalizedTimelineEntry>,
+    /// The response was a thread and every item fit: the conversation from its first turn
+    /// (less the turn the live tail owns). Anything less is advertised as a boundary.
+    pub(crate) complete: bool,
+    /// The source the live tail delivers the left-out turn's prompt under, when a turn was left
+    /// out. The read is only whole if the live tail holds that turn from its prompt.
+    pub(crate) live_turn_prompt: Option<String>,
+}
 
 /// Sessions already read, so a conversation is not re-read on every hook event.
 ///
@@ -61,8 +76,12 @@ fn claim(session_id: &str, process_generation: u64) -> bool {
 /// nobody's waiting.
 ///
 /// `live_run_id` names the turn the live tail already owns, and it is why this is triggered by
-/// the session's first turn rather than by its registration: without a turn to exclude there is
-/// no way to tell the conversation-so-far from the message the person just typed.
+/// the session's first turn event that names a run rather than by its registration: without a
+/// turn to exclude there is no way to tell the conversation-so-far from the message the person
+/// just typed. That is any such event, not only a turn starting — a daemon that restarts
+/// mid-turn first hears the `Stop` or the permission request, and waiting for the next prompt
+/// left that session without its history until someone typed. (A thread resumed in a TUI and
+/// only read registers with nothing at all: `sessionStart` fires on the first prompt.)
 pub(crate) fn spawn_history_read(
     sessions: AgentSessionSupervisor,
     adoptions: std::sync::Arc<crate::codex_adopted::AdoptionRegistry>,
@@ -87,17 +106,29 @@ pub(crate) fn spawn_history_read(
         // proven from a live process, persisted so an unheld thread is reachable after every
         // terminal has closed.
         adoptions.record_binary_evidence(binary.clone());
-        let entries = match read_thread(&binary, &thread_id, &live_run_id).await {
-            Ok(entries) if entries.is_empty() => return,
-            Ok(entries) => entries,
+        let history = match read_thread(&binary, &thread_id, &live_run_id).await {
+            Ok(history) => history,
             Err(error) => {
                 tracing::debug!(error = %error, "reading Codex thread history failed");
                 return;
             }
         };
-        let count = entries.len();
-        match sessions.prepend_bridge_history(&session_id, entries) {
-            Ok(()) => tracing::info!(session = %session_id, count, "Codex history reconciled"),
+        let count = history.entries.len();
+        let complete = complete_with_live_tail(&history, |source| {
+            sessions.holds_source(&session_id, source)
+        });
+        // An empty but complete read still says something: the conversation began with the
+        // turn the live tail is showing, which is what `full` coverage means.
+        match sessions.backfill_bridge_history(
+            &session_id,
+            Some(process_generation),
+            history.entries,
+            complete,
+            None,
+        ) {
+            Ok(()) => {
+                tracing::info!(session = %session_id, count, complete, "Codex history reconciled")
+            }
             Err(error) => tracing::debug!(error = %error, "prepending Codex history failed"),
         }
     });
@@ -134,7 +165,7 @@ pub(crate) async fn read_thread_once(
     thread_id: &str,
 ) -> Vec<NormalizedTimelineEntry> {
     match read_thread(binary, thread_id, "").await {
-        Ok(entries) => entries,
+        Ok(history) => history.entries,
         Err(error) => {
             tracing::debug!(error = %error, "reading Codex thread for the unheld open failed");
             Vec::new()
@@ -146,27 +177,46 @@ async fn read_thread(
     binary: &std::path::Path,
     thread_id: &str,
     live_run_id: &str,
-) -> anyhow::Result<Vec<NormalizedTimelineEntry>> {
+) -> anyhow::Result<ThreadHistory> {
     let result = codex_app_server::request(
         binary,
         "thread/read",
         json!({"threadId": thread_id, "includeTurns": true}),
     )
     .await?;
-    Ok(map_thread(&result, live_run_id))
+    Ok(map_thread_history(&result, live_run_id))
+}
+
+/// Whether a history read, together with the live tail, is the whole conversation. A session
+/// that registered mid-turn — its first event a `Stop`, a permission request or a tool hook —
+/// has the left-out turn only from that point, and its prompt not at all: the read is then not
+/// the whole conversation, however complete it was on its own.
+pub(crate) fn complete_with_live_tail(
+    history: &ThreadHistory,
+    holds_source: impl Fn(&str) -> bool,
+) -> bool {
+    history.complete && history.live_turn_prompt.as_deref().is_none_or(holds_source)
+}
+
+/// The entries of [`map_thread_history`], for the tests that assert on entries alone.
+#[cfg(test)]
+pub(crate) fn map_thread(result: &Value, live_run_id: &str) -> Vec<NormalizedTimelineEntry> {
+    map_thread_history(result, live_run_id).entries
 }
 
 /// Maps a `thread/read` response onto canonical entries. Everything the vocabulary does not
 /// cover becomes a visible `unsupported` card rather than a silent gap: a step the reader
 /// cannot see is worse than one that says it is not understood.
-pub(crate) fn map_thread(result: &Value, live_run_id: &str) -> Vec<NormalizedTimelineEntry> {
+pub(crate) fn map_thread_history(result: &Value, live_run_id: &str) -> ThreadHistory {
     let mut entries = Vec::new();
     let turns = result
         .get("thread")
         .and_then(|thread| thread.get("turns"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+        .and_then(Value::as_array);
+    // A response that is not a thread says nothing about where the conversation starts.
+    let mut complete = turns.is_some();
+    let mut live_turn_prompt = None;
+    let turns = turns.map(Vec::as_slice).unwrap_or_default();
     for turn in turns {
         let turn_id = turn.get("id").and_then(Value::as_str).unwrap_or_default();
         // The turn the live tail owns belongs to the live tail, not to history. Codex persists a
@@ -178,6 +228,7 @@ pub(crate) fn map_thread(result: &Value, live_run_id: &str) -> Vec<NormalizedTim
         // live turn state is per-process in exactly the way loaded-ness is. A status filter here
         // reads as a fix and never fires.
         if codex_run_id(turn_id) == live_run_id {
+            live_turn_prompt = Some(crate::codex_hook::prompt_source_id(turn_id));
             continue;
         }
         let timestamp = turn
@@ -199,8 +250,13 @@ pub(crate) fn map_thread(result: &Value, live_run_id: &str) -> Vec<NormalizedTim
     // The newest end of a long conversation is the part being read.
     if entries.len() > MAX_HISTORY_ENTRIES {
         entries.drain(..entries.len() - MAX_HISTORY_ENTRIES);
+        complete = false;
     }
-    entries
+    ThreadHistory {
+        entries,
+        complete,
+        live_turn_prompt,
+    }
 }
 
 /// Grounded thread-item types this adapter deliberately renders as a categorical
@@ -253,12 +309,12 @@ fn map_item(
             ("tool", TimelineBody::Tool { tool }, truncation)
         }
         "userMessage" => {
-            let (text, truncation) = bounded_text(&content_text(item), MAX_TIMELINE_TEXT_BYTES);
+            let (text, truncation) = bounded_text(&content_text(item), MAX_RETAINED_TEXT_BYTES);
             ("user_message", TimelineBody::Text { text }, truncation)
         }
         "agentMessage" => {
             let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
-            let (text, truncation) = bounded_text(text, MAX_TIMELINE_TEXT_BYTES);
+            let (text, truncation) = bounded_text(text, MAX_RETAINED_TEXT_BYTES);
             ("assistant_message", TimelineBody::Text { text }, truncation)
         }
         "commandExecution"
@@ -279,15 +335,7 @@ fn map_item(
                         result_preview: None,
                     },
                 },
-                if clipped {
-                    crate::agent_protocol::Truncation {
-                        truncated: true,
-                        reason_code: Some("preview_bounded".into()),
-                        original_bytes: None,
-                    }
-                } else {
-                    no_truncation()
-                },
+                crate::hook_common::preview_truncation(clipped, &[Some(item)]),
             )
         }
         // Reasoning, plans, review-mode markers, compaction, and anything Codex adds after this
@@ -335,11 +383,19 @@ pub(crate) fn function_output(
         crate::drift::note("codex", "function_call_output", kind, name, None);
     };
     let mut clipped = false;
-    let (preview, bounded) = match item.get("output") {
+    // What a cut preview names as its original size: the encoded document it stands for — the
+    // output string, or every text block the preview selects from.
+    let (preview, bounded, original_bytes) = match item.get("output") {
         Some(value @ Value::String(_)) => {
-            bounded_preview(Some(value), MAX_TOOL_RESULT_PREVIEW_BYTES)
+            let (preview, bounded) = bounded_preview(Some(value), MAX_TOOL_RESULT_PREVIEW_BYTES);
+            (
+                preview,
+                bounded,
+                crate::agent_protocol::encoded_frame_len(value),
+            )
         }
         Some(Value::Array(blocks)) => {
+            let mut texts: Vec<&str> = Vec::new();
             let mut selected = Vec::new();
             let mut found = false;
             let mut omitted = false;
@@ -352,6 +408,7 @@ pub(crate) fn function_output(
                             continue;
                         };
                         found = true;
+                        texts.push(text);
                         if omitted {
                             continue;
                         }
@@ -384,11 +441,13 @@ pub(crate) fn function_output(
             if !found {
                 return None;
             }
-            if omitted {
+            let original_bytes = crate::agent_protocol::encoded_frame_len(&texts);
+            let (preview, bounded) = if omitted {
                 (None, true)
             } else {
                 bounded_preview(Some(&Value::Array(selected)), MAX_TOOL_RESULT_PREVIEW_BYTES)
-            }
+            };
+            (preview, bounded, original_bytes)
         }
         _ => {
             note("malformed_field", "output");
@@ -399,6 +458,7 @@ pub(crate) fn function_output(
     if complete && (clipped || bounded) {
         truncation.truncated = true;
         truncation.reason_code = Some("preview_bounded".into());
+        truncation.original_bytes = Some(original_bytes as u64);
     }
     Some((
         ToolTimelineBody {
@@ -479,9 +539,24 @@ pub(crate) mod tests {
                 .unwrap()
                 .ends_with("095")
         );
-        for text in [format!("{}é", "a".repeat(2047)), "\"\\\n".repeat(2000)] {
+        // Over the result budget as a whole, so the string cap engages: once on a character
+        // boundary (the cap lands inside the é) and once through escape-heavy text.
+        for text in [
+            format!(
+                "{}é{}",
+                "a".repeat(2047),
+                "b".repeat(MAX_TOOL_RESULT_PREVIEW_BYTES)
+            ),
+            "\"\\\n".repeat(12_000),
+        ] {
             let (tool, truncation) = function_output(&json!({"output":text}), true).unwrap();
             assert!(truncation.truncated);
+            // A cut names how large the output was, as every other tool preview does: the
+            // encoded document the preview stands for.
+            assert_eq!(
+                truncation.original_bytes,
+                Some(serde_json::to_string(&text).unwrap().len() as u64)
+            );
             let preview = tool.result_preview.unwrap();
             assert!(preview.len() <= MAX_TOOL_RESULT_PREVIEW_BYTES);
             serde_json::from_str::<Value>(&preview).unwrap();
@@ -491,6 +566,13 @@ pub(crate) mod tests {
         let (tool, truncation) = function_output(&json!({"output":blocks}), true).unwrap();
         assert!(tool.result_preview.is_none());
         assert_eq!(truncation.reason_code.as_deref(), Some("preview_bounded"));
+        // For blocks, the document is the text the preview selects from — the thousand text
+        // blocks — not the vendor's envelope around them.
+        let texts = vec!["a".repeat(240); 1000];
+        assert_eq!(
+            truncation.original_bytes,
+            Some(serde_json::to_string(&texts).unwrap().len() as u64)
+        );
         let ledger = crate::drift::snapshot();
         assert!(
             ledger.vendors["codex"]
@@ -666,6 +748,56 @@ pub(crate) mod tests {
         assert!(tool.input_preview.as_ref().unwrap().contains("echo hello"));
     }
 
+    /// A thread longer than one snapshot window used to be cut to that window (64 items) before
+    /// it ever reached the host, whose pager then had nothing older to serve and nothing said
+    /// the rest existed. Everything within the host's own bound is carried now.
+    #[test]
+    fn a_conversation_past_one_window_is_carried_whole_within_the_host_bound() {
+        let mut response = grounded_response();
+        let items: Vec<Value> = (0..200)
+            .map(|index| json!({"type": "agentMessage", "id": format!("item-{index}"), "text": format!("message {index}")}))
+            .collect();
+        response["thread"]["turns"][0]["items"] = json!(items);
+        let history = map_thread_history(&response, "codex.turn.none");
+        assert_eq!(history.entries.len(), 200);
+        assert!(history.complete);
+        assert!(map_thread_history(&grounded_response(), "codex.turn.none").complete);
+        // A response that is not a thread says nothing about where the conversation starts.
+        assert!(!map_thread_history(&json!({"thread": {}}), "codex.turn.none").complete);
+    }
+
+    /// Review #7. The read leaves out the turn the live tail owns, so it is only the whole
+    /// conversation if the live tail really does hold that turn from its prompt. A session that
+    /// registered mid-turn — its first event a `Stop`, a permission request or a tool hook — has
+    /// neither, and claimed `full` over the hole.
+    #[test]
+    fn a_read_that_leaves_out_a_turn_the_live_tail_never_saw_is_not_whole() {
+        let turn = "019fbfb4-c1db-7242-9196-c260f02c9c9b";
+        let mut response = grounded_response();
+        let mut earlier = response["thread"]["turns"][0].clone();
+        earlier["id"] = json!("019fbfb4-earlier-turn");
+        response["thread"]["turns"] = json!([earlier, response["thread"]["turns"][0].clone()]);
+        let history = map_thread_history(&response, &codex_run_id(turn));
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "precondition: the live turn was left out"
+        );
+        assert!(
+            history.complete,
+            "precondition: every item that was read fits"
+        );
+        let prompt = crate::codex_hook::prompt_source_id(turn);
+        assert!(
+            !complete_with_live_tail(&history, |_| false),
+            "the live tail never saw the excluded turn's prompt"
+        );
+        assert!(complete_with_live_tail(&history, |source| source == prompt));
+        // No turn left out: nothing for the live tail to owe.
+        let history = map_thread_history(&response, "codex.turn.none");
+        assert!(complete_with_live_tail(&history, |_| false));
+    }
+
     #[test]
     fn a_long_conversation_keeps_its_newest_end() {
         let mut response = grounded_response();
@@ -673,7 +805,12 @@ pub(crate) mod tests {
             .map(|index| json!({"type": "agentMessage", "id": format!("item-{index}"), "text": format!("message {index}")}))
             .collect();
         response["thread"]["turns"][0]["items"] = json!(items);
-        let entries = map_thread(&response, "codex.turn.none");
+        let history = map_thread_history(&response, "codex.turn.none");
+        assert!(
+            !history.complete,
+            "a cut conversation never claims its start"
+        );
+        let entries = history.entries;
         assert_eq!(entries.len(), MAX_HISTORY_ENTRIES);
         assert_eq!(
             entries.last().unwrap().body,

@@ -22,5 +22,8 @@
   "model_catalogue_entries": 16,
   "model_id_bytes": 64,
   "model_display_name_bytes": 48,
-  "effort_levels_per_model": 8
+  "effort_levels_per_model": 8,
+  "timeline_text_bytes": 49152,
+  "retained_text_bytes": 1048576,
+  "entry_body_chunk_bytes": 32768
 }

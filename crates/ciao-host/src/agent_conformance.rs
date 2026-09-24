@@ -66,7 +66,7 @@ fn kind_of(event: &NormalizedAdapterEvent) -> Option<EventKind> {
     Some(match event {
         NormalizedAdapterEvent::SnapshotStart => EventKind::SnapshotStart,
         NormalizedAdapterEvent::SnapshotEntry(_) => EventKind::SnapshotEntry,
-        NormalizedAdapterEvent::SnapshotEnd => EventKind::SnapshotEnd,
+        NormalizedAdapterEvent::SnapshotEnd { .. } => EventKind::SnapshotEnd,
         NormalizedAdapterEvent::UpsertEntry(_) => EventKind::UpsertEntry,
         NormalizedAdapterEvent::AppendText(_) => EventKind::AppendText,
         NormalizedAdapterEvent::Heartbeat => EventKind::Heartbeat,

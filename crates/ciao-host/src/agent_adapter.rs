@@ -11,8 +11,8 @@ use serde_json::Value;
 use crate::{
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentProtocolError, CommandCapabilities,
-        InteractionCapabilities, Observation, PendingInteraction, TimelineBody, Truncation,
-        TurnState, classify_vendor_version, valid_opaque_id, valid_token,
+        InteractionCapabilities, MAX_BRIDGE_FRAME_BYTES, Observation, PendingInteraction,
+        TimelineBody, Truncation, TurnState, classify_vendor_version, valid_opaque_id, valid_token,
     },
     agent_session::{
         NormalizedRegistration, NormalizedTextDelta, NormalizedTimelineEntry,
@@ -34,7 +34,12 @@ pub(crate) enum NormalizedAdapterEvent {
     Registration,
     SnapshotStart,
     SnapshotEntry(NormalizedTimelineEntry),
-    SnapshotEnd,
+    /// `history_complete` is the adapter's word on whether the snapshot holds the conversation
+    /// from its first message, when it has one to give; `None` leaves the session's coverage as
+    /// its registration set it.
+    SnapshotEnd {
+        history_complete: Option<bool>,
+    },
     UpsertEntry(NormalizedTimelineEntry),
     AppendText(NormalizedTextDelta),
     Heartbeat,
@@ -116,6 +121,16 @@ pub(crate) trait AttachedAgentAdapter: Send + Sync {
         &self,
         session: &RegisteredAgentSession,
     ) -> Result<Value, AgentProtocolError>;
+
+    /// The frame bound this dialect's peer is told in `registered` as `frame_bytes`, or `None`
+    /// when it cannot be told. The bridge reads every dialect up to [`MAX_BRIDGE_FRAME_BYTES`];
+    /// the only question is whether the peer tolerates hearing so. The hooks and the managed
+    /// worker read `registered` leniently, so they always hear it. A Pi extension built before
+    /// the grant refuses any key it does not know, so only a Pi that asked in its own
+    /// `register` is answered.
+    fn frame_grant(&self, _register: &[u8]) -> Option<usize> {
+        Some(MAX_BRIDGE_FRAME_BYTES)
+    }
 
     fn command_frame(&self, command: AgentCommand) -> Result<Value, AgentProtocolError>;
 
@@ -504,7 +519,7 @@ impl AttachedHookOutbound {
 /// Splits one adapter frame into its dispatch token and body. The `type` field is the only
 /// thing a dialect needs before choosing an arm.
 pub(crate) fn frame_type(body: &[u8]) -> Result<(String, Value), AgentProtocolError> {
-    let value: Value = crate::agent_protocol::decode_agent_body(body)?;
+    let value: Value = crate::agent_protocol::decode_bridge_body(body)?;
     let message_type = value
         .as_object()
         .and_then(|object| object.get("type"))

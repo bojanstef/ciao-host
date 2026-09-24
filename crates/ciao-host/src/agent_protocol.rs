@@ -19,6 +19,13 @@ pub const CAPABILITY_AGENT_SESSION_MANAGED_V1: &str = "agent.session.managed.v1"
 pub const CAPABILITY_AGENT_SESSION_ADOPTED_V1: &str = "agent.session.adopted.v1";
 pub const CAPABILITY_TERMINAL_AGENT_ROUTE: &str = "terminal.agent_route.v1";
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024;
+/// The local agent bridge's frame bound — the same-user Unix socket adapters register on, never
+/// the phone's stream. It is split from [`MAX_AGENT_FRAME_BYTES`] so an adapter can hand over a
+/// whole retained body ([`MAX_RETAINED_TEXT_BYTES`]) in one entry, with room for JSON escaping.
+/// The daemon reads every bridge frame up to it, but an adapter may send more than 64 KiB only
+/// after its `registered` frame announces `frame_bytes`: an older daemon refuses anything
+/// larger and says nothing, so an adapter that was not told keeps to the old bound.
+pub const MAX_BRIDGE_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_AGENT_LIST_BYTES: usize = 256 * 1024;
 pub const MAX_AGENT_SESSIONS: usize = 64;
 pub const MAX_TIMELINE_PAGE_ENTRIES: usize = 64;
@@ -179,7 +186,25 @@ pub(crate) fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some((major, minor, patch))
 }
 pub const MAX_INTERACTION_TEXT_BYTES: usize = 32 * 1024;
+/// The **wire head** of a text entry (Spec 005 §12, amended 2026-09-23). It exists so one entry
+/// fits one [`MAX_AGENT_FRAME_BYTES`] frame, and it is no longer how much of a message Ciao
+/// keeps: a host holding more than this sends the head with [`TRUNCATION_BODY_AVAILABLE`] and
+/// serves the rest through `agent.timeline.entry`.
 pub const MAX_TIMELINE_TEXT_BYTES: usize = 48 * 1024;
+/// The most text the host keeps, and will serve, for one timeline entry. Beyond it the host
+/// really does cut, and says so with an ordinary truncation reason. A megabyte is past any
+/// message a person reads on a phone and small enough that the per-session 4 MiB host history
+/// bound still holds several of them.
+pub const MAX_RETAINED_TEXT_BYTES: usize = 1024 * 1024;
+/// Decoded bytes one `timeline_entry_chunk` may carry. The host also sizes each chunk so its
+/// *encoded* frame fits [`MAX_AGENT_FRAME_BYTES`]: an escape-heavy body travels in smaller
+/// chunks, never in a bigger frame.
+pub const MAX_ENTRY_BODY_CHUNK_BYTES: usize = 32 * 1024;
+/// A truncation reason that is not a loss: the wire carries a head of at most
+/// [`MAX_TIMELINE_TEXT_BYTES`], `original_bytes` names the size of the whole body, and the host
+/// serves that body on request. An app that predates it sees an unknown reason and a bounded
+/// head — exactly what it showed before — so it needs no capability bit: the entry advertises it.
+pub const TRUNCATION_BODY_AVAILABLE: &str = "body_available";
 pub const MAX_TIMELINE_ENTRIES_IN_SNAPSHOT: usize = 64;
 pub const MAX_WORKSPACE_LIST_ENTRIES: usize = 64;
 pub const MAX_WORKSPACE_LIST_BYTES: usize = 64 * 1024;
@@ -837,9 +862,16 @@ pub enum TimelineBody {
 }
 
 impl TimelineBody {
+    /// The phone's bound: a text body on the wire is at most the head.
     pub fn validate(&self) -> Result<(), AgentProtocolError> {
+        self.validate_within(MAX_TIMELINE_TEXT_BYTES)
+    }
+
+    /// The same checks with a caller-named text bound — [`MAX_RETAINED_TEXT_BYTES`] for what an
+    /// adapter hands the host, which keeps the whole body and cuts only the wire copy.
+    pub fn validate_within(&self, text_bytes: usize) -> Result<(), AgentProtocolError> {
         match self {
-            Self::Text { text } if text.len() <= MAX_TIMELINE_TEXT_BYTES => Ok(()),
+            Self::Text { text } if text.len() <= text_bytes => Ok(()),
             Self::Text { .. } => Err(AgentProtocolError::InvalidValue),
             Self::Tool { tool } => tool.validate(),
             Self::Unsupported { reason_code } => valid_token(reason_code),
@@ -907,6 +939,21 @@ impl TimelineEntry {
         valid_token(&self.kind)?;
         self.body.validate()?;
         self.truncation.validate()?;
+        // `body_available` is a promise the host must be able to keep: a text head strictly
+        // shorter than the body it names, and a body no larger than the host retains.
+        if self.truncation.reason_code.as_deref() == Some(TRUNCATION_BODY_AVAILABLE) {
+            let TimelineBody::Text { text } = &self.body else {
+                return Err(AgentProtocolError::InvalidValue);
+            };
+            let whole = self
+                .truncation
+                .original_bytes
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or(AgentProtocolError::InvalidValue)?;
+            if whole <= text.len() || whole > MAX_RETAINED_TEXT_BYTES {
+                return Err(AgentProtocolError::InvalidValue);
+            }
+        }
         Ok(())
     }
 
@@ -1853,6 +1900,10 @@ pub struct AgentStreamOpen {
     pub lifecycle_command_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_generation: Option<u64>,
+    /// `agent.timeline.entry` only: which entry's retained body to send. Absent from every
+    /// other operation, and so from every open an older app writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
 }
 
 impl AgentStreamOpen {
@@ -1875,7 +1926,8 @@ impl AgentStreamOpen {
             valid_token(capability)?;
         }
         // (session_id, before_sequence, page_limit, workspace_id, lifecycle_command_id,
-        //  expected_generation) — exactly the parameters each operation requires, nothing else.
+        //  expected_generation, entry_id) — exactly the parameters each operation requires,
+        //  nothing else.
         let shape = (
             self.session_id.is_some(),
             self.before_sequence.is_some(),
@@ -1883,22 +1935,28 @@ impl AgentStreamOpen {
             self.workspace_id.is_some(),
             self.lifecycle_command_id.is_some(),
             self.expected_generation.is_some(),
+            self.entry_id.is_some(),
         );
         let valid_shape = match self.operation.as_str() {
             "agent.sessions.list" | "agent.workspaces.list" => {
-                shape == (false, false, false, false, false, false)
+                shape == (false, false, false, false, false, false, false)
             }
             "agent.session.snapshot" | "agent.session.subscribe" | "agent.command.submit" => {
-                shape == (true, false, false, false, false, false)
+                shape == (true, false, false, false, false, false, false)
             }
             "agent.timeline.page" => {
-                shape == (true, true, true, false, false, false)
+                shape == (true, true, true, false, false, false, false)
                     && !self.page_limit.is_none_or(|limit| {
                         limit == 0 || usize::from(limit) > MAX_TIMELINE_PAGE_ENTRIES
                     })
             }
-            "agent.managed.start" => shape == (false, false, false, true, true, false),
-            "agent.managed.stop" => shape == (true, false, false, false, true, true),
+            // Which session and which entry, nothing else. The staleness guards — epoch,
+            // generation, entry revision — ride the `timeline_entry_start` answer, exactly as
+            // the page's ride `timeline_page_start`: the host serves what it holds now and the
+            // phone decides whether that still matches what it is showing.
+            "agent.timeline.entry" => shape == (true, false, false, false, false, false, true),
+            "agent.managed.start" => shape == (false, false, false, true, true, false, false),
+            "agent.managed.stop" => shape == (true, false, false, false, true, true, false),
             // Promote takes the same parameters as resume: which session, and the command to
             // correlate it by. Omitting it here rejected every takeover from a phone as a
             // malformed handshake, while the CLI's IPC route — which never sees this — worked.
@@ -1912,10 +1970,10 @@ impl AgentStreamOpen {
             "agent.managed.resume"
             | "agent.managed.promote"
             | "agent.managed.release"
-            | "agent.managed.forget" => shape == (true, false, false, false, true, false),
+            | "agent.managed.forget" => shape == (true, false, false, false, true, false, false),
             // Pick-up takes promote's parameters for promote's reason: which conversation,
             // and the command to correlate the outcome by (Spec 013 §7).
-            "agent.adopted.pickup" => shape == (true, false, false, false, true, false),
+            "agent.adopted.pickup" => shape == (true, false, false, false, true, false, false),
             _ => return Err(AgentProtocolError::UnexpectedMessage),
         };
         if !valid_shape {
@@ -1945,6 +2003,9 @@ impl AgentStreamOpen {
         }
         if let Some(command_id) = &self.lifecycle_command_id {
             valid_opaque_id(command_id)?;
+        }
+        if let Some(entry_id) = &self.entry_id {
+            valid_opaque_id(entry_id)?;
         }
         if self.expected_generation == Some(0) {
             return Err(AgentProtocolError::InvalidValue);
@@ -2242,6 +2303,37 @@ pub enum AgentServerFrame {
         v: u8,
         page_id: String,
     },
+    /// The answer to `agent.timeline.entry`: the whole retained body of one text entry, as a
+    /// start, contiguous UTF-8 chunks, and an end. The identity fields are the guards — the
+    /// phone applies the body only while its snapshot still has this epoch and generation and
+    /// its copy of the entry is at or below `entry_revision`.
+    TimelineEntryStart {
+        v: u8,
+        session_id: String,
+        snapshot_epoch: u64,
+        process_generation: u64,
+        entry_id: String,
+        entry_revision: u64,
+        /// UTF-8 bytes of the whole body; the chunks sum to exactly this.
+        total_bytes: u32,
+        /// What the retained body itself lost, which is the entry's truncation once the body
+        /// replaces the head. Never `body_available`: that reason names this very answer.
+        truncation: Truncation,
+    },
+    TimelineEntryChunk {
+        v: u8,
+        entry_id: String,
+        /// UTF-8 byte offset of `text` within the body — the running sum of every earlier
+        /// chunk's UTF-8 length, never a character or UTF-16 count.
+        offset: u32,
+        /// At most [`MAX_ENTRY_BODY_CHUNK_BYTES`], and never empty. A JSON string cannot split a
+        /// character, so every chunk is whole characters by construction.
+        text: String,
+    },
+    TimelineEntryEnd {
+        v: u8,
+        entry_id: String,
+    },
     SessionDelta {
         v: u8,
         delta: AgentSessionDelta,
@@ -2284,12 +2376,298 @@ pub enum AgentServerFrame {
     Unknown,
 }
 
+/// The encoded size of one frame body — the number [`MAX_AGENT_FRAME_BYTES`] bounds — without
+/// keeping the encoding.
+pub fn encoded_frame_len<T: Serialize>(value: &T) -> usize {
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_or(usize::MAX, |()| count.0)
+}
+
+/// The wire form of a host-held timeline entry inside one particular frame.
+///
+/// The host keeps up to [`MAX_RETAINED_TEXT_BYTES`] of a text entry and the wire carries a
+/// head: at most [`MAX_TIMELINE_TEXT_BYTES`], cut further on a character boundary until the
+/// *encoded* frame, as `frame_len` measures it, fits [`MAX_AGENT_FRAME_BYTES`]. A control
+/// character encodes to six bytes, so a 48 KiB head of them is ~290 KiB on the wire; before this
+/// measured the frame, an entry like that failed `write_agent_frame` and ended the subscription
+/// carrying it. A cut head says `body_available`, because the host still holds all of it.
+///
+/// A tool entry has no body to fetch, so its previews give way instead — the result first,
+/// then the input — under `preview_bounded`. Anything else is returned as it stands: nothing in
+/// it can shrink, and its envelope is the caller's to fit.
+///
+/// This is the one place a wire entry is sized; every frame that carries an entry — the live
+/// delta, the snapshot, a page — goes through it.
+pub fn fit_entry_to_frame(
+    entry: &TimelineEntry,
+    mut frame_len: impl FnMut(&TimelineEntry) -> usize,
+) -> TimelineEntry {
+    // What the head stands for: the retained body. An entry that is already a head — a
+    // snapshot refitting its newest entry against its own envelope — keeps naming the body it
+    // was cut from, not itself.
+    let whole = match &entry.body {
+        TimelineBody::Text { text }
+            if entry.truncation.reason_code.as_deref() == Some(TRUNCATION_BODY_AVAILABLE) =>
+        {
+            entry
+                .truncation
+                .original_bytes
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .unwrap_or(text.len())
+        }
+        TimelineBody::Text { text } => text.len(),
+        _ => 0,
+    };
+    // Copy only the head of a long body: this runs for every large window entry on every live
+    // append, and a retained body can be a megabyte.
+    let mut wire = match &entry.body {
+        TimelineBody::Text { text } if text.len() > MAX_TIMELINE_TEXT_BYTES => TimelineEntry {
+            entry_id: entry.entry_id.clone(),
+            entry_revision: entry.entry_revision,
+            sequence: entry.sequence,
+            timestamp: entry.timestamp,
+            state: entry.state.clone(),
+            kind: entry.kind.clone(),
+            body: TimelineBody::Text {
+                text: text[..text.floor_char_boundary(MAX_TIMELINE_TEXT_BYTES)].to_owned(),
+            },
+            truncation: entry.truncation.clone(),
+        },
+        _ => entry.clone(),
+    };
+    if whole > MAX_TIMELINE_TEXT_BYTES {
+        cut_to_head(&mut wire, whole, MAX_TIMELINE_TEXT_BYTES);
+    }
+    loop {
+        let size = frame_len(&wire);
+        if size <= MAX_AGENT_FRAME_BYTES {
+            return wire;
+        }
+        match &mut wire.body {
+            TimelineBody::Text { text } if !text.is_empty() => {
+                // Everything but the text is fixed while the text shrinks, so the budget the
+                // text may encode into is exact: keep the longest prefix that encodes within
+                // it. The first cut can add a truncation, so the loop measures once more.
+                let envelope = size.saturating_sub(json_string_len(text));
+                let keep = json_prefix_within(text, MAX_AGENT_FRAME_BYTES.saturating_sub(envelope));
+                cut_to_head(&mut wire, whole, keep);
+            }
+            TimelineBody::Tool { tool }
+                if tool.result_preview.is_some() || tool.input_preview.is_some() =>
+            {
+                if tool.result_preview.take().is_none() {
+                    tool.input_preview = None;
+                }
+                if !wire.truncation.truncated {
+                    wire.truncation = Truncation {
+                        truncated: true,
+                        reason_code: Some("preview_bounded".into()),
+                        original_bytes: None,
+                    };
+                }
+            }
+            _ => return wire,
+        }
+    }
+}
+
+/// How many bytes `text` occupies inside a serde_json string: two for the short escapes, six
+/// for any other control character, and the UTF-8 bytes themselves for everything else — the
+/// arithmetic that makes a 48 KiB head of control characters a ~290 KiB frame.
+fn json_escaped_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        character if (character as u32) < 0x20 => 6,
+        character => character.len_utf8(),
+    }
+}
+
+fn json_string_len(text: &str) -> usize {
+    text.chars().map(json_escaped_len).sum()
+}
+
+/// The longest prefix of `text`, in bytes and on a character boundary, whose JSON encoding
+/// fits `budget` bytes.
+fn json_prefix_within(text: &str, budget: usize) -> usize {
+    let mut encoded = 0;
+    for (index, character) in text.char_indices() {
+        encoded += json_escaped_len(character);
+        if encoded > budget {
+            return index;
+        }
+    }
+    text.len()
+}
+
+fn cut_to_head(wire: &mut TimelineEntry, whole: usize, limit: usize) {
+    let TimelineBody::Text { text } = &mut wire.body else {
+        return;
+    };
+    let mut boundary = limit.min(text.len());
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    wire.truncation = Truncation {
+        truncated: true,
+        reason_code: Some(TRUNCATION_BODY_AVAILABLE.into()),
+        original_bytes: Some(whole as u64),
+    };
+}
+
+/// [`fit_entry_to_frame`] for an entry that must be able to travel on its own: the largest
+/// single-entry envelope there is, a live delta with maximal identifiers, stands in for the
+/// real one. Snapshots and pages size their entries with this, so any entry they hold is one a
+/// page could still carry alone.
+pub fn fit_entry_alone(entry: &TimelineEntry) -> TimelineEntry {
+    // No byte of text encodes to more than six, and the envelope plus every non-text field is
+    // well under the slack — so a small entry fits without being measured. This runs for every
+    // window entry on every live append; measuring only the few that could overflow keeps it
+    // cheap.
+    const ENVELOPE_SLACK: usize = 4 * 1024;
+    if entry.decoded_bytes().saturating_mul(6) + ENVELOPE_SLACK <= MAX_AGENT_FRAME_BYTES {
+        return entry.clone();
+    }
+    fit_entry_to_frame(entry, |candidate| {
+        encoded_frame_len(&AgentServerFrame::SessionDelta {
+            v: AGENT_PROTOCOL_VERSION,
+            delta: AgentSessionDelta {
+                v: AGENT_PROTOCOL_VERSION,
+                session_id: "s".repeat(MAX_OPAQUE_ID_BYTES),
+                snapshot_epoch: u64::MAX,
+                process_generation: u64::MAX,
+                base_revision: u64::MAX,
+                revision: u64::MAX,
+                changes: vec![AgentDeltaChange::UpsertEntry {
+                    entry: candidate.clone(),
+                }],
+            },
+        })
+    })
+}
+
+/// A snapshot that encodes within [`MAX_AGENT_FRAME_BYTES`]: every entry at its wire size, then
+/// the oldest dropped — and said to be, through `has_older` — until the frame fits. The newest
+/// entry is never dropped for size alone: if it is the last one standing it is cut to a head
+/// against the snapshot itself, because a conversation whose newest message vanished from the
+/// screen reads as broken where a shorter head with more available does not.
+pub fn fit_snapshot_to_frame(mut snapshot: AgentSessionSnapshot) -> AgentSessionSnapshot {
+    let frame_len = |snapshot: &AgentSessionSnapshot| {
+        encoded_frame_len(&AgentServerFrame::SessionSnapshot {
+            v: AGENT_PROTOCOL_VERSION,
+            snapshot: Box::new(snapshot.clone()),
+        })
+    };
+    for entry in &mut snapshot.timeline_window.entries {
+        *entry = fit_entry_alone(entry);
+    }
+    while frame_len(&snapshot) > MAX_AGENT_FRAME_BYTES {
+        let window = &mut snapshot.timeline_window;
+        if window.entries.len() <= 1 {
+            let Some(newest) = window.entries.pop() else {
+                break;
+            };
+            let mut without = snapshot.clone();
+            let fitted = fit_entry_to_frame(&newest, |candidate| {
+                without.timeline_window.entries = vec![candidate.clone()];
+                frame_len(&without)
+            });
+            snapshot.timeline_window.entries.push(fitted);
+            break;
+        }
+        window.entries.remove(0);
+        window.has_older = true;
+        window.truncated = true;
+        window.oldest_sequence = window.entries.first().map(|entry| entry.sequence);
+    }
+    snapshot
+}
+
+/// The frames that answer `agent.timeline.entry`: a start, the body in contiguous chunks, and
+/// an end. Each chunk is at most [`MAX_ENTRY_BODY_CHUNK_BYTES`] and is cut shorter, always
+/// between characters, until its *encoded* frame fits [`MAX_AGENT_FRAME_BYTES`] — the same
+/// escape arithmetic as [`fit_entry_to_frame`], applied to a body instead of a head.
+#[allow(clippy::too_many_arguments)] // one frame's worth of named fields; a struct would restate it
+pub fn entry_body_frames(
+    session_id: &str,
+    snapshot_epoch: u64,
+    process_generation: u64,
+    entry_id: &str,
+    entry_revision: u64,
+    truncation: Truncation,
+    body: &str,
+) -> Vec<AgentServerFrame> {
+    let mut frames = vec![AgentServerFrame::TimelineEntryStart {
+        v: AGENT_PROTOCOL_VERSION,
+        session_id: session_id.to_owned(),
+        snapshot_epoch,
+        process_generation,
+        entry_id: entry_id.to_owned(),
+        entry_revision,
+        total_bytes: u32::try_from(body.len()).unwrap_or(u32::MAX),
+        truncation,
+    }];
+    let mut offset = 0;
+    while offset < body.len() {
+        // A chunk is never empty: one whole character is the floor, and one character always
+        // fits — its escape is at most six bytes.
+        let one_character = offset + body[offset..].chars().next().map_or(1, char::len_utf8);
+        let mut end = (offset + MAX_ENTRY_BODY_CHUNK_BYTES).min(body.len());
+        loop {
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            end = end.max(one_character);
+            let frame = AgentServerFrame::TimelineEntryChunk {
+                v: AGENT_PROTOCOL_VERSION,
+                entry_id: entry_id.to_owned(),
+                offset: u32::try_from(offset).unwrap_or(u32::MAX),
+                text: body[offset..end].to_owned(),
+            };
+            let size = encoded_frame_len(&frame);
+            if size <= MAX_AGENT_FRAME_BYTES || end == one_character {
+                frames.push(frame);
+                break;
+            }
+            let chunk = &body[offset..end];
+            let envelope = size.saturating_sub(json_string_len(chunk));
+            end =
+                offset + json_prefix_within(chunk, MAX_AGENT_FRAME_BYTES.saturating_sub(envelope));
+        }
+        offset = end;
+    }
+    frames.push(AgentServerFrame::TimelineEntryEnd {
+        v: AGENT_PROTOCOL_VERSION,
+        entry_id: entry_id.to_owned(),
+    });
+    frames
+}
+
 pub fn encode_agent_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, AgentProtocolError> {
+    encode_agent_frame_within(value, MAX_AGENT_FRAME_BYTES)
+}
+
+/// [`encode_agent_frame`] with a caller-named bound, for an adapter writing to a bridge that
+/// granted [`MAX_BRIDGE_FRAME_BYTES`].
+pub fn encode_agent_frame_within<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<Vec<u8>, AgentProtocolError> {
     let body = serde_json::to_vec(value).map_err(|_| AgentProtocolError::MalformedJson)?;
     if body.is_empty() {
         return Err(AgentProtocolError::ZeroLength);
     }
-    if body.len() > MAX_AGENT_FRAME_BYTES {
+    if body.len() > limit {
         return Err(AgentProtocolError::FrameTooLarge);
     }
     let length = u32::try_from(body.len()).map_err(|_| AgentProtocolError::FrameTooLarge)?;
@@ -2302,10 +2680,24 @@ pub fn encode_agent_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, AgentProto
 pub fn decode_agent_body<T: for<'de> Deserialize<'de>>(
     body: &[u8],
 ) -> Result<T, AgentProtocolError> {
+    decode_agent_body_within(body, MAX_AGENT_FRAME_BYTES)
+}
+
+/// A frame read off the local adapter bridge, bounded by [`MAX_BRIDGE_FRAME_BYTES`].
+pub fn decode_bridge_body<T: for<'de> Deserialize<'de>>(
+    body: &[u8],
+) -> Result<T, AgentProtocolError> {
+    decode_agent_body_within(body, MAX_BRIDGE_FRAME_BYTES)
+}
+
+fn decode_agent_body_within<T: for<'de> Deserialize<'de>>(
+    body: &[u8],
+    limit: usize,
+) -> Result<T, AgentProtocolError> {
     if body.is_empty() {
         return Err(AgentProtocolError::ZeroLength);
     }
-    if body.len() > MAX_AGENT_FRAME_BYTES {
+    if body.len() > limit {
         return Err(AgentProtocolError::FrameTooLarge);
     }
     serde_json::from_slice(body).map_err(|_| AgentProtocolError::MalformedJson)
@@ -2320,18 +2712,27 @@ pub fn decode_agent_body<T: for<'de> Deserialize<'de>>(
 pub struct AgentFrameReader {
     buffered: Vec<u8>,
     chunk: Vec<u8>,
+    limit: usize,
 }
 
 impl Default for AgentFrameReader {
+    /// The phone's bound.
     fn default() -> Self {
-        Self {
-            buffered: Vec::new(),
-            chunk: vec![0_u8; 8 * 1024],
-        }
+        Self::within(MAX_AGENT_FRAME_BYTES)
     }
 }
 
 impl AgentFrameReader {
+    /// A reader for a stream with its own frame bound — [`MAX_BRIDGE_FRAME_BYTES`] for the local
+    /// adapter bridge.
+    pub fn within(limit: usize) -> Self {
+        Self {
+            buffered: Vec::new(),
+            chunk: vec![0_u8; 8 * 1024],
+            limit,
+        }
+    }
+
     /// Cancellation-safe: dropping the returned future never loses stream position.
     pub async fn next<R>(&mut self, reader: &mut R) -> Result<Vec<u8>, AgentProtocolError>
     where
@@ -2365,7 +2766,7 @@ impl AgentFrameReader {
         if length == 0 {
             return Err(AgentProtocolError::ZeroLength);
         }
-        if length > MAX_AGENT_FRAME_BYTES {
+        if length > self.limit {
             return Err(AgentProtocolError::FrameTooLarge);
         }
         if self.buffered.len() < 4 + length {
@@ -2381,13 +2782,24 @@ pub async fn read_agent_frame<R>(reader: &mut R) -> Result<Vec<u8>, AgentProtoco
 where
     R: AsyncRead + Unpin,
 {
+    read_agent_frame_within(reader, MAX_AGENT_FRAME_BYTES).await
+}
+
+/// [`read_agent_frame`] with a caller-named bound: [`MAX_BRIDGE_FRAME_BYTES`] on the local bridge.
+pub async fn read_agent_frame_within<R>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>, AgentProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header = [0_u8; 4];
     read_exact(reader, &mut header).await?;
     let length = u32::from_be_bytes(header) as usize;
     if length == 0 {
         return Err(AgentProtocolError::ZeroLength);
     }
-    if length > MAX_AGENT_FRAME_BYTES {
+    if length > limit {
         return Err(AgentProtocolError::FrameTooLarge);
     }
     let mut body = vec![0_u8; length];
@@ -2400,7 +2812,21 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    writer.write_all(&encode_agent_frame(value)?).await?;
+    write_agent_frame_within(writer, value, MAX_AGENT_FRAME_BYTES).await
+}
+
+pub async fn write_agent_frame_within<W, T>(
+    writer: &mut W,
+    value: &T,
+    limit: usize,
+) -> Result<(), AgentProtocolError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    writer
+        .write_all(&encode_agent_frame_within(value, limit)?)
+        .await?;
     Ok(())
 }
 
@@ -3076,6 +3502,9 @@ mod tests {
             ("model_id_bytes", MAX_MODEL_ID_BYTES),
             ("model_display_name_bytes", MAX_MODEL_DISPLAY_NAME_BYTES),
             ("effort_levels_per_model", MAX_EFFORT_LEVELS_PER_MODEL),
+            ("timeline_text_bytes", MAX_TIMELINE_TEXT_BYTES),
+            ("retained_text_bytes", MAX_RETAINED_TEXT_BYTES),
+            ("entry_body_chunk_bytes", MAX_ENTRY_BODY_CHUNK_BYTES),
         ] {
             assert_eq!(bounds[name].as_u64().unwrap(), actual as u64, "{name}");
         }
@@ -3100,6 +3529,408 @@ mod tests {
         assert!(valid_token(&"x".repeat(MAX_TOKEN_BYTES + 1)).is_err());
         assert!(valid_opaque_id(&"x".repeat(MAX_OPAQUE_ID_BYTES)).is_ok());
         assert!(valid_opaque_id(&"x".repeat(MAX_OPAQUE_ID_BYTES + 1)).is_err());
+    }
+
+    /// Who the phone thinks it is asking about when it opens `agent.timeline.entry`.
+    struct EntryBodyRequest {
+        session_id: String,
+        snapshot_epoch: u64,
+        process_generation: u64,
+        entry_id: String,
+        /// The revision of the entry the phone is showing; an older answer is stale.
+        held_revision: u64,
+    }
+
+    /// The phone's half of `agent.timeline.entry`, written once here so the shared fixtures
+    /// prove the contract instead of one codec round-tripping itself. The app owns the
+    /// production reassembly; this is the reference its tests must agree with, case for case.
+    #[derive(Default)]
+    struct EntryBodyAssembly {
+        total: Option<usize>,
+        body: String,
+        done: bool,
+    }
+
+    impl EntryBodyAssembly {
+        /// `Ok(Some(body))` once the end frame lands; the error is the fixture's `expect` token.
+        fn accept(
+            &mut self,
+            request: &EntryBodyRequest,
+            frame: &AgentServerFrame,
+        ) -> Result<Option<String>, &'static str> {
+            if self.done {
+                return Err("entry_body_order");
+            }
+            match frame {
+                AgentServerFrame::TimelineEntryStart {
+                    v,
+                    session_id,
+                    snapshot_epoch,
+                    process_generation,
+                    entry_id,
+                    entry_revision,
+                    total_bytes,
+                    truncation,
+                } => {
+                    if self.total.is_some() || *v != AGENT_PROTOCOL_VERSION {
+                        return Err("entry_body_order");
+                    }
+                    if *session_id != request.session_id
+                        || *snapshot_epoch != request.snapshot_epoch
+                        || *process_generation != request.process_generation
+                        || *entry_id != request.entry_id
+                    {
+                        return Err("entry_body_identity");
+                    }
+                    if *entry_revision < request.held_revision {
+                        return Err("entry_body_stale");
+                    }
+                    let total = *total_bytes as usize;
+                    if total > MAX_RETAINED_TEXT_BYTES {
+                        return Err("entry_body_over_bound");
+                    }
+                    if truncation.validate().is_err()
+                        || truncation.reason_code.as_deref() == Some(TRUNCATION_BODY_AVAILABLE)
+                    {
+                        return Err("entry_body_identity");
+                    }
+                    self.total = Some(total);
+                    Ok(None)
+                }
+                AgentServerFrame::TimelineEntryChunk {
+                    entry_id,
+                    offset,
+                    text,
+                    ..
+                } => {
+                    let total = self.total.ok_or("entry_body_order")?;
+                    if *entry_id != request.entry_id {
+                        return Err("entry_body_identity");
+                    }
+                    // UTF-8 bytes, not characters: `body.len()` is the only running count.
+                    if *offset as usize != self.body.len() {
+                        return Err("entry_body_gap");
+                    }
+                    if text.is_empty() {
+                        return Err("entry_body_empty_chunk");
+                    }
+                    if text.len() > MAX_ENTRY_BODY_CHUNK_BYTES {
+                        return Err("entry_body_chunk_too_large");
+                    }
+                    if self.body.len() + text.len() > total {
+                        return Err("entry_body_total_mismatch");
+                    }
+                    self.body.push_str(text);
+                    Ok(None)
+                }
+                AgentServerFrame::TimelineEntryEnd { entry_id, .. } => {
+                    let total = self.total.ok_or("entry_body_order")?;
+                    if *entry_id != request.entry_id {
+                        return Err("entry_body_identity");
+                    }
+                    if self.body.len() != total {
+                        return Err("entry_body_total_mismatch");
+                    }
+                    self.done = true;
+                    Ok(Some(std::mem::take(&mut self.body)))
+                }
+                _ => Err("entry_body_order"),
+            }
+        }
+    }
+
+    fn entry_body_request(identity: &Value, held_revision: u64) -> EntryBodyRequest {
+        EntryBodyRequest {
+            session_id: identity["session_id"].as_str().unwrap().into(),
+            snapshot_epoch: identity["snapshot_epoch"].as_u64().unwrap(),
+            process_generation: identity["process_generation"].as_u64().unwrap(),
+            entry_id: identity["entry_id"].as_str().unwrap().into(),
+            held_revision,
+        }
+    }
+
+    #[test]
+    fn a_retained_body_reassembles_from_the_shared_fixture_by_utf8_offset() {
+        let value = fixture();
+        let head: TimelineEntry =
+            serde_json::from_value(value["body_available_entry"].clone()).unwrap();
+        head.validate().unwrap();
+        let exchange = &value["entry_fetch"];
+        let open: AgentStreamOpen = serde_json::from_value(exchange["open"].clone()).unwrap();
+        open.validate().unwrap();
+        assert_eq!(open.entry_id.as_deref(), Some(head.entry_id.as_str()));
+
+        let body = exchange["body"].as_str().unwrap();
+        // The fixture is only worth something if a byte split would have cut a character and
+        // the chunk offsets differ from a character count — the two mistakes a UTF-16 client
+        // makes.
+        let naive = exchange["naive_split_offset"].as_u64().unwrap() as usize;
+        assert!(!body.is_char_boundary(naive));
+        let TimelineBody::Text { text: head_text } = &head.body else {
+            panic!("the advertised entry is text");
+        };
+        assert!(body.starts_with(head_text.as_str()));
+        assert_eq!(head.truncation.original_bytes, Some(body.len() as u64));
+
+        let frames: Vec<AgentServerFrame> =
+            serde_json::from_value(exchange["frames"].clone()).unwrap();
+        let AgentServerFrame::TimelineEntryChunk { offset, text, .. } = &frames[2] else {
+            panic!("the second chunk is the third frame");
+        };
+        assert_ne!(*offset as usize, text.chars().count());
+        let request = EntryBodyRequest {
+            session_id: open.session_id.clone().unwrap(),
+            snapshot_epoch: snapshot().snapshot_epoch,
+            process_generation: snapshot().process_generation,
+            entry_id: head.entry_id.clone(),
+            held_revision: head.entry_revision,
+        };
+        let mut assembly = EntryBodyAssembly::default();
+        let mut assembled = None;
+        for frame in &frames {
+            // Every frame the host sends here fits the phone's frame bound.
+            assert!(encode_agent_frame(frame).is_ok());
+            assembled = assembly.accept(&request, frame).unwrap();
+        }
+        assert_eq!(assembled.as_deref(), Some(body));
+    }
+
+    #[test]
+    fn hostile_entry_bodies_fail_as_declared() {
+        let hostile = hostile_fixture();
+        let block = &hostile["entry_body"];
+        let request =
+            entry_body_request(&block["identity"], block["held_revision"].as_u64().unwrap());
+        let cases = block["cases"].as_array().unwrap();
+        assert!(cases.len() >= 10);
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let frames: Vec<AgentServerFrame> =
+                serde_json::from_value(case["frames"].clone()).unwrap();
+            let mut assembly = EntryBodyAssembly::default();
+            let outcome = frames
+                .iter()
+                .map(|frame| assembly.accept(&request, frame))
+                .find_map(Result::err);
+            assert_eq!(outcome, case["expect"].as_str(), "{name}");
+        }
+    }
+
+    #[test]
+    fn body_available_is_a_promise_the_entry_must_be_able_to_keep() {
+        let entry: TimelineEntry =
+            serde_json::from_value(fixture()["body_available_entry"].clone()).unwrap();
+        entry.validate().unwrap();
+        let with = |text: &str, original: Option<u64>| {
+            let mut candidate = entry.clone();
+            candidate.body = TimelineBody::Text { text: text.into() };
+            candidate.truncation.original_bytes = original;
+            candidate
+        };
+        // The head must be strictly shorter than the body it names.
+        assert!(with("abcd", Some(4)).validate().is_err());
+        assert!(with("abcd", Some(5)).validate().is_ok());
+        // The size is required, and bounded by what a host retains.
+        assert!(with("abcd", None).validate().is_err());
+        assert!(
+            with("abcd", Some(MAX_RETAINED_TEXT_BYTES as u64))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            with("abcd", Some(MAX_RETAINED_TEXT_BYTES as u64 + 1))
+                .validate()
+                .is_err()
+        );
+        // Only text has a body to fetch.
+        let mut tool = entry.clone();
+        tool.body = TimelineBody::Tool {
+            tool: ToolTimelineBody {
+                name: "Bash".into(),
+                status: "completed".into(),
+                input_preview: None,
+                result_preview: None,
+            },
+        };
+        assert!(tool.validate().is_err());
+    }
+
+    #[test]
+    fn an_entry_fetch_names_its_session_and_entry_and_nothing_else() {
+        let base: AgentStreamOpen =
+            serde_json::from_value(fixture()["entry_fetch"]["open"].clone()).unwrap();
+        base.validate().unwrap();
+        let mut missing_entry = base.clone();
+        missing_entry.entry_id = None;
+        assert!(missing_entry.validate().is_err());
+        let mut missing_session = base.clone();
+        missing_session.session_id = None;
+        assert!(missing_session.validate().is_err());
+        let mut paged = base.clone();
+        paged.before_sequence = Some(9);
+        assert!(paged.validate().is_err());
+        let mut hostile_id = base.clone();
+        hostile_id.entry_id = Some("entry with spaces".into());
+        assert!(hostile_id.validate().is_err());
+        // Every other operation refuses the new parameter, so it cannot leak into a shape
+        // that never declared it.
+        let mut snapshot_with_entry = base;
+        snapshot_with_entry.operation = "agent.session.snapshot".into();
+        assert!(snapshot_with_entry.validate().is_err());
+    }
+
+    /// The head and chunk sizing trusts this arithmetic instead of re-encoding on every cut, so
+    /// it has to agree with serde_json character for character.
+    #[test]
+    fn escape_arithmetic_matches_the_encoder() {
+        let characters = (0_u32..0x80).filter_map(char::from_u32).chain([
+            '\u{e9}',
+            '\u{2028}',
+            '\u{fffd}',
+            '\u{1f980}',
+        ]);
+        for character in characters {
+            let text = character.to_string();
+            assert_eq!(
+                json_string_len(&text),
+                serde_json::to_string(&text).unwrap().len() - 2,
+                "{:#x}",
+                character as u32
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_text_entry_travels_as_a_head_and_a_tool_entry_sheds_previews() {
+        let delta_len = |entry: &TimelineEntry| {
+            encoded_frame_len(&AgentServerFrame::TimelinePageEntry {
+                v: AGENT_PROTOCOL_VERSION,
+                page_id: "0".repeat(32),
+                entry: entry.clone(),
+            })
+        };
+        let mut long: TimelineEntry =
+            serde_json::from_value(fixture()["body_available_entry"].clone()).unwrap();
+        let body = "caf\u{e9} \u{1f980} ".repeat(20_000);
+        long.body = TimelineBody::Text { text: body.clone() };
+        long.truncation = Truncation {
+            truncated: false,
+            reason_code: None,
+            original_bytes: None,
+        };
+        let wire = fit_entry_to_frame(&long, delta_len);
+        wire.validate().unwrap();
+        let TimelineBody::Text { text } = &wire.body else {
+            panic!("still text");
+        };
+        assert!(body.starts_with(text.as_str()) && text.len() <= MAX_TIMELINE_TEXT_BYTES);
+        assert!(
+            text.len() > MAX_TIMELINE_TEXT_BYTES - 16,
+            "a plain head is not cut short"
+        );
+        assert_eq!(wire.truncation.original_bytes, Some(body.len() as u64));
+
+        // Control characters encode six to one; the head shrinks until the frame fits, and it
+        // is as long as that allows rather than cut to nothing.
+        long.body = TimelineBody::Text {
+            text: "\u{1}".repeat(MAX_TIMELINE_TEXT_BYTES),
+        };
+        let wire = fit_entry_to_frame(&long, delta_len);
+        assert!(delta_len(&wire) <= MAX_AGENT_FRAME_BYTES);
+        let TimelineBody::Text { text } = &wire.body else {
+            panic!("still text");
+        };
+        assert!(text.len() * 6 > MAX_AGENT_FRAME_BYTES - 1024);
+        wire.validate().unwrap();
+
+        // A small entry passes through untouched.
+        long.body = TimelineBody::Text {
+            text: "Synthetic.".into(),
+        };
+        assert_eq!(fit_entry_to_frame(&long, delta_len), long);
+
+        // A head cut again — the snapshot refits its newest entry against its own envelope —
+        // still names the whole retained body, not the head it was cut from.
+        let head = fit_entry_to_frame(
+            &TimelineEntry {
+                body: TimelineBody::Text { text: body.clone() },
+                ..long.clone()
+            },
+            delta_len,
+        );
+        let tighter = fit_entry_to_frame(&head, |candidate| delta_len(candidate) + 40 * 1024);
+        assert_eq!(tighter.truncation.original_bytes, Some(body.len() as u64));
+        assert!(delta_len(&tighter) + 40 * 1024 <= MAX_AGENT_FRAME_BYTES);
+        tighter.validate().unwrap();
+
+        let mut tool = long.clone();
+        tool.kind = "tool".into();
+        tool.body = TimelineBody::Tool {
+            tool: ToolTimelineBody {
+                name: "Bash".into(),
+                status: "completed".into(),
+                input_preview: Some("\u{1}".repeat(MAX_TOOL_INPUT_PREVIEW_BYTES)),
+                result_preview: Some("\u{1}".repeat(MAX_TOOL_RESULT_PREVIEW_BYTES)),
+            },
+        };
+        let wire = fit_entry_to_frame(&tool, delta_len);
+        assert!(delta_len(&wire) <= MAX_AGENT_FRAME_BYTES);
+        assert_eq!(
+            wire.truncation.reason_code.as_deref(),
+            Some("preview_bounded")
+        );
+        wire.validate().unwrap();
+    }
+
+    #[test]
+    fn a_body_is_chunked_between_characters_and_every_chunk_frame_fits() {
+        let request = EntryBodyRequest {
+            session_id: "session-a".into(),
+            snapshot_epoch: 3,
+            process_generation: 7,
+            entry_id: "entry-long".into(),
+            held_revision: 4,
+        };
+        for body in [
+            "caf\u{e9} \u{1f980} na\u{ef}ve ".repeat(40_000),
+            "\u{1}".repeat(100_000),
+            format!(
+                "{}{}",
+                "a".repeat(MAX_ENTRY_BODY_CHUNK_BYTES - 1),
+                "\u{1f980}".repeat(10)
+            ),
+            String::new(),
+        ] {
+            let frames = entry_body_frames(
+                "session-a",
+                3,
+                7,
+                "entry-long",
+                4,
+                Truncation {
+                    truncated: false,
+                    reason_code: None,
+                    original_bytes: None,
+                },
+                &body,
+            );
+            let mut assembly = EntryBodyAssembly::default();
+            let mut assembled = None;
+            for frame in &frames {
+                assert!(encoded_frame_len(frame) <= MAX_AGENT_FRAME_BYTES);
+                assembled = assembly.accept(&request, frame).unwrap();
+            }
+            assert_eq!(assembled.as_deref(), Some(body.as_str()));
+            // Escapes shrink chunks, but never to a crawl: a chunk carries as much as fits.
+            let chunks = frames.len() - 2;
+            let escaped = json_string_len(&body);
+            assert!(
+                chunks
+                    <= escaped / (MAX_AGENT_FRAME_BYTES - 1024)
+                        + body.len() / MAX_ENTRY_BODY_CHUNK_BYTES
+                        + 1
+            );
+        }
     }
 
     #[tokio::test]
@@ -3616,6 +4447,7 @@ mod tests {
                 workspace_id: None,
                 lifecycle_command_id: command.map(str::to_owned),
                 expected_generation: None,
+                entry_id: None,
             }
         };
         let both = vec![

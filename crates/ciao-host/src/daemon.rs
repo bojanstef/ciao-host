@@ -1903,14 +1903,22 @@ async fn handle_host_session(
                         let state = state.clone();
                         let connection = connection.clone();
                         stream_tasks.spawn(async move {
-                            let _ = handle_agent_stream(
+                            // An operation's own failure is logged where its name is known;
+                            // what reaches here failed before one was accepted.
+                            if let Err(error) = handle_agent_stream(
                                 &connection,
                                 &mut send,
                                 &mut recv,
                                 remote_id,
                                 state,
                             )
-                            .await;
+                            .await
+                            {
+                                tracing::debug!(
+                                    category = agent_stream_error_category(&error),
+                                    "agent stream ended before an operation was accepted"
+                                );
+                            }
                         });
                     }
                     StreamKind::Upload => {
@@ -2729,7 +2737,41 @@ async fn handle_agent_stream(
         },
     )
     .await?;
+    let operation = open.operation.clone();
+    // Logged here, where the operation is known, and then settled: the one caller has nothing
+    // to add, and a subscription that died on a frame it could not encode used to leave no
+    // trace at all. Operation and category only — never content.
+    if let Err(error) = serve_agent_operation(connection, send, recv, remote_id, state, open).await
+    {
+        tracing::warn!(
+            operation = %operation,
+            category = agent_stream_error_category(&error),
+            "agent stream operation ended with an error"
+        );
+    }
+    Ok(())
+}
 
+/// A category for an agent-stream failure that names no content, path, or peer.
+fn agent_stream_error_category(error: &anyhow::Error) -> &'static str {
+    match error.downcast_ref::<crate::agent_protocol::AgentProtocolError>() {
+        Some(crate::agent_protocol::AgentProtocolError::FrameTooLarge) => "frame_too_large",
+        Some(crate::agent_protocol::AgentProtocolError::Io(_)) => "io",
+        Some(crate::agent_protocol::AgentProtocolError::Truncated) => "truncated",
+        Some(crate::agent_protocol::AgentProtocolError::UnexpectedMessage) => "unexpected_message",
+        Some(_) => "malformed",
+        None => "stream",
+    }
+}
+
+async fn serve_agent_operation(
+    connection: &Connection,
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    remote_id: EndpointId,
+    state: Arc<RuntimeState>,
+    open: AgentStreamOpen,
+) -> Result<()> {
     match open.operation.as_str() {
         "agent.sessions.list" => {
             require_finished_agent_request(recv).await?;
@@ -3128,6 +3170,32 @@ async fn handle_agent_stream(
             .await?;
             finish_agent_send(send).await;
         }
+        // The whole body behind a `body_available` head. A session that is not live may still be
+        // an unheld Codex conversation, whose body is read again from the vendor rather than
+        // held; anything else, or an entry this host no longer has, is refused categorically and
+        // the phone keeps the head it already shows.
+        "agent.timeline.entry" => {
+            require_finished_agent_request(recv).await?;
+            let (Some(session_id), Some(entry_id)) = (open.session_id, open.entry_id) else {
+                send_agent_error(send, "malformed_handshake").await;
+                return Ok(());
+            };
+            let frames = match state
+                .agent_sessions
+                .entry_body_frames(&session_id, &entry_id)
+            {
+                Some(frames) => Some(frames),
+                None => codex_unheld_entry_body(&state, &session_id, &entry_id).await,
+            };
+            let Some(frames) = frames else {
+                send_agent_error(send, "entry_unavailable").await;
+                return Ok(());
+            };
+            for frame in &frames {
+                write_agent_frame(send, frame).await?;
+            }
+            finish_agent_send(send).await;
+        }
         "agent.command.submit" => {
             let Some(expected_session) = open.session_id else {
                 send_agent_error(send, "malformed_handshake").await;
@@ -3170,7 +3238,14 @@ async fn handle_agent_stream(
             // A stopped worker leaves no entry in the live supervisor, but its record is still
             // the one the list is built from -- so refusing here left the phone on a Retry that
             // could only fail again, with no way to reach the Resume the snapshot unlocks.
-            let snapshot = match state.agent_sessions.snapshot(&session_id) {
+            //
+            // A live session's snapshot and receiver are taken together: apart, a delta landing
+            // between them reached neither and the phone sat a revision behind.
+            let (live_snapshot, live_updates) = state
+                .agent_sessions
+                .subscribe_from_snapshot(&session_id)
+                .unzip();
+            let snapshot = match live_snapshot {
                 Some(snapshot) => snapshot,
                 None => {
                     let live_terminals = crate::workspace::existing_tmux_sessions(
@@ -3202,7 +3277,7 @@ async fn handle_agent_stream(
             // what lets the phone rest on the snapshot and offer Resume instead of falling
             // through to a stale state.
             let _idle_updates;
-            let mut updates = match state.agent_sessions.subscribe(&session_id) {
+            let mut updates = match live_updates {
                 Some(updates) => updates,
                 None => {
                     let (sender, receiver) = tokio::sync::broadcast::channel(1);
@@ -3309,7 +3384,47 @@ async fn codex_unheld_snapshot(
         Some(binary) => crate::codex_history::read_thread_once(&binary, &row.thread_id).await,
         None => Vec::new(),
     };
-    Some(crate::codex_adopted::unheld_snapshot(&row, entries))
+    // Built outside the supervisor, so it is sized here: heads for long messages (their bodies
+    // are read again on request, below) and the oldest entries dropped until the frame fits.
+    Some(crate::codex_adopted::unheld_snapshot_for_wire(
+        &row, entries,
+    ))
+}
+
+/// The body behind a head in an unheld Codex conversation. Nobody holds the thread, so there is
+/// nothing retained to serve; it is read once more through the vendor, as the open itself was,
+/// and the entry is found by the identity the open gave it.
+async fn codex_unheld_entry_body(
+    state: &Arc<RuntimeState>,
+    session_id: &str,
+    entry_id: &str,
+) -> Option<Vec<AgentServerFrame>> {
+    let row = state
+        .codex_adoptions
+        .unheld_thread_for_session(session_id)
+        .await?;
+    let binary = state.codex_adoptions.recorded_binary()?;
+    let snapshot = crate::codex_adopted::unheld_snapshot(
+        &row,
+        crate::codex_history::read_thread_once(&binary, &row.thread_id).await,
+    );
+    let entry = snapshot
+        .timeline_window
+        .entries
+        .into_iter()
+        .find(|entry| entry.entry_id == entry_id)?;
+    let crate::agent_protocol::TimelineBody::Text { text } = entry.body else {
+        return None;
+    };
+    Some(crate::agent_protocol::entry_body_frames(
+        session_id,
+        snapshot.snapshot_epoch,
+        snapshot.process_generation,
+        entry_id,
+        entry.entry_revision,
+        entry.truncation,
+        &text,
+    ))
 }
 
 /// Picks up an unheld Codex conversation (Spec 013 §7): the tapped row resolves back to its
@@ -6077,6 +6192,7 @@ mod tests {
             workspace_id: None,
             lifecycle_command_id: None,
             expected_generation: None,
+            entry_id: None,
         };
 
         let (mut list_send, mut list_recv) = connection.open_bi().await.unwrap();
@@ -6100,6 +6216,111 @@ mod tests {
         assert_eq!(sessions[0].session_id, session_id);
         assert_eq!(sessions[0].observation.coverage, "partial");
 
+        // A reply longer than the wire head reaches the phone as a head that says the body is
+        // available, and `agent.timeline.entry` serves that body whole, across frames, over the
+        // real stream. An entry the host does not hold is refused categorically.
+        let long_reply = "Synthetic long reply, caf\u{e9} \u{1f980}. ".repeat(3_000);
+        state
+            .agent_sessions
+            .upsert_bridge_entry(
+                &session_id,
+                crate::agent_session::NormalizedTimelineEntry {
+                    source_id: "fixture-long-entry".into(),
+                    source_revision: 1,
+                    timestamp: 2,
+                    state: "complete".into(),
+                    kind: "assistant_message".into(),
+                    body: crate::agent_protocol::TimelineBody::Text {
+                        text: long_reply.clone(),
+                    },
+                    truncation: crate::agent_protocol::Truncation {
+                        truncated: false,
+                        reason_code: None,
+                        original_bytes: None,
+                    },
+                },
+            )
+            .unwrap();
+        let head = state
+            .agent_sessions
+            .snapshot(&session_id)
+            .unwrap()
+            .timeline_window
+            .entries
+            .pop()
+            .unwrap();
+        assert_eq!(
+            head.truncation.reason_code.as_deref(),
+            Some(crate::agent_protocol::TRUNCATION_BODY_AVAILABLE)
+        );
+        assert_eq!(
+            head.truncation.original_bytes,
+            Some(long_reply.len() as u64)
+        );
+        let fetch = |entry_id: &str| AgentStreamOpen {
+            entry_id: Some(entry_id.into()),
+            ..open("agent.timeline.entry", Some(session_id.clone()))
+        };
+        let (mut entry_send, mut entry_recv) = connection.open_bi().await.unwrap();
+        write_stream_preface(&mut entry_send, StreamKind::Agent)
+            .await
+            .unwrap();
+        write_agent_frame(&mut entry_send, &fetch(&head.entry_id))
+            .await
+            .unwrap();
+        entry_send.finish().unwrap();
+        assert!(matches!(
+            read_agent_server(&mut entry_recv).await,
+            AgentServerFrame::StreamAccepted { .. }
+        ));
+        let AgentServerFrame::TimelineEntryStart {
+            entry_revision,
+            total_bytes,
+            truncation,
+            ..
+        } = read_agent_server(&mut entry_recv).await
+        else {
+            panic!("expected the start of the entry body");
+        };
+        assert_eq!(entry_revision, head.entry_revision);
+        assert_eq!(total_bytes as usize, long_reply.len());
+        assert!(!truncation.truncated);
+        let mut body = String::new();
+        let mut chunks = 0;
+        loop {
+            match read_agent_server(&mut entry_recv).await {
+                AgentServerFrame::TimelineEntryChunk { offset, text, .. } => {
+                    assert_eq!(offset as usize, body.len());
+                    body.push_str(&text);
+                    chunks += 1;
+                }
+                AgentServerFrame::TimelineEntryEnd { entry_id, .. } => {
+                    assert_eq!(entry_id, head.entry_id);
+                    break;
+                }
+                other => panic!("unexpected frame in an entry body: {other:?}"),
+            }
+        }
+        assert!(chunks > 1);
+        assert_eq!(body, long_reply);
+
+        let (mut missing_send, mut missing_recv) = connection.open_bi().await.unwrap();
+        write_stream_preface(&mut missing_send, StreamKind::Agent)
+            .await
+            .unwrap();
+        write_agent_frame(&mut missing_send, &fetch("entry-never-held"))
+            .await
+            .unwrap();
+        missing_send.finish().unwrap();
+        assert!(matches!(
+            read_agent_server(&mut missing_recv).await,
+            AgentServerFrame::StreamAccepted { .. }
+        ));
+        assert!(matches!(
+            read_agent_server(&mut missing_recv).await,
+            AgentServerFrame::Error { code, .. } if code == "entry_unavailable"
+        ));
+
         let (mut subscription_send, mut subscription_recv) = connection.open_bi().await.unwrap();
         write_stream_preface(&mut subscription_send, StreamKind::Agent)
             .await
@@ -6119,7 +6340,7 @@ mod tests {
         else {
             panic!("expected complete subscription snapshot");
         };
-        assert_eq!(snapshot.timeline_window.entries.len(), 1);
+        assert_eq!(snapshot.timeline_window.entries.len(), 2);
         assert!(!snapshot.turn.is_authoritative_working());
 
         // The explicit grounded run executes this integration test inside a real tmux pane. It

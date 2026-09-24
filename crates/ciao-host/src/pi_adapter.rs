@@ -14,8 +14,9 @@ use crate::{
     },
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentCommandKind, AgentProtocolError, CommandCapabilities,
-        InteractionCapabilities, Observation, TurnState, decode_agent_body, turn_from_bridge_frame,
-        valid_opaque_id, valid_token, version_major_matches, version_within_tested_minor,
+        InteractionCapabilities, MAX_AGENT_FRAME_BYTES, MAX_BRIDGE_FRAME_BYTES, Observation,
+        TurnState, decode_bridge_body, turn_from_bridge_frame, valid_opaque_id, valid_token,
+        version_major_matches, version_within_tested_minor,
     },
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
@@ -71,6 +72,11 @@ pub(crate) struct PiBridgeRegister {
     pub process_id: u32,
     pub workspace_display: String,
     pub commands: PiBridgeCommandCapabilities,
+    /// The largest frame this extension will send, when it can send more than the phone's
+    /// 64 KiB. Its presence is also the extension saying it reads `frame_bytes` in `registered`
+    /// — which an older extension does not: it refuses any key it does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_bytes: Option<u64>,
 }
 
 impl PiBridgeRegister {
@@ -161,7 +167,11 @@ pub(crate) enum PiBridgeInbound {
     Register(PiBridgeRegister),
     SnapshotStart,
     SnapshotEntry(WireTimelineEntry),
-    SnapshotEnd,
+    /// `history_complete` is sent only by an extension the daemon granted a larger frame, which
+    /// is what proves this decoder reads it; an older daemon refuses the key.
+    SnapshotEnd {
+        history_complete: Option<bool>,
+    },
     UpsertEntry(WireTimelineEntry),
     Turn(TurnState),
     Capabilities(PiBridgeCommandCapabilities),
@@ -178,7 +188,7 @@ pub(crate) enum PiBridgeInbound {
 }
 
 pub(crate) fn decode_pi_bridge_frame(body: &[u8]) -> Result<PiBridgeInbound, AgentProtocolError> {
-    let value: Value = decode_agent_body(body)?;
+    let value: Value = decode_bridge_body(body)?;
     let message_type = value
         .as_object()
         .and_then(|object| object.get("type"))
@@ -212,8 +222,26 @@ pub(crate) fn decode_pi_bridge_frame(body: &[u8]) -> Result<PiBridgeInbound, Age
             Ok(PiBridgeInbound::SnapshotEntry(frame.entry))
         }
         "snapshot_end" => {
-            decode_unit_frame(&value, PI_BRIDGE_PROTOCOL_VERSION, "snapshot_end")?;
-            Ok(PiBridgeInbound::SnapshotEnd)
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Frame {
+                v: u8,
+                #[serde(rename = "type")]
+                message_type: String,
+                #[serde(default)]
+                history_complete: Option<bool>,
+            }
+            let frame: Frame =
+                serde_json::from_value(value).map_err(|_| AgentProtocolError::MalformedJson)?;
+            validate_frame_header(
+                frame.v,
+                PI_BRIDGE_PROTOCOL_VERSION,
+                &frame.message_type,
+                "snapshot_end",
+            )?;
+            Ok(PiBridgeInbound::SnapshotEnd {
+                history_complete: frame.history_complete,
+            })
         }
         "upsert_entry" => {
             #[derive(Deserialize)]
@@ -422,6 +450,16 @@ impl AttachedAgentAdapter for PiAttachedAdapter {
         register.normalize(peer_process_id)
     }
 
+    /// Only an extension that asked is answered, and never with less than the old bound or
+    /// more than the bridge reads.
+    fn frame_grant(&self, register: &[u8]) -> Option<usize> {
+        let PiBridgeInbound::Register(register) = decode_pi_bridge_frame(register).ok()? else {
+            return None;
+        };
+        let asked = usize::try_from(register.frame_bytes?).unwrap_or(usize::MAX);
+        Some(asked.clamp(MAX_AGENT_FRAME_BYTES, MAX_BRIDGE_FRAME_BYTES))
+    }
+
     fn decode_event(&self, body: &[u8]) -> Result<NormalizedAdapterEvent, AgentProtocolError> {
         Ok(match decode_pi_bridge_frame(body)? {
             PiBridgeInbound::Register(_) => NormalizedAdapterEvent::Registration,
@@ -429,7 +467,9 @@ impl AttachedAgentAdapter for PiAttachedAdapter {
             PiBridgeInbound::SnapshotEntry(entry) => {
                 NormalizedAdapterEvent::SnapshotEntry(entry.normalize()?)
             }
-            PiBridgeInbound::SnapshotEnd => NormalizedAdapterEvent::SnapshotEnd,
+            PiBridgeInbound::SnapshotEnd { history_complete } => {
+                NormalizedAdapterEvent::SnapshotEnd { history_complete }
+            }
             PiBridgeInbound::UpsertEntry(entry) => {
                 NormalizedAdapterEvent::UpsertEntry(entry.normalize()?)
             }
@@ -499,6 +539,7 @@ mod tests {
                 follow_up: true,
                 interrupt: true,
             },
+            frame_bytes: None,
         }
     }
 
@@ -621,6 +662,36 @@ mod tests {
             PiAttachedAdapter.decode_event(unknown).unwrap(),
             NormalizedAdapterEvent::Unknown
         );
+    }
+
+    /// An older extension ends a snapshot with no word on coverage; a granted one says whether
+    /// the branch arrived whole. Anything else in the frame is still refused.
+    #[test]
+    fn a_snapshot_end_carries_coverage_only_when_the_extension_gives_it() {
+        for (frame, expected) in [
+            (r#"{"v":1,"type":"snapshot_end"}"#, None),
+            (
+                r#"{"v":1,"type":"snapshot_end","history_complete":false}"#,
+                Some(false),
+            ),
+            (
+                r#"{"v":1,"type":"snapshot_end","history_complete":true}"#,
+                Some(true),
+            ),
+        ] {
+            assert_eq!(
+                PiAttachedAdapter.decode_event(frame.as_bytes()).unwrap(),
+                NormalizedAdapterEvent::SnapshotEnd {
+                    history_complete: expected
+                }
+            );
+        }
+        for hostile in [
+            r#"{"v":1,"type":"snapshot_end","history_complete":"no"}"#,
+            r#"{"v":1,"type":"snapshot_end","private":"synthetic"}"#,
+        ] {
+            assert!(decode_pi_bridge_frame(hostile.as_bytes()).is_err());
+        }
     }
 
     #[test]

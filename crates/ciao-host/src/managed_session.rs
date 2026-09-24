@@ -532,11 +532,17 @@ impl ManagedSessionDirectory {
             capabilities: descriptor.capabilities,
             pending_interactions: Vec::new(),
             // Ciao keeps no transcript for a stored record — the managed store is metadata-only
-            // — so an empty window is the truthful answer rather than a missing one.
+            // — so an empty window is the truthful answer rather than a missing one. A record
+            // that began a conversation has one Claude holds, so the window says where the
+            // rest is (Spec 006 §20.2's marker) instead of reading as a conversation that
+            // never happened; Resume loads it.
             timeline_window: TimelineWindow {
                 entries: Vec::new(),
                 has_older: false,
-                history_boundary: None,
+                history_boundary: record
+                    .vendor_session_id
+                    .is_some()
+                    .then(|| "resume".to_owned()),
                 oldest_sequence: None,
                 newest_sequence: None,
                 truncated: false,
@@ -581,6 +587,17 @@ impl ManagedSessionDirectory {
             .iter()
             .find(|record| record.session_id == session_id)
             .map(|record| record.workspace_path.clone())
+    }
+
+    /// The Claude conversation a managed session resumes, for the host-side history read that
+    /// covers what the worker's own reader refuses to load. Host-only, like the path above.
+    pub(crate) fn vendor_session(&self, session_id: &str) -> Option<String> {
+        self.store
+            .lock()
+            .records
+            .iter()
+            .find(|record| record.session_id == session_id)
+            .and_then(|record| record.vendor_session_id.clone())
     }
 
     /// Bounded, privacy-safe rows for the local CLI: display labels only, no
@@ -1991,6 +2008,27 @@ mod tests {
             Ok(()),
             "the phone rejects an invalid snapshot outright"
         );
+        // It never began a conversation, so there is nothing earlier to point at.
+        assert_eq!(snapshot.timeline_window.history_boundary, None);
+
+        // One that did has a conversation Claude holds and this record does not: the empty
+        // window is the part Ciao keeps, and the boundary says where the rest is.
+        let talked = directory
+            .managed_start_at_path(&workspace, "cmd-stored-talked")
+            .await
+            .session_id
+            .unwrap();
+        directory.record_vendor_session(&talked, "11111111-2222-4333-8444-555555555555");
+        directory.managed_stop(&talked, 1, "cmd-stop-talked").await;
+        let snapshot = directory
+            .stored_snapshot(&talked, &HashSet::new())
+            .expect("a stopped session must still be openable");
+        assert!(snapshot.timeline_window.entries.is_empty());
+        assert_eq!(
+            snapshot.timeline_window.history_boundary.as_deref(),
+            Some("resume")
+        );
+        snapshot.validate().unwrap();
     }
 
     #[tokio::test]

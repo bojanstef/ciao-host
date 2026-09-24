@@ -24,10 +24,9 @@ use crate::{
     agent_protocol::{
         AgentCapabilities, AgentCommandKind, AgentModelOption, CommandCapabilities,
         InteractionAnswer, InteractionCapabilities, InteractionCapability,
-        MAX_LIVE_TEXT_DELTA_BYTES, MAX_MODEL_CATALOGUE_ENTRIES, MAX_TIMELINE_TEXT_BYTES,
-        MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES, Observation,
-        PendingInteraction, ResponseChoice, ResponseSchema, TerminalFallback, TimelineBody,
-        ToolTimelineBody, TurnState,
+        MAX_MODEL_CATALOGUE_ENTRIES, MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES,
+        MAX_TOOL_RESULT_PREVIEW_BYTES, Observation, PendingInteraction, ResponseChoice,
+        ResponseSchema, TerminalFallback, TimelineBody, ToolTimelineBody, TurnState,
     },
     agent_session::{
         AgentSessionSupervisor, BridgeCommandEnvelope, NormalizedRegistration, NormalizedTextDelta,
@@ -552,11 +551,27 @@ pub(crate) fn codex_resume_command(thread_id: &str) -> Option<String> {
 /// session is opened, and a failed read degrades to an empty timeline — the pick-up slot is
 /// the point of the screen, and a short history is a degradation where a refused open was a
 /// wall.
+///
+/// Nothing holds this session, so there is no pager behind the window: it carries the newest
+/// window's worth, and a conversation longer than that says so with the `resume` boundary
+/// instead of reading as one that began there. Picking it up loads the rest.
 pub(crate) fn unheld_snapshot(
     row: &UnheldThread,
-    entries: Vec<NormalizedTimelineEntry>,
+    mut entries: Vec<NormalizedTimelineEntry>,
 ) -> crate::agent_protocol::AgentSessionSnapshot {
-    let descriptor = unheld_descriptor(row);
+    let mut descriptor = unheld_descriptor(row);
+    let window = crate::agent_protocol::MAX_TIMELINE_ENTRIES_IN_SNAPSHOT;
+    let beyond_window = entries.len() > window;
+    if beyond_window {
+        entries.drain(..entries.len() - window);
+    }
+    // An empty read cannot tell an empty thread from a failed one, so it claims nothing.
+    let (history, boundary) = if entries.is_empty() {
+        ("live_tail", None)
+    } else {
+        crate::agent_session::history_coverage(!beyond_window)
+    };
+    history.clone_into(&mut descriptor.capabilities.history);
     let timeline: Vec<crate::agent_protocol::TimelineEntry> = entries
         .into_iter()
         .enumerate()
@@ -601,12 +616,32 @@ pub(crate) fn unheld_snapshot(
             newest_sequence: newest,
             entries: timeline,
             has_older: false,
-            history_boundary: None,
-            truncated: false,
+            history_boundary: boundary,
+            truncated: beyond_window,
         },
         terminal_fallback: descriptor.terminal_fallback,
         latest_command_receipts: Vec::new(),
     }
+}
+
+/// `unheld_snapshot`, sized to one frame as the open sends it. Fitting drops the oldest entries
+/// and marks older ones available, but nothing pages behind an unheld row — every page request
+/// is refused — so what was dropped is said the only way this row can: the boundary, and no
+/// claim to the whole conversation.
+pub(crate) fn unheld_snapshot_for_wire(
+    row: &UnheldThread,
+    entries: Vec<NormalizedTimelineEntry>,
+) -> crate::agent_protocol::AgentSessionSnapshot {
+    let snapshot = unheld_snapshot(row, entries);
+    let before = snapshot.timeline_window.entries.len();
+    let mut snapshot = crate::agent_protocol::fit_snapshot_to_frame(snapshot);
+    if snapshot.timeline_window.entries.len() < before {
+        snapshot.timeline_window.has_older = false;
+        let (history, boundary) = crate::agent_session::history_coverage(false);
+        history.clone_into(&mut snapshot.capabilities.history);
+        snapshot.timeline_window.history_boundary = boundary;
+    }
+    snapshot
 }
 
 /// The model surface an adopted thread offers, read from the vendor at pickup: which model the
@@ -766,7 +801,7 @@ pub(crate) async fn adopt(
     // The resume response carries `thread.turns` in the same shape `thread/read` answers, so
     // the Spec 012 history mapper applies unchanged. There is no live tail to exclude: the
     // empty run ID matches no turn.
-    let entries = codex_history::map_thread(&resumed, "");
+    let history = codex_history::map_thread_history(&resumed, "");
     let models = model_surface(&connection, &resumed).await;
 
     let (command_sender, command_receiver) = mpsc::channel::<BridgeCommandEnvelope>(16);
@@ -778,7 +813,16 @@ pub(crate) async fn adopt(
             return Err(AdoptRefusal::Vendor(error));
         }
     };
-    if let Err(error) = supervisor.replace_bridge_snapshot(&registered.session_id, entries) {
+    // The session is new and empty, so this lays the whole read down as its timeline — and,
+    // being the supervisor's one history-coverage owner, says whether that is the whole
+    // conversation (ADR 006 §5: the rollout is readable in its entirety) or its newest part.
+    if let Err(error) = supervisor.backfill_bridge_history(
+        &registered.session_id,
+        Some(registered.process_generation),
+        history.entries,
+        history.complete,
+        None,
+    ) {
         connection.shutdown().await;
         return Err(AdoptRefusal::Vendor(error));
     }
@@ -1123,7 +1167,7 @@ fn on_notification(
                 return;
             }
             let revision = tracking.next_revision(&source_id);
-            let (text, truncation) = bounded_text(delta, MAX_LIVE_TEXT_DELTA_BYTES);
+            let (text, truncation) = bounded_text(delta, MAX_RETAINED_TEXT_BYTES);
             let _ = supervisor.append_bridge_text(
                 session,
                 NormalizedTextDelta {
@@ -1190,7 +1234,7 @@ fn live_item_entry(
             if text.is_empty() {
                 text = item["text"].as_str().unwrap_or_default().to_owned();
             }
-            let (text, truncation) = bounded_text(&text, MAX_TIMELINE_TEXT_BYTES);
+            let (text, truncation) = bounded_text(&text, MAX_RETAINED_TEXT_BYTES);
             ("user_message", TimelineBody::Text { text }, truncation)
         }
         "agentMessage" => {
@@ -1202,7 +1246,7 @@ fn live_item_entry(
             }
             let (text, truncation) = bounded_text(
                 item["text"].as_str().unwrap_or_default(),
-                MAX_TIMELINE_TEXT_BYTES,
+                MAX_RETAINED_TEXT_BYTES,
             );
             ("assistant_message", TimelineBody::Text { text }, truncation)
         }
@@ -1227,11 +1271,13 @@ fn live_item_entry(
             } else {
                 (None, false)
             };
-            let mut truncation = no_truncation();
-            if input_truncated || result_truncated {
-                truncation.truncated = true;
-                truncation.reason_code = Some("preview_bounded".into());
-            }
+            let truncation = crate::hook_common::preview_truncation(
+                input_truncated || result_truncated,
+                &[
+                    item.get("command").or_else(|| item.get("query")),
+                    complete.then(|| item.get("aggregatedOutput")).flatten(),
+                ],
+            );
             (
                 "tool",
                 TimelineBody::Tool {
@@ -2311,7 +2357,7 @@ mod tests {
                 truncation: no_truncation(),
             },
         ];
-        let snapshot = unheld_snapshot(&row, entries);
+        let snapshot = unheld_snapshot(&row, entries.clone());
         snapshot.validate().unwrap();
         assert_eq!(snapshot.session_id, row.session_id);
         assert_eq!(snapshot.timeline_window.entries.len(), 2);
@@ -2319,10 +2365,84 @@ mod tests {
         // The point of the screen: read-only facts that leave the pick-up slot offerable.
         assert_eq!(snapshot.capabilities.commands, CommandCapabilities::none());
         assert_eq!(snapshot.topology, "attached");
-        // And an empty read still opens rather than refusing.
+        // Everything read fits the window: this is the whole conversation.
+        assert_eq!(snapshot.capabilities.history, "full");
+        assert_eq!(snapshot.timeline_window.history_boundary, None);
+        // And an empty read still opens rather than refusing, claiming nothing either way.
         let empty = unheld_snapshot(&row, Vec::new());
         empty.validate().unwrap();
         assert!(empty.timeline_window.entries.is_empty());
+        assert_eq!(empty.capabilities.history, "live_tail");
+        assert_eq!(empty.timeline_window.history_boundary, None);
+
+        // A conversation longer than the window it can be shown in: the newest window, and
+        // the boundary where the rest begins. Nothing pages behind an unheld row.
+        let window = crate::agent_protocol::MAX_TIMELINE_ENTRIES_IN_SNAPSHOT;
+        let long: Vec<_> = (0..window + 5)
+            .map(|index| NormalizedTimelineEntry {
+                source_id: format!("codex.item.long-{index}"),
+                ..entries[0].clone()
+            })
+            .collect();
+        let snapshot = unheld_snapshot(&row, long);
+        snapshot.validate().unwrap();
+        assert_eq!(snapshot.timeline_window.entries.len(), window);
+        assert_eq!(snapshot.capabilities.history, "live_tail");
+        assert_eq!(
+            snapshot.timeline_window.history_boundary.as_deref(),
+            Some("resume")
+        );
+        assert!(!snapshot.timeline_window.has_older);
+    }
+
+    /// Review #5. An unheld conversation's open is sized to one frame by dropping its oldest
+    /// entries, which used to leave `has_older` set on a row with no pager behind it (every page
+    /// request is `page_unavailable`) and `full` coverage over a window that no longer starts at
+    /// the beginning. What was dropped is said the only way this row can: the boundary.
+    #[test]
+    fn an_unheld_open_cut_to_its_frame_says_where_the_rest_is() {
+        let listed = json!({"data": [
+            {"id": "thread-frame", "path": "/tmp/rollout-frame.jsonl", "cwd": "/home/user/project",
+             "preview": "hello", "updatedAt": 1_700_000_000_u64, "cliVersion": "0.146.0"},
+        ]});
+        let row = unheld_rows(&listed).into_iter().next().unwrap();
+        let entries: Vec<_> = (0..6)
+            .map(|index| NormalizedTimelineEntry {
+                source_id: format!("codex.item.frame-{index}"),
+                source_revision: 1,
+                timestamp: 1_700_000_000,
+                state: "complete".into(),
+                kind: "assistant_message".into(),
+                body: TimelineBody::Text {
+                    text: "w".repeat(30 * 1024),
+                },
+                truncation: no_truncation(),
+            })
+            .collect();
+        let whole = unheld_snapshot(&row, entries.clone());
+        assert_eq!(
+            whole.capabilities.history, "full",
+            "precondition: everything was read"
+        );
+        let snapshot = unheld_snapshot_for_wire(&row, entries.clone());
+        snapshot.validate().unwrap();
+        assert!(
+            snapshot.timeline_window.entries.len() < entries.len(),
+            "precondition: the frame could not carry every entry"
+        );
+        assert!(
+            !snapshot.timeline_window.has_older,
+            "nothing pages behind an unheld row"
+        );
+        assert_eq!(snapshot.capabilities.history, "live_tail");
+        assert_eq!(
+            snapshot.timeline_window.history_boundary.as_deref(),
+            Some("resume")
+        );
+        // One that fits is sent as it was read.
+        let small = unheld_snapshot_for_wire(&row, entries[..1].to_vec());
+        assert_eq!(small.capabilities.history, "full");
+        assert_eq!(small.timeline_window.history_boundary, None);
     }
 
     #[test]

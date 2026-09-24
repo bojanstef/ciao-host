@@ -694,5 +694,71 @@
   "stale_epoch": 2,
   "duplicate_revision": 10,
   "gapped_revision": 13
+ },
+ "body_available_entry": {
+  "entry_id": "entry-long",
+  "entry_revision": 4,
+  "sequence": 5,
+  "timestamp": 1700000012,
+  "state": "complete",
+  "kind": "assistant_message",
+  "body": {
+   "type": "text",
+   "text": "Synthetic head."
+  },
+  "truncation": {
+   "truncated": true,
+   "reason_code": "body_available",
+   "original_bytes": 93
+  }
+ },
+ "entry_fetch": {
+  "open": {
+   "v": 1,
+   "type": "agent_stream_open",
+   "client_instance_id": "client-fixture-1",
+   "operation": "agent.timeline.entry",
+   "capabilities": [
+    "agent.session.v1"
+   ],
+   "session_id": "session-a",
+   "entry_id": "entry-long"
+  },
+  "naive_split_offset": 77,
+  "frames": [
+   {
+    "type": "timeline_entry_start",
+    "v": 1,
+    "session_id": "session-a",
+    "snapshot_epoch": 3,
+    "process_generation": 7,
+    "entry_id": "entry-long",
+    "entry_revision": 4,
+    "total_bytes": 93,
+    "truncation": {
+     "truncated": false
+    }
+   },
+   {
+    "type": "timeline_entry_chunk",
+    "v": 1,
+    "entry_id": "entry-long",
+    "offset": 0,
+    "text": "Synthetic head. The rest of this synthetic body is held on the host: café "
+   },
+   {
+    "type": "timeline_entry_chunk",
+    "v": 1,
+    "entry_id": "entry-long",
+    "offset": 75,
+    "text": "🦀 naïve, done."
+   },
+   {
+    "type": "timeline_entry_end",
+    "v": 1,
+    "entry_id": "entry-long"
+   }
+  ],
+  "body": "Synthetic head. The rest of this synthetic body is held on the host: café 🦀 naïve, done."
  }
 }

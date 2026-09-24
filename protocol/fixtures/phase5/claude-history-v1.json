@@ -1,0 +1,171 @@
+{
+  "description": "One synthetic Claude Code transcript and the canonical timeline both history mappers must produce from it: the managed worker's canonicalHistory (worker.mjs, fed through the SDK reader's documented filter) and the host's claude_history (fed the raw lines). Records are in file order, one JSONL line each. Expected entries name their source per scheme: `managed_source` is the worker's literal source ID; `attached_source` is the [namespace, key] pair the host digests under the attached hook's domain, so a history row and a live hook row for the same prompt or tool land on one entry. Object keys inside tool inputs are sorted because the two JSON encoders only agree on sorted keys. Long strings are written as {\"$repeat\": [text, count]} and {\"$concat\": [parts]} and expanded by both test harnesses before use. Synthetic throughout: no real prompt, path, or identifier.",
+  "created_at_ms": 1700000000000,
+  "records": [
+    {"type": "file-history-snapshot", "messageId": "synthetic-snapshot", "snapshot": {"trackedFileBackups": {}}},
+    {"type": "user", "uuid": "u-01", "parentUuid": null, "promptId": "p-01", "promptSource": "typed", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:20.000Z", "message": {"role": "user", "content": "First synthetic question."}},
+    {"type": "assistant", "uuid": "a-02", "parentUuid": "u-01", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:21.000Z", "message": {"role": "assistant", "id": "msg-01", "content": [{"type": "thinking", "thinking": "Omitted synthetic reasoning.", "signature": "x"}]}},
+    {"type": "assistant", "uuid": "a-03", "parentUuid": "a-02", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:22.000Z", "message": {"role": "assistant", "id": "msg-01", "content": [{"type": "text", "text": "Let me look."}]}},
+    {"type": "assistant", "uuid": "a-04", "parentUuid": "a-03", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:23.000Z", "message": {"role": "assistant", "id": "msg-01", "content": [{"type": "tool_use", "id": "toolu-01", "name": "Read", "input": {"file_path": "README.md"}}]}},
+    {"type": "user", "uuid": "u-05", "parentUuid": "a-04", "promptId": "p-01", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:24.000Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu-01", "content": "Synthetic file contents."}]}},
+    {"type": "user", "uuid": "u-06", "parentUuid": "u-05", "promptId": "p-01", "isMeta": true, "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:25.000Z", "message": {"role": "user", "content": "Synthetic injected meta text that is not a message."}},
+    {"type": "attachment", "uuid": "t-07", "parentUuid": "u-05", "isSidechain": false, "timestamp": "2023-11-14T22:13:25.500Z", "attachment": {"type": "synthetic"}},
+    {"type": "assistant", "uuid": "a-08", "parentUuid": "u-05", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:26.000Z", "message": {"role": "assistant", "id": "msg-02", "content": [{"type": "text", "text": "Done with the first question."}]}},
+    {"type": "user", "uuid": "u-09", "parentUuid": "a-08", "promptId": "p-02", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:27.000Z", "message": {"role": "user", "content": "<command-name>/model</command-name>"}},
+    {"type": "system", "uuid": "s-10", "parentUuid": "u-09", "subtype": "informational", "isSidechain": false, "timestamp": "2023-11-14T22:13:28.000Z", "content": "Synthetic notice."},
+    {"type": "user", "uuid": "u-11", "parentUuid": "s-10", "promptId": "p-03", "promptSource": "typed", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:29.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "Second "}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "c3ludGhldGlj"}}, {"type": "text", "text": "question."}]}},
+    {"type": "assistant", "uuid": "a-12", "parentUuid": "u-11", "isSidechain": true, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:30.000Z", "message": {"role": "assistant", "id": "msg-side", "content": [{"type": "text", "text": "A synthetic sidechain reply that is not the conversation."}]}},
+    {"type": "assistant", "uuid": "a-13", "parentUuid": "u-11", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:31.000Z", "message": {"role": "assistant", "id": "msg-03", "content": [{"type": "tool_use", "id": "toolu-02", "name": "Bash", "input": {"command": "false", "description": "Synthetic failing command"}}]}},
+    {"type": "user", "uuid": "u-14", "parentUuid": "a-13", "promptId": "p-03", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:32.000Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu-02", "is_error": true, "content": [{"type": "text", "text": "Synthetic "}, {"type": "text", "text": "failure."}]}]}},
+    {"type": "assistant", "uuid": "a-15", "parentUuid": "u-14", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:33.000Z", "message": {"role": "assistant", "id": "msg-04", "content": [{"type": "synthetic_future_block", "payload": "never forwarded"}]}},
+    {"type": "assistant", "uuid": "a-16", "parentUuid": "a-15", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:34.000Z", "message": {"role": "assistant", "id": "msg-05", "content": [{"type": "text", "text": "Trying once more."}, {"type": "tool_use", "id": "toolu-03", "name": "mcp__synthetic server__probe", "input": {}}]}}
+,
+    {"type": "user", "uuid": "u-17", "parentUuid": "a-16", "promptSource": "typed", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:35.000Z", "message": {"role": "user", "content": "A prompt written before prompt ids existed."}},
+    {"type": "user", "uuid": "u-18", "parentUuid": "u-17", "promptId": "p-03", "promptSource": "queued", "isSidechain": false, "sessionId": "synthetic-session", "message": {"role": "user", "content": "A queued follow-up sharing an earlier prompt id, with no timestamp."}}
+,
+    {"type": "assistant", "uuid": "a-19", "parentUuid": "u-18", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:36.000Z", "message": {"role": "assistant", "id": "msg-06", "content": [{"type": "text", "text": {"$repeat": ["t", 50000]}}, {"type": "tool_use", "id": "toolu-04", "name": "Write", "input": {"content": {"$repeat": ["a", 17000]}, "file_path": "big.txt"}}]}},
+    {"type": "user", "uuid": "u-20", "parentUuid": "a-19", "promptId": "p-03", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:37.000Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu-04", "content": {"$repeat": ["r", 33000]}}]}}
+  ],
+  "expected": [
+    {
+      "managed_source": "user-u-01",
+      "attached_source": ["prompt", "p-01"],
+      "source_revision": 1,
+      "timestamp": 1700000000,
+      "state": "complete",
+      "kind": "user_message",
+      "body": {"type": "text", "text": "First synthetic question."},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "assistant-msg-01",
+      "attached_source": ["reply", "msg-01"],
+      "source_revision": 1,
+      "timestamp": 1700000002,
+      "state": "complete",
+      "kind": "assistant_message",
+      "body": {"type": "text", "text": "Let me look."},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "tool-toolu-01",
+      "attached_source": ["tool", "toolu-01"],
+      "source_revision": 2,
+      "timestamp": 1700000004,
+      "state": "complete",
+      "kind": "tool",
+      "body": {"type": "tool", "tool": {"name": "Read", "status": "complete", "input_preview": "{\"file_path\":\"README.md\"}", "result_preview": "Synthetic file contents."}},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "assistant-msg-02",
+      "attached_source": ["reply", "msg-02"],
+      "source_revision": 1,
+      "timestamp": 1700000006,
+      "state": "complete",
+      "kind": "assistant_message",
+      "body": {"type": "text", "text": "Done with the first question."},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "user-u-11",
+      "attached_source": ["prompt", "p-03"],
+      "source_revision": 1,
+      "timestamp": 1700000009,
+      "state": "complete",
+      "kind": "user_message",
+      "body": {"type": "text", "text": "Second question."},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "unsupported-u-11-1",
+      "attached_source": ["unsupported", "u-11-1"],
+      "source_revision": 1,
+      "timestamp": 1700000009,
+      "state": "complete",
+      "kind": "unsupported",
+      "body": {"type": "unsupported", "reason_code": "claude_history_content"},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "tool-toolu-02",
+      "attached_source": ["tool", "toolu-02"],
+      "source_revision": 2,
+      "timestamp": 1700000012,
+      "state": "complete",
+      "kind": "tool",
+      "body": {"type": "tool", "tool": {"name": "Bash", "status": "failed", "input_preview": "{\"command\":\"false\",\"description\":\"Synthetic failing command\"}", "result_preview": "Synthetic failure."}},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "unsupported-a-15-0",
+      "attached_source": ["unsupported", "a-15-0"],
+      "source_revision": 1,
+      "timestamp": 1700000013,
+      "state": "complete",
+      "kind": "unsupported",
+      "body": {"type": "unsupported", "reason_code": "claude_history_content"},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "assistant-msg-05",
+      "attached_source": ["reply", "msg-05"],
+      "source_revision": 1,
+      "timestamp": 1700000014,
+      "state": "complete",
+      "kind": "assistant_message",
+      "body": {"type": "text", "text": "Trying once more."},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "tool-toolu-03",
+      "attached_source": ["tool", "toolu-03"],
+      "source_revision": 1,
+      "timestamp": 1700000014,
+      "state": "complete",
+      "kind": "tool",
+      "body": {"type": "tool", "tool": {"name": "mcp__synthetic_server__probe", "status": "unknown", "input_preview": "{}"}},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "user-u-17",
+      "attached_source": ["user", "u-17"],
+      "source_revision": 1,
+      "timestamp": 1700000015,
+      "state": "complete",
+      "kind": "user_message",
+      "body": {"type": "text", "text": "A prompt written before prompt ids existed."},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "user-u-18",
+      "attached_source": ["user", "u-18"],
+      "source_revision": 1,
+      "timestamp": 1700000013,
+      "state": "complete",
+      "kind": "user_message",
+      "body": {"type": "text", "text": "A queued follow-up sharing an earlier prompt id, with no timestamp."},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "assistant-msg-06",
+      "attached_source": ["reply", "msg-06"],
+      "source_revision": 1,
+      "timestamp": 1700000016,
+      "state": "complete",
+      "kind": "assistant_message",
+      "body": {"type": "text", "text": {"$repeat": ["t", 50000]}},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "tool-toolu-04",
+      "attached_source": ["tool", "toolu-04"],
+      "source_revision": 2,
+      "timestamp": 1700000017,
+      "state": "complete",
+      "kind": "tool",
+      "body": {"type": "tool", "tool": {"name": "Write", "status": "complete", "input_preview": {"$concat": ["{\"content\":\"", {"$repeat": ["a", 2048]}, "\",\"file_path\":\"big.txt\"}"]}, "result_preview": {"$repeat": ["r", 32768]}}},
+      "truncation": {"truncated": true, "reason_code": "preview_bounded", "original_bytes": 35084}
+    }
+  ]
+}
