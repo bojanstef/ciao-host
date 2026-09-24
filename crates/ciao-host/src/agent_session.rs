@@ -896,10 +896,26 @@ impl AgentSessionSupervisor {
             .insert(session_id.to_owned(), history);
     }
 
+    /// The snapshot with no word on coverage, which is how the reconcile tests drive it; the
+    /// bridge always passes along what the adapter said.
+    #[cfg(test)]
     pub(crate) fn replace_bridge_snapshot(
         &self,
         session_id: &str,
         entries: Vec<NormalizedTimelineEntry>,
+    ) -> Result<()> {
+        self.replace_bridge_snapshot_covering(session_id, entries, None)
+    }
+
+    /// [`Self::replace_bridge_snapshot`] with the adapter's word on coverage. `Some(complete)`
+    /// sets the session's `history` capability and boundary through [`history_coverage`] —
+    /// `full` only if the snapshot held the conversation from its first message and this host's
+    /// own bound kept all of it. `None` leaves both as registration set them.
+    pub(crate) fn replace_bridge_snapshot_covering(
+        &self,
+        session_id: &str,
+        entries: Vec<NormalizedTimelineEntry>,
+        history_complete: Option<bool>,
     ) -> Result<()> {
         if entries.len() > 4096 {
             bail!("bridge snapshot entry count exceeds the host memory bound");
@@ -962,7 +978,14 @@ impl AgentSessionSupervisor {
         }
         session.history = history;
         fence_rewritten_history(&self.metadata, session, &held)?;
+        let held_before_bound = session.history.len();
         enforce_history_bound(session);
+        if let Some(complete) = history_complete {
+            let cut_by_bound = session.history.len() < held_before_bound;
+            let (history, boundary) = history_coverage(complete && !cut_by_bound);
+            history.clone_into(&mut session.snapshot.capabilities.history);
+            session.snapshot.timeline_window.history_boundary = boundary;
+        }
         bump_revision(session);
         refresh_snapshot_window(session);
         let _ = session.updates.send(AgentServerFrame::ResyncRequired {

@@ -679,7 +679,10 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
             ClaudeManagedInbound::SnapshotEntry(entry) => {
                 NormalizedAdapterEvent::SnapshotEntry(entry.normalize()?)
             }
-            ClaudeManagedInbound::SnapshotEnd => NormalizedAdapterEvent::SnapshotEnd,
+            // The worker states its coverage once, at registration (`history_complete`).
+            ClaudeManagedInbound::SnapshotEnd => NormalizedAdapterEvent::SnapshotEnd {
+                history_complete: None,
+            },
             ClaudeManagedInbound::UpsertEntry(entry) => {
                 NormalizedAdapterEvent::UpsertEntry(entry.normalize()?)
             }

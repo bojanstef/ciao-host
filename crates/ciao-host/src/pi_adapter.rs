@@ -167,7 +167,11 @@ pub(crate) enum PiBridgeInbound {
     Register(PiBridgeRegister),
     SnapshotStart,
     SnapshotEntry(WireTimelineEntry),
-    SnapshotEnd,
+    /// `history_complete` is sent only by an extension the daemon granted a larger frame, which
+    /// is what proves this decoder reads it; an older daemon refuses the key.
+    SnapshotEnd {
+        history_complete: Option<bool>,
+    },
     UpsertEntry(WireTimelineEntry),
     Turn(TurnState),
     Capabilities(PiBridgeCommandCapabilities),
@@ -218,8 +222,26 @@ pub(crate) fn decode_pi_bridge_frame(body: &[u8]) -> Result<PiBridgeInbound, Age
             Ok(PiBridgeInbound::SnapshotEntry(frame.entry))
         }
         "snapshot_end" => {
-            decode_unit_frame(&value, PI_BRIDGE_PROTOCOL_VERSION, "snapshot_end")?;
-            Ok(PiBridgeInbound::SnapshotEnd)
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Frame {
+                v: u8,
+                #[serde(rename = "type")]
+                message_type: String,
+                #[serde(default)]
+                history_complete: Option<bool>,
+            }
+            let frame: Frame =
+                serde_json::from_value(value).map_err(|_| AgentProtocolError::MalformedJson)?;
+            validate_frame_header(
+                frame.v,
+                PI_BRIDGE_PROTOCOL_VERSION,
+                &frame.message_type,
+                "snapshot_end",
+            )?;
+            Ok(PiBridgeInbound::SnapshotEnd {
+                history_complete: frame.history_complete,
+            })
         }
         "upsert_entry" => {
             #[derive(Deserialize)]
@@ -445,7 +467,9 @@ impl AttachedAgentAdapter for PiAttachedAdapter {
             PiBridgeInbound::SnapshotEntry(entry) => {
                 NormalizedAdapterEvent::SnapshotEntry(entry.normalize()?)
             }
-            PiBridgeInbound::SnapshotEnd => NormalizedAdapterEvent::SnapshotEnd,
+            PiBridgeInbound::SnapshotEnd { history_complete } => {
+                NormalizedAdapterEvent::SnapshotEnd { history_complete }
+            }
             PiBridgeInbound::UpsertEntry(entry) => {
                 NormalizedAdapterEvent::UpsertEntry(entry.normalize()?)
             }
@@ -638,6 +662,36 @@ mod tests {
             PiAttachedAdapter.decode_event(unknown).unwrap(),
             NormalizedAdapterEvent::Unknown
         );
+    }
+
+    /// An older extension ends a snapshot with no word on coverage; a granted one says whether
+    /// the branch arrived whole. Anything else in the frame is still refused.
+    #[test]
+    fn a_snapshot_end_carries_coverage_only_when_the_extension_gives_it() {
+        for (frame, expected) in [
+            (r#"{"v":1,"type":"snapshot_end"}"#, None),
+            (
+                r#"{"v":1,"type":"snapshot_end","history_complete":false}"#,
+                Some(false),
+            ),
+            (
+                r#"{"v":1,"type":"snapshot_end","history_complete":true}"#,
+                Some(true),
+            ),
+        ] {
+            assert_eq!(
+                PiAttachedAdapter.decode_event(frame.as_bytes()).unwrap(),
+                NormalizedAdapterEvent::SnapshotEnd {
+                    history_complete: expected
+                }
+            );
+        }
+        for hostile in [
+            r#"{"v":1,"type":"snapshot_end","history_complete":"no"}"#,
+            r#"{"v":1,"type":"snapshot_end","private":"synthetic"}"#,
+        ] {
+            assert!(decode_pi_bridge_frame(hostile.as_bytes()).is_err());
+        }
     }
 
     #[test]

@@ -417,7 +417,7 @@ export function fitEntryFrame(
 	entry: BridgeEntry,
 	frameBytes = MAX_FRAME_BYTES,
 ): WireObject {
-	const textBytes = frameBytes > MAX_FRAME_BYTES ? MAX_RETAINED_TEXT_BYTES : MAX_TEXT_BYTES;
+	const textBytes = textBytesFor(frameBytes);
 	let fitted: BridgeEntry = entry;
 	if (fitted.body.type === "text" && utf8Bytes(fitted.body.text) > textBytes) {
 		const cut = truncateUtf8(fitted.body.text, textBytes);
@@ -457,6 +457,12 @@ export function fitEntryFrame(
 		}
 		return frame;
 	}
+}
+
+/// The most of one message a daemon receives: whole bodies once it granted a larger frame, the
+/// phone's head before that.
+function textBytesFor(frameBytes: number): number {
+	return frameBytes > MAX_FRAME_BYTES ? MAX_RETAINED_TEXT_BYTES : MAX_TEXT_BYTES;
 }
 
 function jsonTextBytes(text: string): number {
@@ -611,6 +617,17 @@ function entryTimestamp(entry: Record<string, unknown>): number {
 
 /** Maps only documented displayable session records. Non-display metadata is omitted. */
 export function mapSessionBranch(entries: readonly SessionEntry[]): BridgeEntry[] {
+	return mapSessionHistory(entries, MAX_RETAINED_TEXT_BYTES).entries;
+}
+
+/// The branch as a snapshot within its bound, and whether that is the whole branch. `textBytes`
+/// is the most of one message the daemon will receive, which is what the bound has to count: a
+/// daemon that granted nothing larger gets 48 KiB heads, so counting whole bodies against it
+/// would drop messages it could have held.
+export function mapSessionHistory(
+	entries: readonly SessionEntry[],
+	textBytes: number,
+): { entries: BridgeEntry[]; complete: boolean } {
 	const mapped: BridgeEntry[] = [];
 	const tools = new Map<string, BridgeEntry>();
 	for (const raw of entries as readonly unknown[]) {
@@ -677,11 +694,11 @@ export function mapSessionBranch(entries: readonly SessionEntry[]): BridgeEntry[
 	// Tool-result records replace the matching call record rather than adding token/result rows.
 	mapped.push(...tools.values());
 	mapped.sort((left, right) => left.timestamp - right.timestamp || left.source_id.localeCompare(right.source_id));
-	return boundSnapshot(mapped);
+	return boundSnapshot(mapped, textBytes);
 }
 
-function entryContentBytes(entry: BridgeEntry): number {
-	if (entry.body.type === "text") return utf8Bytes(entry.body.text);
+function entryContentBytes(entry: BridgeEntry, textBytes: number): number {
+	if (entry.body.type === "text") return Math.min(utf8Bytes(entry.body.text), textBytes);
 	if (entry.body.type === "tool") {
 		return (
 			utf8Bytes(entry.body.tool.name) +
@@ -693,16 +710,19 @@ function entryContentBytes(entry: BridgeEntry): number {
 	return utf8Bytes(entry.body.reason_code);
 }
 
-function boundSnapshot(entries: BridgeEntry[]): BridgeEntry[] {
+/// The newest entries that fit the snapshot bound. `complete` is false when the oldest were left
+/// out, which the host must hear: it advertises `full` history only when it holds the
+/// conversation from its first message.
+function boundSnapshot(entries: BridgeEntry[], textBytes: number): { entries: BridgeEntry[]; complete: boolean } {
 	let total = 0;
 	const kept: BridgeEntry[] = [];
 	for (let index = entries.length - 1; index >= 0 && kept.length < MAX_SNAPSHOT_ENTRIES; index -= 1) {
-		const bytes = entryContentBytes(entries[index]);
+		const bytes = entryContentBytes(entries[index], textBytes);
 		if (total + bytes > MAX_SNAPSHOT_BYTES) break;
 		total += bytes;
 		kept.push(entries[index]);
 	}
-	return kept.reverse();
+	return { entries: kept.reverse(), complete: kept.length === entries.length };
 }
 
 function workspaceDisplay(cwd: string): string {
@@ -1070,10 +1090,17 @@ export class CiaoAgentBridge {
 		if (!this.registered || !this.context) return;
 		this.revisions.clear();
 		this.enqueue({ v: BRIDGE_VERSION, type: "snapshot_start" });
-		for (const entry of mapSessionBranch(this.context.sessionManager.getBranch())) {
+		const history = mapSessionHistory(this.context.sessionManager.getBranch(), textBytesFor(this.frameBytes));
+		for (const entry of history.entries) {
 			this.enqueue(fitEntryFrame("snapshot_entry", this.version(entry), this.frameBytes));
 		}
-		this.enqueue({ v: BRIDGE_VERSION, type: "snapshot_end" });
+		// Whether the host now holds the branch from its first message. Only a daemon that granted
+		// a larger frame reads the field; an older one's decoder refuses any key it does not know.
+		this.enqueue({
+			v: BRIDGE_VERSION,
+			type: "snapshot_end",
+			...(this.frameBytes > MAX_FRAME_BYTES ? { history_complete: history.complete } : {}),
+		});
 	}
 
 	private publishEntry(entry: BridgeEntry, coalesce: boolean): void {

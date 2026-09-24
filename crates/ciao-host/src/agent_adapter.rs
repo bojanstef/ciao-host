@@ -34,7 +34,12 @@ pub(crate) enum NormalizedAdapterEvent {
     Registration,
     SnapshotStart,
     SnapshotEntry(NormalizedTimelineEntry),
-    SnapshotEnd,
+    /// `history_complete` is the adapter's word on whether the snapshot holds the conversation
+    /// from its first message, when it has one to give; `None` leaves the session's coverage as
+    /// its registration set it.
+    SnapshotEnd {
+        history_complete: Option<bool>,
+    },
     UpsertEntry(NormalizedTimelineEntry),
     AppendText(NormalizedTextDelta),
     Heartbeat,

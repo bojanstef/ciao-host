@@ -221,10 +221,13 @@ async fn apply_adapter_event(
             }
             ctx.snapshot_entries.push(entry);
         }
-        NormalizedAdapterEvent::SnapshotEnd if ctx.snapshot_open => {
+        NormalizedAdapterEvent::SnapshotEnd { history_complete } if ctx.snapshot_open => {
             ctx.snapshot_open = false;
-            ctx.sessions
-                .replace_bridge_snapshot(session_id, std::mem::take(&mut ctx.snapshot_entries))?;
+            ctx.sessions.replace_bridge_snapshot_covering(
+                session_id,
+                std::mem::take(&mut ctx.snapshot_entries),
+                history_complete,
+            )?;
             // A resumed worker refuses a transcript past its SDK reader's bound and opens on
             // the boundary alone. The host reads the newest part itself, under the worker's
             // own source IDs, so the live stream continues the same rows.
@@ -1041,6 +1044,113 @@ mod tests {
             })
             .collect();
         assert_eq!(body, prompt);
+    }
+
+    /// Pi trims its snapshot to a bound and the host used to advertise `full` history regardless,
+    /// which with megabyte bodies is wrong after about four long messages. A granted extension
+    /// says on `snapshot_end` whether the branch arrived whole, and the session's coverage
+    /// follows the one rule: `full` from the first message, else `live_tail` with `resume`.
+    #[tokio::test]
+    async fn a_pi_snapshot_that_says_it_was_trimmed_is_not_advertised_as_full_history() {
+        let temporary = tempdir().unwrap();
+        let sessions = AgentSessionSupervisor::load(
+            &temporary.path().join("agent-metadata.json"),
+            WorkspaceConfig::with_binary_dirs(Vec::new()),
+        )
+        .unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let managed = crate::managed_session::ManagedSessionDirectory::load(
+            &temporary.path().join("agent-managed.json"),
+            temporary.path(),
+            crate::managed_session::ManagedLauncher::Fake(Default::default()),
+        )
+        .unwrap();
+        let task = tokio::spawn(handle_agent_bridge(
+            server,
+            sessions.clone(),
+            std::sync::Arc::new(crate::managed_worker::WorkerTable::default()),
+            managed,
+            std::sync::Arc::new(crate::codex_adopted::AdoptionRegistry::default()),
+            Notifier::new(
+                std::sync::Arc::new(parking_lot::Mutex::new(
+                    crate::storage::PairedDeviceStore::load(temporary.path().join("paired.json"))
+                        .unwrap(),
+                )),
+                "fixture-host".into(),
+            ),
+            shutdown,
+        ));
+        let mut register: Value = serde_json::from_slice(&pi_registration(Some("pi"))).unwrap();
+        register["frame_bytes"] = MAX_BRIDGE_FRAME_BYTES.into();
+        write_agent_frame(&mut client, &register).await.unwrap();
+        let registered: Value =
+            decode_agent_body(&read_agent_frame(&mut client).await.unwrap()).unwrap();
+        let session_id = registered["session_id"].as_str().unwrap().to_owned();
+
+        for (revision, complete) in [(1_u64, false), (2, true), (3, false)] {
+            write_agent_frame(
+                &mut client,
+                &serde_json::json!({"v": 1, "type": "snapshot_start"}),
+            )
+            .await
+            .unwrap();
+            write_agent_frame(
+                &mut client,
+                &serde_json::json!({
+                    "v": 1,
+                    "type": "snapshot_entry",
+                    "entry": {
+                        "source_id": "pi.message.newest",
+                        "source_revision": revision,
+                        "timestamp": 1,
+                        "state": "complete",
+                        "kind": "user_message",
+                        "body": { "type": "text", "text": "Synthetic newest message." },
+                        "truncation": { "truncated": false }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            write_agent_frame(
+                &mut client,
+                &serde_json::json!({"v": 1, "type": "snapshot_end", "history_complete": complete}),
+            )
+            .await
+            .unwrap();
+            let expected = if complete {
+                ("full", None)
+            } else {
+                ("live_tail", Some("resume"))
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(snapshot) = sessions.snapshot(&session_id)
+                        && snapshot
+                            .timeline_window
+                            .entries
+                            .first()
+                            .is_some_and(|entry| entry.entry_revision == revision)
+                    {
+                        assert_eq!(
+                            (
+                                snapshot.capabilities.history.as_str(),
+                                snapshot.timeline_window.history_boundary.as_deref()
+                            ),
+                            expected,
+                            "snapshot {revision}"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the snapshot lands");
+        }
+        drop(client);
+        let _ = task.await.unwrap();
     }
 
     /// Pi's extension refused unknown keys in `registered` until it learned this one, so only an

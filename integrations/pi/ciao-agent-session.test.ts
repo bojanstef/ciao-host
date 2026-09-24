@@ -701,3 +701,83 @@ test("a daemon restart does not cost the extension its grant", async () => {
 	await eventually(() => daemon.registrations.length >= 2, 5_000);
 	expect(daemon.registrations[1].frame_bytes).toBe(2 * 1024 * 1024);
 });
+
+/// A branch of `count` user messages of `bytes` each, in order.
+function longBranch(count: number, bytes: number) {
+	return Array.from({ length: count }, (_, index) => ({
+		type: "message",
+		id: `m${index}`,
+		parentId: index === 0 ? null : `m${index - 1}`,
+		timestamp: "2026-09-23T00:00:00Z",
+		message: {
+			role: "user",
+			content: `${index}:`.padEnd(bytes, "x"),
+			timestamp: 1_758_585_600_000 + index * 1_000,
+		},
+	}));
+}
+
+test("a snapshot trimmed to its bound says so, to a daemon that granted the frame to hear it", async () => {
+	// Five whole megabyte messages overflow the 4 MiB snapshot bound; the host must not be told
+	// the conversation is whole when its first messages were never sent.
+	for (const [branch, complete] of [
+		[longBranch(5, 1024 * 1024), false],
+		[longBranch(3, 1024), true],
+	] as const) {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-pi-trim-"));
+		const socketPath = path.join(root, "agent.sock");
+		const daemon = await restartableDaemon(socketPath);
+		const bridge = new CiaoAgentBridge({} as any, socketPath);
+		resources.push(async () => {
+			bridge.stop(true);
+			await daemon.stop();
+			fs.rmSync(root, { recursive: true, force: true });
+		});
+		bridge.start(piContext(branch as unknown[]));
+		await eventually(() => daemon.snapshotEnds.length > 0, 5_000);
+		expect(daemon.snapshotEnds[0].history_complete).toBe(complete);
+	}
+});
+
+test("a daemon that granted nothing never sees the field, and its bound counts what it is sent", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-pi-trim-old-"));
+	const socketPath = path.join(root, "agent.sock");
+	const snapshotEnds: Record<string, unknown>[] = [];
+	let entries = 0;
+	const server = net.createServer((socket) => {
+		socket.on(
+			"data",
+			decodeFrames((frame) => {
+				if (frame.type === "snapshot_entry") entries += 1;
+				if (frame.type === "snapshot_end") snapshotEnds.push(frame);
+				if (frame.type !== "register") return;
+				// A daemon from before the grant: registers, but never grants.
+				socket.write(
+					encodeBridgeFrame({
+						v: 1,
+						type: "registered",
+						session_id: "0123456789abcdef0123456789abcdef",
+						process_generation: 1,
+						snapshot_epoch: 1,
+					}),
+				);
+			}),
+		);
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(socketPath, resolve);
+	});
+	const bridge = new CiaoAgentBridge({} as any, socketPath);
+	resources.push(async () => {
+		bridge.stop(true);
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+	bridge.start(piContext(longBranch(6, 1024 * 1024)));
+	await eventually(() => snapshotEnds.length > 0, 5_000);
+	// Its strict decoder would refuse an unknown key on `snapshot_end`.
+	expect(Object.keys(snapshotEnds[0]).sort()).toEqual(["type", "v"]);
+	// Each message reaches it as a 48 KiB head, so all six fit its 4 MiB bound.
+	expect(entries).toBe(6);
+});
