@@ -2412,7 +2412,19 @@ pub fn fit_entry_to_frame(
     entry: &TimelineEntry,
     mut frame_len: impl FnMut(&TimelineEntry) -> usize,
 ) -> TimelineEntry {
+    // What the head stands for: the retained body. An entry that is already a head — a
+    // snapshot refitting its newest entry against its own envelope — keeps naming the body it
+    // was cut from, not itself.
     let whole = match &entry.body {
+        TimelineBody::Text { text }
+            if entry.truncation.reason_code.as_deref() == Some(TRUNCATION_BODY_AVAILABLE) =>
+        {
+            entry
+                .truncation
+                .original_bytes
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .unwrap_or(text.len())
+        }
         TimelineBody::Text { text } => text.len(),
         _ => 0,
     };
@@ -3820,6 +3832,20 @@ mod tests {
             text: "Synthetic.".into(),
         };
         assert_eq!(fit_entry_to_frame(&long, delta_len), long);
+
+        // A head cut again — the snapshot refits its newest entry against its own envelope —
+        // still names the whole retained body, not the head it was cut from.
+        let head = fit_entry_to_frame(
+            &TimelineEntry {
+                body: TimelineBody::Text { text: body.clone() },
+                ..long.clone()
+            },
+            delta_len,
+        );
+        let tighter = fit_entry_to_frame(&head, |candidate| delta_len(candidate) + 40 * 1024);
+        assert_eq!(tighter.truncation.original_bytes, Some(body.len() as u64));
+        assert!(delta_len(&tighter) + 40 * 1024 <= MAX_AGENT_FRAME_BYTES);
+        tighter.validate().unwrap();
 
         let mut tool = long.clone();
         tool.kind = "tool".into();
