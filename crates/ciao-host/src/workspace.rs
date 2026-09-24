@@ -1548,17 +1548,7 @@ pub(crate) fn parse_tmux_list(stdout: &[u8]) -> (Vec<TmuxSessionEntry>, u32) {
             continue;
         }
         let parsed = (|| {
-            let [name, attached, windows, created] = if line.contains(UNIT_SEPARATOR) {
-                let fields: Vec<&str> = line.split(UNIT_SEPARATOR).collect();
-                <[&str; 4]>::try_from(fields).ok()?
-            } else if line.contains(UNIT_SEPARATOR_ESCAPE) {
-                let fields: Vec<&str> = line.split(UNIT_SEPARATOR_ESCAPE).collect();
-                <[&str; 4]>::try_from(fields).ok()?
-            } else {
-                let fields: Vec<&str> = line.rsplitn(4, '_').collect();
-                let [created, windows, attached, name] = <[&str; 4]>::try_from(fields).ok()?;
-                [name, attached, windows, created]
-            };
+            let [name, attached, windows, created] = split_tmux_fields::<4>(line)?;
             if !valid_session_name(name) {
                 return None;
             }
@@ -1576,6 +1566,30 @@ pub(crate) fn parse_tmux_list(stdout: &[u8]) -> (Vec<TmuxSessionEntry>, u32) {
         }
     }
     (sessions, omitted)
+}
+
+/// One tmux `-F` line whose fields were joined by the unit separator, split in whichever form
+/// tmux wrote it: the raw 0x1F byte under a UTF-8 locale, or — in the daemon's clean
+/// environment, which carries no locale under launchd — the four characters `\037` (tmux 3.4) or
+/// a bare `_` (tmux 3.7b, observed 2026-09-24). The escaped form splits from the left and the
+/// substituted form from the right, which is why only the **first** field of a format may be one
+/// that can hold `_` (a session name), and none may hold a backslash. `None` unless exactly `N`
+/// fields result.
+///
+/// One owner, because two parsers used to carry their own copy: the session list learned the
+/// fallbacks and the agent route's pane list did not, so on tmux 3.7b every pane parsed to
+/// nothing and no Claude running in tmux was ever matched to its tab.
+pub(crate) fn split_tmux_fields<const N: usize>(line: &str) -> Option<[&str; N]> {
+    let fields: Vec<&str> = if line.contains(UNIT_SEPARATOR) {
+        line.split(UNIT_SEPARATOR).collect()
+    } else if line.contains(UNIT_SEPARATOR_ESCAPE) {
+        line.split(UNIT_SEPARATOR_ESCAPE).collect()
+    } else {
+        let mut fields: Vec<&str> = line.rsplitn(N, '_').collect();
+        fields.reverse();
+        fields
+    };
+    <[&str; N]>::try_from(fields).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
