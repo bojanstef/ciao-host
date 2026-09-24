@@ -52,6 +52,39 @@ const DIALECT: AttachedHookDialect = AttachedHookDialect {
 
 pub(crate) struct ClaudeAttachedAdapter;
 
+/// The dialect's adapter token and family, for callers that match a sighting or a mapping to
+/// this adapter without holding its dialect.
+pub(crate) const CLAUDE_ADAPTER_TOKEN: &str = DIALECT.adapter;
+pub(crate) const CLAUDE_FAMILY: &str = DIALECT.family;
+
+/// The registration a live Claude's own hook would send, rebuilt from what a restarted daemon
+/// can see: the vendor session ID herdr read, the process, the adapter version the metadata
+/// recorded for it, and its working directory. Through the same `normalize` as a hook's frame,
+/// so it states the same facts — and the same unknown turn, since no registration path may
+/// produce a working one. The caller vouches for the process; `process_id` stands in for the
+/// peer a hook connection would have presented.
+pub(crate) fn readopted_registration(
+    vendor_session_id: &str,
+    process_id: u32,
+    process_nonce: String,
+    adapter_version: String,
+    cwd: &str,
+) -> Result<NormalizedRegistration, AgentProtocolError> {
+    AttachedHookRegister {
+        v: DIALECT.protocol_version,
+        message_type: "register".into(),
+        adapter: DIALECT.adapter.into(),
+        adapter_version,
+        mode: "tui_hook".into(),
+        session_id: vendor_session_id.into(),
+        process_nonce,
+        process_id,
+        workspace_display: crate::hook_common::workspace_display(cwd),
+        workspace_path: cwd.into(),
+    }
+    .normalize(Some(process_id), &DIALECT)
+}
+
 /// Frames the Claude hook process serializes. This enum is the encode side of the dialect's
 /// vocabulary; the decode side is `decode_event` below, and the two must name the same set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

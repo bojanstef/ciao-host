@@ -131,7 +131,7 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
         hook_event_name == "SessionStart",
     )
     .await?;
-    let process_nonce = opaque_digest("process", &process_id.to_string());
+    let process_nonce = process_nonce(process_id);
     let facts = HookRuntimeFacts {
         process_id,
         process_nonce,
@@ -604,6 +604,13 @@ pub(crate) fn opaque_digest(namespace: &str, value: &str) -> String {
         "claude.{namespace}.{}",
         keyed_digest(CLAUDE_DIGEST_DOMAIN, namespace, value)
     )
+}
+
+/// The nonce a Claude process's hooks present, before the bridge binds it to the process start.
+/// One owner, because a startup re-adoption (`agent_bridge::readopt_attached_claude`) has to
+/// arrive at exactly the value every hook from that process sent.
+pub(crate) fn process_nonce(process_id: u32) -> String {
+    opaque_digest("process", &process_id.to_string())
 }
 
 #[cfg(test)]

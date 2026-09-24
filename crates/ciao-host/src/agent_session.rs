@@ -34,7 +34,9 @@ use crate::{
         TimelineWindow, Truncation, TurnState, bounded_session_list, encoded_frame_len,
         fit_entry_alone, fit_entry_to_frame, fit_snapshot_to_frame, valid_opaque_id, valid_token,
     },
-    agent_route::{AgentRouteProof, AgentTerminalPlan, RouteContinuity, TerminalRouteResolver},
+    agent_route::{
+        AgentRouteProof, AgentSighting, AgentTerminalPlan, RouteContinuity, TerminalRouteResolver,
+    },
     host_protocol::AgentTabIndex,
     notify::NotificationFacts,
     process::exists as process_exists,
@@ -383,6 +385,31 @@ impl AgentSessionSupervisor {
             supervisor.refresh_route(&session_id).await;
         });
         Ok(registered)
+    }
+
+    /// Agents herdr says are running, for a startup re-adoption to check against the metadata.
+    pub(crate) async fn herdr_agent_sightings(&self, adapter: &str) -> Vec<AgentSighting> {
+        self.routes.herdr_agent_sightings(adapter).await
+    }
+
+    /// The adapter family and version this exact process last registered with, or `None`
+    /// unless the metadata maps `upstream_identity` to a session whose process nonce is this
+    /// one. The nonce binds pid and process start (`agent_bridge`), so a match is proof that
+    /// the process passed a live registration before — which is what lets a restart re-adopt
+    /// it without the hook, and without the metadata ever holding a raw vendor ID.
+    pub(crate) fn registered_process(
+        &self,
+        upstream_identity: &str,
+        process_nonce: &str,
+    ) -> Option<(String, String)> {
+        let metadata = self.metadata.lock();
+        metadata.mapping_for_process(upstream_identity, process_nonce)?;
+        metadata.mapping_for(upstream_identity).map(|mapping| {
+            (
+                mapping.adapter_family.clone(),
+                mapping.adapter_version.clone(),
+            )
+        })
     }
 
     fn refresh_observer_registration(

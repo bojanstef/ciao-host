@@ -761,6 +761,15 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     let workspace = WorkspaceConfig::for_home(&paths.home);
     let agent_sessions =
         AgentSessionSupervisor::load(&paths.agent_metadata_file, workspace.clone())?;
+    // A restart forgets every attached agent until it next speaks; bring back the ones herdr can
+    // vouch for and the metadata already binds to their process. Off the startup path: it asks
+    // herdr, and a slow herdr must not hold back the daemon's readiness.
+    tokio::spawn({
+        let sessions = agent_sessions.clone();
+        async move {
+            crate::agent_bridge::readopt_attached_claude(&sessions).await;
+        }
+    });
     // The managed launcher is available only when the Ciao-owned SDK prefix and
     // worker entrypoint are installed; otherwise start/resume refuse
     // categorically while stored sessions stay listed.

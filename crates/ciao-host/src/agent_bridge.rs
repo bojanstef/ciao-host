@@ -22,11 +22,13 @@ use crate::{
         AgentProtocolError, MAX_BRIDGE_FRAME_BYTES, TimelineBody, Truncation, TurnState,
         decode_bridge_body, read_agent_frame_within, valid_token, write_agent_frame,
     },
-    agent_route::{process_looks_like_tui, process_start_fingerprint},
+    agent_route::{AgentSighting, process_looks_like_tui, process_start_fingerprint},
     agent_session::{
         AgentSessionSupervisor, AttentionKind, NormalizedTimelineEntry, RegisteredAgentSession,
     },
-    claude_adapter::ClaudeAttachedAdapter,
+    claude_adapter::{
+        CLAUDE_ADAPTER_TOKEN, CLAUDE_FAMILY, ClaudeAttachedAdapter, readopted_registration,
+    },
     claude_managed_adapter::ClaudeManagedAdapter,
     codex_adapter::CodexAttachedAdapter,
     host_protocol::HOST_OPERATION_TIMEOUT,
@@ -650,6 +652,77 @@ fn authenticated_process_nonce(nonce: &str, process_id: u32, process_start: &str
         .collect()
 }
 
+/// Re-adopts the attached Claude sessions a daemon restart forgot. An attached agent registers
+/// only on a hook event, so after a restart every idle one was invisible — no conversation, no
+/// tab link, no flip — until it next spoke (2026-09-23: every host update did this to every
+/// agent on the machine). herdr says which Claude runs in which pane and under which session
+/// ID; each sighting is re-registered exactly as its hook would have, and only when the
+/// persisted metadata already binds that session ID to this very process (pid and start), so a
+/// restart can restore what a live hook once proved and nothing else. The turn stays unknown
+/// until the agent's next event, as after any re-registration (ARCHITECTURE §11.5); the history
+/// comes back whole, from the transcript, the way a hook's registration fills it.
+pub(crate) async fn readopt_attached_claude(
+    sessions: &AgentSessionSupervisor,
+) -> Vec<RegisteredAgentSession> {
+    let mut readopted = Vec::new();
+    for sighting in sessions.herdr_agent_sightings(CLAUDE_ADAPTER_TOKEN).await {
+        // The same gate a hook connection passes: a batch `claude -p` is never an attached TUI.
+        if !process_looks_like_tui(sighting.process_id, CLAUDE_ADAPTER_TOKEN).await {
+            continue;
+        }
+        let Some(process_start) = process_start_fingerprint(sighting.process_id).await else {
+            continue;
+        };
+        if let Some(registered) = readopt_claude(sessions, &sighting, &process_start).await {
+            readopted.push(registered);
+        }
+    }
+    tracing::info!(
+        readopted = readopted.len(),
+        "re-adopted attached agent sessions after startup"
+    );
+    readopted
+}
+
+/// One sighting, with the process start already read — the part a test can drive without a
+/// live herdr or a live process.
+async fn readopt_claude(
+    sessions: &AgentSessionSupervisor,
+    sighting: &AgentSighting,
+    process_start: &str,
+) -> Option<RegisteredAgentSession> {
+    let hook_nonce = crate::claude_hook::process_nonce(sighting.process_id);
+    let nonce = authenticated_process_nonce(&hook_nonce, sighting.process_id, process_start);
+    let (family, adapter_version) =
+        sessions.registered_process(&sighting.vendor_session_id, &nonce)?;
+    if family != CLAUDE_FAMILY {
+        return None;
+    }
+    let mut registration = readopted_registration(
+        &sighting.vendor_session_id,
+        sighting.process_id,
+        hook_nonce,
+        adapter_version,
+        &sighting.cwd,
+    )
+    .ok()?;
+    registration.process_nonce = nonce;
+    // The hook path's own rule (`handle_agent_bridge`): an unestablished build's transcript is
+    // no better established than its hooks, so only a compatible one is read.
+    let backfill = registration.compatible;
+    let registered = sessions.register_observer(registration).await.ok()?;
+    if backfill {
+        crate::claude_history::spawn_backfill(
+            sessions.clone(),
+            registered.session_id.clone(),
+            sighting.vendor_session_id.clone(),
+            registered.process_generation,
+            crate::claude_history::SourceScheme::Attached,
+        );
+    }
+    Some(registered)
+}
+
 /// The vendor-side identity of an observed process, kept together so the transient handler can
 /// reach the agent itself rather than only the session Ciao gave it.
 struct AgentProcessIdentity {
@@ -843,6 +916,118 @@ mod tests {
             AdapterConnectionKind::TransientEvent
         );
         assert_eq!(selected.registration.capabilities.history, "live_tail");
+    }
+
+    /// A restart forgets an attached agent until its next hook; re-adoption brings it back from a
+    /// herdr sighting, but only where the metadata already binds that session ID to this very
+    /// process. Same Ciao session, same generation, a fresh epoch and an unknown turn — exactly
+    /// what the agent's next hook would have produced — and nothing at all for a reused pid or
+    /// for an ID this daemon never mapped.
+    #[tokio::test]
+    async fn a_restart_readopts_only_the_process_its_metadata_already_knows() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("agent-metadata.json");
+        let load = || {
+            AgentSessionSupervisor::load(&path, WorkspaceConfig::with_binary_dirs(Vec::new()))
+                .unwrap()
+        };
+        let vendor = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let pid = 4242;
+        let cwd = "/Users/u/project";
+        let sighting = AgentSighting {
+            vendor_session_id: vendor.into(),
+            process_id: pid,
+            cwd: cwd.into(),
+        };
+
+        // Before the restart: the hook's registration, bound to the process start the way the
+        // bridge binds every hook's nonce.
+        let before = load();
+        let hook_nonce = crate::claude_hook::process_nonce(pid);
+        let mut hooked =
+            readopted_registration(vendor, pid, hook_nonce.clone(), "2.1.222".into(), cwd).unwrap();
+        hooked.process_nonce = authenticated_process_nonce(&hook_nonce, pid, "start-a");
+        let first = before.register_observer(hooked).await.unwrap();
+        let first_epoch = before.snapshot(&first.session_id).unwrap().snapshot_epoch;
+        drop(before);
+
+        let after = load();
+        assert_eq!(
+            after.active_count(),
+            0,
+            "a restart starts with nothing registered"
+        );
+        assert!(
+            readopt_claude(&after, &sighting, "start-b").await.is_none(),
+            "the same pid started again is a different process"
+        );
+        let stranger = AgentSighting {
+            vendor_session_id: "11111111-2222-4333-8444-555555555555".into(),
+            ..sighting.clone()
+        };
+        assert!(
+            readopt_claude(&after, &stranger, "start-a").await.is_none(),
+            "an ID this daemon never mapped"
+        );
+        assert_eq!(after.active_count(), 0);
+
+        let readopted = readopt_claude(&after, &sighting, "start-a")
+            .await
+            .expect("the process the metadata knows comes back");
+        assert_eq!(readopted.session_id, first.session_id);
+        assert_eq!(readopted.process_generation, first.process_generation);
+        let snapshot = after.snapshot(&readopted.session_id).unwrap();
+        assert_ne!(
+            snapshot.snapshot_epoch, first_epoch,
+            "old cursors are fenced"
+        );
+        assert_eq!(snapshot.presence, "live");
+        assert!(
+            matches!(snapshot.turn, TurnState::Unknown { .. }),
+            "a re-adoption never infers a working turn"
+        );
+        assert_eq!(after.active_count(), 1);
+    }
+
+    /// Live probe, opt-in: what a restart would re-adopt on this machine, against the real herdr,
+    /// the real processes and a real metadata file. `CIAO_TEST_LIVE_READOPT` names a **copy** of
+    /// the daemon's `agent-metadata.json` — loading rewrites the file, so never the live one —
+    /// and the probe prints counts only. Run with the `HERDR_*` variables unset, or the shell's
+    /// own session silently overrides `--session`.
+    #[tokio::test]
+    async fn grounded_system_herdr_readopts_this_machines_agents_when_explicitly_enabled() {
+        let Some(copy) = std::env::var_os("CIAO_TEST_LIVE_READOPT") else {
+            return;
+        };
+        let directories = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        let sessions = AgentSessionSupervisor::load(
+            std::path::Path::new(&copy),
+            WorkspaceConfig::with_binary_dirs(directories),
+        )
+        .unwrap();
+        let sighted = sessions
+            .herdr_agent_sightings(CLAUDE_ADAPTER_TOKEN)
+            .await
+            .len();
+        let readopted = readopt_attached_claude(&sessions).await;
+        // The transcript read runs in the background, as it does for a hook's registration.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let with_history = readopted
+            .iter()
+            .filter(|registered| {
+                sessions
+                    .snapshot(&registered.session_id)
+                    .is_some_and(|snapshot| !snapshot.timeline_window.entries.is_empty())
+            })
+            .count();
+        println!(
+            "live readopt: sighted={sighted} readopted={} with_history={with_history}",
+            readopted.len()
+        );
+        assert!(sighted > 0, "herdr reported no Claude panes to probe");
     }
 
     #[tokio::test]

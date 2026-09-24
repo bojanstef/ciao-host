@@ -544,6 +544,148 @@ pub(crate) async fn process_start_fingerprint(pid: u32) -> Option<String> {
     process::start_fingerprint(pid, MAX_OPAQUE_ID_BYTES).await
 }
 
+/// An agent herdr says is running, with the vendor session ID herdr read for it and the process
+/// behind its pane: what a startup re-adoption needs to rebuild the registration the agent's own
+/// hook would have sent. Raw and transient — the vendor ID is used for one keyed-digest lookup
+/// and never stored (Spec 005 §8.2) — and a claim, not a proof: the caller accepts it only where
+/// the persisted metadata already binds this exact process to that ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentSighting {
+    pub(crate) vendor_session_id: String,
+    pub(crate) process_id: u32,
+    pub(crate) cwd: String,
+}
+
+impl TerminalRouteResolver {
+    /// Every pane herdr says runs `adapter`, across its sessions, bounded like a route search.
+    /// Each costs one `api snapshot` per session and one `pane process-info` per matching pane;
+    /// any failure is simply no sighting.
+    pub(crate) async fn herdr_agent_sightings(&self, adapter: &str) -> Vec<AgentSighting> {
+        let Some(binary) = self.workspace.resolve(ProviderKind::Herdr) else {
+            return Vec::new();
+        };
+        let mut sightings = Vec::new();
+        let mut inspected = 0_usize;
+        for session_name in list_herdr_sessions(&binary).await {
+            let Some(snapshot) = herdr_snapshot(&binary, &session_name).await else {
+                continue;
+            };
+            for (pane_id, vendor_session_id) in herdr_agent_panes(&snapshot, adapter) {
+                if inspected >= MAX_HERDR_PANES {
+                    return sightings;
+                }
+                inspected += 1;
+                if let Some((process_id, cwd)) =
+                    herdr_agent_process(&binary, &session_name, &pane_id, adapter).await
+                {
+                    sightings.push(AgentSighting {
+                        vendor_session_id,
+                        process_id,
+                        cwd,
+                    });
+                }
+            }
+        }
+        sightings
+    }
+}
+
+/// The panes of one `api snapshot` whose agent herdr names `adapter` and identifies by session
+/// ID (herdr 0.9.0: `agent_session: {agent, kind: "id", source, value}`). A pane naming this
+/// agent whose identity is some other kind, or malformed, is the one input swallowed here — the
+/// rest of a pane is deliberately ignored — so it is tallied for the drift ledger (Spec 017).
+fn herdr_agent_panes(snapshot: &Value, adapter: &str) -> Vec<(String, String)> {
+    let panes = snapshot
+        .get("result")
+        .and_then(|value| value.get("snapshot"))
+        .and_then(|value| value.get("panes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_HERDR_PANES);
+    let mut found = Vec::new();
+    for pane in panes {
+        let Some(pane_id) = pane
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .filter(|id| valid_provider_id(id))
+        else {
+            continue;
+        };
+        let Some(session) = pane.get("agent_session") else {
+            continue;
+        };
+        if session.get("agent").and_then(Value::as_str) != Some(adapter) {
+            continue;
+        }
+        let identity = session
+            .get("value")
+            .and_then(Value::as_str)
+            .filter(|_| session.get("kind").and_then(Value::as_str) == Some("id"))
+            .filter(|id| valid_opaque_id(id).is_ok());
+        match identity {
+            Some(id) => found.push((pane_id.to_owned(), id.to_owned())),
+            None => crate::drift::note("herdr", "agent_session", "invalid", "value", None),
+        }
+    }
+    found
+}
+
+async fn herdr_agent_process(
+    binary: &Path,
+    session_name: &str,
+    pane_id: &str,
+    adapter: &str,
+) -> Option<(u32, String)> {
+    if !valid_session_name(session_name) || !valid_provider_id(pane_id) {
+        return None;
+    }
+    let output = run_bounded(
+        binary,
+        &[
+            "--session",
+            session_name,
+            "pane",
+            "process-info",
+            "--pane",
+            pane_id,
+        ],
+    )
+    .await
+    .ok()?;
+    if !output.status_success || output.stdout_truncated {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+    parse_herdr_agent_process(&value, pane_id, adapter)
+}
+
+/// The pane's foreground process started as `adapter` (by `argv0`'s file name — Claude's binary
+/// is named for its version, so the name is not it), with its absolute working directory.
+fn parse_herdr_agent_process(value: &Value, pane_id: &str, adapter: &str) -> Option<(u32, String)> {
+    let info = value.get("result")?.get("process_info")?;
+    if info.get("pane_id").and_then(Value::as_str) != Some(pane_id) {
+        return None;
+    }
+    info.get("foreground_processes")?
+        .as_array()?
+        .iter()
+        .find_map(|process| {
+            let argv0 = process.get("argv0")?.as_str()?;
+            if Path::new(argv0).file_name()?.to_str()? != adapter {
+                return None;
+            }
+            let pid = u32::try_from(process.get("pid")?.as_u64()?)
+                .ok()
+                .filter(|pid| *pid != 0)?;
+            let cwd = process
+                .get("cwd")?
+                .as_str()
+                .filter(|cwd| Path::new(cwd).is_absolute())?;
+            Some((pid, cwd.to_owned()))
+        })
+}
+
 async fn list_herdr_sessions(binary: &Path) -> Vec<String> {
     let Ok(output) = run_bounded(binary, &["session", "list", "--json"]).await else {
         return Vec::new();
@@ -647,6 +789,51 @@ mod tests {
     fn executable(path: &Path, body: &str) {
         fs::write(path, body).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A startup re-adoption reads two herdr documents: which panes name the agent by session
+    /// ID, and which foreground process in that pane is the agent. The rest — a pane naming
+    /// another agent, an identity of another kind, the shell beside the agent, a relative cwd,
+    /// another pane's answer — names nothing.
+    #[test]
+    fn herdr_agent_sightings_parse_the_identity_and_the_process_behind_it() {
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let snapshot = serde_json::json!({"result": {"snapshot": {"panes": [
+            {"pane_id": "w1:p1", "agent_session":
+                {"agent": "claude", "kind": "id", "source": "herdr:claude", "value": id}},
+            {"pane_id": "w1:p2", "agent_session": {"agent": "codex", "kind": "id", "value": id}},
+            {"pane_id": "w1:p3"},
+            {"pane_id": "w1:p4", "agent_session": {"agent": "claude", "kind": "path", "value": id}},
+            {"pane_id": "bad pane", "agent_session": {"agent": "claude", "kind": "id", "value": id}},
+        ]}}});
+        assert_eq!(
+            herdr_agent_panes(&snapshot, "claude"),
+            vec![("w1:p1".to_owned(), id.to_owned())]
+        );
+
+        let info = |pane: &str, cwd: &str, pid: u64| {
+            serde_json::json!({"result": {"process_info": {"pane_id": pane, "foreground_processes": [
+                {"argv0": "npm exec something", "pid": 11, "cwd": "/Users/u"},
+                {"argv0": "claude", "argv": ["claude"], "name": "2.1.280", "pid": pid, "cwd": cwd},
+            ]}}})
+        };
+        assert_eq!(
+            parse_herdr_agent_process(&info("w1:p1", "/Users/u/project", 42), "w1:p1", "claude"),
+            Some((42, "/Users/u/project".to_owned()))
+        );
+        assert_eq!(
+            parse_herdr_agent_process(&info("w1:p9", "/Users/u/project", 42), "w1:p1", "claude"),
+            None,
+            "another pane's answer"
+        );
+        assert_eq!(
+            parse_herdr_agent_process(&info("w1:p1", "project", 42), "w1:p1", "claude"),
+            None
+        );
+        assert_eq!(
+            parse_herdr_agent_process(&info("w1:p1", "/Users/u/project", 0), "w1:p1", "claude"),
+            None
+        );
     }
 
     #[test]
