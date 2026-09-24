@@ -169,6 +169,50 @@ class PackTests(unittest.TestCase):
         self.assertFalse(stale.exists(), "a failed build cannot ship the previous binary")
 
 
+class NotarizeTests(unittest.TestCase):
+    """Absent a Developer ID the macOS binary stays ad-hoc and says so; present, every step is
+    required and anything but Apple's "Accepted" refuses the pack."""
+
+    SUBMISSION = "0f0e0d0c-0b0a-0908-0706-050403020100"
+    KEYS = {"CIAO_DEVELOPER_ID": "Developer ID Application: Fixture (TEAM000000)",
+            "CIAO_NOTARY_KEY_PATH": "/tmp/fixture.p8", "CIAO_NOTARY_KEY_ID": "KEY0000000", "CIAO_NOTARY_ISSUER": "issuer"}
+
+    def runner(self, status):
+        calls = []
+
+        def run(argv, *, cwd=None, timeout, env=None):
+            calls.append(list(argv))
+            if argv[:2] == ["xcrun", "notarytool"]:
+                return 0, f'{{"id": "{self.SUBMISSION}", "status": "{status}", "message": "Processing complete"}}\n'.encode()
+            return 0, b""
+        return run, calls
+
+    def test_without_an_identity_nothing_runs_and_the_log_says_so(self):
+        run, calls = self.runner("Accepted")
+        lines = []
+        self.assertFalse(rb.notarize(run, Path("/tmp/ciao"), DARWIN, {}, emit=lines.append))
+        self.assertFalse(rb.notarize(run, Path("/tmp/ciao"), LINUX, self.KEYS, emit=lines.append))
+        self.assertEqual(calls, [])
+        self.assertEqual(lines, ["Not notarized: CIAO_DEVELOPER_ID is unset, so the binary keeps its ad-hoc signature"])
+
+    def test_an_identity_without_notary_credentials_refuses_before_signing(self):
+        run, calls = self.runner("Accepted")
+        with self.assertRaisesRegex(rb.Refused, "notary_credentials_required"):
+            rb.notarize(run, Path("/tmp/ciao"), DARWIN, {**self.KEYS, "CIAO_NOTARY_ISSUER": " "}, emit=lambda _line: None)
+        self.assertEqual(calls, [])
+
+    def test_signs_with_the_hardened_runtime_then_waits_for_apples_verdict(self):
+        run, calls = self.runner("Accepted")
+        self.assertTrue(rb.notarize(run, Path("/tmp/ciao"), DARWIN, self.KEYS, emit=lambda _line: None))
+        self.assertEqual([c[0] for c in calls], ["codesign", "ditto", "xcrun"])
+        self.assertEqual(calls[0], ["codesign", "--force", "--options", "runtime", "--timestamp", "--sign",
+                                    self.KEYS["CIAO_DEVELOPER_ID"], "/tmp/ciao"])
+        self.assertIn("--wait", calls[2])
+        for status in ("Invalid", "In Progress", "Rejected"):
+            with self.subTest(status=status), self.assertRaisesRegex(rb.Refused, f"notarization_not_accepted: {self.SUBMISSION}"):
+                rb.notarize(self.runner(status)[0], Path("/tmp/ciao"), DARWIN, self.KEYS, emit=lambda _line: None)
+
+
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

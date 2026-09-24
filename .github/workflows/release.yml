@@ -75,7 +75,33 @@ jobs:
         # a green record is still a whole green run, never a partial one.
         run: python3 scripts/release_build.py native --out dist/native-darwin-arm64.json || python3 scripts/release_build.py native --out dist/native-darwin-arm64.json
       - name: Release build and archive
-        run: python3 scripts/release_build.py pack --out dist
+        # Developer ID signing and notarization (`release_build.notarize`). Until the secrets exist
+        # the binary stays ad-hoc and the log says so; once DEVELOPER_ID_P12 is set, the certificate
+        # lives only in this job's throwaway keychain and a missing identity fails the job.
+        env:
+          DEVELOPER_ID_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          CIAO_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          CIAO_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          if [ -n "$DEVELOPER_ID_P12" ]; then
+            keychain="$RUNNER_TEMP/developer-id.keychain-db"
+            password="$(uuidgen)"
+            security create-keychain -p "$password" "$keychain"
+            security set-keychain-settings -lut 3600 "$keychain"
+            security unlock-keychain -p "$password" "$keychain"
+            printf '%s' "$DEVELOPER_ID_P12" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+            security import "$RUNNER_TEMP/developer-id.p12" -k "$keychain" -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+            rm -f "$RUNNER_TEMP/developer-id.p12"
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+            security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+            CIAO_DEVELOPER_ID="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -n 1)"
+            [ -n "$CIAO_DEVELOPER_ID" ] || { echo "::error::release_build: developer_id_identity_missing"; exit 2; }
+            printf '%s' "$NOTARY_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+            export CIAO_DEVELOPER_ID CIAO_NOTARY_KEY_PATH="$RUNNER_TEMP/notary.p8"
+          fi
+          python3 scripts/release_build.py pack --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ciao-darwin-arm64
