@@ -20,10 +20,12 @@ use serde_json::Value;
 use crate::{
     agent_adapter::{
         AdapterConnectionKind, AttachedAgentAdapter, AttachedHookDialect, AttachedHookOutbound,
-        AttachedHookRegister, NormalizedAdapterEvent, WireTimelineEntry, decode_entry_frame,
-        decode_notification_frame, decode_turn_frame, decode_unit_frame, frame_type,
+        AttachedHookRegister, NormalizedAdapterEvent, RestartRecovery, VendorRecord,
+        WireTimelineEntry, decode_entry_frame, decode_notification_frame, decode_turn_frame,
+        decode_unit_frame, frame_type, readopted_hook_registration,
     },
     agent_protocol::{AgentCommand, AgentProtocolError, TurnState},
+    agent_route::AgentSighting,
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
 
@@ -152,6 +154,31 @@ impl AttachedAgentAdapter for CodexAttachedAdapter {
 
     fn requires_tui_process(&self) -> bool {
         true
+    }
+
+    /// Hooks, like Claude's, fire only on events. Codex keeps no per-process record, but a
+    /// running Codex holds its thread's rollout open and the file name ends in the thread ID
+    /// (observed on 0.156.1); a Codex never messaged has no thread and nothing to restore.
+    fn restart_recovery(&self) -> RestartRecovery {
+        RestartRecovery::Rediscovered(VendorRecord::CodexOpenRollout)
+    }
+
+    fn hook_process_nonce(&self, process_id: u32) -> Option<String> {
+        Some(crate::codex_hook::process_nonce(process_id))
+    }
+
+    fn readopted_registration(
+        &self,
+        sighting: &AgentSighting,
+        hook_nonce: String,
+        adapter_version: String,
+    ) -> Option<Result<NormalizedRegistration, AgentProtocolError>> {
+        Some(readopted_hook_registration(
+            &DIALECT,
+            sighting,
+            hook_nonce,
+            adapter_version,
+        ))
     }
 
     fn decode_registration(

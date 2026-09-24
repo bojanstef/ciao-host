@@ -18,13 +18,13 @@ use crate::{
     process,
     workspace::{
         WorkspaceConfig, focus_tab, parse_herdr_tab_list, run_bounded, sanitize_tab_label,
+        split_tmux_fields,
     },
 };
 
 const ROUTE_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 const TMUX_ROUTE_FORMAT: &str = "#{session_name}\u{1f}#{session_id}\u{1f}#{window_id}\u{1f}#{pane_id}\u{1f}#{pane_pid}\u{1f}#{pane_tty}";
 const MAX_HERDR_PANES: usize = 64;
-const UNIT_SEPARATOR: char = '\u{1f}';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteContinuity {
@@ -414,7 +414,8 @@ fn parse_tmux_panes(stdout: &[u8]) -> Vec<TmuxPane> {
     let text = String::from_utf8_lossy(stdout);
     text.lines()
         .filter_map(|line| {
-            let fields: Vec<&str> = line.split(UNIT_SEPARATOR).collect();
+            // Session name first: it is the one field that may hold `_`, which is what the
+            // shared split needs to recover a 3.7b line whose separators became `_`.
             let [
                 session_name,
                 session_id,
@@ -422,7 +423,7 @@ fn parse_tmux_panes(stdout: &[u8]) -> Vec<TmuxPane> {
                 pane_id,
                 pane_pid,
                 pane_tty,
-            ] = <[&str; 6]>::try_from(fields).ok()?;
+            ] = split_tmux_fields::<6>(line)?;
             if !valid_session_name(session_name)
                 || !valid_tmux_id(session_id, '$')
                 || !valid_tmux_id(window_id, '@')
@@ -834,6 +835,31 @@ mod tests {
             parse_herdr_agent_process(&info("w1:p1", "/Users/u/project", 0), "w1:p1", "claude"),
             None
         );
+    }
+
+    /// The daemon runs tmux with no locale, and tmux then does not write the unit separator:
+    /// 3.4 writes the four characters `\037`, 3.7b a bare `_` (observed 2026-09-24 as
+    /// `testing_$0_@0_%0_83094_/dev/ttys000`). The pane parser read only the raw byte, so on 3.7b
+    /// every pane parsed to nothing and no Claude in tmux was ever matched to its tab. Every
+    /// form must yield the same pane, including a session name that itself holds `_`.
+    #[test]
+    fn tmux_panes_parse_in_every_form_the_separator_comes_back_in() {
+        for line in [
+            "testing\u{1f}$0\u{1f}@0\u{1f}%0\u{1f}83094\u{1f}/dev/ttys000\n",
+            "testing\\037$0\\037@0\\037%0\\03783094\\037/dev/ttys000\n",
+            "testing_$0_@0_%0_83094_/dev/ttys000\n",
+        ] {
+            let panes = parse_tmux_panes(line.as_bytes());
+            assert_eq!(panes.len(), 1, "{line:?}");
+            assert_eq!(panes[0].session_name, "testing");
+            assert_eq!(panes[0].pane_id, "%0");
+            assert_eq!(panes[0].pane_pid, 83094);
+            assert_eq!(panes[0].pane_tty, "/dev/ttys000");
+        }
+        let underscored = parse_tmux_panes(b"my_project_$1_@2_%3_42_/dev/ttys001\n");
+        assert_eq!(underscored.len(), 1);
+        assert_eq!(underscored[0].session_name, "my_project");
+        assert_eq!(underscored[0].session_id, "$1");
     }
 
     #[test]

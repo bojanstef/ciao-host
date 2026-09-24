@@ -898,6 +898,12 @@ impl ManagedChatsToRestore {
         for session_id in &self.session_ids {
             match ipc::request_agent_resume(&self.socket, session_id).await {
                 Ok(outcome) if outcome.state == "accepted" => resumed += 1,
+                // A daemon that resumes the chats its own start stored (`take_restart_resumable`)
+                // has usually done this already, so finding one live is success. Kept for the
+                // rollback path, where the restarted daemon may be one that does not.
+                Ok(outcome) if outcome.reason_code.as_deref() == Some("already_live") => {
+                    resumed += 1
+                }
                 Ok(outcome) => println!(
                     "Could not resume {session_id}: {}. Resume it from the app.",
                     outcome.reason_code.as_deref().unwrap_or("unknown_reason")

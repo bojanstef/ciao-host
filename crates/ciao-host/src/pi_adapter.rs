@@ -9,8 +9,8 @@ use serde_json::Value;
 
 use crate::{
     agent_adapter::{
-        AttachedAgentAdapter, NormalizedAdapterEvent, WireTimelineEntry, decode_unit_frame,
-        validate_frame_header,
+        AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery, WireTimelineEntry,
+        decode_unit_frame, validate_frame_header,
     },
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentCommandKind, AgentProtocolError, CommandCapabilities,
@@ -433,6 +433,12 @@ impl PiBridgeOutbound {
 impl AttachedAgentAdapter for PiAttachedAdapter {
     fn id(&self) -> &'static str {
         "pi"
+    }
+
+    /// The extension holds a persistent bridge and reconnects on its own, backing off to 5 s
+    /// (`integrations/pi/ciao-agent-session.ts`), so a restart costs it seconds, not a session.
+    fn restart_recovery(&self) -> RestartRecovery {
+        RestartRecovery::Reconnects
     }
 
     fn accepts_legacy_registration(&self) -> bool {

@@ -16,7 +16,7 @@ use tokio::{
 use crate::{
     agent_adapter::{
         ADAPTER_COMMAND_CHANNEL_CAPACITY, AdapterConnectionKind, AttachedAgentAdapter,
-        NormalizedAdapterEvent,
+        NormalizedAdapterEvent, RestartRecovery, VendorRecord,
     },
     agent_protocol::{
         AgentProtocolError, MAX_BRIDGE_FRAME_BYTES, TimelineBody, Truncation, TurnState,
@@ -26,9 +26,7 @@ use crate::{
     agent_session::{
         AgentSessionSupervisor, AttentionKind, NormalizedTimelineEntry, RegisteredAgentSession,
     },
-    claude_adapter::{
-        CLAUDE_ADAPTER_TOKEN, CLAUDE_FAMILY, ClaudeAttachedAdapter, readopted_registration,
-    },
+    claude_adapter::ClaudeAttachedAdapter,
     claude_managed_adapter::ClaudeManagedAdapter,
     codex_adapter::CodexAttachedAdapter,
     host_protocol::HOST_OPERATION_TIMEOUT,
@@ -652,29 +650,52 @@ fn authenticated_process_nonce(nonce: &str, process_id: u32, process_start: &str
         .collect()
 }
 
-/// Re-adopts the attached Claude sessions a daemon restart forgot. An attached agent registers
-/// only on a hook event, so after a restart every idle one was invisible — no conversation, no
-/// tab link, no flip — until it next spoke (2026-09-23: every host update did this to every
-/// agent on the machine). herdr says which Claude runs in which pane and under which session
-/// ID; each sighting is re-registered exactly as its hook would have, and only when the
+/// Re-adopts the attached sessions a daemon restart forgot, for every adapter that declared
+/// `RestartRecovery::Rediscovered`. An attached agent registers only on a hook event, so after a
+/// restart every idle one was invisible — no conversation, no tab link, no flip — until it next
+/// spoke (2026-09-23: every host update did this to every agent on the machine). Each adapter's
+/// vendor record says which of its processes are running and under which session ID, in
+/// whatever terminal; herdr's own detection is a second source for a build whose record is
+/// missing. Each sighting is re-registered exactly as its hook would have, and only where the
 /// persisted metadata already binds that session ID to this very process (pid and start), so a
-/// restart can restore what a live hook once proved and nothing else. The turn stays unknown
-/// until the agent's next event, as after any re-registration (ARCHITECTURE §11.5); the history
-/// comes back whole, from the transcript, the way a hook's registration fills it.
-pub(crate) async fn readopt_attached_claude(
+/// restart restores what a live hook once proved and nothing else. The turn stays unknown until
+/// the agent's next event, as after any re-registration (ARCHITECTURE §11.5); the history comes
+/// back the way each dialect's hook path reads it.
+pub(crate) async fn readopt_attached(
     sessions: &AgentSessionSupervisor,
+    adoptions: &std::sync::Arc<crate::codex_adopted::AdoptionRegistry>,
 ) -> Vec<RegisteredAgentSession> {
     let mut readopted = Vec::new();
-    for sighting in sessions.herdr_agent_sightings(CLAUDE_ADAPTER_TOKEN).await {
-        // The same gate a hook connection passes: a batch `claude -p` is never an attached TUI.
-        if !process_looks_like_tui(sighting.process_id, CLAUDE_ADAPTER_TOKEN).await {
-            continue;
-        }
-        let Some(process_start) = process_start_fingerprint(sighting.process_id).await else {
+    for adapter in PRODUCTION_ADAPTERS.iter().copied() {
+        let RestartRecovery::Rediscovered(record) = adapter.restart_recovery() else {
             continue;
         };
-        if let Some(registered) = readopt_claude(sessions, &sighting, &process_start).await {
-            readopted.push(registered);
+        let mut sightings = match record {
+            VendorRecord::ClaudeSessionFiles => {
+                tokio::task::spawn_blocking(crate::claude_transcript::live_session_sightings)
+                    .await
+                    .unwrap_or_default()
+            }
+            VendorRecord::CodexOpenRollout => crate::codex_history::live_rollout_sightings().await,
+        };
+        sightings.extend(sessions.herdr_agent_sightings(adapter.id()).await);
+        let mut seen = std::collections::HashSet::new();
+        for sighting in sightings {
+            if !seen.insert(sighting.process_id) {
+                continue;
+            }
+            // The same gate a hook connection passes: a batch process is never an attached TUI.
+            if !process_looks_like_tui(sighting.process_id, adapter.id()).await {
+                continue;
+            }
+            let Some(process_start) = process_start_fingerprint(sighting.process_id).await else {
+                continue;
+            };
+            if let Some(registered) =
+                readopt_one(sessions, adoptions, adapter, &sighting, &process_start).await
+            {
+                readopted.push(registered);
+            }
         }
     }
     tracing::info!(
@@ -685,40 +706,50 @@ pub(crate) async fn readopt_attached_claude(
 }
 
 /// One sighting, with the process start already read — the part a test can drive without a
-/// live herdr or a live process.
-async fn readopt_claude(
+/// live vendor, herdr, or process.
+async fn readopt_one(
     sessions: &AgentSessionSupervisor,
+    adoptions: &std::sync::Arc<crate::codex_adopted::AdoptionRegistry>,
+    adapter: &dyn AttachedAgentAdapter,
     sighting: &AgentSighting,
     process_start: &str,
 ) -> Option<RegisteredAgentSession> {
-    let hook_nonce = crate::claude_hook::process_nonce(sighting.process_id);
+    let hook_nonce = adapter.hook_process_nonce(sighting.process_id)?;
     let nonce = authenticated_process_nonce(&hook_nonce, sighting.process_id, process_start);
     let (family, adapter_version) =
         sessions.registered_process(&sighting.vendor_session_id, &nonce)?;
-    if family != CLAUDE_FAMILY {
+    let mut registration = adapter
+        .readopted_registration(sighting, hook_nonce, adapter_version)?
+        .ok()?;
+    // The mapping is this adapter's only if this adapter's hook made it.
+    if registration.adapter_family != family {
         return None;
     }
-    let mut registration = readopted_registration(
-        &sighting.vendor_session_id,
-        sighting.process_id,
-        hook_nonce,
-        adapter_version,
-        &sighting.cwd,
-    )
-    .ok()?;
     registration.process_nonce = nonce;
-    // The hook path's own rule (`handle_agent_bridge`): an unestablished build's transcript is
-    // no better established than its hooks, so only a compatible one is read.
-    let backfill = registration.compatible;
+    // The hook path's own rule: an unestablished build's record is no better established than
+    // its hooks, so only a compatible one is read.
+    let read_history = registration.compatible;
     let registered = sessions.register_observer(registration).await.ok()?;
-    if backfill {
-        crate::claude_history::spawn_backfill(
-            sessions.clone(),
-            registered.session_id.clone(),
-            sighting.vendor_session_id.clone(),
-            registered.process_generation,
-            crate::claude_history::SourceScheme::Attached,
-        );
+    if read_history {
+        match adapter.id() {
+            "claude" => crate::claude_history::spawn_backfill(
+                sessions.clone(),
+                registered.session_id.clone(),
+                sighting.vendor_session_id.clone(),
+                registered.process_generation,
+                crate::claude_history::SourceScheme::Attached,
+            ),
+            "codex" => crate::codex_history::spawn_history_read(
+                sessions.clone(),
+                adoptions.clone(),
+                registered.session_id.clone(),
+                sighting.vendor_session_id.clone(),
+                crate::codex_history::NO_LIVE_RUN.into(),
+                sighting.process_id,
+                registered.process_generation,
+            ),
+            _ => {}
+        }
     }
     Some(registered)
 }
@@ -919,83 +950,114 @@ mod tests {
     }
 
     /// A restart forgets an attached agent until its next hook; re-adoption brings it back from a
-    /// herdr sighting, but only where the metadata already binds that session ID to this very
-    /// process. Same Ciao session, same generation, a fresh epoch and an unknown turn — exactly
-    /// what the agent's next hook would have produced — and nothing at all for a reused pid or
-    /// for an ID this daemon never mapped.
+    /// sighting, but only where the metadata already binds that session ID to this very process.
+    /// Same Ciao session, same generation, a fresh epoch and an unknown turn — exactly what the
+    /// agent's next hook would have produced — and nothing at all for a reused pid, for an ID this
+    /// daemon never mapped, or for another adapter claiming the same process. Run for every
+    /// adapter that declares rediscovery, so a dialect cannot join the rule without passing it.
     #[tokio::test]
     async fn a_restart_readopts_only_the_process_its_metadata_already_knows() {
-        let temporary = tempdir().unwrap();
-        let path = temporary.path().join("agent-metadata.json");
-        let load = || {
-            AgentSessionSupervisor::load(&path, WorkspaceConfig::with_binary_dirs(Vec::new()))
+        let rediscovered: Vec<&dyn AttachedAgentAdapter> = PRODUCTION_ADAPTERS
+            .iter()
+            .copied()
+            .filter(|adapter| {
+                matches!(adapter.restart_recovery(), RestartRecovery::Rediscovered(_))
+            })
+            .collect();
+        assert_eq!(rediscovered.len(), 2, "claude and codex rediscover");
+        for adapter in rediscovered {
+            let id = adapter.id();
+            let temporary = tempdir().unwrap();
+            let path = temporary.path().join("agent-metadata.json");
+            let load = || {
+                AgentSessionSupervisor::load(&path, WorkspaceConfig::with_binary_dirs(Vec::new()))
+                    .unwrap()
+            };
+            let adoptions = std::sync::Arc::new(crate::codex_adopted::AdoptionRegistry::default());
+            let version = match id {
+                "claude" => crate::claude_adapter::PINNED_CLAUDE_VERSION,
+                _ => crate::codex_adapter::PINNED_CODEX_VERSION,
+            };
+            let pid = 4242;
+            let sighting = AgentSighting {
+                vendor_session_id: "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
+                process_id: pid,
+                cwd: "/Users/u/project".into(),
+            };
+
+            // Before the restart: the hook's registration, bound to the process start the way
+            // the bridge binds every hook's nonce.
+            let before = load();
+            let hook_nonce = adapter.hook_process_nonce(pid).unwrap();
+            let mut hooked = adapter
+                .readopted_registration(&sighting, hook_nonce.clone(), version.into())
                 .unwrap()
-        };
-        let vendor = "0f8fad5b-d9cb-469f-a165-70867728950e";
-        let pid = 4242;
-        let cwd = "/Users/u/project";
-        let sighting = AgentSighting {
-            vendor_session_id: vendor.into(),
-            process_id: pid,
-            cwd: cwd.into(),
-        };
+                .unwrap();
+            hooked.process_nonce = authenticated_process_nonce(&hook_nonce, pid, "start-a");
+            let first = before.register_observer(hooked).await.unwrap();
+            let first_epoch = before.snapshot(&first.session_id).unwrap().snapshot_epoch;
+            drop(before);
 
-        // Before the restart: the hook's registration, bound to the process start the way the
-        // bridge binds every hook's nonce.
-        let before = load();
-        let hook_nonce = crate::claude_hook::process_nonce(pid);
-        let mut hooked =
-            readopted_registration(vendor, pid, hook_nonce.clone(), "2.1.222".into(), cwd).unwrap();
-        hooked.process_nonce = authenticated_process_nonce(&hook_nonce, pid, "start-a");
-        let first = before.register_observer(hooked).await.unwrap();
-        let first_epoch = before.snapshot(&first.session_id).unwrap().snapshot_epoch;
-        drop(before);
+            let after = load();
+            assert_eq!(after.active_count(), 0, "{id}: a restart starts empty");
+            assert!(
+                readopt_one(&after, &adoptions, adapter, &sighting, "start-b")
+                    .await
+                    .is_none(),
+                "{id}: the same pid started again is a different process"
+            );
+            let stranger = AgentSighting {
+                vendor_session_id: "11111111-2222-4333-8444-555555555555".into(),
+                ..sighting.clone()
+            };
+            assert!(
+                readopt_one(&after, &adoptions, adapter, &stranger, "start-a")
+                    .await
+                    .is_none(),
+                "{id}: an ID this daemon never mapped"
+            );
+            let other: &dyn AttachedAgentAdapter = if id == "claude" {
+                &CODEX_ADAPTER
+            } else {
+                &CLAUDE_ADAPTER
+            };
+            assert!(
+                readopt_one(&after, &adoptions, other, &sighting, "start-a")
+                    .await
+                    .is_none(),
+                "{id}: another dialect cannot claim this process"
+            );
+            assert_eq!(after.active_count(), 0);
 
-        let after = load();
-        assert_eq!(
-            after.active_count(),
-            0,
-            "a restart starts with nothing registered"
-        );
-        assert!(
-            readopt_claude(&after, &sighting, "start-b").await.is_none(),
-            "the same pid started again is a different process"
-        );
-        let stranger = AgentSighting {
-            vendor_session_id: "11111111-2222-4333-8444-555555555555".into(),
-            ..sighting.clone()
-        };
-        assert!(
-            readopt_claude(&after, &stranger, "start-a").await.is_none(),
-            "an ID this daemon never mapped"
-        );
-        assert_eq!(after.active_count(), 0);
-
-        let readopted = readopt_claude(&after, &sighting, "start-a")
-            .await
-            .expect("the process the metadata knows comes back");
-        assert_eq!(readopted.session_id, first.session_id);
-        assert_eq!(readopted.process_generation, first.process_generation);
-        let snapshot = after.snapshot(&readopted.session_id).unwrap();
-        assert_ne!(
-            snapshot.snapshot_epoch, first_epoch,
-            "old cursors are fenced"
-        );
-        assert_eq!(snapshot.presence, "live");
-        assert!(
-            matches!(snapshot.turn, TurnState::Unknown { .. }),
-            "a re-adoption never infers a working turn"
-        );
-        assert_eq!(after.active_count(), 1);
+            let readopted = readopt_one(&after, &adoptions, adapter, &sighting, "start-a")
+                .await
+                .unwrap_or_else(|| panic!("{id}: the process the metadata knows comes back"));
+            assert_eq!(readopted.session_id, first.session_id, "{id}");
+            assert_eq!(
+                readopted.process_generation, first.process_generation,
+                "{id}"
+            );
+            let snapshot = after.snapshot(&readopted.session_id).unwrap();
+            assert_ne!(
+                snapshot.snapshot_epoch, first_epoch,
+                "{id}: old cursors are fenced"
+            );
+            assert_eq!(snapshot.presence, "live", "{id}");
+            assert!(
+                matches!(snapshot.turn, TurnState::Unknown { .. }),
+                "{id}: a re-adoption never infers a working turn"
+            );
+            assert_eq!(after.active_count(), 1, "{id}");
+        }
     }
 
-    /// Live probe, opt-in: what a restart would re-adopt on this machine, against the real herdr,
-    /// the real processes and a real metadata file. `CIAO_TEST_LIVE_READOPT` names a **copy** of
-    /// the daemon's `agent-metadata.json` — loading rewrites the file, so never the live one —
-    /// and the probe prints counts only. Run with the `HERDR_*` variables unset, or the shell's
-    /// own session silently overrides `--session`.
+    /// Live probe, opt-in: what a restart would re-adopt on this machine, against the real vendor
+    /// records, herdr, processes and a real metadata file. `CIAO_TEST_LIVE_READOPT` names a
+    /// **copy** of the daemon's `agent-metadata.json` — loading rewrites the file, so never the
+    /// live one — and the probe prints counts only, per source. Run with the `HERDR_*` variables
+    /// unset, or the shell's own session silently overrides `--session`.
     #[tokio::test]
-    async fn grounded_system_herdr_readopts_this_machines_agents_when_explicitly_enabled() {
+    async fn grounded_system_readopts_this_machines_agents_when_explicitly_enabled() {
         let Some(copy) = std::env::var_os("CIAO_TEST_LIVE_READOPT") else {
             return;
         };
@@ -1008,13 +1070,14 @@ mod tests {
             WorkspaceConfig::with_binary_dirs(directories),
         )
         .unwrap();
-        let sighted = sessions
-            .herdr_agent_sightings(CLAUDE_ADAPTER_TOKEN)
-            .await
-            .len();
-        let readopted = readopt_attached_claude(&sessions).await;
-        // The transcript read runs in the background, as it does for a hook's registration.
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let adoptions = std::sync::Arc::new(crate::codex_adopted::AdoptionRegistry::default());
+        let claude_files = crate::claude_transcript::live_session_sightings().len();
+        let codex_rollouts = crate::codex_history::live_rollout_sightings().await.len();
+        let herdr_claude = sessions.herdr_agent_sightings("claude").await.len();
+        let herdr_codex = sessions.herdr_agent_sightings("codex").await.len();
+        let readopted = readopt_attached(&sessions, &adoptions).await;
+        // History reads run in the background, as they do for a hook's registration.
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
         let with_history = readopted
             .iter()
             .filter(|registered| {
@@ -1024,10 +1087,15 @@ mod tests {
             })
             .count();
         println!(
-            "live readopt: sighted={sighted} readopted={} with_history={with_history}",
+            "live readopt: claude_files={claude_files} codex_rollouts={codex_rollouts} \
+             herdr_claude={herdr_claude} herdr_codex={herdr_codex} readopted={} \
+             with_history={with_history}",
             readopted.len()
         );
-        assert!(sighted > 0, "herdr reported no Claude panes to probe");
+        assert!(
+            claude_files + codex_rollouts + herdr_claude + herdr_codex > 0,
+            "nothing running to probe"
+        );
     }
 
     #[tokio::test]

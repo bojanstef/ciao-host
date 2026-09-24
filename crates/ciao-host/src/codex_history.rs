@@ -58,6 +58,62 @@ fn already_read() -> &'static Mutex<HashSet<String>> {
     ALREADY_READ.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// A `live_run_id` no turn ever has, for a history read with nothing in flight: after a daemon
+/// restart the live tail owns no turn yet, so the whole thread is history.
+pub(crate) const NO_LIVE_RUN: &str = "codex.turn.none";
+
+/// How many running Codexes a restart inspects. Each costs two bounded process reads.
+const MAX_CODEX_SIGHTINGS: usize = 64;
+
+/// The Codexes running on this machine that hold a thread, from the rollout each keeps open —
+/// `…/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread id>.jsonl` (observed on 0.156.1) — in
+/// whatever terminal. Codex keeps no per-process record of its own; a Codex never messaged has
+/// no rollout, no thread, and nothing to restore. A sighting is a claim: the caller proves it
+/// against the metadata before trusting it.
+pub(crate) async fn live_rollout_sightings() -> Vec<crate::agent_route::AgentSighting> {
+    let mut sightings = Vec::new();
+    for pid in crate::process::named("codex")
+        .await
+        .into_iter()
+        .take(MAX_CODEX_SIGHTINGS)
+    {
+        let open = crate::process::open_files(pid).await;
+        let Some(thread_id) = open.iter().find_map(|path| rollout_thread_id(path)) else {
+            continue;
+        };
+        let Some(cwd) = crate::process::cwd(pid)
+            .await
+            .and_then(|cwd| cwd.to_str().map(str::to_owned))
+        else {
+            continue;
+        };
+        sightings.push(crate::agent_route::AgentSighting {
+            vendor_session_id: thread_id,
+            process_id: pid,
+            cwd,
+        });
+    }
+    sightings
+}
+
+/// The thread ID a rollout file's name ends in: `rollout-<timestamp>-<uuid>.jsonl` under a
+/// `sessions` directory. The timestamp has hyphens of its own, so the ID is the trailing 36
+/// bytes, held to a UUID's shape rather than split on `-`.
+fn rollout_thread_id(path: &std::path::Path) -> Option<String> {
+    if !path.components().any(|part| part.as_os_str() == "sessions") {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let id = stem.get(stem.len().checked_sub(36)?..)?;
+    let uuid_shaped = id.len() == 36
+        && id.char_indices().all(|(index, character)| match index {
+            8 | 13 | 18 | 23 => character == '-',
+            _ => character.is_ascii_hexdigit(),
+        });
+    uuid_shaped.then(|| id.to_owned())
+}
+
 fn claim(session_id: &str, process_generation: u64) -> bool {
     let key = format!("{session_id}:{process_generation}");
     let Ok(mut seen) = already_read().lock() else {
@@ -487,6 +543,42 @@ pub(crate) fn content_text(item: &Value) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// The thread ID is the rollout name's trailing UUID, taken whole: the timestamp in front
+    /// has hyphens of its own, so splitting on `-` would cut it apart. Anything not a rollout
+    /// under a `sessions` directory, or not UUID-shaped at the end, names no thread.
+    #[test]
+    fn an_open_rollout_names_its_thread() {
+        let id = "0199a8f2-7c3e-7d41-9b2a-5e6f7a8b9c0d";
+        let path = |name: &str| {
+            std::path::PathBuf::from(format!("/Users/u/.codex/sessions/2026/09/24/{name}"))
+        };
+        assert_eq!(
+            super::rollout_thread_id(&path(&format!("rollout-2026-09-24T13-17-47-{id}.jsonl"))),
+            Some(id.to_owned())
+        );
+        assert_eq!(
+            super::rollout_thread_id(std::path::Path::new(&format!(
+                "/Users/u/.codex/archived/rollout-2026-09-24T13-17-47-{id}.jsonl"
+            ))),
+            None,
+            "not under sessions"
+        );
+        assert_eq!(
+            super::rollout_thread_id(&path(&format!("history-{id}.jsonl"))),
+            None
+        );
+        assert_eq!(
+            super::rollout_thread_id(&path(
+                "rollout-2026-09-24T13-17-47-not-a-uuid-at-all-here-xx.jsonl"
+            )),
+            None
+        );
+        assert_eq!(
+            super::rollout_thread_id(&path(&format!("rollout-{id}.json"))),
+            None
+        );
+    }
+
     #[test]
     fn function_output_projection_privacy_shapes_and_bounds() {
         for output in [

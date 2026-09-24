@@ -55,6 +55,118 @@ async fn ps_field(pid: u32, extra: &[&str], field: &str, strict: bool) -> Option
     Some(std::str::from_utf8(&output.stdout).ok()?.trim().to_owned())
 }
 
+/// This account's processes whose executable file is named `name` — the running copies of one
+/// program, whatever launched them. `comm` is the executable's path on macOS and its name on
+/// Linux, so the file name is what is compared. Bounded by `run_bounded`'s output cap.
+pub(crate) async fn named(name: &str) -> Vec<u32> {
+    let Some(binary) = ps_binary() else {
+        return Vec::new();
+    };
+    let uid = nix::unistd::Uid::effective().to_string();
+    let Ok(output) = run_bounded(binary, &["-U", &uid, "-o", "pid=", "-o", "comm="]).await else {
+        return Vec::new();
+    };
+    if !output.status_success || output.stdout_truncated {
+        return Vec::new();
+    }
+    parse_named(&output.stdout, name)
+}
+
+fn parse_named(stdout: &[u8], name: &str) -> Vec<u32> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, comm) = line.trim_start().split_once(char::is_whitespace)?;
+            let file_name = Path::new(comm.trim()).file_name()?;
+            (file_name == name)
+                .then(|| pid.parse::<u32>().ok())
+                .flatten()
+        })
+        .filter(|pid| *pid != 0)
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lsof_binary() -> Option<&'static Path> {
+    [Path::new("/usr/sbin/lsof"), Path::new("/usr/bin/lsof")]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+/// The absolute paths a bounded `lsof -F n` answer names: its `n` records, minus the ones that
+/// are not files (sockets, pipes, anything not rooted at `/`).
+#[cfg(any(not(target_os = "linux"), test))]
+fn parse_lsof_names(stdout: &[u8]) -> Vec<std::path::PathBuf> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter(|name| name.starts_with('/'))
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// The files a process holds open, as absolute paths. Linux reads `/proc/<pid>/fd`; elsewhere a
+/// bounded `lsof`. Empty when unreadable — this is a fact about the process or nothing.
+pub(crate) async fn open_files(pid: u32) -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let directory = format!("/proc/{pid}/fd");
+        tokio::task::spawn_blocking(move || {
+            std::fs::read_dir(directory)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .take(4096)
+                        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                        .filter(|path| path.is_absolute())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Some(binary) = lsof_binary() else {
+            return Vec::new();
+        };
+        let pid = pid.to_string();
+        let Ok(output) = run_bounded(binary, &["-n", "-P", "-F", "n", "-p", &pid]).await else {
+            return Vec::new();
+        };
+        if output.stdout_truncated {
+            return Vec::new();
+        }
+        parse_lsof_names(&output.stdout)
+    }
+}
+
+/// A process's working directory, or `None` if it cannot be read.
+pub(crate) async fn cwd(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .filter(|path| path.is_absolute())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let binary = lsof_binary()?;
+        let pid = pid.to_string();
+        let output = run_bounded(
+            binary,
+            &["-a", "-n", "-P", "-d", "cwd", "-F", "n", "-p", &pid],
+        )
+        .await
+        .ok()?;
+        if !output.status_success || output.stdout_truncated {
+            return None;
+        }
+        parse_lsof_names(&output.stdout).into_iter().next()
+    }
+}
+
 /// The controlling terminal of a process, as `ps` names it and with the `/dev/` prefix it
 /// omits. Callers validate the shape; this only reports what was read.
 pub(crate) async fn tty(pid: u32) -> Option<String> {
@@ -269,6 +381,31 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    /// `ps -o pid= -o comm=` answers a path on macOS and a bare name on Linux; either way the
+    /// program is its file name, never a substring of it.
+    #[test]
+    fn named_processes_match_the_executable_file_name_only() {
+        let stdout = b"  101 /usr/local/lib/node_modules/codex/vendor/codex\n\
+                       202 codex\n\
+                       303 node\n\
+                       404 /opt/codex-helper\n\
+                       0 codex\n";
+        assert_eq!(parse_named(stdout, "codex"), vec![101, 202]);
+    }
+
+    /// `lsof -F n` names every open descriptor; only absolute paths are files.
+    #[test]
+    fn lsof_names_keep_only_absolute_paths() {
+        let stdout = b"p42\nfcwd\nn/Users/u/project\nf3\nnlocalhost:6768\nf4\nn/Users/u/.codex/sessions/x.jsonl\n";
+        assert_eq!(
+            parse_lsof_names(stdout),
+            vec![
+                std::path::PathBuf::from("/Users/u/project"),
+                std::path::PathBuf::from("/Users/u/.codex/sessions/x.jsonl"),
+            ]
+        );
+    }
 
     /// Spawns a real process that outlives the test unless signalled, so the process paths are
     /// exercised against a live pid rather than a mock.

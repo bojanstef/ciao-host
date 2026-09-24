@@ -107,7 +107,7 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
     .await?;
     let facts = HookRuntimeFacts {
         process_id,
-        process_nonce: opaque_digest("process", &process_id.to_string()),
+        process_nonce: process_nonce(process_id),
         adapter_version,
     };
     let Some(dispatch) = map_hook_input(&value, &facts)? else {
@@ -499,6 +499,13 @@ fn opaque_digest(namespace: &str, value: &str) -> String {
         "codex.{namespace}.{}",
         keyed_digest(CODEX_DIGEST_DOMAIN, namespace, value)
     )
+}
+
+/// The nonce a Codex process's hooks present, before the bridge binds it to the process start.
+/// One owner, because a restart's re-adoption has to arrive at exactly the value every hook from
+/// that process sent.
+pub(crate) fn process_nonce(process_id: u32) -> String {
+    opaque_digest("process", &process_id.to_string())
 }
 
 fn run_id(turn_id: &str) -> String {
