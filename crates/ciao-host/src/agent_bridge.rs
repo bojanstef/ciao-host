@@ -266,7 +266,8 @@ async fn apply_adapter_event(
             // the live tail already owns — without it, history and the live tail both deliver
             // the message the person just typed.
             if ctx.codec.id() == "codex"
-                && let (Some(agent), TurnState::Running { run_id, .. }) = (ctx.agent, &turn)
+                && let Some(agent) = ctx.agent
+                && let Some(run_id) = named_run(&turn)
             {
                 crate::codex_history::spawn_history_read(
                     ctx.sessions.clone(),
@@ -706,6 +707,18 @@ async fn handle_transient_agent_event(
         .ok_or_else(|| anyhow!("transient adapter has no event acknowledgement"))?;
     write_agent_frame(&mut stream, &acknowledgement).await?;
     Ok(())
+}
+
+/// The run a turn event names, when it names one. Codex's history read excludes that turn: the
+/// live tail owns it, whether it is starting, blocked on a person, or just finished.
+fn named_run(turn: &TurnState) -> Option<&String> {
+    match turn {
+        TurnState::Running { run_id, .. } => Some(run_id),
+        TurnState::AwaitingInteraction { run_id } | TurnState::Completed { run_id } => {
+            run_id.as_ref()
+        }
+        _ => None,
+    }
 }
 
 /// Unknown structured adapter events become categorical canonical content. Adapter objects are
@@ -1230,6 +1243,39 @@ mod tests {
         }))
         .unwrap();
         assert!(registry.select(&malformed, None).is_err());
+    }
+
+    /// Codex's history read excludes the turn the live tail owns, so any event that names that
+    /// turn can start it — a daemon restarted mid-turn first hears the `Stop` or the permission
+    /// request, and used to wait for the next prompt. An event that names no run cannot say
+    /// what to exclude, so it does not start one.
+    #[test]
+    fn codex_history_starts_on_any_turn_event_that_names_its_run() {
+        let run = || "codex.turn.fixture".to_owned();
+        for named in [
+            TurnState::Running {
+                run_id: run(),
+                activity: "responding".into(),
+            },
+            TurnState::AwaitingInteraction {
+                run_id: Some(run()),
+            },
+            TurnState::Completed {
+                run_id: Some(run()),
+            },
+        ] {
+            assert_eq!(named_run(&named), Some(&run()), "{named:?}");
+        }
+        for unnamed in [
+            TurnState::Idle,
+            TurnState::AwaitingInteraction { run_id: None },
+            TurnState::Completed { run_id: None },
+            TurnState::Unknown {
+                reason_code: "partial_observation".into(),
+            },
+        ] {
+            assert_eq!(named_run(&unnamed), None, "{unnamed:?}");
+        }
     }
 
     /// The alert is owed to the turn, not to a vendor hook — so this table is the whole of which

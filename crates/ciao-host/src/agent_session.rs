@@ -1091,9 +1091,7 @@ impl AgentSessionSupervisor {
         let cut_by_bound = session.history.len() < held_before_bound;
         let coverage_changed = match mode {
             ReconcileMode::Backfill { complete } => {
-                let complete = complete && !cut_by_bound;
-                let history = if complete { "full" } else { "live_tail" };
-                let boundary = (!complete).then(|| "resume".to_owned());
+                let (history, boundary) = history_coverage(complete && !cut_by_bound);
                 let changed = session.snapshot.capabilities.history != history
                     || session.snapshot.timeline_window.history_boundary != boundary;
                 history.clone_into(&mut session.snapshot.capabilities.history);
@@ -2499,6 +2497,19 @@ fn normalize_entry(session: &mut LiveSession, entry: NormalizedTimelineEntry) ->
         kind: entry.kind,
         body: entry.body,
         truncation: entry.truncation,
+    }
+}
+
+/// The one rule for what a history read lets a session claim, as the `history` capability and
+/// the window's boundary: `full` with no boundary only when the read holds the conversation from
+/// its first message, and otherwise `live_tail` with the `resume` boundary — the pair a managed
+/// worker's partial resume has always sent, and what the phone draws as "earlier messages stay
+/// in" the vendor rather than as a conversation that began mid-thought.
+pub(crate) fn history_coverage(complete: bool) -> (&'static str, Option<String>) {
+    if complete {
+        ("full", None)
+    } else {
+        ("live_tail", Some("resume".to_owned()))
     }
 }
 

@@ -551,11 +551,27 @@ pub(crate) fn codex_resume_command(thread_id: &str) -> Option<String> {
 /// session is opened, and a failed read degrades to an empty timeline — the pick-up slot is
 /// the point of the screen, and a short history is a degradation where a refused open was a
 /// wall.
+///
+/// Nothing holds this session, so there is no pager behind the window: it carries the newest
+/// window's worth, and a conversation longer than that says so with the `resume` boundary
+/// instead of reading as one that began there. Picking it up loads the rest.
 pub(crate) fn unheld_snapshot(
     row: &UnheldThread,
-    entries: Vec<NormalizedTimelineEntry>,
+    mut entries: Vec<NormalizedTimelineEntry>,
 ) -> crate::agent_protocol::AgentSessionSnapshot {
-    let descriptor = unheld_descriptor(row);
+    let mut descriptor = unheld_descriptor(row);
+    let window = crate::agent_protocol::MAX_TIMELINE_ENTRIES_IN_SNAPSHOT;
+    let beyond_window = entries.len() > window;
+    if beyond_window {
+        entries.drain(..entries.len() - window);
+    }
+    // An empty read cannot tell an empty thread from a failed one, so it claims nothing.
+    let (history, boundary) = if entries.is_empty() {
+        ("live_tail", None)
+    } else {
+        crate::agent_session::history_coverage(!beyond_window)
+    };
+    history.clone_into(&mut descriptor.capabilities.history);
     let timeline: Vec<crate::agent_protocol::TimelineEntry> = entries
         .into_iter()
         .enumerate()
@@ -600,8 +616,8 @@ pub(crate) fn unheld_snapshot(
             newest_sequence: newest,
             entries: timeline,
             has_older: false,
-            history_boundary: None,
-            truncated: false,
+            history_boundary: boundary,
+            truncated: beyond_window,
         },
         terminal_fallback: descriptor.terminal_fallback,
         latest_command_receipts: Vec::new(),
@@ -765,7 +781,7 @@ pub(crate) async fn adopt(
     // The resume response carries `thread.turns` in the same shape `thread/read` answers, so
     // the Spec 012 history mapper applies unchanged. There is no live tail to exclude: the
     // empty run ID matches no turn.
-    let entries = codex_history::map_thread(&resumed, "");
+    let history = codex_history::map_thread_history(&resumed, "");
     let models = model_surface(&connection, &resumed).await;
 
     let (command_sender, command_receiver) = mpsc::channel::<BridgeCommandEnvelope>(16);
@@ -777,7 +793,16 @@ pub(crate) async fn adopt(
             return Err(AdoptRefusal::Vendor(error));
         }
     };
-    if let Err(error) = supervisor.replace_bridge_snapshot(&registered.session_id, entries) {
+    // The session is new and empty, so this lays the whole read down as its timeline — and,
+    // being the supervisor's one history-coverage owner, says whether that is the whole
+    // conversation (ADR 006 §5: the rollout is readable in its entirety) or its newest part.
+    if let Err(error) = supervisor.backfill_bridge_history(
+        &registered.session_id,
+        Some(registered.process_generation),
+        history.entries,
+        history.complete,
+        None,
+    ) {
         connection.shutdown().await;
         return Err(AdoptRefusal::Vendor(error));
     }
@@ -2312,7 +2337,7 @@ mod tests {
                 truncation: no_truncation(),
             },
         ];
-        let snapshot = unheld_snapshot(&row, entries);
+        let snapshot = unheld_snapshot(&row, entries.clone());
         snapshot.validate().unwrap();
         assert_eq!(snapshot.session_id, row.session_id);
         assert_eq!(snapshot.timeline_window.entries.len(), 2);
@@ -2320,10 +2345,34 @@ mod tests {
         // The point of the screen: read-only facts that leave the pick-up slot offerable.
         assert_eq!(snapshot.capabilities.commands, CommandCapabilities::none());
         assert_eq!(snapshot.topology, "attached");
-        // And an empty read still opens rather than refusing.
+        // Everything read fits the window: this is the whole conversation.
+        assert_eq!(snapshot.capabilities.history, "full");
+        assert_eq!(snapshot.timeline_window.history_boundary, None);
+        // And an empty read still opens rather than refusing, claiming nothing either way.
         let empty = unheld_snapshot(&row, Vec::new());
         empty.validate().unwrap();
         assert!(empty.timeline_window.entries.is_empty());
+        assert_eq!(empty.capabilities.history, "live_tail");
+        assert_eq!(empty.timeline_window.history_boundary, None);
+
+        // A conversation longer than the window it can be shown in: the newest window, and
+        // the boundary where the rest begins. Nothing pages behind an unheld row.
+        let window = crate::agent_protocol::MAX_TIMELINE_ENTRIES_IN_SNAPSHOT;
+        let long: Vec<_> = (0..window + 5)
+            .map(|index| NormalizedTimelineEntry {
+                source_id: format!("codex.item.long-{index}"),
+                ..entries[0].clone()
+            })
+            .collect();
+        let snapshot = unheld_snapshot(&row, long);
+        snapshot.validate().unwrap();
+        assert_eq!(snapshot.timeline_window.entries.len(), window);
+        assert_eq!(snapshot.capabilities.history, "live_tail");
+        assert_eq!(
+            snapshot.timeline_window.history_boundary.as_deref(),
+            Some("resume")
+        );
+        assert!(!snapshot.timeline_window.has_older);
     }
 
     #[test]
