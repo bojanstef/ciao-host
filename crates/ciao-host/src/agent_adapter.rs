@@ -14,6 +14,7 @@ use crate::{
         InteractionCapabilities, MAX_BRIDGE_FRAME_BYTES, Observation, PendingInteraction,
         TimelineBody, Truncation, TurnState, classify_vendor_version, valid_opaque_id, valid_token,
     },
+    agent_route::AgentSighting,
     agent_session::{
         NormalizedRegistration, NormalizedTextDelta, NormalizedTimelineEntry,
         RegisteredAgentSession,
@@ -27,6 +28,32 @@ pub(crate) const ADAPTER_COMMAND_CHANNEL_CAPACITY: usize = 128;
 pub(crate) enum AdapterConnectionKind {
     PersistentBridge,
     TransientEvent,
+}
+
+/// How a session on an adapter comes back after the daemon restarts. The product rule is that
+/// every live session returns by itself, without having to speak; this is each integration's
+/// answer to it. Every adapter declares one and the parity ledger holds it there, so a new
+/// dialect cannot ship without saying how it survives a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartRecovery {
+    /// The integration keeps a persistent bridge and reconnects on its own (Pi's extension).
+    Reconnects,
+    /// The daemon finds the live process in the vendor's own record, re-registers it the way
+    /// its hook would have, and accepts it only where the metadata already binds that exact
+    /// process (`agent_bridge::readopt_attached`).
+    Rediscovered(VendorRecord),
+    /// The daemon owns the worker, stores it at startup and resumes it (managed sessions).
+    Resumed,
+}
+
+/// Where a restarted daemon finds a vendor's live processes and the session ID each holds.
+/// Vendor state, never Ciao's: nothing is persisted to make a restart recoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VendorRecord {
+    /// `<claude config>/sessions/<pid>.json`, which Claude Code writes per running process.
+    ClaudeSessionFiles,
+    /// The rollout a running Codex holds open, whose file name ends in the thread ID.
+    CodexOpenRollout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +124,28 @@ pub(crate) trait AttachedAgentAdapter: Send + Sync {
 
     fn connection_kind(&self) -> AdapterConnectionKind {
         AdapterConnectionKind::PersistentBridge
+    }
+
+    /// How this adapter's sessions come back after a daemon restart. No default: every dialect
+    /// has to answer.
+    fn restart_recovery(&self) -> RestartRecovery;
+
+    /// For `Rediscovered`: the nonce this dialect's hook presents for `process_id`, before the
+    /// bridge binds it to the process start. `None` for every other recovery.
+    fn hook_process_nonce(&self, _process_id: u32) -> Option<String> {
+        None
+    }
+
+    /// For `Rediscovered`: the registration this dialect's hook would have sent for a live
+    /// process the daemon found itself — through the dialect's own `normalize`, so it states the
+    /// same facts and the same unknown turn. `None` for every other recovery.
+    fn readopted_registration(
+        &self,
+        _sighting: &AgentSighting,
+        _hook_nonce: String,
+        _adapter_version: String,
+    ) -> Option<Result<NormalizedRegistration, AgentProtocolError>> {
+        None
     }
 
     fn requires_tui_process(&self) -> bool {
@@ -457,6 +506,32 @@ impl AttachedHookRegister {
             control_owner: "terminal".into(),
         })
     }
+}
+
+/// The registration an attached hook of `dialect` would have sent for a process a restarted
+/// daemon found itself. One owner for the rebuild, so a restored Claude and a restored Codex
+/// state exactly what their hooks state. The caller vouches for the process — it is accepted
+/// only where the metadata already binds it — which is why its pid stands in for the peer a
+/// hook connection presents.
+pub(crate) fn readopted_hook_registration(
+    dialect: &AttachedHookDialect,
+    sighting: &AgentSighting,
+    hook_nonce: String,
+    adapter_version: String,
+) -> Result<NormalizedRegistration, AgentProtocolError> {
+    AttachedHookRegister {
+        v: dialect.protocol_version,
+        message_type: "register".into(),
+        adapter: dialect.adapter.into(),
+        adapter_version,
+        mode: "tui_hook".into(),
+        session_id: sighting.vendor_session_id.clone(),
+        process_nonce: hook_nonce,
+        process_id: sighting.process_id,
+        workspace_display: crate::hook_common::workspace_display(&sighting.cwd),
+        workspace_path: sighting.cwd.clone(),
+    }
+    .normalize(Some(sighting.process_id), dialect)
 }
 
 /// The service frames every attached hook dialect answers with — identical across dialects by

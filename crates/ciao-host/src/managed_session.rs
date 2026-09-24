@@ -273,6 +273,10 @@ pub(crate) struct ManagedSessionDirectory {
     /// the start that follows it must scan the same tree, or an ID the phone was just offered
     /// resolves to nothing.
     home: PathBuf,
+    /// The chats this daemon's own start stored because their worker died with the previous
+    /// daemon — and only those, so a chat someone stopped, or one an older restart left stored,
+    /// stays where it was. Taken once by the startup resume.
+    restart_resumable: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,25 +292,34 @@ pub(crate) struct ManagedSessionSummary {
 impl ManagedSessionDirectory {
     pub(crate) fn load(path: &Path, home: &Path, launcher: ManagedLauncher) -> Result<Self> {
         let mut store = ManagedMetadataStore::load(path)?;
-        // Daemon restart is a session fact: any record still marked live lost its
-        // worker with the previous daemon and resumes only by explicit command.
-        let mut transitioned = false;
+        // Daemon restart is a session fact: any record still marked live lost its worker with
+        // the previous daemon. It is stored under `daemon_restart` and named for the startup
+        // resume, which puts back exactly these (the product rule that a restart returns every
+        // live session by itself, ARCHITECTURE §11.5).
+        let mut restart_resumable = Vec::new();
         for record in &mut store.records {
             if record.presence == "live" {
                 record.presence = "stored".into();
                 record.stored_reason = Some("daemon_restart".into());
                 record.updated_at = unix_now();
-                transitioned = true;
+                restart_resumable.push(record.session_id.clone());
             }
         }
-        if transitioned {
+        if !restart_resumable.is_empty() {
             store.persist()?;
         }
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             launcher: Arc::new(launcher),
             home: home.to_owned(),
+            restart_resumable: Arc::new(Mutex::new(restart_resumable)),
         })
+    }
+
+    /// The chats this start stored and owes back, once: a second call is empty, so no later
+    /// caller can resume a chat twice on the restart's say-so.
+    pub(crate) fn take_restart_resumable(&self) -> Vec<String> {
+        std::mem::take(&mut *self.restart_resumable.lock())
     }
 
     /// Workspaces Ciao has run a session in, then every other git checkout under home.
@@ -2467,16 +2480,53 @@ mod tests {
                 .await;
             started.session_id.unwrap()
         };
-        // A fresh load models the daemon restart: the worker is gone and the
-        // session resumes only by explicit command.
+        // A fresh load models the daemon restart: the worker is gone, the record is stored,
+        // and this start names it — once — for the startup resume.
         let directory = directory(&store);
         assert_eq!(directory.live_count(), 0);
         let stored = directory.stored_descriptors(&all_recorded_handbacks(&directory));
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].session_id, session_id);
         assert_eq!(stored[0].stored_reason.as_deref(), Some("daemon_restart"));
+        assert_eq!(directory.take_restart_resumable(), vec![session_id.clone()]);
+        assert!(
+            directory.take_restart_resumable().is_empty(),
+            "a restart's resume list is taken once"
+        );
         let resumed = directory.managed_resume(&session_id, "cmd-resume").await;
         assert_eq!(resumed.state, "accepted");
+        assert_eq!(
+            directory
+                .managed_resume(&session_id, "cmd-resume-again")
+                .await
+                .reason_code
+                .as_deref(),
+            Some("already_live"),
+            "what the CLI's own post-install resume then hears, and treats as done"
+        );
+    }
+
+    /// Only what this start stored comes back by itself. A chat an earlier restart left stored,
+    /// and nobody resumed since, is somebody's choice to leave alone: a later restart must not
+    /// quietly start its worker again.
+    #[tokio::test]
+    async fn only_the_chats_this_start_stored_are_owed_back() {
+        let home = tempdir().unwrap();
+        let store = home.path().join("agent-managed.json");
+        let workspace = home.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        {
+            let directory = directory(&store);
+            directory
+                .managed_start_at_path(&workspace, "cmd-start")
+                .await
+                .session_id
+                .unwrap();
+        }
+        // The first restart stores it; nobody resumes it.
+        assert_eq!(directory(&store).take_restart_resumable().len(), 1);
+        // The next restart finds nothing live, so owes nothing.
+        assert!(directory(&store).take_restart_resumable().is_empty());
     }
 
     /// The ownership check ran only before a worker started, so a terminal that resumed the

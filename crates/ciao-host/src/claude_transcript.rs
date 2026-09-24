@@ -143,15 +143,74 @@ pub(crate) fn transcript_path(projects: &Path, vendor_session_id: &str) -> Optio
 
 /// The same two sources `claude_integration` resolves the plugin directory from, so an
 /// operator who relocated Claude's config keeps working without configuring Ciao twice.
-pub(crate) fn claude_projects_dir() -> Option<PathBuf> {
-    let config = match env::var_os("CLAUDE_CONFIG_DIR") {
+fn claude_config_dir() -> Option<PathBuf> {
+    match env::var_os("CLAUDE_CONFIG_DIR") {
         Some(value) if !value.is_empty() => {
             let path = PathBuf::from(value);
-            path.is_absolute().then_some(path)?
+            path.is_absolute().then_some(path)
         }
-        _ => PathBuf::from(env::var_os("HOME")?).join(".claude"),
+        _ => Some(PathBuf::from(env::var_os("HOME")?).join(".claude")),
+    }
+}
+
+pub(crate) fn claude_projects_dir() -> Option<PathBuf> {
+    Some(claude_config_dir()?.join("projects"))
+}
+
+/// How many per-process session files a restart reads, and how large one may be. Observed ones
+/// are well under 1 KiB; a machine with hundreds of live Claudes is not one this bound serves.
+const MAX_SESSION_FILES: usize = 256;
+const MAX_SESSION_FILE_BYTES: u64 = 16 * 1024;
+
+/// The Claudes running on this machine, from Claude Code's own record of them:
+/// `<config>/sessions/<pid>.json`, one per interactive process (observed on 2.1.280), naming the
+/// pid, the session ID and the working directory — whatever terminal the process runs in.
+/// Vendor-internal and release-unstable, so read leniently: a file that is not that shape is
+/// tallied for the drift ledger by name and skipped. A file left behind by an exited process is
+/// harmless; the caller proves every sighting against the live process before trusting it.
+pub(crate) fn live_session_sightings() -> Vec<crate::agent_route::AgentSighting> {
+    let Some(directory) = claude_config_dir().map(|config| config.join("sessions")) else {
+        return Vec::new();
     };
-    Some(config.join("projects"))
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .take(MAX_SESSION_FILES)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let named_pid = path.file_stem()?.to_str()?.parse::<u32>().ok()?;
+            if fs::metadata(&path).ok()?.len() > MAX_SESSION_FILE_BYTES {
+                return None;
+            }
+            let sighting = parse_session_record(&fs::read(&path).ok()?, named_pid);
+            if sighting.is_none() {
+                crate::drift::note("claude", "session_record", "invalid", "record", None);
+            }
+            sighting
+        })
+        .collect()
+}
+
+/// One `sessions/<pid>.json`. The file's own pid must agree with its name: a record that says
+/// one thing and is filed as another describes neither.
+fn parse_session_record(bytes: &[u8], named_pid: u32) -> Option<crate::agent_route::AgentSighting> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let record = value.as_object()?;
+    let pid = u32::try_from(record.get("pid")?.as_u64()?).ok()?;
+    let session_id = record.get("sessionId")?.as_str()?;
+    let cwd = record.get("cwd")?.as_str()?;
+    (pid != 0
+        && pid == named_pid
+        && valid_opaque_id(session_id).is_ok()
+        && Path::new(cwd).is_absolute())
+    .then(|| crate::agent_route::AgentSighting {
+        vendor_session_id: session_id.to_owned(),
+        process_id: pid,
+        cwd: cwd.to_owned(),
+    })
 }
 
 fn read_tail(path: &Path) -> Option<String> {
@@ -208,6 +267,34 @@ fn first_line_bounded(text: &str, limit: usize) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    /// Claude's per-process record, in the shape 2.1.280 writes (extra fields ignored). The pid
+    /// inside must agree with the file's name, and the session ID and cwd must be usable; a
+    /// record failing any of that is no sighting.
+    #[test]
+    fn a_claude_session_record_names_its_process_session_and_directory() {
+        let record = |pid: u32, session: &str, cwd: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "pid": pid, "sessionId": session, "cwd": cwd, "startedAt": 1,
+                "procStart": "Thu Sep 24 09:46:48 2026", "version": "2.1.280",
+                "kind": "interactive", "status": "idle"
+            }))
+            .unwrap()
+        };
+        let id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let sighting = parse_session_record(&record(546, id, "/Users/u/project"), 546).unwrap();
+        assert_eq!(sighting.process_id, 546);
+        assert_eq!(sighting.vendor_session_id, id);
+        assert_eq!(sighting.cwd, "/Users/u/project");
+        assert!(
+            parse_session_record(&record(546, id, "/Users/u/project"), 547).is_none(),
+            "filed under another pid"
+        );
+        assert!(parse_session_record(&record(546, id, "project"), 546).is_none());
+        assert!(parse_session_record(&record(546, "has space", "/p"), 546).is_none());
+        assert!(parse_session_record(&record(0, id, "/p"), 0).is_none());
+        assert!(parse_session_record(b"not json", 546).is_none());
+    }
 
     /// Every shape a real transcript puts under `type: "user"`, newest last.
     fn transcript() -> String {

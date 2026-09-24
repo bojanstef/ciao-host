@@ -761,15 +761,6 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     let workspace = WorkspaceConfig::for_home(&paths.home);
     let agent_sessions =
         AgentSessionSupervisor::load(&paths.agent_metadata_file, workspace.clone())?;
-    // A restart forgets every attached agent until it next speaks; bring back the ones herdr can
-    // vouch for and the metadata already binds to their process. Off the startup path: it asks
-    // herdr, and a slow herdr must not hold back the daemon's readiness.
-    tokio::spawn({
-        let sessions = agent_sessions.clone();
-        async move {
-            crate::agent_bridge::readopt_attached_claude(&sessions).await;
-        }
-    });
     // The managed launcher is available only when the Ciao-owned SDK prefix and
     // worker entrypoint are installed; otherwise start/resume refuse
     // categorically while stored sessions stay listed.
@@ -840,6 +831,7 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     let mut iroh_task = tokio::spawn(serve_iroh(endpoint.clone(), state.clone()));
     let mut ipc_task = tokio::spawn(serve_ipc(listener, endpoint.clone(), state.clone()));
     let mut agent_ipc_task = tokio::spawn(serve_agent_ipc(agent_listener, state.clone()));
+    tokio::spawn(recover_sessions_after_restart(state.clone()));
 
     tracing::info!(
         host = %short_endpoint_id(endpoint.id()),
@@ -947,6 +939,30 @@ async fn bind_agent_socket(paths: &CiaoPaths) -> Result<UnixListener> {
     fs::set_permissions(&paths.agent_socket_file, fs::Permissions::from_mode(0o600))
         .context("secure agent bridge socket")?;
     Ok(listener)
+}
+
+/// The product rule for a restart: every session that was live comes back by itself, without
+/// having to speak (ARCHITECTURE §11.5). Attached agents are re-adopted from their vendors' own
+/// records (`agent_bridge::readopt_attached`); the managed chats this start stored are resumed;
+/// Pi's bridge reconnects on its own. Each adapter declares which of these it relies on, and the
+/// parity ledger holds it there. Runs once the agent socket is listening, because a resumed
+/// worker registers back through it, and off the startup path, because both halves wait on
+/// other processes.
+async fn recover_sessions_after_restart(state: Arc<RuntimeState>) {
+    crate::agent_bridge::readopt_attached(&state.agent_sessions, &state.codex_adoptions).await;
+    for session_id in state.managed_sessions.take_restart_resumable() {
+        let command_id = format!("{:032x}", rand::random::<u128>());
+        let outcome = state
+            .managed_sessions
+            .managed_resume(&session_id, &command_id)
+            .await;
+        tracing::info!(
+            session = %session_id,
+            state = %outcome.state,
+            reason = ?outcome.reason_code,
+            "resumed a managed chat the restart stored"
+        );
+    }
 }
 
 async fn monitor_home_relay(endpoint: Endpoint, state: Arc<RuntimeState>) {

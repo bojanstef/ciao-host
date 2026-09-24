@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::{
     agent_adapter::{
-        AttachedAgentAdapter, NormalizedAdapterEvent, WireTextDelta, WireTimelineEntry,
+        AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery, WireTextDelta,
+        WireTimelineEntry,
     },
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentCommandKind, AgentModelOption, AgentProtocolError,
@@ -652,6 +653,12 @@ fn decode_managed_frame(body: &[u8]) -> Result<ClaudeManagedInbound, AgentProtoc
 impl AttachedAgentAdapter for ClaudeManagedAdapter {
     fn id(&self) -> &'static str {
         "claude-managed"
+    }
+
+    /// The daemon owns the worker: a starting daemon stores every chat still marked live and
+    /// resumes exactly those (`ManagedSessionDirectory::take_restart_resumable`).
+    fn restart_recovery(&self) -> RestartRecovery {
+        RestartRecovery::Resumed
     }
 
     fn decode_registration(

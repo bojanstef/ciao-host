@@ -22,7 +22,10 @@
 use serde_json::{Value, json};
 
 use crate::{
-    agent_adapter::{AdapterConnectionKind, AttachedAgentAdapter, NormalizedAdapterEvent},
+    agent_adapter::{
+        AdapterConnectionKind, AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery,
+        VendorRecord,
+    },
     agent_bridge::{AgentAdapterRegistry, PRODUCTION_ADAPTERS},
     agent_protocol::{
         AGENT_PROTOCOL_VERSION, AgentCommand, AgentCommandKind, CommandCapabilities,
@@ -169,6 +172,9 @@ struct ParityContract {
     family: &'static str,
     topology: &'static str,
     connection: AdapterConnectionKind,
+    /// How the integration's sessions come back after a daemon restart — the product rule that
+    /// every live session returns by itself — declared by the adapter and held to this cell.
+    restart_recovery: RestartRecovery,
     requires_tui: bool,
     accepts_legacy: bool,
     coverage: &'static str,
@@ -532,6 +538,7 @@ fn contracts() -> [ParityContract; 4] {
             family: "Pi",
             topology: "attached",
             connection: AdapterConnectionKind::PersistentBridge,
+            restart_recovery: RestartRecovery::Reconnects,
             requires_tui: false,
             accepts_legacy: true,
             coverage: "partial",
@@ -588,6 +595,7 @@ fn contracts() -> [ParityContract; 4] {
             family: "Claude",
             topology: "attached",
             connection: AdapterConnectionKind::TransientEvent,
+            restart_recovery: RestartRecovery::Rediscovered(VendorRecord::ClaudeSessionFiles),
             requires_tui: true,
             accepts_legacy: false,
             coverage: "partial",
@@ -615,6 +623,7 @@ fn contracts() -> [ParityContract; 4] {
             family: "Claude",
             topology: "managed",
             connection: AdapterConnectionKind::PersistentBridge,
+            restart_recovery: RestartRecovery::Resumed,
             requires_tui: false,
             accepts_legacy: false,
             coverage: "authoritative",
@@ -689,6 +698,7 @@ fn contracts() -> [ParityContract; 4] {
             family: "Codex",
             topology: "attached",
             connection: AdapterConnectionKind::TransientEvent,
+            restart_recovery: RestartRecovery::Rediscovered(VendorRecord::CodexOpenRollout),
             requires_tui: true,
             accepts_legacy: false,
             coverage: "partial",
@@ -780,6 +790,70 @@ fn the_ledger_covers_exactly_the_production_adapters() {
         "every production adapter needs exactly one parity ledger row; update agent_conformance \
          and docs/audits/2026-08-05-adapter-parity-audit.md together"
     );
+}
+
+/// The product rule for a restart — every live session returns by itself, without speaking —
+/// is one cell per row, and the adapter's own declaration must match it. A `Rediscovered`
+/// adapter must be able to rebuild its hook's registration, and the rebuild must state the same
+/// facts as the pinned registration; every other kind must offer no rebuild at all, because a
+/// restart path the ledger does not declare is one nobody is holding to anything.
+#[test]
+fn every_adapter_declares_its_ledger_restart_recovery() {
+    let sighting = crate::agent_route::AgentSighting {
+        vendor_session_id: "conformance-session-a".into(),
+        process_id: CONFORMANCE_PROCESS,
+        cwd: "/conformance/workspace".into(),
+    };
+    for contract in contracts() {
+        let id = contract.id;
+        let adapter = contract.adapter();
+        assert_eq!(
+            adapter.restart_recovery(),
+            contract.restart_recovery,
+            "{id}: restart recovery"
+        );
+        let nonce = adapter.hook_process_nonce(CONFORMANCE_PROCESS);
+        let pinned = normalized(&contract);
+        let rebuilt = adapter.readopted_registration(
+            &sighting,
+            nonce.clone().unwrap_or_default(),
+            pinned.adapter_version.clone(),
+        );
+        match contract.restart_recovery {
+            RestartRecovery::Rediscovered(_) => {
+                assert!(
+                    nonce.is_some(),
+                    "{id}: a rediscovered adapter derives its nonce"
+                );
+                let rebuilt = rebuilt
+                    .unwrap_or_else(|| panic!("{id}: a rediscovered adapter rebuilds"))
+                    .unwrap_or_else(|error| panic!("{id}: the rebuild must normalize: {error}"));
+                assert_eq!(
+                    rebuilt.adapter_family, pinned.adapter_family,
+                    "{id}: family"
+                );
+                assert_eq!(rebuilt.topology, pinned.topology, "{id}: topology");
+                assert_eq!(
+                    rebuilt.capabilities, pinned.capabilities,
+                    "{id}: capabilities"
+                );
+                assert_eq!(rebuilt.observation, pinned.observation, "{id}: observation");
+                assert!(
+                    !rebuilt.turn.is_authoritative_working(),
+                    "{id}: no registration path produces a working turn"
+                );
+                assert_eq!(rebuilt.upstream_identity, sighting.vendor_session_id);
+                assert_eq!(rebuilt.process_id, sighting.process_id);
+            }
+            RestartRecovery::Reconnects | RestartRecovery::Resumed => {
+                assert!(
+                    nonce.is_none(),
+                    "{id}: no rebuild nonce outside rediscovery"
+                );
+                assert!(rebuilt.is_none(), "{id}: no rebuild outside rediscovery");
+            }
+        }
+    }
 }
 
 /// The pinned registration is each integration's whole opening claim; every observable field
