@@ -343,7 +343,7 @@ const SYNTHETIC_PROMPT_ENVELOPES: [&str; 8] = [
 ///
 /// ponytail: prefix match. A person who pastes one of these verbatim loses one timeline row and
 /// nothing else — the prompt still reaches Claude untouched.
-fn is_synthetic_prompt(prompt: &str) -> bool {
+pub(crate) fn is_synthetic_prompt(prompt: &str) -> bool {
     let trimmed = prompt.trim_start();
     SYNTHETIC_PROMPT_ENVELOPES
         .iter()
@@ -596,7 +596,10 @@ fn tool_event(
     })
 }
 
-fn opaque_digest(namespace: &str, value: &str) -> String {
+/// The attached hook's source-ID spelling. `claude_history` digests transcript keys through it
+/// too, which is what lets a history row and a live hook row for one prompt or tool land on
+/// the same timeline entry.
+pub(crate) fn opaque_digest(namespace: &str, value: &str) -> String {
     format!(
         "claude.{namespace}.{}",
         keyed_digest(CLAUDE_DIGEST_DOMAIN, namespace, value)

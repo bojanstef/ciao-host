@@ -526,6 +526,60 @@ test("canonical history keeps its newest entries inside the independent byte bou
 	expect(entries.at(-1).source_id).toBe("user-byte-bound-user-259");
 });
 
+/// The host maps the same Claude transcript itself — for an attached session, and for a managed
+/// one whose transcript is past this worker's reader bound — and the two must draw one
+/// conversation identically. The shared fixture is the contract; the host's claude_history
+/// tests read the same file. The reader filter here is the pinned SDK's documented one for a
+/// linear chain: user and assistant records that are neither meta, sidechain nor team traffic,
+/// projected to its SessionMessage shape.
+test("canonical history matches the shared Claude transcript fixture", async () => {
+	const fixture = JSON.parse(
+		fs.readFileSync(
+			path.join(import.meta.dir, "../../../protocol/fixtures/phase5/claude-history-v1.json"),
+			"utf8",
+		),
+	);
+	const messages = fixture.records
+		.filter(
+			(record: any) =>
+				(record.type === "user" || record.type === "assistant") &&
+				typeof record.uuid === "string" &&
+				!record.isMeta &&
+				!record.isSidechain &&
+				!record.teamName,
+		)
+		.map((record: any) => ({
+			type: record.type,
+			uuid: record.uuid,
+			session_id: record.sessionId,
+			message: record.message,
+			parent_tool_use_id: null,
+			parent_agent_id: null,
+			timestamp: record.timestamp,
+		}));
+	const { frames } = await startWorker([], undefined, {
+		sessionID: "11111111-2222-4333-8444-555555555555",
+		fileSize: 16_384,
+		createdAt: fixture.created_at_ms,
+		messages,
+	});
+	await eventually(() => frames.some((frame) => frame.type === "snapshot_end"));
+
+	const registration = frames.find((frame) => frame.type === "register") as Record<string, any>;
+	expect(registration.history_complete).toBe(true);
+	const entries = frames
+		.filter((frame) => frame.type === "snapshot_entry")
+		.map((frame) => (frame as any).entry);
+	expect(entries).toEqual(
+		fixture.expected.map(({ managed_source, attached_source, ...entry }: any) => ({
+			source_id: managed_source,
+			...entry,
+		})),
+	);
+	expect(JSON.stringify(entries)).not.toContain("never forwarded");
+	expect(JSON.stringify(entries)).not.toContain("Omitted synthetic reasoning");
+});
+
 test("a message type outside the SDK's union is reported as drift, once, and skipped", async () => {
 	const { frames } = await startWorker([
 		{ type: "user", isReplay: true, uuid: "u1", message: { content: "hello" } },

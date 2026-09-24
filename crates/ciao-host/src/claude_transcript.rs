@@ -122,10 +122,15 @@ fn recent_model_in(projects: &Path, vendor_session_id: &str) -> Option<String> {
         })
 }
 
+/// Where `vendor_session_id`'s transcript lives, when Claude has one on disk.
+pub(crate) fn session_transcript_path(vendor_session_id: &str) -> Option<PathBuf> {
+    transcript_path(&claude_projects_dir()?, vendor_session_id)
+}
+
 /// Located by search rather than derived. Claude's project directory name is its own encoding
 /// of the workspace path, a rule Ciao does not own and must not reimplement. Session IDs are
 /// unique, so asking each project directory whether it holds this one needs no such rule.
-fn transcript_path(projects: &Path, vendor_session_id: &str) -> Option<PathBuf> {
+pub(crate) fn transcript_path(projects: &Path, vendor_session_id: &str) -> Option<PathBuf> {
     // Rejects a separator, so the join below cannot leave the directory it is given.
     valid_opaque_id(vendor_session_id).ok()?;
     let file_name = format!("{vendor_session_id}.jsonl");
@@ -138,7 +143,7 @@ fn transcript_path(projects: &Path, vendor_session_id: &str) -> Option<PathBuf> 
 
 /// The same two sources `claude_integration` resolves the plugin directory from, so an
 /// operator who relocated Claude's config keeps working without configuring Ciao twice.
-fn claude_projects_dir() -> Option<PathBuf> {
+pub(crate) fn claude_projects_dir() -> Option<PathBuf> {
     let config = match env::var_os("CLAUDE_CONFIG_DIR") {
         Some(value) if !value.is_empty() => {
             let path = PathBuf::from(value);

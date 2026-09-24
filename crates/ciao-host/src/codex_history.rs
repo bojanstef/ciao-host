@@ -96,7 +96,14 @@ pub(crate) fn spawn_history_read(
             }
         };
         let count = entries.len();
-        match sessions.prepend_bridge_history(&session_id, entries) {
+        let complete = count < MAX_HISTORY_ENTRIES;
+        match sessions.backfill_bridge_history(
+            &session_id,
+            Some(process_generation),
+            entries,
+            complete,
+            None,
+        ) {
             Ok(()) => tracing::info!(session = %session_id, count, "Codex history reconciled"),
             Err(error) => tracing::debug!(error = %error, "prepending Codex history failed"),
         }

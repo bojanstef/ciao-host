@@ -225,6 +225,21 @@ async fn apply_adapter_event(
             ctx.snapshot_open = false;
             ctx.sessions
                 .replace_bridge_snapshot(session_id, std::mem::take(&mut ctx.snapshot_entries))?;
+            // A resumed worker refuses a transcript past its SDK reader's bound and opens on
+            // the boundary alone. The host reads the newest part itself, under the worker's
+            // own source IDs, so the live stream continues the same rows.
+            if ctx.codec.id() == "claude-managed"
+                && ctx.sessions.awaits_history(session_id)
+                && let Some(vendor_session_id) = ctx.managed.vendor_session(ctx.managed_session_id)
+            {
+                crate::claude_history::spawn_backfill(
+                    ctx.sessions.clone(),
+                    session_id.clone(),
+                    vendor_session_id,
+                    ctx.registered.process_generation,
+                    crate::claude_history::SourceScheme::Managed,
+                );
+            }
         }
         NormalizedAdapterEvent::UpsertEntry(entry) if !ctx.snapshot_open => {
             ctx.sessions.upsert_bridge_entry(session_id, entry)?;
@@ -260,6 +275,18 @@ async fn apply_adapter_event(
                     agent.thread_id.clone(),
                     run_id.clone(),
                     agent.process_id,
+                    ctx.registered.process_generation,
+                );
+            }
+            // A finished Claude turn is on disk in full, so the record repairs whatever of it
+            // the best-effort hooks lost. Only a hook connection names the conversation.
+            if ctx.codec.id() == "claude"
+                && let (Some(agent), TurnState::Completed { .. }) = (ctx.agent, &turn)
+            {
+                crate::claude_history::spawn_turn_reconcile(
+                    ctx.sessions.clone(),
+                    session_id.clone(),
+                    agent.thread_id.clone(),
                     ctx.registered.process_generation,
                 );
             }
@@ -463,8 +490,22 @@ pub(crate) async fn handle_agent_bridge(
         if selected.codec.id() == "codex" {
             adoptions.note_hook_event(&thread_id, agent_process_id);
         }
+        // A build whose hook payloads are unestablished reports nothing but its own existence,
+        // and its transcript is no better established than its hooks.
+        let backfill_claude = selected.codec.id() == "claude" && selected.registration.compatible;
         let registered = sessions.register_observer(selected.registration).await?;
         log_registration("observer", &adapter_family, &adapter_version, &registered);
+        // Claude's transcript is the conversation of record; hooks only ever saw what happened
+        // while they were watching. Read once per process incarnation (the claim is inside).
+        if backfill_claude {
+            crate::claude_history::spawn_backfill(
+                sessions.clone(),
+                registered.session_id.clone(),
+                thread_id.clone(),
+                registered.process_generation,
+                crate::claude_history::SourceScheme::Attached,
+            );
+        }
         let registered_frame = granting_frame_bound(
             selected.codec.registered_frame(&registered)?,
             selected.codec.frame_grant(&first),
