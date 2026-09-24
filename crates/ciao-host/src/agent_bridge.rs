@@ -19,8 +19,8 @@ use crate::{
         NormalizedAdapterEvent,
     },
     agent_protocol::{
-        AgentProtocolError, TimelineBody, Truncation, TurnState, decode_agent_body,
-        read_agent_frame, valid_token, write_agent_frame,
+        AgentProtocolError, MAX_BRIDGE_FRAME_BYTES, TimelineBody, Truncation, TurnState,
+        decode_bridge_body, read_agent_frame_within, valid_token, write_agent_frame,
     },
     agent_route::{process_looks_like_tui, process_start_fingerprint},
     agent_session::{
@@ -70,7 +70,7 @@ impl<'a> AgentAdapterRegistry<'a> {
         body: &[u8],
         peer_process_id: Option<u32>,
     ) -> Result<SelectedAdapter<'a>, AgentProtocolError> {
-        let value: Value = decode_agent_body(body)?;
+        let value: Value = decode_bridge_body(body)?;
         let object = value.as_object().ok_or(AgentProtocolError::MalformedJson)?;
         if object.get("type").and_then(Value::as_str) != Some("register") {
             return Err(AgentProtocolError::UnexpectedMessage);
@@ -405,9 +405,12 @@ pub(crate) async fn handle_agent_bridge(
         bail!("agent bridge peer has the wrong account");
     }
     let peer_pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
-    let first = timeout(HOST_OPERATION_TIMEOUT, read_agent_frame(&mut stream))
-        .await
-        .map_err(|_| anyhow!("agent bridge registration timed out"))??;
+    let first = timeout(
+        HOST_OPERATION_TIMEOUT,
+        read_agent_frame_within(&mut stream, MAX_BRIDGE_FRAME_BYTES),
+    )
+    .await
+    .map_err(|_| anyhow!("agent bridge registration timed out"))??;
     let mut selected = AgentAdapterRegistry::production()
         .select(&first, peer_pid)
         .map_err(|_| anyhow!("agent bridge registration was invalid"))?;
@@ -462,7 +465,10 @@ pub(crate) async fn handle_agent_bridge(
         }
         let registered = sessions.register_observer(selected.registration).await?;
         log_registration("observer", &adapter_family, &adapter_version, &registered);
-        let registered_frame = selected.codec.registered_frame(&registered)?;
+        let registered_frame = granting_frame_bound(
+            selected.codec.registered_frame(&registered)?,
+            selected.codec.frame_grant(&first),
+        );
         write_agent_frame(&mut stream, &registered_frame).await?;
         return handle_transient_agent_event(
             stream,
@@ -489,7 +495,10 @@ pub(crate) async fn handle_agent_bridge(
         .register(selected.registration, command_sender)
         .await?;
     log_registration("stream", &adapter_family, &adapter_version, &registered);
-    let registered_frame = selected.codec.registered_frame(&registered)?;
+    let registered_frame = granting_frame_bound(
+        selected.codec.registered_frame(&registered)?,
+        selected.codec.frame_grant(&first),
+    );
     write_agent_frame(&mut stream, &registered_frame).await?;
 
     let mut context = AdapterEventContext {
@@ -510,7 +519,7 @@ pub(crate) async fn handle_agent_bridge(
     // Not `read_agent_frame`: a command or shutdown winning this select! drops the read future,
     // and that function loses consumed bytes on drop — a partial frame (big snapshots
     // especially) would desync the adapter stream.
-    let mut frames = crate::agent_protocol::AgentFrameReader::default();
+    let mut frames = crate::agent_protocol::AgentFrameReader::within(MAX_BRIDGE_FRAME_BYTES);
     let result = loop {
         tokio::select! {
             incoming = frames.next(&mut stream) => {
@@ -556,10 +565,19 @@ pub(crate) async fn handle_agent_bridge(
     result
 }
 
+/// Tells a peer the bridge's frame bound, when its dialect says the peer can be told. The bound
+/// is the transport's to state, which is why it is added here rather than by each dialect.
+fn granting_frame_bound(mut registered: Value, grant: Option<usize>) -> Value {
+    if let (Some(bytes), Some(frame)) = (grant, registered.as_object_mut()) {
+        frame.insert("frame_bytes".into(), bytes.into());
+    }
+    registered
+}
+
 /// Extracts a managed worker's one-time spawn token without giving the daemon
 /// any other view of an adapter's registration payload.
 fn managed_spawn_token(body: &[u8]) -> Option<String> {
-    let value: Value = decode_agent_body(body).ok()?;
+    let value: Value = decode_bridge_body(body).ok()?;
     let object = value.as_object()?;
     if object.get("adapter").and_then(Value::as_str)? != "claude-managed" {
         return None;
@@ -605,7 +623,10 @@ async fn handle_transient_agent_event(
     agent: AgentProcessIdentity,
 ) -> Result<()> {
     let body = tokio::select! {
-        incoming = timeout(HOST_OPERATION_TIMEOUT, read_agent_frame(&mut stream)) => {
+        incoming = timeout(
+            HOST_OPERATION_TIMEOUT,
+            read_agent_frame_within(&mut stream, MAX_BRIDGE_FRAME_BYTES),
+        ) => {
             incoming
                 .map_err(|_| anyhow!("agent event timed out"))??
         }
@@ -697,7 +718,8 @@ mod tests {
     use tokio::net::UnixStream;
 
     use crate::{
-        agent_protocol::TimelineBody, claude_adapter::PINNED_CLAUDE_VERSION,
+        agent_protocol::{TimelineBody, decode_agent_body, read_agent_frame},
+        claude_adapter::PINNED_CLAUDE_VERSION,
         workspace::WorkspaceConfig,
     };
 
@@ -817,6 +839,8 @@ mod tests {
         let registered: Value = decode_agent_body(&registered_body).unwrap();
         let session_id = registered["session_id"].as_str().unwrap().to_owned();
         assert_eq!(registered["type"], "registered");
+        // A hook reads `registered` leniently, so it is always told the bridge's bound.
+        assert_eq!(registered["frame_bytes"], MAX_BRIDGE_FRAME_BYTES);
 
         write_agent_frame(
             &mut client,
@@ -858,6 +882,146 @@ mod tests {
                 text: "Synthetic response.".into()
             }
         );
+    }
+
+    /// A hook that was told the bridge's bound hands over a prompt larger than a phone frame in
+    /// one event, and the host keeps all of it: the phone sees a head that says so, and the
+    /// fetch returns every byte.
+    #[tokio::test]
+    async fn a_granted_hook_hands_over_a_body_larger_than_a_phone_frame() {
+        use crate::agent_protocol::{
+            MAX_AGENT_FRAME_BYTES, TRUNCATION_BODY_AVAILABLE, write_agent_frame_within,
+        };
+        let temporary = tempdir().unwrap();
+        let sessions = AgentSessionSupervisor::load(
+            &temporary.path().join("agent-metadata.json"),
+            WorkspaceConfig::with_binary_dirs(Vec::new()),
+        )
+        .unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let managed = crate::managed_session::ManagedSessionDirectory::load(
+            &temporary.path().join("agent-managed.json"),
+            temporary.path(),
+            crate::managed_session::ManagedLauncher::Fake(Default::default()),
+        )
+        .unwrap();
+        let task = tokio::spawn(handle_agent_bridge(
+            server,
+            sessions.clone(),
+            std::sync::Arc::new(crate::managed_worker::WorkerTable::default()),
+            managed,
+            std::sync::Arc::new(crate::codex_adopted::AdoptionRegistry::default()),
+            Notifier::new(
+                std::sync::Arc::new(parking_lot::Mutex::new(
+                    crate::storage::PairedDeviceStore::load(temporary.path().join("paired.json"))
+                        .unwrap(),
+                )),
+                "fixture-host".into(),
+            ),
+            shutdown,
+        ));
+        write_agent_frame(
+            &mut client,
+            &serde_json::json!({
+                "v": 1,
+                "type": "register",
+                "adapter": "claude",
+                "adapter_version": PINNED_CLAUDE_VERSION,
+                "mode": "tui_hook",
+                "session_id": "fixture-claude-session",
+                "process_nonce": "0123456789abcdef0123456789abcdef",
+                "process_id": std::process::id(),
+                "workspace_display": "Fixture workspace",
+                "workspace_path": "/private/synthetic/Fixture workspace"
+            }),
+        )
+        .await
+        .unwrap();
+        let registered: Value =
+            decode_agent_body(&read_agent_frame(&mut client).await.unwrap()).unwrap();
+        let session_id = registered["session_id"].as_str().unwrap().to_owned();
+        let prompt = "Synthetic long prompt \u{1f980}. ".repeat(12_000);
+        let event = serde_json::json!({
+            "v": 1,
+            "type": "upsert_entry",
+            "entry": {
+                "source_id": "claude.prompt.fixture",
+                "source_revision": 1,
+                "timestamp": 1,
+                "state": "complete",
+                "kind": "user_message",
+                "body": { "type": "text", "text": prompt },
+                "truncation": { "truncated": false }
+            }
+        });
+        assert!(serde_json::to_vec(&event).unwrap().len() > MAX_AGENT_FRAME_BYTES);
+        write_agent_frame_within(&mut client, &event, MAX_BRIDGE_FRAME_BYTES)
+            .await
+            .unwrap();
+        let applied: Value =
+            decode_agent_body(&read_agent_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(applied["type"], "event_applied");
+        task.await.unwrap().unwrap();
+
+        let head = sessions
+            .snapshot(&session_id)
+            .unwrap()
+            .timeline_window
+            .entries
+            .pop()
+            .unwrap();
+        assert_eq!(
+            head.truncation.reason_code.as_deref(),
+            Some(TRUNCATION_BODY_AVAILABLE)
+        );
+        let body: String = sessions
+            .entry_body_frames(&session_id, &head.entry_id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|frame| match frame {
+                crate::agent_protocol::AgentServerFrame::TimelineEntryChunk { text, .. } => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(body, prompt);
+    }
+
+    /// Pi's extension refused unknown keys in `registered` until it learned this one, so only an
+    /// extension that asked in its own `register` is told — and never less than the old bound
+    /// nor more than the bridge reads. Every other dialect reads `registered` leniently.
+    #[test]
+    fn only_a_pi_that_asked_is_told_the_frame_bound() {
+        use crate::agent_protocol::MAX_AGENT_FRAME_BYTES;
+        let registry = AgentAdapterRegistry::production();
+        let legacy = pi_registration(Some("pi"));
+        let selected = registry.select(&legacy, Some(std::process::id())).unwrap();
+        assert_eq!(selected.codec.frame_grant(&legacy), None);
+        for (asked, granted) in [
+            (MAX_BRIDGE_FRAME_BYTES as u64, MAX_BRIDGE_FRAME_BYTES),
+            (1_u64 << 40, MAX_BRIDGE_FRAME_BYTES),
+            (10, MAX_AGENT_FRAME_BYTES),
+        ] {
+            let mut value: Value = serde_json::from_slice(&legacy).unwrap();
+            value["frame_bytes"] = asked.into();
+            let asking = serde_json::to_vec(&value).unwrap();
+            // The new field is accepted by registration itself, not only by the grant.
+            let selected = registry.select(&asking, Some(std::process::id())).unwrap();
+            assert_eq!(selected.codec.frame_grant(&asking), Some(granted));
+        }
+        for adapter in PRODUCTION_ADAPTERS
+            .iter()
+            .filter(|adapter| adapter.id() != "pi")
+        {
+            assert_eq!(
+                adapter.frame_grant(b"{}"),
+                Some(MAX_BRIDGE_FRAME_BYTES),
+                "{}",
+                adapter.id()
+            );
+        }
     }
 
     // Exercise the real process reader -> authenticated nonce -> supervisor chain. A fixed

@@ -22,7 +22,7 @@ use tokio::time::timeout;
 use crate::{
     agent_adapter::{AttachedHookRegister, WireTimelineEntry},
     agent_protocol::{
-        MAX_TIMELINE_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
+        MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
         TimelineBody, ToolTimelineBody, Truncation, TurnState, classify_vendor_version,
         valid_opaque_id, valid_token,
     },
@@ -326,7 +326,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
             "UserPromptSubmit" => {
                 let turn_id = required_string(object, "turn_id")?;
                 let (text, truncation) =
-                    bounded_text(required_string(object, "prompt")?, MAX_TIMELINE_TEXT_BYTES);
+                    bounded_text(required_string(object, "prompt")?, MAX_RETAINED_TEXT_BYTES);
                 (
                     CodexHookEventFrame::UpsertEntry {
                         v: CODEX_HOOK_PROTOCOL_VERSION,
@@ -357,7 +357,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 let turn_id = required_string(object, "turn_id")?;
                 let (text, truncation) = bounded_text(
                     required_string(object, "last_assistant_message")?,
-                    MAX_TIMELINE_TEXT_BYTES,
+                    MAX_RETAINED_TEXT_BYTES,
                 );
                 (
                     CodexHookEventFrame::UpsertEntry {
@@ -806,6 +806,27 @@ pub(crate) mod tests {
                 text: "Run the shell command: echo hello. Then reply done.".into()
             }
         );
+    }
+
+    /// Codex hands over a turn's answer whole in `Stop`, so a long one used to arrive cut at the
+    /// phone's head. It is mapped whole now; the daemon keeps it and sends a head that says so.
+    #[test]
+    fn a_long_prompt_and_a_long_answer_are_mapped_whole() {
+        let long = "Synthetic long answer, na\u{ef}ve. ".repeat(4_000);
+        assert!(long.len() > 2 * crate::agent_protocol::MAX_TIMELINE_TEXT_BYTES);
+        let mut prompt = turn(common("UserPromptSubmit"));
+        prompt["prompt"] = json!(long);
+        let mut stop = turn(common("Stop"));
+        stop["last_assistant_message"] = json!(long);
+        for payload in [prompt, stop] {
+            let CodexHookEventFrame::UpsertEntry { entry, .. } =
+                map_hook_input(&payload, &facts()).unwrap().unwrap().event
+            else {
+                panic!("expected an entry");
+            };
+            assert_eq!(entry.body, TimelineBody::Text { text: long.clone() });
+            assert!(!entry.truncation.truncated);
+        }
     }
 
     #[test]

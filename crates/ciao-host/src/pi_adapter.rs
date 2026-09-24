@@ -14,8 +14,9 @@ use crate::{
     },
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentCommandKind, AgentProtocolError, CommandCapabilities,
-        InteractionCapabilities, Observation, TurnState, decode_agent_body, turn_from_bridge_frame,
-        valid_opaque_id, valid_token, version_major_matches, version_within_tested_minor,
+        InteractionCapabilities, MAX_AGENT_FRAME_BYTES, MAX_BRIDGE_FRAME_BYTES, Observation,
+        TurnState, decode_bridge_body, turn_from_bridge_frame, valid_opaque_id, valid_token,
+        version_major_matches, version_within_tested_minor,
     },
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
@@ -71,6 +72,11 @@ pub(crate) struct PiBridgeRegister {
     pub process_id: u32,
     pub workspace_display: String,
     pub commands: PiBridgeCommandCapabilities,
+    /// The largest frame this extension will send, when it can send more than the phone's
+    /// 64 KiB. Its presence is also the extension saying it reads `frame_bytes` in `registered`
+    /// — which an older extension does not: it refuses any key it does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_bytes: Option<u64>,
 }
 
 impl PiBridgeRegister {
@@ -178,7 +184,7 @@ pub(crate) enum PiBridgeInbound {
 }
 
 pub(crate) fn decode_pi_bridge_frame(body: &[u8]) -> Result<PiBridgeInbound, AgentProtocolError> {
-    let value: Value = decode_agent_body(body)?;
+    let value: Value = decode_bridge_body(body)?;
     let message_type = value
         .as_object()
         .and_then(|object| object.get("type"))
@@ -422,6 +428,16 @@ impl AttachedAgentAdapter for PiAttachedAdapter {
         register.normalize(peer_process_id)
     }
 
+    /// Only an extension that asked is answered, and never with less than the old bound or
+    /// more than the bridge reads.
+    fn frame_grant(&self, register: &[u8]) -> Option<usize> {
+        let PiBridgeInbound::Register(register) = decode_pi_bridge_frame(register).ok()? else {
+            return None;
+        };
+        let asked = usize::try_from(register.frame_bytes?).unwrap_or(usize::MAX);
+        Some(asked.clamp(MAX_AGENT_FRAME_BYTES, MAX_BRIDGE_FRAME_BYTES))
+    }
+
     fn decode_event(&self, body: &[u8]) -> Result<NormalizedAdapterEvent, AgentProtocolError> {
         Ok(match decode_pi_bridge_frame(body)? {
             PiBridgeInbound::Register(_) => NormalizedAdapterEvent::Registration,
@@ -499,6 +515,7 @@ mod tests {
                 follow_up: true,
                 interrupt: true,
             },
+            frame_bytes: None,
         }
     }
 

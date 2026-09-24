@@ -24,10 +24,9 @@ use crate::{
     agent_protocol::{
         AgentCapabilities, AgentCommandKind, AgentModelOption, CommandCapabilities,
         InteractionAnswer, InteractionCapabilities, InteractionCapability,
-        MAX_LIVE_TEXT_DELTA_BYTES, MAX_MODEL_CATALOGUE_ENTRIES, MAX_TIMELINE_TEXT_BYTES,
-        MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES, Observation,
-        PendingInteraction, ResponseChoice, ResponseSchema, TerminalFallback, TimelineBody,
-        ToolTimelineBody, TurnState,
+        MAX_MODEL_CATALOGUE_ENTRIES, MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES,
+        MAX_TOOL_RESULT_PREVIEW_BYTES, Observation, PendingInteraction, ResponseChoice,
+        ResponseSchema, TerminalFallback, TimelineBody, ToolTimelineBody, TurnState,
     },
     agent_session::{
         AgentSessionSupervisor, BridgeCommandEnvelope, NormalizedRegistration, NormalizedTextDelta,
@@ -1123,7 +1122,7 @@ fn on_notification(
                 return;
             }
             let revision = tracking.next_revision(&source_id);
-            let (text, truncation) = bounded_text(delta, MAX_LIVE_TEXT_DELTA_BYTES);
+            let (text, truncation) = bounded_text(delta, MAX_RETAINED_TEXT_BYTES);
             let _ = supervisor.append_bridge_text(
                 session,
                 NormalizedTextDelta {
@@ -1190,7 +1189,7 @@ fn live_item_entry(
             if text.is_empty() {
                 text = item["text"].as_str().unwrap_or_default().to_owned();
             }
-            let (text, truncation) = bounded_text(&text, MAX_TIMELINE_TEXT_BYTES);
+            let (text, truncation) = bounded_text(&text, MAX_RETAINED_TEXT_BYTES);
             ("user_message", TimelineBody::Text { text }, truncation)
         }
         "agentMessage" => {
@@ -1202,7 +1201,7 @@ fn live_item_entry(
             }
             let (text, truncation) = bounded_text(
                 item["text"].as_str().unwrap_or_default(),
-                MAX_TIMELINE_TEXT_BYTES,
+                MAX_RETAINED_TEXT_BYTES,
             );
             ("assistant_message", TimelineBody::Text { text }, truncation)
         }

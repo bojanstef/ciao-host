@@ -19,6 +19,13 @@ pub const CAPABILITY_AGENT_SESSION_MANAGED_V1: &str = "agent.session.managed.v1"
 pub const CAPABILITY_AGENT_SESSION_ADOPTED_V1: &str = "agent.session.adopted.v1";
 pub const CAPABILITY_TERMINAL_AGENT_ROUTE: &str = "terminal.agent_route.v1";
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024;
+/// The local agent bridge's frame bound — the same-user Unix socket adapters register on, never
+/// the phone's stream. It is split from [`MAX_AGENT_FRAME_BYTES`] so an adapter can hand over a
+/// whole retained body ([`MAX_RETAINED_TEXT_BYTES`]) in one entry, with room for JSON escaping.
+/// The daemon reads every bridge frame up to it, but an adapter may send more than 64 KiB only
+/// after its `registered` frame announces `frame_bytes`: an older daemon refuses anything
+/// larger and says nothing, so an adapter that was not told keeps to the old bound.
+pub const MAX_BRIDGE_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_AGENT_LIST_BYTES: usize = 256 * 1024;
 pub const MAX_AGENT_SESSIONS: usize = 64;
 pub const MAX_TIMELINE_PAGE_ENTRIES: usize = 64;
@@ -2619,11 +2626,20 @@ pub fn entry_body_frames(
 }
 
 pub fn encode_agent_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, AgentProtocolError> {
+    encode_agent_frame_within(value, MAX_AGENT_FRAME_BYTES)
+}
+
+/// [`encode_agent_frame`] with a caller-named bound, for an adapter writing to a bridge that
+/// granted [`MAX_BRIDGE_FRAME_BYTES`].
+pub fn encode_agent_frame_within<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<Vec<u8>, AgentProtocolError> {
     let body = serde_json::to_vec(value).map_err(|_| AgentProtocolError::MalformedJson)?;
     if body.is_empty() {
         return Err(AgentProtocolError::ZeroLength);
     }
-    if body.len() > MAX_AGENT_FRAME_BYTES {
+    if body.len() > limit {
         return Err(AgentProtocolError::FrameTooLarge);
     }
     let length = u32::try_from(body.len()).map_err(|_| AgentProtocolError::FrameTooLarge)?;
@@ -2636,10 +2652,24 @@ pub fn encode_agent_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, AgentProto
 pub fn decode_agent_body<T: for<'de> Deserialize<'de>>(
     body: &[u8],
 ) -> Result<T, AgentProtocolError> {
+    decode_agent_body_within(body, MAX_AGENT_FRAME_BYTES)
+}
+
+/// A frame read off the local adapter bridge, bounded by [`MAX_BRIDGE_FRAME_BYTES`].
+pub fn decode_bridge_body<T: for<'de> Deserialize<'de>>(
+    body: &[u8],
+) -> Result<T, AgentProtocolError> {
+    decode_agent_body_within(body, MAX_BRIDGE_FRAME_BYTES)
+}
+
+fn decode_agent_body_within<T: for<'de> Deserialize<'de>>(
+    body: &[u8],
+    limit: usize,
+) -> Result<T, AgentProtocolError> {
     if body.is_empty() {
         return Err(AgentProtocolError::ZeroLength);
     }
-    if body.len() > MAX_AGENT_FRAME_BYTES {
+    if body.len() > limit {
         return Err(AgentProtocolError::FrameTooLarge);
     }
     serde_json::from_slice(body).map_err(|_| AgentProtocolError::MalformedJson)
@@ -2654,18 +2684,27 @@ pub fn decode_agent_body<T: for<'de> Deserialize<'de>>(
 pub struct AgentFrameReader {
     buffered: Vec<u8>,
     chunk: Vec<u8>,
+    limit: usize,
 }
 
 impl Default for AgentFrameReader {
+    /// The phone's bound.
     fn default() -> Self {
-        Self {
-            buffered: Vec::new(),
-            chunk: vec![0_u8; 8 * 1024],
-        }
+        Self::within(MAX_AGENT_FRAME_BYTES)
     }
 }
 
 impl AgentFrameReader {
+    /// A reader for a stream with its own frame bound — [`MAX_BRIDGE_FRAME_BYTES`] for the local
+    /// adapter bridge.
+    pub fn within(limit: usize) -> Self {
+        Self {
+            buffered: Vec::new(),
+            chunk: vec![0_u8; 8 * 1024],
+            limit,
+        }
+    }
+
     /// Cancellation-safe: dropping the returned future never loses stream position.
     pub async fn next<R>(&mut self, reader: &mut R) -> Result<Vec<u8>, AgentProtocolError>
     where
@@ -2699,7 +2738,7 @@ impl AgentFrameReader {
         if length == 0 {
             return Err(AgentProtocolError::ZeroLength);
         }
-        if length > MAX_AGENT_FRAME_BYTES {
+        if length > self.limit {
             return Err(AgentProtocolError::FrameTooLarge);
         }
         if self.buffered.len() < 4 + length {
@@ -2715,13 +2754,24 @@ pub async fn read_agent_frame<R>(reader: &mut R) -> Result<Vec<u8>, AgentProtoco
 where
     R: AsyncRead + Unpin,
 {
+    read_agent_frame_within(reader, MAX_AGENT_FRAME_BYTES).await
+}
+
+/// [`read_agent_frame`] with a caller-named bound: [`MAX_BRIDGE_FRAME_BYTES`] on the local bridge.
+pub async fn read_agent_frame_within<R>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>, AgentProtocolError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut header = [0_u8; 4];
     read_exact(reader, &mut header).await?;
     let length = u32::from_be_bytes(header) as usize;
     if length == 0 {
         return Err(AgentProtocolError::ZeroLength);
     }
-    if length > MAX_AGENT_FRAME_BYTES {
+    if length > limit {
         return Err(AgentProtocolError::FrameTooLarge);
     }
     let mut body = vec![0_u8; length];
@@ -2734,7 +2784,21 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    writer.write_all(&encode_agent_frame(value)?).await?;
+    write_agent_frame_within(writer, value, MAX_AGENT_FRAME_BYTES).await
+}
+
+pub async fn write_agent_frame_within<W, T>(
+    writer: &mut W,
+    value: &T,
+    limit: usize,
+) -> Result<(), AgentProtocolError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    writer
+        .write_all(&encode_agent_frame_within(value, limit)?)
+        .await?;
     Ok(())
 }
 

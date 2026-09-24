@@ -16,7 +16,7 @@ use crate::{
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentCommandKind, AgentModelOption, AgentProtocolError,
         CommandCapabilities, InteractionCapabilities, InteractionCapability, Observation,
-        PendingInteraction, ResponseSchema, TerminalFallback, TurnState, decode_agent_body,
+        PendingInteraction, ResponseSchema, TerminalFallback, TurnState, decode_bridge_body,
         turn_from_bridge_frame, valid_model_id, valid_opaque_id, valid_token,
         validate_model_catalogue,
     },
@@ -365,7 +365,7 @@ pub(crate) enum ClaudeManagedOutbound {
 /// tagged representation consumes the `type` key, which a `deny_unknown_fields`
 /// payload cannot reconstruct.
 fn decode_managed_frame(body: &[u8]) -> Result<ClaudeManagedInbound, AgentProtocolError> {
-    let value: Value = decode_agent_body(body)?;
+    let value: Value = decode_bridge_body(body)?;
     let object = value
         .as_object()
         .ok_or(AgentProtocolError::MalformedJson)?

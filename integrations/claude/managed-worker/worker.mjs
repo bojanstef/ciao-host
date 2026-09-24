@@ -12,15 +12,24 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 const PROTOCOL_VERSION = 1;
+// Every daemon reads a frame this size, and a daemon from before the bridge grant reads nothing
+// larger: it refuses the frame and drops the connection without a word.
 const MAX_FRAME_BYTES = 64 * 1024;
+// The most a `registered` grant is believed (MAX_BRIDGE_FRAME_BYTES host-side).
+const MAX_BRIDGE_FRAME_BYTES = 2 * 1024 * 1024;
 const MAX_TEXT_DELTA_BYTES = 16 * 1024;
-// A finished message body, mirroring the host's MAX_TIMELINE_TEXT_BYTES — the ceiling the
-// timeline actually renders, and what the attached adapter already keeps of a long reply.
-// Only streaming deltas stay on MAX_TEXT_DELTA_BYTES, which is a wire-frame bound
-// (MAX_LIVE_TEXT_DELTA_BYTES host-side), not a display budget.
+// A finished message body as a daemon that granted nothing larger validates it: the host's
+// MAX_TIMELINE_TEXT_BYTES, which is the phone's head. Streaming deltas stay on
+// MAX_TEXT_DELTA_BYTES there (MAX_LIVE_TEXT_DELTA_BYTES host-side).
 const MAX_TEXT_BYTES = 48 * 1024;
+// A finished message body as a granting daemon keeps it (MAX_RETAINED_TEXT_BYTES host-side):
+// whole, with only the phone's copy cut to a head the phone can fetch past.
+const MAX_RETAINED_TEXT_BYTES = 1024 * 1024;
 const MAX_TOOL_INPUT_PREVIEW_BYTES = 16 * 1024;
 const MAX_TOOL_RESULT_PREVIEW_BYTES = 32 * 1024;
+// The per-string caps a JSON preview retreats to when the whole document does not fit its
+// budget — GENEROUS_PREVIEW_STRING_BYTES and MAX_PREVIEW_STRING_BYTES host-side.
+const PREVIEW_STRING_CAPS = [2048, 512];
 // The SDK applies `limit` only after reading the whole transcript. Check the local file size
 // first, or a long conversation would turn a nominally bounded history request into an
 // unbounded worker allocation. Canonical output is independently held to the host/iOS bound.
@@ -119,9 +128,14 @@ await new Promise((resolve, reject) => {
 	socket.once("error", reject);
 });
 
+// The largest frame this worker's daemon granted in `registered`; until then, and for a daemon
+// that grants nothing, the bound every daemon reads.
+let frameBytes = MAX_FRAME_BYTES;
+const granted = () => frameBytes > MAX_FRAME_BYTES;
+
 function writeFrame(value) {
 	const body = Buffer.from(JSON.stringify({ v: PROTOCOL_VERSION, ...value }), "utf8");
-	if (body.length > MAX_FRAME_BYTES) return false;
+	if (body.length > frameBytes) return false;
 	const header = Buffer.alloc(4);
 	header.writeUInt32BE(body.length);
 	return socket.write(Buffer.concat([header, body]));
@@ -156,16 +170,96 @@ const inboundHandlers = [];
 
 function boundedText(text, limit) {
 	const buffer = Buffer.from(String(text ?? ""), "utf8");
-	if (buffer.length <= limit) return { text: buffer.toString("utf8"), truncated: false };
+	if (buffer.length <= limit) {
+		return { text: buffer.toString("utf8"), truncated: false, originalBytes: buffer.length };
+	}
 	// Slice on a character boundary so the daemon always receives valid UTF-8.
+	let end = limit;
+	while (end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
 	return {
-		text: buffer.subarray(0, limit).toString("utf8").replace(/�$/, ""),
+		text: buffer.subarray(0, end).toString("utf8"),
 		truncated: true,
+		originalBytes: buffer.length,
 	};
 }
 
-function truncation(truncated, reason) {
-	return truncated ? { truncated: true, reason_code: reason } : { truncated: false };
+/// `adapter_bound` for prose that was cut and `preview_bounded` for a tool preview — the tokens
+/// the host's own adapters use, so the phone reads one vocabulary whichever agent is running.
+function truncation(truncated, reason, originalBytes) {
+	if (!truncated) return { truncated: false };
+	return {
+		truncated: true,
+		reason_code: reason,
+		...(Number.isSafeInteger(originalBytes) && originalBytes > 0 ? { original_bytes: originalBytes } : {}),
+	};
+}
+
+/// Bytes one character occupies inside a JSON string as JSON.stringify writes it: two for the
+/// short escapes, six for any other control character or a lone surrogate, the UTF-8 bytes of
+/// anything else. Mirrors the host's `json_escaped_len`; a copy lives in the Pi extension too,
+/// because each integration ships as one self-contained file.
+function jsonEscapedBytes(character) {
+	const point = character.codePointAt(0) ?? 0;
+	if (character === '"' || character === "\\" || "\b\f\n\r\t".includes(character)) return 2;
+	if (point < 0x20 || (point >= 0xd800 && point <= 0xdfff)) return 6;
+	return Buffer.byteLength(character, "utf8");
+}
+
+function jsonTextBytes(text) {
+	let bytes = 0;
+	for (const character of text) bytes += jsonEscapedBytes(character);
+	return bytes;
+}
+
+/// The longest prefix of `text`, in whole characters, whose JSON encoding fits `budget` bytes.
+function jsonPrefixWithin(text, budget) {
+	let encoded = 0;
+	let end = 0;
+	for (const character of text) {
+		encoded += jsonEscapedBytes(character);
+		if (encoded > budget) break;
+		end += character.length;
+	}
+	return text.slice(0, end);
+}
+
+/// An entry this worker's daemon will read. Only the rare escape-heavy body needs it once text
+/// is bounded: its encoding outgrows the frame, and writeFrame would otherwise drop the whole
+/// entry without a word. Text is cut to what fits under a named loss; a tool sheds its previews,
+/// result first.
+function fitEntry(type, entry) {
+	let fitted = entry;
+	for (;;) {
+		const size = Buffer.byteLength(JSON.stringify({ v: PROTOCOL_VERSION, type, entry: fitted }));
+		if (size <= frameBytes) return fitted;
+		const body = fitted.body;
+		if (body?.type === "text" && body.text.length > 0) {
+			const budget = frameBytes - (size - jsonTextBytes(body.text));
+			const prefix = jsonPrefixWithin(body.text, Math.max(0, budget));
+			const whole = Math.max(
+				fitted.truncation?.original_bytes ?? 0,
+				Buffer.byteLength(entry.body.text, "utf8"),
+			);
+			fitted = {
+				...fitted,
+				body: { type: "text", text: prefix.length < body.text.length ? prefix : "" },
+				truncation: truncation(true, "adapter_bound", whole),
+			};
+			continue;
+		}
+		if (body?.type === "tool" && (body.tool.result_preview !== undefined || body.tool.input_preview !== undefined)) {
+			const tool = { ...body.tool };
+			if (tool.result_preview !== undefined) delete tool.result_preview;
+			else delete tool.input_preview;
+			fitted = {
+				...fitted,
+				body: { type: "tool", tool },
+				truncation: fitted.truncation?.truncated ? fitted.truncation : truncation(true, "preview_bounded"),
+			};
+			continue;
+		}
+		return fitted;
+	}
 }
 
 function nowSeconds() {
@@ -182,7 +276,7 @@ function nextRevision(sourceID) {
 function sendEntry(type, sourceID, kind, body, state = "complete") {
 	writeFrame({
 		type,
-		entry: {
+		entry: fitEntry(type, {
 			source_id: sourceID,
 			source_revision: nextRevision(sourceID),
 			timestamp: nowSeconds(),
@@ -190,7 +284,7 @@ function sendEntry(type, sourceID, kind, body, state = "complete") {
 			kind,
 			body: body.body,
 			truncation: body.truncation,
-		},
+		}),
 	});
 }
 
@@ -198,15 +292,21 @@ function textBody(text, limit = MAX_TEXT_BYTES) {
 	const bounded = boundedText(text, limit);
 	return {
 		body: { type: "text", text: bounded.text },
-		truncation: truncation(bounded.truncated, "content_bound"),
+		truncation: truncation(bounded.truncated, "adapter_bound", bounded.originalBytes),
 	};
+}
+
+/// A live message's text: whole for a daemon that keeps it, the head for one that granted
+/// nothing larger.
+function liveTextBody(text) {
+	return textBody(text, granted() ? MAX_RETAINED_TEXT_BYTES : MAX_TEXT_BYTES);
 }
 
 /// One chunk of an entry that is still being written. The host appends it to whatever the
 /// source ID already holds and derives `streaming` from `final_chunk`, so the phone draws the
 /// caret without the worker ever saying so.
 function appendText(sourceID, kind, delta) {
-	const bounded = boundedText(delta, MAX_TEXT_DELTA_BYTES);
+	const bounded = boundedText(delta, granted() ? MAX_RETAINED_TEXT_BYTES : MAX_TEXT_DELTA_BYTES);
 	writeFrame({
 		type: "append_text",
 		delta: {
@@ -216,7 +316,7 @@ function appendText(sourceID, kind, delta) {
 			kind,
 			delta: bounded.text,
 			final_chunk: false,
-			truncation: truncation(bounded.truncated, "content_bound"),
+			truncation: truncation(bounded.truncated, "adapter_bound", bounded.originalBytes),
 		},
 	});
 }
@@ -249,23 +349,57 @@ function isSyntheticPrompt(text) {
 	return SYNTHETIC_PROMPT_ENVELOPES.some((envelope) => trimmed.startsWith(envelope));
 }
 
+/// Every string in a parsed JSON value cut to `cap` UTF-8 bytes, on a character boundary.
+function capStrings(value, cap) {
+	if (typeof value === "string") return boundedText(value, cap).text;
+	if (Array.isArray(value)) return value.map((item) => capStrings(item, cap));
+	if (value !== null && typeof value === "object") {
+		return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, capStrings(field, cap)]));
+	}
+	return value;
+}
+
+/// A tool argument preview the phone can still parse to name the step. Whole when the document
+/// fits its budget; otherwise its strings capped, generous before tight — never a byte cut
+/// through the serialized text. The same three attempts as the host's `bounded_preview`. Text
+/// that is not JSON is cut like prose.
+function jsonPreview(serialized, limit) {
+	let document;
+	try {
+		document = JSON.parse(serialized);
+	} catch {
+		return boundedText(serialized, limit);
+	}
+	const originalBytes = Buffer.byteLength(serialized, "utf8");
+	if (originalBytes <= limit) return { text: serialized, truncated: false, originalBytes };
+	for (const cap of PREVIEW_STRING_CAPS) {
+		const text = JSON.stringify(capStrings(document, cap));
+		if (Buffer.byteLength(text, "utf8") <= limit) return { text, truncated: true, originalBytes };
+	}
+	// Omitting beats sending something the reader cannot parse.
+	return { text: undefined, truncated: true, originalBytes };
+}
+
 function toolBody(name, status, input, result) {
-	const boundedInput = input === undefined ? undefined : boundedText(input, MAX_TOOL_INPUT_PREVIEW_BYTES);
+	const boundedInput = input === undefined ? undefined : jsonPreview(input, MAX_TOOL_INPUT_PREVIEW_BYTES);
 	const boundedResult =
 		result === undefined ? undefined : boundedText(result, MAX_TOOL_RESULT_PREVIEW_BYTES);
+	const truncated = Boolean(boundedInput?.truncated || boundedResult?.truncated);
 	return {
 		body: {
 			type: "tool",
 			tool: {
 				name,
 				status,
-				...(boundedInput ? { input_preview: boundedInput.text } : {}),
+				...(boundedInput?.text !== undefined ? { input_preview: boundedInput.text } : {}),
 				...(boundedResult ? { result_preview: boundedResult.text } : {}),
 			},
 		},
 		truncation: truncation(
-			Boolean(boundedInput?.truncated || boundedResult?.truncated),
-			"content_bound",
+			truncated,
+			"preview_bounded",
+			(boundedInput?.truncated ? boundedInput.originalBytes : 0) +
+				(boundedResult?.truncated ? boundedResult.originalBytes : 0),
 		),
 	};
 }
@@ -820,6 +954,11 @@ writeFrame({
 inboundHandlers.push((frame) => {
 	switch (frame?.type) {
 		case "registered":
+			// A daemon that keeps whole messages says how large a frame it reads. One that
+			// predates the grant says nothing, and everything stays within the old bounds.
+			if (Number.isSafeInteger(frame.frame_bytes)) {
+				frameBytes = Math.min(MAX_BRIDGE_FRAME_BYTES, Math.max(MAX_FRAME_BYTES, frame.frame_bytes));
+			}
 			writeFrame({ type: "snapshot_start" });
 			for (const entry of resumedHistory.entries) {
 				writeFrame({ type: "snapshot_entry", entry });
@@ -1237,7 +1376,7 @@ try {
 			// turn ended, mid-turn, once per notification.
 			if (isSyntheticPrompt(text)) continue;
 			if (text) {
-				sendEntry("upsert_entry", sourceID("user", message.uuid), "user_message", textBody(text));
+				sendEntry("upsert_entry", sourceID("user", message.uuid), "user_message", liveTextBody(text));
 			}
 			// The prompt was delivered and a turn is in flight. That is all this knows: nothing
 			// has reported thinking, and saying so here was a guess that then sat on screen for
@@ -1319,7 +1458,7 @@ try {
 					// of the streamed copy staying beside the finished one.
 					sourceID("assistant", message.message?.id ?? message.uuid ?? assistantSequence),
 					"assistant_message",
-					textBody(text),
+					liveTextBody(text),
 				);
 			}
 			if (Array.isArray(content)) {

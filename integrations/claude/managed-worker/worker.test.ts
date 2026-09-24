@@ -207,7 +207,7 @@ async function startWorker(
 	models?: unknown[],
 	extraEnv?: Record<string, string>,
 	hold?: boolean,
-	bridge: { eofOnRegister?: boolean; runtime?: string } = {},
+	bridge: { eofOnRegister?: boolean; runtime?: string; grant?: number } = {},
 ): Promise<Harness> {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-managed-worker-"));
 	const socketPath = path.join(root, "agent.sock");
@@ -227,6 +227,9 @@ async function startWorker(
 						session_id: SESSION_ID,
 						process_generation: 1,
 						snapshot_epoch: 1,
+						// A current daemon grants its bridge bound; without it this plays one from
+						// before the grant.
+						...(bridge.grant ? { frame_bytes: bridge.grant } : {}),
 					});
 					if (bridge.eofOnRegister) {
 						// Send the acknowledgement and EOF together, but never drain the snapshot.
@@ -1441,12 +1444,107 @@ test("a finished message between the delta and timeline bounds arrives whole", a
 	]);
 	expect(finished[0].entry.body.text).toBe(midText);
 	expect(finished[0].entry.truncation).toEqual({ truncated: false });
-	// Past the host's own render bound the worker still truncates, and says so.
+	// A daemon from before the bridge grant validates nothing past the phone's head, so for it
+	// the worker still cuts — and names the cut in the host's own vocabulary, with the size.
 	expect(finished[1].entry.body.text.length).toBe(48 * 1024);
 	expect(finished[1].entry.truncation).toEqual({
 		truncated: true,
-		reason_code: "content_bound",
+		reason_code: "adapter_bound",
+		original_bytes: 50 * 1024,
 	});
+});
+
+test("a daemon that grants its bridge bound gets every finished message whole", async () => {
+	const overText = "o".repeat(300 * 1024);
+	const { frames } = await startWorker(
+		[
+			{ type: "user", isReplay: true, uuid: "u1", message: { content: "p".repeat(70 * 1024) } },
+			{
+				type: "assistant",
+				uuid: "a2",
+				message: { id: "m2", content: [{ type: "text", text: overText }] },
+			},
+			{ type: "result", subtype: "success" },
+		],
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		false,
+		{ grant: 2 * 1024 * 1024 },
+	);
+	await eventually(() =>
+		frames.some((frame) => frame.type === "turn" && frame.state === "completed"),
+	);
+	const entries = frames.filter((frame) => frame.type === "upsert_entry") as any[];
+	const user = entries.find((frame) => frame.entry.kind === "user_message");
+	expect(user.entry.body.text).toBe("p".repeat(70 * 1024));
+	const reply = entries.find((frame) => frame.entry.kind === "assistant_message");
+	expect(reply.entry.body.text).toBe(overText);
+	expect(reply.entry.truncation).toEqual({ truncated: false });
+});
+
+test("an escape-heavy reply is cut to what the frame holds instead of vanishing", async () => {
+	const hostile = "\u0001".repeat(40 * 1024);
+	const { frames } = await startWorker([
+		{ type: "user", isReplay: true, uuid: "u1", message: { content: "go" } },
+		{
+			type: "assistant",
+			uuid: "a1",
+			message: { id: "m1", content: [{ type: "text", text: hostile }] },
+		},
+		{ type: "result", subtype: "success" },
+	]);
+	await eventually(() =>
+		frames.some((frame) => frame.type === "turn" && frame.state === "completed"),
+	);
+	const reply = frames.find(
+		(frame) => frame.type === "upsert_entry" && (frame as any).entry.kind === "assistant_message",
+	) as any;
+	// It used to be dropped whole: its encoding outgrew the frame and writeFrame refused it.
+	expect(reply).toBeDefined();
+	expect(Buffer.byteLength(JSON.stringify(reply))).toBeLessThanOrEqual(64 * 1024);
+	expect(reply.entry.body.text.length * 6).toBeGreaterThan(64 * 1024 - 1024);
+	expect(reply.entry.truncation).toEqual({
+		truncated: true,
+		reason_code: "adapter_bound",
+		original_bytes: 40 * 1024,
+	});
+});
+
+test("a tool argument that fits its budget is whole, and a larger one still parses", async () => {
+	const content = "y".repeat(3 * 1024);
+	const huge = "z".repeat(40 * 1024);
+	const { frames } = await startWorker([
+		{ type: "user", isReplay: true, uuid: "u1", message: { content: "write" } },
+		{
+			type: "assistant",
+			uuid: "a1",
+			message: {
+				id: "m1",
+				content: [
+					{ type: "tool_use", id: "tool-fits", name: "Write", input: { file_path: "/tmp/a", content } },
+					{ type: "tool_use", id: "tool-big", name: "Write", input: { file_path: "/tmp/b", content: huge } },
+				],
+			},
+		},
+		{ type: "result", subtype: "success" },
+	]);
+	await eventually(() =>
+		frames.some((frame) => frame.type === "turn" && frame.state === "completed"),
+	);
+	const tools = frames.filter(
+		(frame) => frame.type === "upsert_entry" && (frame as any).entry.kind === "tool",
+	) as any[];
+	const fits = tools.find((frame) => frame.entry.source_id === "tool-tool-fits");
+	expect(JSON.parse(fits.entry.body.tool.input_preview).content).toBe(content);
+	expect(fits.entry.truncation).toEqual({ truncated: false });
+	const big = tools.find((frame) => frame.entry.source_id === "tool-tool-big");
+	const parsed = JSON.parse(big.entry.body.tool.input_preview);
+	expect(parsed.file_path).toBe("/tmp/b");
+	expect(Buffer.byteLength(parsed.content)).toBeLessThanOrEqual(2048);
+	expect(big.entry.truncation.reason_code).toBe("preview_bounded");
+	expect(big.entry.truncation.original_bytes).toBeGreaterThan(40 * 1024);
 });
 
 // Node is the production interpreter; Bun is the CI runner and the historical test interpreter.

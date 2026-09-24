@@ -8,6 +8,7 @@ const {
 	CiaoAgentBridge,
 	defaultBridgeSocketPath,
 	encodeBridgeFrame,
+	fitEntryFrame,
 	detectPiCommandSurface,
 	isPiMajorCompatible,
 	isTestedPiVersion,
@@ -459,4 +460,164 @@ test("real framed socket correlates prompt receipts and deduplicates commands", 
 	expect(completed?.state).toBe("completed");
 	// The run that ended is the run that started, so the phone can tell turns apart.
 	expect(completed?.run_id).toBe(running?.run_id);
+});
+describe("whole messages, sized for the daemon they reach", () => {
+	const textEntry = (text: string) => ({
+		source_id: "pi.message.fixture",
+		source_revision: 1,
+		timestamp: 1,
+		state: "complete" as const,
+		kind: "assistant_message" as const,
+		body: { type: "text" as const, text },
+		truncation: { truncated: false },
+	});
+	const frameBytes = (frame: unknown) => Buffer.byteLength(JSON.stringify(frame));
+
+	test("a granting daemon gets the whole message; one that granted nothing gets a named cut", () => {
+		const long = "Synthetic long reply, café 🦀. ".repeat(8_000);
+		expect(Buffer.byteLength(long)).toBeGreaterThan(64 * 1024);
+		const whole = fitEntryFrame("upsert_entry", textEntry(long), 2 * 1024 * 1024) as any;
+		expect(whole.entry.body.text).toBe(long);
+		expect(whole.entry.truncation).toEqual({ truncated: false });
+
+		const legacy = fitEntryFrame("upsert_entry", textEntry(long)) as any;
+		expect(Buffer.byteLength(legacy.entry.body.text)).toBeLessThanOrEqual(48 * 1024);
+		expect(long.startsWith(legacy.entry.body.text)).toBe(true);
+		expect(legacy.entry.truncation).toEqual({
+			truncated: true,
+			reason_code: "adapter_bound",
+			original_bytes: Buffer.byteLength(long),
+		});
+		expect(frameBytes(legacy)).toBeLessThanOrEqual(64 * 1024);
+	});
+
+	test("an escape-heavy message is cut to what fits the frame instead of failing it", () => {
+		const hostile = "\u0001".repeat(48 * 1024);
+		const frame = fitEntryFrame("snapshot_entry", textEntry(hostile)) as any;
+		expect(frameBytes(frame)).toBeLessThanOrEqual(64 * 1024);
+		// As long as the frame allows, not cut to nothing.
+		expect(frame.entry.body.text.length * 6).toBeGreaterThan(64 * 1024 - 1024);
+		expect(frame.entry.truncation.reason_code).toBe("adapter_bound");
+		expect(frame.entry.truncation.original_bytes).toBe(hostile.length);
+
+		const tool = {
+			...textEntry(""),
+			kind: "tool" as const,
+			body: {
+				type: "tool" as const,
+				tool: {
+					name: "bash",
+					status: "complete",
+					input_preview: "\u0001".repeat(16 * 1024),
+					result_preview: "\u0001".repeat(32 * 1024),
+				},
+			},
+		};
+		const shed = fitEntryFrame("upsert_entry", tool) as any;
+		expect(frameBytes(shed)).toBeLessThanOrEqual(64 * 1024);
+		expect(shed.entry.truncation.reason_code).toBe("preview_bounded");
+	});
+
+	test("a tool argument that fits its budget is sent whole, and a larger one still parses", () => {
+		const content = "y".repeat(3 * 1024);
+		const huge = "z".repeat(40 * 1024);
+		const branch = [
+			{
+				type: "message",
+				id: "m1",
+				parentId: null,
+				timestamp: "2026-09-23T00:00:00Z",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "toolCall", id: "tool-fits", name: "write", arguments: { path: "/tmp/a", content } },
+						{ type: "toolCall", id: "tool-big", name: "write", arguments: { path: "/tmp/b", content: huge } },
+					],
+					stopReason: "toolUse",
+					timestamp: 1_758_585_600_000,
+				},
+			},
+		] as any;
+		const tools = mapSessionBranch(branch).filter((entry) => entry.body.type === "tool") as any[];
+		const fits = tools.find((entry) => JSON.parse(entry.body.tool.input_preview).path === "/tmp/a");
+		expect(JSON.parse(fits.body.tool.input_preview).content).toBe(content);
+		expect(fits.truncation).toEqual({ truncated: false });
+
+		const big = tools.find((entry) => JSON.parse(entry.body.tool.input_preview).path === "/tmp/b");
+		const parsed = JSON.parse(big.body.tool.input_preview);
+		expect(Buffer.byteLength(parsed.content)).toBeLessThanOrEqual(2048);
+		expect(big.truncation.reason_code).toBe("preview_bounded");
+		expect(big.truncation.original_bytes).toBeGreaterThan(40 * 1024);
+	});
+
+	test("an extension asks for the larger bound, and falls back once when an old daemon refuses", async () => {
+		const long = "Synthetic long user message, naïve. ".repeat(4_000);
+		for (const daemon of ["current", "old"] as const) {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-pi-grant-"));
+			const socketPath = path.join(root, "agent.sock");
+			const registrations: Record<string, unknown>[] = [];
+			const entries: any[] = [];
+			const server = net.createServer((socket) => {
+				socket.on(
+					"data",
+					decodeFrames((frame) => {
+						if (frame.type === "snapshot_entry") entries.push(frame.entry);
+						if (frame.type !== "register") return;
+						registrations.push(frame);
+						const asked = "frame_bytes" in frame;
+						// An old daemon's strict register decoder refuses the field and hangs up.
+						if (daemon === "old" && asked) return socket.destroy();
+						socket.write(
+							encodeBridgeFrame({
+								v: 1,
+								type: "registered",
+								session_id: "0123456789abcdef0123456789abcdef",
+								process_generation: 1,
+								snapshot_epoch: 1,
+								...(daemon === "current" && asked ? { frame_bytes: 2 * 1024 * 1024 } : {}),
+							}),
+						);
+					}),
+				);
+			});
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(socketPath, resolve);
+			});
+			const bridge = new CiaoAgentBridge({} as any, socketPath);
+			resources.push(async () => {
+				bridge.stop(true);
+				await new Promise<void>((resolve) => server.close(() => resolve()));
+				fs.rmSync(root, { recursive: true, force: true });
+			});
+			bridge.start({
+				mode: "tui",
+				cwd: "/synthetic/workspace",
+				isIdle: () => true,
+				sessionManager: {
+					getSessionId: () => `synthetic-${daemon}`,
+					getBranch: () => [
+						{
+							type: "message",
+							id: "m1",
+							parentId: null,
+							timestamp: "2026-09-23T00:00:00Z",
+							message: { role: "user", content: long, timestamp: 1_758_585_600_000 },
+						},
+					],
+				},
+			} as any);
+			await eventually(() => entries.length > 0);
+			expect(registrations[0].frame_bytes).toBe(2 * 1024 * 1024);
+			if (daemon === "current") {
+				expect(registrations).toHaveLength(1);
+				expect(entries[0].body.text).toBe(long);
+			} else {
+				expect(registrations).toHaveLength(2);
+				expect("frame_bytes" in registrations[1]).toBe(false);
+				expect(Buffer.byteLength(entries[0].body.text)).toBeLessThanOrEqual(48 * 1024);
+				expect(entries[0].truncation.reason_code).toBe("adapter_bound");
+			}
+		}
+	});
 });

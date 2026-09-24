@@ -20,7 +20,12 @@ use sha2::{Digest, Sha256};
 use tokio::{net::UnixStream, time::timeout};
 
 use crate::{
-    agent_protocol::{Truncation, decode_agent_body, read_agent_frame, write_agent_frame},
+    agent_adapter::{WireTextDelta, WireTimelineEntry},
+    agent_protocol::{
+        MAX_AGENT_FRAME_BYTES, MAX_BRIDGE_FRAME_BYTES, MAX_LIVE_TEXT_DELTA_BYTES,
+        MAX_TIMELINE_TEXT_BYTES, TimelineBody, Truncation, decode_agent_body, encoded_frame_len,
+        read_agent_frame, write_agent_frame, write_agent_frame_within,
+    },
     storage::CiaoPaths,
 };
 
@@ -268,14 +273,22 @@ pub(crate) async fn deliver(
         write_agent_frame(&mut stream, registration)
     );
     let registered = step!("read-registered", read_agent_frame(&mut stream));
-    validate_response(&registered, protocol_version, "registered")?;
-
-    step!("write-event", write_agent_frame(&mut stream, event));
+    let grant = frame_grant(&validate_response(
+        &registered,
+        protocol_version,
+        "registered",
+    )?);
+    let event = sized_for_daemon(event, grant);
+    let bound = grant.unwrap_or(MAX_AGENT_FRAME_BYTES);
+    step!(
+        "write-event",
+        write_agent_frame_within(&mut stream, &event, bound)
+    );
     let applied = step!("read-applied", read_agent_frame(&mut stream));
-    validate_response(&applied, protocol_version, "event_applied")
+    validate_response(&applied, protocol_version, "event_applied").map(|_| ())
 }
 
-fn validate_response(body: &[u8], protocol_version: u8, expected_type: &str) -> Result<()> {
+fn validate_response(body: &[u8], protocol_version: u8, expected_type: &str) -> Result<Value> {
     let value: Value = decode_agent_body(body).map_err(|_| anyhow!("invalid hook response"))?;
     let object = object(&value)?;
     if object.get("v").and_then(Value::as_u64) != Some(u64::from(protocol_version))
@@ -283,7 +296,70 @@ fn validate_response(body: &[u8], protocol_version: u8, expected_type: &str) -> 
     {
         bail!("unexpected hook response");
     }
-    Ok(())
+    Ok(value)
+}
+
+/// The bridge bound the daemon announced in `registered`, if it announced one. A daemon from
+/// before the split says nothing, and reads nothing larger than a phone frame.
+fn frame_grant(registered: &Value) -> Option<usize> {
+    registered
+        .get("frame_bytes")
+        .and_then(Value::as_u64)
+        .map(|bytes| {
+            usize::try_from(bytes)
+                .unwrap_or(usize::MAX)
+                .clamp(MAX_AGENT_FRAME_BYTES, MAX_BRIDGE_FRAME_BYTES)
+        })
+}
+
+/// The event a hook maps carries the whole message, because a current daemon keeps it. A
+/// daemon that granted no larger frame — one older than the grant, met in the seconds of an
+/// update — would refuse that frame and lose the event outright, so it gets the event cut to
+/// the bounds it has always validated, and the cut is named. An event that fits as it is goes
+/// unchanged.
+fn sized_for_daemon(event: &Value, grant: Option<usize>) -> std::borrow::Cow<'_, Value> {
+    if grant.is_some_and(|bytes| encoded_frame_len(event) <= bytes) {
+        return std::borrow::Cow::Borrowed(event);
+    }
+    let mut event = event.clone();
+    if let Some(slot) = event.get_mut("entry")
+        && let Ok(mut entry) = serde_json::from_value::<WireTimelineEntry>(slot.clone())
+        && let TimelineBody::Text { text } = &mut entry.body
+        && cut_named(text, &mut entry.truncation, MAX_TIMELINE_TEXT_BYTES)
+        && let Ok(value) = serde_json::to_value(&entry)
+    {
+        *slot = value;
+    }
+    if let Some(slot) = event.get_mut("delta")
+        && let Ok(mut delta) = serde_json::from_value::<WireTextDelta>(slot.clone())
+        && cut_named(
+            &mut delta.delta,
+            &mut delta.truncation,
+            MAX_LIVE_TEXT_DELTA_BYTES,
+        )
+        && let Ok(value) = serde_json::to_value(&delta)
+    {
+        *slot = value;
+    }
+    std::borrow::Cow::Owned(event)
+}
+
+fn cut_named(text: &mut String, truncation: &mut Truncation, bound: usize) -> bool {
+    let (head, cut) = truncate_utf8(text, bound);
+    if cut {
+        let whole = truncation
+            .original_bytes
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or(0)
+            .max(text.len());
+        *text = head;
+        *truncation = Truncation {
+            truncated: true,
+            reason_code: Some("adapter_bound".into()),
+            original_bytes: Some(whole as u64),
+        };
+    }
+    cut
 }
 
 /// Opt-in by existence: nothing is written unless the trace file is already there, so the
@@ -809,6 +885,157 @@ mod tests {
         let (preview, clipped) = bounded_preview(Some(&value), 16 * 1024);
         assert_eq!(preview, None);
         assert!(clipped);
+    }
+
+    fn prompt_event(text: &str) -> Value {
+        json!({
+            "v": 1,
+            "type": "upsert_entry",
+            "entry": {
+                "source_id": "claude.prompt.fixture",
+                "source_revision": 1,
+                "timestamp": 1,
+                "state": "complete",
+                "kind": "user_message",
+                "body": { "type": "text", "text": text },
+                "truncation": { "truncated": false }
+            }
+        })
+    }
+
+    /// A daemon older than the bridge grant refuses a frame over 64 KiB and loses the event
+    /// outright, so the hook cuts the event to what that daemon has always validated — and names
+    /// the cut — rather than send the whole message. A current daemon gets every byte.
+    #[test]
+    fn an_event_is_cut_and_named_only_for_a_daemon_that_granted_nothing_larger() {
+        let prompt = "\u{1f980} synthetic prompt ".repeat(8_000);
+        let event = prompt_event(&prompt);
+        assert!(matches!(
+            sized_for_daemon(&event, Some(MAX_BRIDGE_FRAME_BYTES)),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let legacy = sized_for_daemon(&event, None);
+        let text = legacy["entry"]["body"]["text"].as_str().unwrap();
+        assert!(text.len() <= MAX_TIMELINE_TEXT_BYTES && prompt.starts_with(text));
+        assert_eq!(
+            legacy["entry"]["truncation"]["reason_code"],
+            "adapter_bound"
+        );
+        assert_eq!(
+            legacy["entry"]["truncation"]["original_bytes"],
+            prompt.len() as u64
+        );
+        assert!(encoded_frame_len(&*legacy) <= MAX_AGENT_FRAME_BYTES);
+        // Granted, but still too big for the grant: the old bound is the safe answer.
+        assert!(matches!(
+            sized_for_daemon(&event, Some(MAX_AGENT_FRAME_BYTES)),
+            std::borrow::Cow::Owned(_)
+        ));
+
+        let chunk = "d".repeat(MAX_LIVE_TEXT_DELTA_BYTES + 100);
+        let delta = json!({
+            "v": 1,
+            "type": "append_text",
+            "delta": {
+                "source_id": "claude.message.fixture",
+                "source_revision": 1,
+                "timestamp": 1,
+                "kind": "assistant_message",
+                "delta": chunk,
+                "final_chunk": false,
+                "truncation": { "truncated": false }
+            }
+        });
+        let legacy = sized_for_daemon(&delta, None);
+        assert_eq!(
+            legacy["delta"]["delta"].as_str().unwrap().len(),
+            MAX_LIVE_TEXT_DELTA_BYTES
+        );
+        assert_eq!(
+            legacy["delta"]["truncation"]["reason_code"],
+            "adapter_bound"
+        );
+        // What was already within the old bounds passes through untouched either way.
+        let small = prompt_event("Synthetic.");
+        assert_eq!(*sized_for_daemon(&small, None), small);
+    }
+
+    #[test]
+    fn the_grant_is_read_from_registered_and_clamped_to_the_bridge() {
+        assert_eq!(frame_grant(&json!({"v": 1, "type": "registered"})), None);
+        assert_eq!(
+            frame_grant(&json!({"frame_bytes": MAX_BRIDGE_FRAME_BYTES})),
+            Some(MAX_BRIDGE_FRAME_BYTES)
+        );
+        assert_eq!(
+            frame_grant(&json!({"frame_bytes": u64::MAX})),
+            Some(MAX_BRIDGE_FRAME_BYTES)
+        );
+        assert_eq!(
+            frame_grant(&json!({"frame_bytes": 1})),
+            Some(MAX_AGENT_FRAME_BYTES)
+        );
+    }
+
+    /// The whole handshake against a stand-in daemon, once as a current one and once as one
+    /// from before the grant: what reaches the socket is what each can read.
+    #[tokio::test]
+    async fn delivery_sends_what_the_registered_daemon_can_read() {
+        use crate::agent_protocol::{read_agent_frame_within, write_agent_frame};
+        for grant in [Some(MAX_BRIDGE_FRAME_BYTES), None] {
+            // A short root: a Unix socket path has to fit `SUN_LEN`.
+            let home = tempfile::tempdir_in("/tmp").unwrap();
+            let paths = CiaoPaths::for_home(home.path());
+            std::fs::create_dir_all(paths.agent_socket_file.parent().unwrap()).unwrap();
+            let listener = tokio::net::UnixListener::bind(&paths.agent_socket_file).unwrap();
+            let daemon = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_agent_frame_within(&mut stream, MAX_BRIDGE_FRAME_BYTES)
+                    .await
+                    .unwrap();
+                let mut registered = json!({
+                    "v": 1,
+                    "type": "registered",
+                    "session_id": "session-a",
+                    "process_generation": 1,
+                    "snapshot_epoch": 1
+                });
+                if let Some(bytes) = grant {
+                    registered["frame_bytes"] = bytes.into();
+                }
+                write_agent_frame(&mut stream, &registered).await.unwrap();
+                let event: Value = serde_json::from_slice(
+                    &read_agent_frame_within(&mut stream, MAX_BRIDGE_FRAME_BYTES)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                write_agent_frame(&mut stream, &json!({"v": 1, "type": "event_applied"}))
+                    .await
+                    .unwrap();
+                event
+            });
+            let prompt = "p".repeat(3 * MAX_TIMELINE_TEXT_BYTES);
+            deliver(
+                &paths,
+                1,
+                &json!({"v": 1, "type": "register"}),
+                &prompt_event(&prompt),
+            )
+            .await
+            .unwrap();
+            let received = daemon.await.unwrap();
+            let text = received["entry"]["body"]["text"].as_str().unwrap();
+            if grant.is_some() {
+                assert_eq!(text, prompt);
+            } else {
+                assert_eq!(text.len(), MAX_TIMELINE_TEXT_BYTES);
+                assert_eq!(
+                    received["entry"]["truncation"]["reason_code"],
+                    "adapter_bound"
+                );
+            }
+        }
     }
 
     #[test]

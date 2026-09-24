@@ -26,9 +26,9 @@ use tokio::time::timeout;
 use crate::{
     agent_adapter::{AttachedHookRegister, WireTextDelta, WireTimelineEntry},
     agent_protocol::{
-        MAX_LIVE_TEXT_DELTA_BYTES, MAX_TIMELINE_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES,
-        MAX_TOOL_RESULT_PREVIEW_BYTES, TimelineBody, ToolTimelineBody, Truncation, TurnState,
-        classify_vendor_version, valid_opaque_id, valid_token,
+        MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
+        TimelineBody, ToolTimelineBody, Truncation, TurnState, classify_vendor_version,
+        valid_opaque_id, valid_token,
     },
     claude_adapter::{CLAUDE_HOOK_PROTOCOL_VERSION, ClaudeHookEventFrame, PINNED_CLAUDE_VERSION},
     claude_integration::parse_claude_version_output,
@@ -421,7 +421,9 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                             run_id: run_id(prompt_id),
                             activity: "responding".into(),
                         });
-                        let (text, truncation) = bounded_text(prompt, MAX_TIMELINE_TEXT_BYTES);
+                        // The whole prompt: the daemon keeps it and sends the phone a head. A
+                        // daemon too old to take it gets it cut at delivery instead.
+                        let (text, truncation) = bounded_text(prompt, MAX_RETAINED_TEXT_BYTES);
                         ClaudeHookEventFrame::UpsertEntry {
                             v: CLAUDE_HOOK_PROTOCOL_VERSION,
                             entry: WireTimelineEntry {
@@ -441,7 +443,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                     let index = required_u64(object, "index")?;
                     let final_chunk = required_bool(object, "final")?;
                     let (delta, truncation) =
-                        bounded_text(required_string(object, "delta")?, MAX_LIVE_TEXT_DELTA_BYTES);
+                        bounded_text(required_string(object, "delta")?, MAX_RETAINED_TEXT_BYTES);
                     ClaudeHookEventFrame::AppendText {
                         v: CLAUDE_HOOK_PROTOCOL_VERSION,
                         delta: WireTextDelta {
@@ -614,7 +616,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::hook_common::GENEROUS_PREVIEW_STRING_BYTES;
+    use crate::{
+        agent_protocol::MAX_LIVE_TEXT_DELTA_BYTES, hook_common::GENEROUS_PREVIEW_STRING_BYTES,
+    };
 
     fn facts() -> HookRuntimeFacts {
         HookRuntimeFacts {
@@ -680,6 +684,38 @@ mod tests {
         assert_eq!(delta.source_revision, 1);
         assert!(delta.final_chunk);
         assert!(!delta.source_id.contains("fixture-message-id"));
+    }
+
+    /// A prompt or a display chunk longer than the phone's head is mapped whole: the daemon
+    /// keeps it, and `deliver` cuts it only for a daemon too old to take it.
+    #[test]
+    fn a_long_prompt_and_a_long_display_chunk_are_mapped_whole() {
+        let long = "Synthetic long prompt, caf\u{e9}. ".repeat(4_000);
+        assert!(long.len() > 2 * crate::agent_protocol::MAX_TIMELINE_TEXT_BYTES);
+        let mut user = common("UserPromptSubmit");
+        user["prompt_id"] = json!("fixture-prompt-id");
+        user["prompt"] = json!(long);
+        let ClaudeHookEventFrame::UpsertEntry { entry, .. } =
+            map_hook_input(&user, &facts()).unwrap().unwrap().event
+        else {
+            panic!("expected user entry");
+        };
+        assert_eq!(entry.body, TimelineBody::Text { text: long.clone() });
+        assert!(!entry.truncation.truncated);
+
+        let mut display = common("MessageDisplay");
+        display["message_id"] = json!("fixture-message-id");
+        display["index"] = json!(0);
+        display["final"] = json!(false);
+        display["delta"] = json!(long);
+        let ClaudeHookEventFrame::AppendText { delta, .. } =
+            map_hook_input(&display, &facts()).unwrap().unwrap().event
+        else {
+            panic!("expected display delta");
+        };
+        assert!(delta.delta.len() > MAX_LIVE_TEXT_DELTA_BYTES);
+        assert_eq!(delta.delta, long);
+        assert!(!delta.truncation.truncated);
     }
 
     /// A hook event name outside this build's vocabulary degrades to the same heartbeat it

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::{
     agent_protocol::{
-        MAX_TIMELINE_ENTRIES_IN_SNAPSHOT, MAX_TIMELINE_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES,
+        MAX_RETAINED_TEXT_BYTES, MAX_TIMELINE_ENTRIES_IN_SNAPSHOT, MAX_TOOL_INPUT_PREVIEW_BYTES,
         MAX_TOOL_RESULT_PREVIEW_BYTES, TimelineBody, ToolTimelineBody,
     },
     agent_session::{AgentSessionSupervisor, NormalizedTimelineEntry},
@@ -253,12 +253,12 @@ fn map_item(
             ("tool", TimelineBody::Tool { tool }, truncation)
         }
         "userMessage" => {
-            let (text, truncation) = bounded_text(&content_text(item), MAX_TIMELINE_TEXT_BYTES);
+            let (text, truncation) = bounded_text(&content_text(item), MAX_RETAINED_TEXT_BYTES);
             ("user_message", TimelineBody::Text { text }, truncation)
         }
         "agentMessage" => {
             let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
-            let (text, truncation) = bounded_text(text, MAX_TIMELINE_TEXT_BYTES);
+            let (text, truncation) = bounded_text(text, MAX_RETAINED_TEXT_BYTES);
             ("assistant_message", TimelineBody::Text { text }, truncation)
         }
         "commandExecution"
