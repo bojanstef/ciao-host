@@ -3238,7 +3238,14 @@ async fn serve_agent_operation(
             // A stopped worker leaves no entry in the live supervisor, but its record is still
             // the one the list is built from -- so refusing here left the phone on a Retry that
             // could only fail again, with no way to reach the Resume the snapshot unlocks.
-            let snapshot = match state.agent_sessions.snapshot(&session_id) {
+            //
+            // A live session's snapshot and receiver are taken together: apart, a delta landing
+            // between them reached neither and the phone sat a revision behind.
+            let (live_snapshot, live_updates) = state
+                .agent_sessions
+                .subscribe_from_snapshot(&session_id)
+                .unzip();
+            let snapshot = match live_snapshot {
                 Some(snapshot) => snapshot,
                 None => {
                     let live_terminals = crate::workspace::existing_tmux_sessions(
@@ -3270,7 +3277,7 @@ async fn serve_agent_operation(
             // what lets the phone rest on the snapshot and offer Resume instead of falling
             // through to a stale state.
             let _idle_updates;
-            let mut updates = match state.agent_sessions.subscribe(&session_id) {
+            let mut updates = match live_updates {
                 Some(updates) => updates,
                 None => {
                     let (sender, receiver) = tokio::sync::broadcast::channel(1);

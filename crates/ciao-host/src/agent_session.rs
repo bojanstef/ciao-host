@@ -909,6 +909,7 @@ impl AgentSessionSupervisor {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| anyhow!("registered session is unavailable"))?;
+        let held = held_sequences(session);
         let mut source_ids = HashSet::new();
         let mut history = Vec::with_capacity(entries.len());
         for mut entry in entries {
@@ -954,6 +955,7 @@ impl AgentSessionSupervisor {
             history = combined;
         }
         session.history = history;
+        fence_rewritten_history(&self.metadata, session, &held)?;
         enforce_history_bound(session);
         bump_revision(session);
         refresh_snapshot_window(session);
@@ -1003,6 +1005,7 @@ impl AgentSessionSupervisor {
         if entries.is_empty() {
             return Ok(());
         }
+        let held = held_sequences(session);
         let count = entries.len() as u64;
         for mapping in session.source_entries.values_mut() {
             mapping.sequence = mapping.sequence.saturating_add(count);
@@ -1036,6 +1039,7 @@ impl AgentSessionSupervisor {
         }
         history.append(&mut session.history);
         session.history = history;
+        fence_rewritten_history(&self.metadata, session, &held)?;
         enforce_history_bound(session);
         bump_revision(session);
         refresh_snapshot_window(session);
@@ -1698,15 +1702,20 @@ impl AgentSessionSupervisor {
         ))
     }
 
-    pub(crate) fn subscribe(
+    /// A snapshot and the stream that continues it, taken under one lock.
+    ///
+    /// Taken separately, a delta applied between the two reached neither: the snapshot predated
+    /// it and the receiver did not exist yet, so a phone sat one revision behind until some
+    /// later delta happened to trip its revision check. Every update is published under this
+    /// same lock, so here the first frame the receiver sees is exactly the one after this
+    /// snapshot's revision.
+    pub(crate) fn subscribe_from_snapshot(
         &self,
         session_id: &str,
-    ) -> Option<broadcast::Receiver<AgentServerFrame>> {
-        self.inner
-            .lock()
-            .sessions
-            .get(session_id)
-            .map(|session| session.updates.subscribe())
+    ) -> Option<(AgentSessionSnapshot, broadcast::Receiver<AgentServerFrame>)> {
+        let inner = self.inner.lock();
+        let session = inner.sessions.get(session_id)?;
+        Some((snapshot_for_wire(session), session.updates.subscribe()))
     }
 
     pub(crate) async fn submit_command(&self, command: AgentCommand) -> CommandReceipt {
@@ -2413,6 +2422,64 @@ fn normalize_entry(session: &mut LiveSession, entry: NormalizedTimelineEntry) ->
     }
 }
 
+/// Where every entry a client may already hold sits, taken before a history rewrite so
+/// [`fence_rewritten_history`] can tell whether the rewrite moved any of them.
+fn held_sequences(session: &LiveSession) -> HashMap<String, u64> {
+    session
+        .history
+        .iter()
+        .map(|entry| (entry.entry_id.clone(), entry.sequence))
+        .collect()
+}
+
+/// The one owner of the rule that keeps a client's retained history truthful.
+///
+/// A client keeps the entries older than a fresh snapshot window across a resync in the same
+/// epoch (the phone's answer to preloaded history collapsing on every resync). That is only
+/// sound while an entry's sequence never changes once a client may have seen it. A rewrite
+/// that renumbers or drops such an entry therefore mints a new epoch, which tells every client
+/// to start clean, and moves the metadata with it — re-registration compares against the
+/// stored epoch, and a stale one would read the next hook event as a new incarnation and drop
+/// the session's history. Receipts are bound to the epoch they were issued under, so the
+/// snapshot sheds the old ones; the durable store keeps them for idempotent resubmission.
+///
+/// Dropping only the oldest entries is the shape bound eviction already has, and a client
+/// tolerates it the same way; dropping one from the middle leaves the client a row the host no
+/// longer has, which is a rewrite like any other.
+fn fence_rewritten_history(
+    metadata: &Mutex<AgentMetadataStore>,
+    session: &mut LiveSession,
+    before: &HashMap<String, u64>,
+) -> Result<bool> {
+    let after = held_sequences(session);
+    let renumbered = before.iter().any(|(entry_id, sequence)| {
+        after
+            .get(entry_id)
+            .is_some_and(|current| current != sequence)
+    });
+    let oldest_survivor = before
+        .iter()
+        .filter(|(entry_id, _)| after.contains_key(*entry_id))
+        .map(|(_, sequence)| *sequence)
+        .min();
+    let removed_from_the_middle = before.iter().any(|(entry_id, sequence)| {
+        !after.contains_key(entry_id) && oldest_survivor.is_some_and(|oldest| *sequence > oldest)
+    });
+    if !renumbered && !removed_from_the_middle {
+        return Ok(false);
+    }
+    let previous = session.snapshot.snapshot_epoch;
+    let epoch = std::iter::repeat_with(nonzero_random_u64)
+        .find(|candidate| *candidate != previous)
+        .unwrap_or(previous.wrapping_add(1).max(1));
+    session.snapshot.snapshot_epoch = epoch;
+    session.snapshot.latest_command_receipts.clear();
+    metadata
+        .lock()
+        .update_epoch(&session.snapshot.session_id, epoch)?;
+    Ok(true)
+}
+
 fn truncate_utf8(value: &mut String, maximum_bytes: usize) -> bool {
     if value.len() <= maximum_bytes {
         return false;
@@ -3107,6 +3174,21 @@ impl AgentMetadataStore {
             .find(|mapping| mapping.session_id == session_id)
         {
             mapping.revision_seed = mapping.revision_seed.max(revision);
+            mapping.updated_at = unix_now();
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Moves a live mapping to the epoch its session was just fenced into, so the next
+    /// registration of the same process still recognises it (see `fence_rewritten_history`).
+    fn update_epoch(&mut self, session_id: &str, epoch: u64) -> Result<()> {
+        if let Some(mapping) = self
+            .mappings
+            .iter_mut()
+            .find(|mapping| mapping.session_id == session_id)
+        {
+            mapping.snapshot_epoch = epoch;
             mapping.updated_at = unix_now();
             self.persist()?;
         }
@@ -4553,7 +4635,9 @@ mod tests {
             .register(registration("nonce-escape"), sender)
             .await
             .unwrap();
-        let mut updates = supervisor.subscribe(&registered.session_id).unwrap();
+        let (_, mut updates) = supervisor
+            .subscribe_from_snapshot(&registered.session_id)
+            .unwrap();
         let hostile = "\u{1}".repeat(MAX_TIMELINE_TEXT_BYTES);
         supervisor
             .upsert_bridge_entry(&registered.session_id, entry("escape", 2, &hostile))
@@ -4648,7 +4732,9 @@ mod tests {
             .register_observer(observer_registration("nonce-long"))
             .await
             .unwrap();
-        let mut updates = supervisor.subscribe(&registered.session_id).unwrap();
+        let (_, mut updates) = supervisor
+            .subscribe_from_snapshot(&registered.session_id)
+            .unwrap();
         let reply =
             "Synthetic reply with caf\u{e9}, \u{1f980} and na\u{ef}ve words. ".repeat(4_000);
         assert!(reply.len() > 3 * MAX_TIMELINE_TEXT_BYTES);
@@ -5561,6 +5647,114 @@ mod tests {
                 .entries
                 .len(),
             3
+        );
+    }
+
+    /// A client keeps the entries older than a fresh window across a resync in the same epoch,
+    /// so an entry whose sequence moved underneath it is drawn twice — once where it was, once
+    /// where it went — and the slot it left reads as a hole. Renumbering therefore has to mint
+    /// a new epoch, and the metadata that re-registration compares against has to move with it
+    /// or the next hook event would mistake the session for a new incarnation and drop it.
+    #[tokio::test]
+    async fn renumbering_entries_a_client_may_hold_mints_a_new_epoch() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-renumber"))
+            .await
+            .unwrap();
+
+        // Nothing held yet: history lands beneath an empty timeline without moving anything.
+        supervisor
+            .prepend_bridge_history(
+                &registered.session_id,
+                vec![entry("history-early", 1, "early")],
+            )
+            .unwrap();
+        let untouched = supervisor.snapshot(&registered.session_id).unwrap();
+        assert_eq!(untouched.snapshot_epoch, registered.snapshot_epoch);
+
+        supervisor
+            .upsert_bridge_entry(&registered.session_id, entry("live-prompt", 1, "live"))
+            .unwrap();
+        let before = supervisor.snapshot(&registered.session_id).unwrap();
+        let held: HashMap<_, _> = before
+            .timeline_window
+            .entries
+            .iter()
+            .map(|entry| (entry.entry_id.clone(), entry.sequence))
+            .collect();
+        let (_, mut updates) = supervisor
+            .subscribe_from_snapshot(&registered.session_id)
+            .unwrap();
+
+        // Older history arrives after the live tail: everything already numbered shifts up.
+        supervisor
+            .prepend_bridge_history(
+                &registered.session_id,
+                vec![entry("history-older", 1, "older")],
+            )
+            .unwrap();
+        let after = supervisor.snapshot(&registered.session_id).unwrap();
+        assert!(
+            after.timeline_window.entries.iter().any(|entry| held
+                .get(&entry.entry_id)
+                .is_some_and(|sequence| *sequence != entry.sequence)),
+            "precondition: the prepend renumbered an entry the client held"
+        );
+        assert_ne!(
+            after.snapshot_epoch, before.snapshot_epoch,
+            "renumbered entries must not be mistaken for the ones a client kept"
+        );
+        after.validate().unwrap();
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(AgentServerFrame::ResyncRequired { .. })
+        ));
+
+        // The next hook event is the same live process: it must find the same session, with
+        // its history, under the epoch it now has.
+        let again = supervisor
+            .register_observer(observer_registration("nonce-renumber"))
+            .await
+            .unwrap();
+        assert_eq!(again.session_id, registered.session_id);
+        assert_eq!(again.snapshot_epoch, after.snapshot_epoch);
+        assert_eq!(
+            supervisor
+                .snapshot(&registered.session_id)
+                .unwrap()
+                .timeline_window
+                .entries
+                .len(),
+            3
+        );
+    }
+
+    /// The subscription a phone opens must continue exactly where its snapshot ends: the
+    /// first delta it hears is based on the snapshot's revision, never one it cannot place.
+    #[tokio::test]
+    async fn a_subscription_continues_exactly_where_its_snapshot_ends() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-subscribe"))
+            .await
+            .unwrap();
+        let (snapshot, mut updates) = supervisor
+            .subscribe_from_snapshot(&registered.session_id)
+            .unwrap();
+        supervisor
+            .upsert_bridge_entry(&registered.session_id, entry("live", 1, "after"))
+            .unwrap();
+        let Ok(AgentServerFrame::SessionDelta { delta, .. }) = updates.try_recv() else {
+            panic!("the change after the snapshot reaches the subscriber");
+        };
+        assert_eq!(delta.base_revision, snapshot.revision);
+        assert!(
+            supervisor
+                .subscribe_from_snapshot("no-such-session")
+                .is_none()
         );
     }
 
