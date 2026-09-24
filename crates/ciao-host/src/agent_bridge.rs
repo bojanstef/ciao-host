@@ -285,13 +285,15 @@ async fn apply_adapter_event(
             // A finished Claude turn is on disk in full, so the record repairs whatever of it
             // the best-effort hooks lost. Only a hook connection names the conversation.
             if ctx.codec.id() == "claude"
-                && let (Some(agent), TurnState::Completed { .. }) = (ctx.agent, &turn)
+                && let (Some(agent), TurnState::Completed { run_id }) = (ctx.agent, &turn)
             {
                 crate::claude_history::spawn_turn_reconcile(
                     ctx.sessions.clone(),
                     session_id.clone(),
                     agent.thread_id.clone(),
                     ctx.registered.process_generation,
+                    run_id.clone(),
+                    ctx.sessions.turn_mark(session_id),
                 );
             }
             // The turn edge is the alert, for every adapter alike. Only on an actual edge: an

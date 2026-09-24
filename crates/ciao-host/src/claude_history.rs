@@ -39,7 +39,7 @@ use crate::{
         MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
         TimelineBody, ToolTimelineBody, Truncation,
     },
-    agent_session::{AgentSessionSupervisor, NormalizedTimelineEntry},
+    agent_session::{AgentSessionSupervisor, NormalizedTimelineEntry, TurnMark, TurnScope},
     claude_hook::{is_synthetic_prompt, opaque_digest},
 };
 
@@ -123,6 +123,28 @@ pub(crate) struct TranscriptHistory {
     /// The conversation from its first record: nothing was left unread and nothing was cut to
     /// fit. Anything less advertises a boundary rather than claiming the start.
     pub(crate) complete: bool,
+    /// Attached scheme: the run a `Stop` names (`claude_hook::run_id` of the prompt ID), mapped
+    /// to the source of the prompt that opened it — where that turn starts in `entries`.
+    turn_prompts: HashMap<String, String>,
+}
+
+impl TranscriptHistory {
+    /// The part of the read that belongs to the turn `run_id` names, from its prompt on, and
+    /// whether it could be narrowed that far. A turn-end reconcile repairs that turn and what
+    /// followed it; an older anomaly still inside the read window is no longer its business.
+    pub(crate) fn into_turn(self, run_id: Option<&str>) -> (Vec<NormalizedTimelineEntry>, bool) {
+        let start = run_id
+            .and_then(|run_id| self.turn_prompts.get(run_id))
+            .and_then(|prompt| {
+                self.entries
+                    .iter()
+                    .position(|entry| &entry.source_id == prompt)
+            });
+        match start {
+            Some(start) => (self.entries.into_iter().skip(start).collect(), true),
+            None => (self.entries, false),
+        }
+    }
 }
 
 /// The attached hook's source namespace for a `MessageDisplay` row (`claude_hook` digests the
@@ -186,13 +208,18 @@ pub(crate) fn spawn_backfill(
     });
 }
 
-/// Repairs the turns that just ended from the newest end of the transcript: rows whose hooks
+/// Repairs the turn that just ended from the newest end of the transcript: rows whose hooks
 /// never arrived, a tool whose completion was lost, a reply cut by a lost display chunk.
+///
+/// `run_id` is the run the `Stop` closed, which narrows the read to that turn; `mark` is where
+/// the timeline stood when it closed, so what arrived since stays after the repaired turn.
 pub(crate) fn spawn_turn_reconcile(
     sessions: AgentSessionSupervisor,
     session_id: String,
     vendor_session_id: String,
     process_generation: u64,
+    run_id: Option<String>,
+    mark: Option<TurnMark>,
 ) {
     tokio::spawn(async move {
         let read = tokio::task::spawn_blocking(move || {
@@ -202,11 +229,16 @@ pub(crate) fn spawn_turn_reconcile(
         let Ok(Some(history)) = read else {
             return;
         };
+        let (entries, from_turn_start) = history.into_turn(run_id.as_deref());
         if let Err(error) = sessions.reconcile_bridge_turn(
             &session_id,
             Some(process_generation),
-            history.entries,
+            entries,
             Some(LIVE_DISPLAY_PREFIX),
+            TurnScope {
+                from_turn_start,
+                mark,
+            },
         ) {
             tracing::debug!(error = %error, "reconciling a Claude turn failed");
         }
@@ -388,6 +420,7 @@ struct HistoryMapper {
     /// Attached prompts already keyed by their `promptId`; a second human record sharing one
     /// is keyed by its own record ID instead of overwriting the first.
     prompts: HashSet<String>,
+    turn_prompts: HashMap<String, String>,
     messages: usize,
     truncated: bool,
 }
@@ -403,6 +436,7 @@ impl HistoryMapper {
             evicted: HashSet::new(),
             bytes: 0,
             prompts: HashSet::new(),
+            turn_prompts: HashMap::new(),
             messages: 0,
             truncated: false,
         }
@@ -541,7 +575,10 @@ impl HistoryMapper {
             && let Some(prompt_id) = record.get("promptId").and_then(Value::as_str)
             && self.prompts.insert(prompt_id.to_owned())
         {
-            return opaque_digest("prompt", prompt_id);
+            let source = opaque_digest("prompt", prompt_id);
+            self.turn_prompts
+                .insert(crate::claude_hook::run_id(prompt_id), source.clone());
+            return source;
         }
         self.source("user", uuid)
     }
@@ -686,6 +723,7 @@ impl HistoryMapper {
         TranscriptHistory {
             entries,
             complete: !self.truncated,
+            turn_prompts: self.turn_prompts,
         }
     }
 }
@@ -1221,6 +1259,32 @@ mod tests {
         assert!(!format!("{:?}", mapped.entries).contains("CANARY"));
     }
 
+    /// A `Stop` names its run; the read is narrowed to the turn that run opened, starting at
+    /// its own prompt, so an anomaly in an older turn still inside the window is not re-read at
+    /// every later Stop. A run the read cannot place leaves the read whole, and says so.
+    #[test]
+    fn a_turn_read_starts_at_the_prompt_of_the_run_that_ended() {
+        let fixture = fixture();
+        let mapped = map_records(
+            fixture["records"].as_array().unwrap(),
+            SourceScheme::Attached,
+            1,
+        );
+        let whole = mapped.entries.len();
+        let (entries, scoped) = mapped
+            .clone()
+            .into_turn(Some(&crate::claude_hook::run_id("p-03")));
+        assert!(scoped);
+        assert_eq!(entries[0].source_id, opaque_digest("prompt", "p-03"));
+        assert!(entries.len() < whole);
+        let (entries, scoped) = mapped.clone().into_turn(Some("claude.turn.unknown"));
+        assert!(!scoped);
+        assert_eq!(entries.len(), whole);
+        let (entries, scoped) = mapped.into_turn(None);
+        assert!(!scoped);
+        assert_eq!(entries.len(), whole);
+    }
+
     /// The prefix names exactly the rows the attached hook creates from `MessageDisplay`, and
     /// nothing the transcript mapping produces.
     #[test]
@@ -1368,6 +1432,7 @@ mod tests {
                     Some(registered.process_generation),
                     tail.entries,
                     Some(LIVE_DISPLAY_PREFIX),
+                    TurnScope::default(),
                 )
                 .unwrap();
             let reconciled = sessions.snapshot(&registered.session_id).unwrap();

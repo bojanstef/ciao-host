@@ -541,7 +541,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
 /// `UserPromptSubmit` and the `Stop` that closes it carry the same one, so both edges of a turn
 /// name the same run without the host holding any correlation state. The vendor's ID never
 /// leaves this process.
-fn run_id(prompt_id: &str) -> String {
+pub(crate) fn run_id(prompt_id: &str) -> String {
     // `opaque_digest` already namespaces what it returns — prefixing it again here produced
     // `claude.turn.claude.turn.<digest>`, which the live walk printed into the daemon log.
     // Harmless, since a run ID is opaque and only ever compared for equality, and both edges

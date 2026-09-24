@@ -332,7 +332,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                     CodexHookEventFrame::UpsertEntry {
                         v: CODEX_HOOK_PROTOCOL_VERSION,
                         entry: Box::new(WireTimelineEntry {
-                            source_id: opaque_digest("prompt", turn_id),
+                            source_id: prompt_source_id(turn_id),
                             source_revision: 1,
                             timestamp,
                             state: "complete".into(),
@@ -486,6 +486,12 @@ fn tool_event(
             truncation,
         }),
     })
+}
+
+/// The source ID a turn's `UserPromptSubmit` entry is delivered under — what the history read
+/// asks the live tail about when it leaves that turn out.
+pub(crate) fn prompt_source_id(turn_id: &str) -> String {
+    opaque_digest("prompt", turn_id)
 }
 
 fn opaque_digest(namespace: &str, value: &str) -> String {

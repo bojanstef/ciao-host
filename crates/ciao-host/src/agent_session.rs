@@ -305,6 +305,11 @@ pub(crate) struct PromotionTarget {
 struct SourceEntryMapping {
     entry_id: String,
     sequence: u64,
+    /// A live-only source (a Claude display) whose row a turn reconcile re-keyed onto the
+    /// vendor's own record. It still names that row, so a chunk arriving after the repair
+    /// finds it rather than starting a second copy — and it no longer writes to it, because
+    /// the row now holds the finished text.
+    settled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -978,13 +983,17 @@ impl AgentSessionSupervisor {
         }
         session.history = history;
         fence_rewritten_history(&self.metadata, session, &held)?;
-        let held_before_bound = session.history.len();
-        enforce_history_bound(session);
-        if let Some(complete) = history_complete {
-            let cut_by_bound = session.history.len() < held_before_bound;
-            let (history, boundary) = history_coverage(complete && !cut_by_bound);
-            history.clone_into(&mut session.snapshot.capabilities.history);
-            session.snapshot.timeline_window.history_boundary = boundary;
+        // The adapter's word on whether its snapshot was whole, and the host's own bound either
+        // way: evicting the start withdraws `full` whatever the adapter said.
+        let cut_by_bound = enforce_history_bound(session);
+        match history_complete {
+            Some(complete) => {
+                set_history_coverage(session, complete && !cut_by_bound);
+            }
+            None if cut_by_bound => {
+                set_history_coverage(session, false);
+            }
+            None => {}
         }
         bump_revision(session);
         refresh_snapshot_window(session);
@@ -1030,6 +1039,7 @@ impl AgentSessionSupervisor {
             entries,
             ReconcileMode::Backfill { complete },
             live_only_prefix,
+            TurnScope::default(),
         )
     }
 
@@ -1048,14 +1058,40 @@ impl AgentSessionSupervisor {
         process_generation: Option<u64>,
         entries: Vec<NormalizedTimelineEntry>,
         live_only_prefix: Option<&str>,
+        scope: TurnScope,
     ) -> Result<()> {
         self.reconcile_bridge_history(
             session_id,
             process_generation,
             entries,
-            ReconcileMode::Turn,
+            ReconcileMode::Turn {
+                from_turn_start: false,
+                after: None,
+            },
             live_only_prefix,
+            scope,
         )
+    }
+
+    /// Where the timeline stood when a turn ended: every row created after this belongs to what
+    /// came next. Taken when the turn edge is applied, before the reconcile it starts reads
+    /// anything, so a prompt that lands in between is not mistaken for part of the ended turn.
+    pub(crate) fn turn_mark(&self, session_id: &str) -> Option<TurnMark> {
+        let inner = self.inner.lock();
+        let session = inner.sessions.get(session_id)?;
+        Some(TurnMark {
+            snapshot_epoch: session.snapshot.snapshot_epoch,
+            next_sequence: session.next_sequence,
+        })
+    }
+
+    /// Whether the live tail delivered a row under `source_id`.
+    pub(crate) fn holds_source(&self, session_id: &str, source_id: &str) -> bool {
+        self.inner
+            .lock()
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.source_entries.contains_key(source_id))
     }
 
     fn reconcile_bridge_history(
@@ -1065,6 +1101,7 @@ impl AgentSessionSupervisor {
         authority: Vec<NormalizedTimelineEntry>,
         mode: ReconcileMode,
         live_only_prefix: Option<&str>,
+        scope: TurnScope,
     ) -> Result<()> {
         if authority.len() > MAX_HOST_TIMELINE_ENTRIES {
             bail!("bridge history entry count exceeds the host memory bound");
@@ -1086,9 +1123,24 @@ impl AgentSessionSupervisor {
         {
             return Ok(());
         }
+        // A mark taken under another epoch was taken over other numbers; without it, every held
+        // row counts as part of the ended turn, which is the old, merely less precise, reading.
+        let mode = match mode {
+            ReconcileMode::Turn { .. } => ReconcileMode::Turn {
+                from_turn_start: scope.from_turn_start,
+                after: scope
+                    .mark
+                    .filter(|mark| mark.snapshot_epoch == session.snapshot.snapshot_epoch)
+                    .map(|mark| mark.next_sequence),
+            },
+            backfill => backfill,
+        };
+        // A settled display alias names a row the record already names; anchoring is by the
+        // record's own source.
         let source_of: HashMap<&str, &str> = session
             .source_entries
             .iter()
+            .filter(|(_, mapping)| !mapping.settled)
             .map(|(source, mapping)| (mapping.entry_id.as_str(), source.as_str()))
             .collect();
         let held: Vec<HeldEntry<'_>> = session
@@ -1109,19 +1161,12 @@ impl AgentSessionSupervisor {
         let before = held_sequences(session);
         let rewritten = apply_reconcile_plan(session, &plan, &authority);
         let fenced = fence_rewritten_history(&self.metadata, session, &before)?;
-        let held_before_bound = session.history.len();
-        enforce_history_bound(session);
-        let cut_by_bound = session.history.len() < held_before_bound;
+        let cut_by_bound = enforce_history_bound(session);
         let coverage_changed = match mode {
             ReconcileMode::Backfill { complete } => {
-                let (history, boundary) = history_coverage(complete && !cut_by_bound);
-                let changed = session.snapshot.capabilities.history != history
-                    || session.snapshot.timeline_window.history_boundary != boundary;
-                history.clone_into(&mut session.snapshot.capabilities.history);
-                session.snapshot.timeline_window.history_boundary = boundary;
-                changed
+                set_history_coverage(session, complete && !cut_by_bound)
             }
-            ReconcileMode::Turn => false,
+            ReconcileMode::Turn { .. } => cut_by_bound && set_history_coverage(session, false),
         };
         if !rewritten && !fenced && !cut_by_bound && !coverage_changed {
             return Ok(());
@@ -1166,7 +1211,7 @@ impl AgentSessionSupervisor {
             session.history.push(canonical.clone());
             session.history.sort_by_key(|candidate| candidate.sequence);
         }
-        enforce_history_bound(session);
+        let start_evicted = enforce_history_bound(session);
         let base_revision = session.snapshot.revision;
         bump_revision(session);
         refresh_snapshot_window(session);
@@ -1174,6 +1219,7 @@ impl AgentSessionSupervisor {
         let _ = session
             .updates
             .send(entry_delta(session, base_revision, &canonical, attention));
+        publish_evicted_start(session, start_evicted);
         Ok(())
     }
 
@@ -1316,6 +1362,10 @@ impl AgentSessionSupervisor {
             .ok_or_else(|| anyhow!("registered session is unavailable"))?;
         if previous_source_revision(session, &delta.source_id)
             .is_some_and(|revision| delta.source_revision <= revision)
+            || session
+                .source_entries
+                .get(&delta.source_id)
+                .is_some_and(|mapping| mapping.settled)
         {
             return Ok(());
         }
@@ -1408,7 +1458,7 @@ impl AgentSessionSupervisor {
             session.history.push(canonical.clone());
             session.history.sort_by_key(|entry| entry.sequence);
         }
-        enforce_history_bound(session);
+        let start_evicted = enforce_history_bound(session);
         let base_revision = session.snapshot.revision;
         bump_revision(session);
         refresh_snapshot_window(session);
@@ -1416,6 +1466,7 @@ impl AgentSessionSupervisor {
         let _ = session
             .updates
             .send(entry_delta(session, base_revision, &canonical, attention));
+        publish_evicted_start(session, start_evicted);
         Ok(())
     }
 
@@ -2506,6 +2557,7 @@ fn normalize_entry(session: &mut LiveSession, entry: NormalizedTimelineEntry) ->
             let mapping = SourceEntryMapping {
                 entry_id: random_id(),
                 sequence: session.next_sequence,
+                settled: false,
             };
             session.next_sequence = session.next_sequence.saturating_add(1).max(1);
             mapping
@@ -2536,15 +2588,62 @@ pub(crate) fn history_coverage(complete: bool) -> (&'static str, Option<String>)
     }
 }
 
+/// Sets the history coverage a read (or an eviction) established, by the one rule above.
+/// Returns whether anything a client reads changed.
+fn set_history_coverage(session: &mut LiveSession, complete: bool) -> bool {
+    let (history, boundary) = history_coverage(complete);
+    let changed = session.snapshot.capabilities.history != history
+        || session.snapshot.timeline_window.history_boundary != boundary;
+    history.clone_into(&mut session.snapshot.capabilities.history);
+    session.snapshot.timeline_window.history_boundary = boundary;
+    changed
+}
+
+/// After a live append or upsert pushed the oldest rows past the host bound: the session no
+/// longer holds its conversation's start, so it stops claiming it, and the phone — which reads
+/// the boundary only from a snapshot — is sent for one.
+fn publish_evicted_start(session: &mut LiveSession, start_evicted: bool) {
+    if !start_evicted || !set_history_coverage(session, false) {
+        return;
+    }
+    bump_revision(session);
+    let _ = session.updates.send(AgentServerFrame::ResyncRequired {
+        v: AGENT_PROTOCOL_VERSION,
+        session_id: session.snapshot.session_id.clone(),
+        reason_code: "history_bounded".into(),
+    });
+}
+
+/// Where the timeline stood when a turn ended (`AgentSessionSupervisor::turn_mark`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnMark {
+    snapshot_epoch: u64,
+    next_sequence: u64,
+}
+
+/// What a turn-end reconcile knows about the read it was handed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TurnScope {
+    /// The read begins at the ended turn's own prompt, so everything in it belongs to that
+    /// turn — including rows that precede the first one the live tail holds, which are then
+    /// restored in front of it instead of being left out as possibly older than the turn.
+    pub(crate) from_turn_start: bool,
+    /// Rows created after this belong to what followed the turn; restored rows go before them.
+    pub(crate) mark: Option<TurnMark>,
+}
+
 /// How a vendor-side read lines up with what a session already holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReconcileMode {
     /// Registration: history older than everything held goes beneath it, and the read says how
     /// much of the conversation the session now shows. Live rows are left exactly as they are.
     Backfill { complete: bool },
-    /// A turn ended: repair what the live tail lost or garbled, and reach no further back than
-    /// the first row both sides share.
-    Turn,
+    /// A turn ended: repair what the live tail lost or garbled. `from_turn_start` and `after`
+    /// are `TurnScope`'s, the mark resolved to a sequence.
+    Turn {
+        from_turn_start: bool,
+        after: Option<u64>,
+    },
 }
 
 /// One held timeline row and the adapter source it was delivered under.
@@ -2570,16 +2669,22 @@ enum Planned {
 
 /// Lines a vendor-side read up with the held timeline.
 ///
-/// Rows that share a source are anchors, and must appear in the same order on both sides — a
-/// read that disagrees about order is not aligned by guesswork, and `None` leaves the timeline as
-/// delivered. Between consecutive anchors (and after the last), the gap on each side is merged:
-/// held rows keep their relative order, missing authoritative rows are placed before the next
-/// held row they precede, and — after a turn has ended — live display rows (sources under
-/// `live_only_prefix`) are paired with the replies the record holds for the same gap. Pairing is
-/// positional when both sides counted the same number of replies, which is exactly the case a
-/// lost display chunk leaves; otherwise a display row pairs only with a reply that begins with
-/// its text. An unpaired display row whose text the record already holds as a reply is the
-/// same reply drawn twice and is dropped; any other held row is kept.
+/// Rows that share a source are matches. The longest chain of matches that both sides order
+/// the same way are the anchors; a match off that chain (parallel tools whose hooks landed
+/// reversed, a tool first seen at its completion) stays exactly where it is, and its record
+/// copy is never added a second time. Refusing the whole read instead switched turn repair off
+/// for as long as the pair stayed in the read window.
+///
+/// Between consecutive anchors (and after the last) the gaps are merged: held rows keep their
+/// order, missing record rows go before the next held row they precede, and — after a turn has
+/// ended — live display rows (sources under `live_only_prefix`) are paired with the replies the
+/// record holds for the same gap. Pairing is positional when both sides counted the same number
+/// of replies, which is exactly the case a lost display chunk leaves; otherwise a display pairs
+/// only with a reply that begins with its text. An unpaired display whose text the record holds
+/// as a reply in that same gap (or as the anchor opening it) is the same reply drawn twice and
+/// is dropped; one it does not hold is newer than everything it does, and follows the restored
+/// rows. Any other held row is kept. Rows created after the turn ended (`after`) are never
+/// paired or dropped, and restored rows always go before them.
 fn plan_reconcile(
     held: &[HeldEntry<'_>],
     authority: &[NormalizedTimelineEntry],
@@ -2591,7 +2696,7 @@ fn plan_reconcile(
         .enumerate()
         .map(|(index, entry)| (entry.source_id.as_str(), index))
         .collect();
-    let anchors: Vec<(usize, usize)> = held
+    let matches: Vec<(usize, usize)> = held
         .iter()
         .enumerate()
         .filter_map(|(index, row)| {
@@ -2600,46 +2705,54 @@ fn plan_reconcile(
                 .map(|authority| (index, *authority))
         })
         .collect();
-    if anchors.windows(2).any(|pair| pair[0].1 >= pair[1].1) {
-        return None;
-    }
-    let mut plan = Vec::with_capacity(held.len() + authority.len());
+    let held_authority: HashSet<usize> = matches.iter().map(|(_, authority)| *authority).collect();
+    let anchors = longest_increasing_chain(&matches);
+    let new_rows = |range: std::ops::Range<usize>| {
+        range
+            .filter(|index| !held_authority.contains(index))
+            .map(|authority| Planned::New { authority })
+            .collect::<Vec<_>>()
+    };
+    let (turn, from_turn_start, after) = match mode {
+        ReconcileMode::Turn {
+            from_turn_start,
+            after,
+        } => (true, from_turn_start, after),
+        ReconcileMode::Backfill { .. } => (false, false, None),
+    };
+    let after_turn = |index: usize| after.is_some_and(|mark| held[index].entry.sequence >= mark);
+    let is_display = |index: usize| {
+        turn && !after_turn(index)
+            && live_only_prefix
+                .zip(held[index].source)
+                .is_some_and(|(prefix, source)| source.starts_with(prefix))
+    };
     let held_row = |index| Planned::Held {
         index,
         refresh: None,
         rekey: false,
     };
-    match (anchors.first(), mode) {
-        (None, ReconcileMode::Turn) => return None,
-        (None, ReconcileMode::Backfill { .. }) => {
-            plan.extend((0..authority.len()).map(|authority| Planned::New { authority }));
-            plan.extend((0..held.len()).map(held_row));
-            return Some(plan);
+    let mut plan = Vec::with_capacity(held.len() + authority.len());
+    let Some(&(first_held, first_authority)) = anchors.first() else {
+        if turn {
+            return None;
         }
-        (Some(&(first_held, _)), ReconcileMode::Turn) => {
-            plan.extend((0..first_held).map(held_row));
-        }
-        (Some(&(first_held, first_authority)), ReconcileMode::Backfill { .. }) => {
-            plan.extend((0..first_authority).map(|authority| Planned::New { authority }));
-            plan.extend((0..first_held).map(held_row));
-        }
-    }
-    let pair_displays = mode == ReconcileMode::Turn && live_only_prefix.is_some();
-    let is_display = |index: usize| {
-        pair_displays
-            && live_only_prefix
-                .zip(held[index].source)
-                .is_some_and(|(prefix, source)| source.starts_with(prefix))
+        plan.extend(new_rows(0..authority.len()));
+        plan.extend((0..held.len()).map(held_row));
+        return Some(plan);
     };
-    let first_anchor = anchors.first().map_or(0, |anchor| anchor.1);
-    let recorded_replies: HashSet<&str> = authority[first_anchor..]
-        .iter()
-        .filter(|entry| entry.kind == "assistant_message")
-        .filter_map(|entry| match &entry.body {
-            TimelineBody::Text { text } => Some(text.trim()),
-            _ => None,
-        })
-        .collect();
+    if turn {
+        // A read that starts at the ended turn's prompt holds nothing older than the turn, so
+        // what precedes its first anchor is the turn's own lost beginning. An unscoped read may
+        // reach back past rows the live tail no longer holds, and leaves that part alone.
+        plan.extend((0..first_held).map(held_row));
+        if from_turn_start {
+            plan.extend(new_rows(0..first_authority));
+        }
+    } else {
+        plan.extend(new_rows(0..first_authority));
+        plan.extend((0..first_held).map(held_row));
+    }
     for (position, &(held_index, authority_index)) in anchors.iter().enumerate() {
         plan.push(Planned::Held {
             index: held_index,
@@ -2650,42 +2763,87 @@ fn plan_reconcile(
         let (held_end, authority_end) = anchors
             .get(position + 1)
             .map_or((held.len(), authority.len()), |next| (next.0, next.1));
-        let gap_held: Vec<usize> = (held_index + 1..held_end).collect();
         let gap_authority = authority_index + 1..authority_end;
-        let displays: Vec<usize> = gap_held
-            .iter()
-            .copied()
+        let gap_new: Vec<usize> = gap_authority
+            .clone()
+            .filter(|index| !held_authority.contains(index))
+            .collect();
+        let displays: Vec<usize> = (held_index + 1..held_end)
             .filter(|index| is_display(*index))
             .collect();
-        let replies: Vec<usize> = gap_authority
-            .clone()
+        let replies: Vec<usize> = gap_new
+            .iter()
+            .copied()
             .filter(|index| authority[*index].kind == "assistant_message")
             .collect();
         let pairs = pair_displays_with_replies(held, authority, &displays, &replies);
-        let mut next_authority = gap_authority.start;
-        for index in gap_held {
-            if let Some(&reply) = pairs.get(&index) {
-                plan.extend((next_authority..reply).map(|authority| Planned::New { authority }));
+        // Only this gap's replies, and the anchor opening it: an earlier reply with the same
+        // words is a different message.
+        let gap_replies: HashSet<&str> = std::iter::once(authority_index)
+            .chain(gap_authority)
+            .map(|index| &authority[index])
+            .filter(|entry| entry.kind == "assistant_message")
+            .filter_map(|entry| match &entry.body {
+                TimelineBody::Text { text } => Some(text.trim()),
+                _ => None,
+            })
+            .collect();
+        let mut pending = gap_new.iter().copied().peekable();
+        for (index, row) in held.iter().enumerate().take(held_end).skip(held_index + 1) {
+            if after_turn(index) {
+                plan.extend(pending.by_ref().map(|authority| Planned::New { authority }));
+                plan.push(held_row(index));
+            } else if let Some(&reply) = pairs.get(&index) {
+                while let Some(authority) = pending.next_if(|authority| *authority < reply) {
+                    plan.push(Planned::New { authority });
+                }
+                pending.next_if_eq(&reply);
                 plan.push(Planned::Held {
                     index,
                     refresh: Some(reply),
                     rekey: true,
                 });
-                next_authority = reply + 1;
             } else if is_display(index)
-                && text_of(held[index].entry)
-                    .is_some_and(|text| recorded_replies.contains(text.trim()))
+                && text_of(row.entry).is_some_and(|text| gap_replies.contains(text.trim()))
             {
                 // The same reply, already on the timeline under the record's own source.
             } else {
+                if is_display(index) {
+                    // A reply the record does not hold yet was written after everything it
+                    // does hold in this gap.
+                    plan.extend(pending.by_ref().map(|authority| Planned::New { authority }));
+                }
                 plan.push(held_row(index));
             }
         }
-        plan.extend(
-            (next_authority..gap_authority.end).map(|authority| Planned::New { authority }),
-        );
+        plan.extend(pending.map(|authority| Planned::New { authority }));
     }
     Some(plan)
+}
+
+/// The longest run of `(held, authority)` matches, in held order, whose authority indices also
+/// increase: the rows both sides agree on the order of. Patience sorting, O(n log n).
+fn longest_increasing_chain(matches: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    // tails[length - 1] is the index into `matches` ending the best chain of that length.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut previous: Vec<Option<usize>> = vec![None; matches.len()];
+    for (position, &(_, authority)) in matches.iter().enumerate() {
+        let length = tails.partition_point(|&tail| matches[tail].1 < authority);
+        previous[position] = length.checked_sub(1).map(|shorter| tails[shorter]);
+        if length == tails.len() {
+            tails.push(position);
+        } else {
+            tails[length] = position;
+        }
+    }
+    let mut chain = Vec::with_capacity(tails.len());
+    let mut cursor = tails.last().copied();
+    while let Some(position) = cursor {
+        chain.push(matches[position]);
+        cursor = previous[position];
+    }
+    chain.reverse();
+    chain
 }
 
 /// Whether an anchored row takes the record's copy. A reply always does — the record is the
@@ -2703,7 +2861,7 @@ fn refreshes(
     differs
         && match authority.kind.as_str() {
             "assistant_message" => true,
-            "tool" => mode == ReconcileMode::Turn && held.state == "streaming",
+            "tool" => matches!(mode, ReconcileMode::Turn { .. }) && held.state == "streaming",
             _ => false,
         }
 }
@@ -2748,22 +2906,31 @@ fn pair_displays_with_replies(
     pairs
 }
 
-/// Carries out a reconcile plan: repaired rows keep their entry IDs, new rows get fresh ones,
-/// and the whole timeline is numbered once. Numbers are kept where every held row can keep
-/// its own — appends, pure prepends into room left by eviction, in-place repairs — and
-/// renumbered densely otherwise, which `fence_rewritten_history` then answers with a new epoch.
-/// Returns whether a client could see any difference.
+/// Carries out a reconcile plan: repaired rows keep their entry IDs, new rows get fresh ones.
+///
+/// Every held row keeps its number — they stay in order, so they can — and a restored row takes
+/// a number nothing else holds: past the end for rows after the last held one, otherwise one
+/// free between its held neighbours. Only a restored row with no free number between its
+/// neighbours renumbers the timeline densely, which `fence_rewritten_history` answers with a new
+/// epoch. Reading a hole eviction left as a renumbering minted an epoch at every Stop, and the
+/// phone reloaded the whole conversation each turn. Returns whether a client could see any
+/// difference.
 fn apply_reconcile_plan(
     session: &mut LiveSession,
     plan: &[Planned],
     authority: &[NormalizedTimelineEntry],
 ) -> bool {
     let old = std::mem::take(&mut session.history);
-    let mut source_of: HashMap<String, String> = session
-        .source_entries
-        .drain()
-        .map(|(source, mapping)| (mapping.entry_id, source))
-        .collect();
+    let mut source_of: HashMap<String, String> = HashMap::new();
+    // Settled display aliases, (source, entry): carried to wherever their row goes.
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    for (source, mapping) in session.source_entries.drain() {
+        if mapping.settled {
+            aliases.push((source, mapping.entry_id));
+        } else {
+            source_of.insert(mapping.entry_id, source);
+        }
+    }
     let mut visible = plan
         .iter()
         .filter(|item| matches!(item, Planned::Held { .. }))
@@ -2794,8 +2961,8 @@ fn apply_reconcile_plan(
                             .max(authority.source_revision);
                         visible = true;
                     }
-                    if rekey {
-                        source = Some(authority.source_id.clone());
+                    if rekey && let Some(display) = source.replace(authority.source_id.clone()) {
+                        aliases.push((display, entry.entry_id.clone()));
                     }
                 }
                 rows.push((entry, source));
@@ -2819,47 +2986,86 @@ fn apply_reconcile_plan(
             }
         }
     }
-    // One numbering for the whole timeline: the offset every held row already agrees on when
-    // there is one, and a fresh dense run from the first held row's place when there is not.
-    let offsets: Vec<i128> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, (entry, _))| entry.sequence != 0)
-        .map(|(position, (entry, _))| i128::from(entry.sequence) - position as i128)
-        .collect();
-    let agreed = offsets
-        .first()
-        .filter(|first| **first >= 1 && offsets.iter().all(|offset| offset == *first))
-        .copied();
-    let start = agreed.unwrap_or_else(|| {
-        offsets
-            .first()
-            .map_or(i128::from(session.next_sequence), |first| *first)
-            .max(1)
-    });
-    let renumbered = agreed.is_none() && !offsets.is_empty();
-    for (position, (entry, source)) in rows.iter_mut().enumerate() {
-        entry.sequence = u64::try_from(start + position as i128).unwrap_or(u64::MAX);
+    let renumbered = !number_restored_rows(&mut rows, session.next_sequence);
+    if renumbered {
+        let start = rows
+            .iter()
+            .position(|(entry, _)| entry.sequence != 0)
+            .map_or(1, |position| {
+                (i128::from(rows[position].0.sequence) - position as i128).max(1)
+            });
+        for (position, (entry, _)) in rows.iter_mut().enumerate() {
+            entry.sequence = u64::try_from(start + position as i128).unwrap_or(u64::MAX);
+        }
+    }
+    let mut sequence_of = HashMap::with_capacity(rows.len());
+    for (entry, source) in &mut rows {
+        sequence_of.insert(entry.entry_id.clone(), entry.sequence);
         if let Some(source) = source.take() {
             session.source_entries.insert(
                 source,
                 SourceEntryMapping {
                     entry_id: entry.entry_id.clone(),
                     sequence: entry.sequence,
+                    settled: false,
                 },
             );
         }
     }
-    let next = rows.last().map_or(session.next_sequence, |(entry, _)| {
-        entry.sequence.saturating_add(1)
-    });
+    for (source, entry_id) in aliases {
+        if let Some(&sequence) = sequence_of.get(&entry_id) {
+            session.source_entries.insert(
+                source,
+                SourceEntryMapping {
+                    entry_id,
+                    sequence,
+                    settled: true,
+                },
+            );
+        }
+    }
+    let newest = rows.last().map_or(0, |(entry, _)| entry.sequence);
     session.next_sequence = if renumbered {
-        next
+        newest.saturating_add(1)
     } else {
-        next.max(session.next_sequence)
+        session.next_sequence.max(newest.saturating_add(1))
     };
     session.history = rows.into_iter().map(|(entry, _)| entry).collect();
     visible || renumbered
+}
+
+/// Gives every restored row (sequence 0) a number without moving a held one: past `next` after
+/// the last held row, otherwise free between its held neighbours. `false` when some run of
+/// restored rows has no room, or the held rows are out of order, and the caller must renumber.
+fn number_restored_rows(rows: &mut [(TimelineEntry, Option<String>)], next: u64) -> bool {
+    let mut previous = 0_u64;
+    let mut position = 0;
+    while position < rows.len() {
+        let sequence = rows[position].0.sequence;
+        if sequence != 0 {
+            if sequence <= previous {
+                return false;
+            }
+            previous = sequence;
+            position += 1;
+            continue;
+        }
+        let run = position;
+        while position < rows.len() && rows[position].0.sequence == 0 {
+            position += 1;
+        }
+        let count = (position - run) as u64;
+        let first = match rows.get(position).map(|(entry, _)| entry.sequence) {
+            None => next.max(previous.saturating_add(1)),
+            Some(above) if above.saturating_sub(previous) > count => previous + 1,
+            Some(_) => return false,
+        };
+        for (offset, (entry, _)) in rows[run..position].iter_mut().enumerate() {
+            entry.sequence = first + offset as u64;
+        }
+        previous = first + count - 1;
+    }
+    true
 }
 
 /// Where every entry a client may already hold sits, taken before a history rewrite so
@@ -2932,13 +3138,17 @@ fn truncate_utf8(value: &mut String, maximum_bytes: usize) -> bool {
     true
 }
 
-fn enforce_history_bound(session: &mut LiveSession) {
+/// Evicts to the host bound. Returns whether anything went — which is always the oldest end, so
+/// the session no longer holds its conversation's start.
+fn enforce_history_bound(session: &mut LiveSession) -> bool {
     let mut bytes: usize = session
         .history
         .iter()
         .map(TimelineEntry::decoded_bytes)
         .sum();
+    let mut evicted = false;
     while bytes > MAX_HOST_TIMELINE_BYTES || session.history.len() > MAX_HOST_TIMELINE_ENTRIES {
+        evicted = true;
         let index = session
             .history
             .iter()
@@ -2953,6 +3163,7 @@ fn enforce_history_bound(session: &mut LiveSession) {
             .source_entries
             .retain(|_, mapping| mapping.entry_id != removed.entry_id);
     }
+    evicted
 }
 
 fn refresh_snapshot_window(session: &mut LiveSession) {
@@ -6415,6 +6626,7 @@ mod tests {
                 Some(registered.process_generation),
                 record.clone(),
                 Some("claude.message."),
+                TurnScope::default(),
             )
             .unwrap();
         let after = supervisor.snapshot(&session_id).unwrap();
@@ -6435,7 +6647,13 @@ mod tests {
         );
 
         supervisor
-            .reconcile_bridge_turn(&session_id, None, record, Some("claude.message."))
+            .reconcile_bridge_turn(
+                &session_id,
+                None,
+                record,
+                Some("claude.message."),
+                TurnScope::default(),
+            )
             .unwrap();
         assert_eq!(
             supervisor.snapshot(&session_id).unwrap().revision,
@@ -6483,6 +6701,7 @@ mod tests {
                     authority_reply("claude.reply.m1", "Done."),
                 ],
                 Some("claude.message."),
+                TurnScope::default(),
             )
             .unwrap();
         let after = supervisor.snapshot(&session_id).unwrap();
@@ -6529,6 +6748,7 @@ mod tests {
                     authority_reply("claude.reply.m1", "answer"),
                 ],
                 Some("claude.message."),
+                TurnScope::default(),
             )
             .unwrap();
         let after = supervisor.snapshot(&session_id).unwrap();
@@ -6580,7 +6800,13 @@ mod tests {
             "registration leaves the live row alone: it may still be streaming"
         );
         supervisor
-            .reconcile_bridge_turn(&session_id, None, record.clone(), Some("claude.message."))
+            .reconcile_bridge_turn(
+                &session_id,
+                None,
+                record.clone(),
+                Some("claude.message."),
+                TurnScope::default(),
+            )
             .unwrap();
         assert_eq!(
             texts(&timeline(&supervisor, &session_id)),
@@ -6594,7 +6820,13 @@ mod tests {
             )
             .unwrap();
         supervisor
-            .reconcile_bridge_turn(&session_id, None, record, Some("claude.message."))
+            .reconcile_bridge_turn(
+                &session_id,
+                None,
+                record,
+                Some("claude.message."),
+                TurnScope::default(),
+            )
             .unwrap();
         assert_eq!(
             texts(&timeline(&supervisor, &session_id)),
@@ -6628,10 +6860,351 @@ mod tests {
             ],
         ] {
             supervisor
-                .reconcile_bridge_turn(&session_id, None, record, Some("claude.message."))
+                .reconcile_bridge_turn(
+                    &session_id,
+                    None,
+                    record,
+                    Some("claude.message."),
+                    TurnScope::default(),
+                )
                 .unwrap();
             assert_eq!(supervisor.snapshot(&session_id).unwrap(), before);
         }
+    }
+
+    fn text_bytes(text: &str, bytes: usize) -> String {
+        text.repeat(bytes / text.len())
+    }
+
+    /// Review #2. Parallel tools whose PreToolUse hooks arrived reversed — or a lost PreToolUse,
+    /// so the row was created at PostToolUse after its sibling — put two anchors out of the
+    /// record's order. That refused the whole reconcile, and every later Stop re-read the same
+    /// pair: turn repair was off for as long as it stayed in the read window. The longest chain
+    /// of anchors that agrees is used instead, and the rows off it stay where they are.
+    #[tokio::test]
+    async fn anchors_out_of_order_do_not_switch_turn_repair_off() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-reversed"))
+            .await
+            .unwrap();
+        let session_id = registered.session_id.clone();
+        supervisor
+            .upsert_bridge_entry(&session_id, prompt_entry("claude.prompt.p1", 1, "question"))
+            .unwrap();
+        // The second tool's hook landed first.
+        for source in ["claude.tool.t2", "claude.tool.t1"] {
+            supervisor
+                .upsert_bridge_entry(&session_id, tool_entry(source, 2, "complete", "completed"))
+                .unwrap();
+        }
+        for (revision, chunk, last) in [(1, "All ", false), (3, "done.", true)] {
+            supervisor
+                .append_bridge_text(
+                    &session_id,
+                    claude_display("claude.message.d1", revision, chunk, last),
+                )
+                .unwrap();
+        }
+        let before = supervisor.snapshot(&session_id).unwrap();
+        supervisor
+            .reconcile_bridge_turn(
+                &session_id,
+                None,
+                vec![
+                    prompt_entry("claude.prompt.p1", 1, "question"),
+                    tool_entry("claude.tool.t1", 2, "complete", "complete"),
+                    tool_entry("claude.tool.t2", 2, "complete", "complete"),
+                    authority_reply("claude.reply.m1", "All three are done."),
+                ],
+                Some("claude.message."),
+                TurnScope::default(),
+            )
+            .unwrap();
+        let after = supervisor.snapshot(&session_id).unwrap();
+        assert_eq!(
+            texts(&after.timeline_window.entries),
+            vec![
+                "question",
+                "tool:completed",
+                "tool:completed",
+                "All three are done."
+            ],
+            "the gapped reply is repaired, and neither tool is drawn a second time"
+        );
+        assert_eq!(after.snapshot_epoch, before.snapshot_epoch);
+    }
+
+    /// Review #3. The final reply's display was lost, and the next prompt landed before the
+    /// reconcile the Stop spawned. The restored reply belongs to the turn that ended, so it goes
+    /// before the prompt that followed it, not after.
+    #[tokio::test]
+    async fn a_restored_reply_goes_before_what_arrived_after_its_turn_ended() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-late-prompt"))
+            .await
+            .unwrap();
+        let session_id = registered.session_id.clone();
+        supervisor
+            .upsert_bridge_entry(&session_id, prompt_entry("claude.prompt.p1", 1, "first"))
+            .unwrap();
+        let before = supervisor.snapshot(&session_id).unwrap();
+        // The Stop: taken before the next prompt arrives.
+        let mark = supervisor.turn_mark(&session_id);
+        supervisor
+            .upsert_bridge_entry(&session_id, prompt_entry("claude.prompt.p2", 1, "second"))
+            .unwrap();
+        supervisor
+            .reconcile_bridge_turn(
+                &session_id,
+                None,
+                vec![
+                    prompt_entry("claude.prompt.p1", 1, "first"),
+                    authority_reply("claude.reply.m1", "first answer"),
+                ],
+                Some("claude.message."),
+                TurnScope {
+                    from_turn_start: true,
+                    mark,
+                },
+            )
+            .unwrap();
+        let after = supervisor.snapshot(&session_id).unwrap();
+        assert_eq!(
+            texts(&after.timeline_window.entries),
+            vec!["first", "first answer", "second"]
+        );
+        // Moving the next prompt down renumbers it, which the phone must hear about.
+        assert_ne!(after.snapshot_epoch, before.snapshot_epoch);
+        after.validate().unwrap();
+    }
+
+    /// Review #4. Live appends and upserts evict the oldest entries at the host bound without a
+    /// word about coverage, so a session kept claiming `full` after its start was gone. With
+    /// whole bodies retained, a handful of long replies is enough.
+    #[tokio::test]
+    async fn evicting_the_start_withdraws_full_coverage() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-evict"))
+            .await
+            .unwrap();
+        let session_id = registered.session_id.clone();
+        supervisor
+            .backfill_bridge_history(
+                &session_id,
+                None,
+                vec![prompt_entry("history-first", 1, "the first message")],
+                true,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .snapshot(&session_id)
+                .unwrap()
+                .capabilities
+                .history,
+            "full"
+        );
+        let mut updates = supervisor.subscribe_from_snapshot(&session_id).unwrap().1;
+        for index in 0..5 {
+            supervisor
+                .upsert_bridge_entry(
+                    &session_id,
+                    NormalizedTimelineEntry {
+                        state: "complete".into(),
+                        ..entry(
+                            &format!("claude.reply.long-{index}"),
+                            1,
+                            &text_bytes("x", 1024 * 1024 - 64),
+                        )
+                    },
+                )
+                .unwrap();
+        }
+        let after = supervisor.snapshot(&session_id).unwrap();
+        assert!(
+            !texts(&after.timeline_window.entries).contains(&"the first message".to_owned()),
+            "precondition: the start was evicted"
+        );
+        assert_eq!(after.capabilities.history, "live_tail");
+        assert_eq!(
+            after.timeline_window.history_boundary.as_deref(),
+            Some("resume")
+        );
+        let mut resynced = false;
+        while let Ok(frame) = updates.try_recv() {
+            resynced |= matches!(frame, AgentServerFrame::ResyncRequired { .. });
+        }
+        assert!(resynced, "the phone is told the boundary moved");
+    }
+
+    /// Review #6. Eviction skips a stuck `streaming` oldest row, which leaves a hole in the
+    /// numbering; a later reconcile that changes nothing read that hole as a renumbering and
+    /// minted an epoch at every Stop — a full phone reload every turn.
+    #[tokio::test]
+    async fn a_reconcile_that_changes_nothing_keeps_the_epoch_across_a_numbering_hole() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-hole"))
+            .await
+            .unwrap();
+        let session_id = registered.session_id.clone();
+        supervisor
+            .append_bridge_text(
+                &session_id,
+                claude_display("claude.message.stuck", 1, "never finished", false),
+            )
+            .unwrap();
+        let large = text_bytes("p", 1024 * 1024 - 64);
+        for index in 0..5 {
+            supervisor
+                .upsert_bridge_entry(
+                    &session_id,
+                    NormalizedTimelineEntry {
+                        state: "complete".into(),
+                        ..prompt_entry(&format!("claude.prompt.p{index}"), 1, &large)
+                    },
+                )
+                .unwrap();
+        }
+        let before = supervisor.snapshot(&session_id).unwrap();
+        // The host's own history: the window a snapshot carries holds only what fits a frame.
+        let sequences: Vec<_> = supervisor.inner.lock().sessions[&session_id]
+            .history
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect();
+        assert!(
+            sequences.windows(2).any(|pair| pair[1] > pair[0] + 1),
+            "precondition: eviction left a hole behind the stuck row: {sequences:?}"
+        );
+        supervisor
+            .reconcile_bridge_turn(
+                &session_id,
+                None,
+                (1..5)
+                    .map(|index| NormalizedTimelineEntry {
+                        state: "complete".into(),
+                        ..prompt_entry(&format!("claude.prompt.p{index}"), 1, "p")
+                    })
+                    .collect(),
+                Some("claude.message."),
+                TurnScope::default(),
+            )
+            .unwrap();
+        let after = supervisor.snapshot(&session_id).unwrap();
+        assert_eq!(after.snapshot_epoch, before.snapshot_epoch);
+        assert_eq!(
+            after.revision, before.revision,
+            "nothing changed, nothing resyncs"
+        );
+    }
+
+    /// Review #8, first half. A display chunk that arrives after the Stop reconcile re-keyed its
+    /// row belongs to that row. It used to find no mapping and start a second, fragmentary copy
+    /// of the reply that nothing would ever remove.
+    #[tokio::test]
+    async fn a_late_display_chunk_after_repair_draws_nothing_new() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-late-chunk"))
+            .await
+            .unwrap();
+        let session_id = registered.session_id.clone();
+        supervisor
+            .upsert_bridge_entry(&session_id, prompt_entry("claude.prompt.p1", 1, "question"))
+            .unwrap();
+        for (revision, chunk, last) in [(1, "Let me ", false), (3, "look.", true)] {
+            supervisor
+                .append_bridge_text(
+                    &session_id,
+                    claude_display("claude.message.d1", revision, chunk, last),
+                )
+                .unwrap();
+        }
+        supervisor
+            .reconcile_bridge_turn(
+                &session_id,
+                None,
+                vec![
+                    prompt_entry("claude.prompt.p1", 1, "question"),
+                    authority_reply("claude.reply.m1", "Let me take a look."),
+                ],
+                Some("claude.message."),
+                TurnScope::default(),
+            )
+            .unwrap();
+        let repaired = supervisor.snapshot(&session_id).unwrap();
+        for revision in [2, 4] {
+            supervisor
+                .append_bridge_text(
+                    &session_id,
+                    claude_display("claude.message.d1", revision, "late", false),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            texts(&timeline(&supervisor, &session_id)),
+            vec!["question", "Let me take a look."]
+        );
+        assert_eq!(supervisor.snapshot(&session_id).unwrap(), repaired);
+    }
+
+    /// Review #8, second half. An unpaired display row is dropped only when the record holds the
+    /// same reply in its own stretch of the conversation. An earlier reply with the same words
+    /// ("Done.") is a different message, and dropping the new one lost it.
+    #[tokio::test]
+    async fn an_unpaired_reply_is_not_dropped_for_matching_an_earlier_one() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let registered = supervisor
+            .register_observer(observer_registration("nonce-same-words"))
+            .await
+            .unwrap();
+        let session_id = registered.session_id.clone();
+        for (prompt, display) in [
+            ("claude.prompt.p1", "claude.message.d1"),
+            ("claude.prompt.p2", "claude.message.d2"),
+        ] {
+            supervisor
+                .upsert_bridge_entry(&session_id, prompt_entry(prompt, 1, prompt))
+                .unwrap();
+            supervisor
+                .append_bridge_text(&session_id, claude_display(display, 1, "Done.", true))
+                .unwrap();
+        }
+        supervisor
+            .reconcile_bridge_turn(
+                &session_id,
+                None,
+                vec![
+                    prompt_entry("claude.prompt.p1", 1, "claude.prompt.p1"),
+                    authority_reply("claude.reply.m1", "Done."),
+                    prompt_entry("claude.prompt.p2", 1, "claude.prompt.p2"),
+                    tool_entry("claude.tool.t2", 2, "complete", "complete"),
+                ],
+                Some("claude.message."),
+                TurnScope::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            texts(&timeline(&supervisor, &session_id)),
+            vec![
+                "claude.prompt.p1",
+                "Done.",
+                "claude.prompt.p2",
+                "tool:complete",
+                "Done."
+            ]
+        );
     }
 
     #[tokio::test]

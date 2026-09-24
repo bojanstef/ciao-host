@@ -3386,8 +3386,8 @@ async fn codex_unheld_snapshot(
     };
     // Built outside the supervisor, so it is sized here: heads for long messages (their bodies
     // are read again on request, below) and the oldest entries dropped until the frame fits.
-    Some(crate::agent_protocol::fit_snapshot_to_frame(
-        crate::codex_adopted::unheld_snapshot(&row, entries),
+    Some(crate::codex_adopted::unheld_snapshot_for_wire(
+        &row, entries,
     ))
 }
 

@@ -43,6 +43,9 @@ pub(crate) struct ThreadHistory {
     /// The response was a thread and every item fit: the conversation from its first turn
     /// (less the turn the live tail owns). Anything less is advertised as a boundary.
     pub(crate) complete: bool,
+    /// The source the live tail delivers the left-out turn's prompt under, when a turn was left
+    /// out. The read is only whole if the live tail holds that turn from its prompt.
+    pub(crate) live_turn_prompt: Option<String>,
 }
 
 /// Sessions already read, so a conversation is not re-read on every hook event.
@@ -111,7 +114,9 @@ pub(crate) fn spawn_history_read(
             }
         };
         let count = history.entries.len();
-        let complete = history.complete;
+        let complete = complete_with_live_tail(&history, |source| {
+            sessions.holds_source(&session_id, source)
+        });
         // An empty but complete read still says something: the conversation began with the
         // turn the live tail is showing, which is what `full` coverage means.
         match sessions.backfill_bridge_history(
@@ -182,6 +187,17 @@ async fn read_thread(
     Ok(map_thread_history(&result, live_run_id))
 }
 
+/// Whether a history read, together with the live tail, is the whole conversation. A session
+/// that registered mid-turn — its first event a `Stop`, a permission request or a tool hook —
+/// has the left-out turn only from that point, and its prompt not at all: the read is then not
+/// the whole conversation, however complete it was on its own.
+pub(crate) fn complete_with_live_tail(
+    history: &ThreadHistory,
+    holds_source: impl Fn(&str) -> bool,
+) -> bool {
+    history.complete && history.live_turn_prompt.as_deref().is_none_or(holds_source)
+}
+
 /// The entries of [`map_thread_history`], for the tests that assert on entries alone.
 #[cfg(test)]
 pub(crate) fn map_thread(result: &Value, live_run_id: &str) -> Vec<NormalizedTimelineEntry> {
@@ -199,6 +215,7 @@ pub(crate) fn map_thread_history(result: &Value, live_run_id: &str) -> ThreadHis
         .and_then(Value::as_array);
     // A response that is not a thread says nothing about where the conversation starts.
     let mut complete = turns.is_some();
+    let mut live_turn_prompt = None;
     let turns = turns.map(Vec::as_slice).unwrap_or_default();
     for turn in turns {
         let turn_id = turn.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -211,6 +228,7 @@ pub(crate) fn map_thread_history(result: &Value, live_run_id: &str) -> ThreadHis
         // live turn state is per-process in exactly the way loaded-ness is. A status filter here
         // reads as a fix and never fires.
         if codex_run_id(turn_id) == live_run_id {
+            live_turn_prompt = Some(crate::codex_hook::prompt_source_id(turn_id));
             continue;
         }
         let timestamp = turn
@@ -234,7 +252,11 @@ pub(crate) fn map_thread_history(result: &Value, live_run_id: &str) -> ThreadHis
         entries.drain(..entries.len() - MAX_HISTORY_ENTRIES);
         complete = false;
     }
-    ThreadHistory { entries, complete }
+    ThreadHistory {
+        entries,
+        complete,
+        live_turn_prompt,
+    }
 }
 
 /// Grounded thread-item types this adapter deliberately renders as a categorical
@@ -742,6 +764,38 @@ pub(crate) mod tests {
         assert!(map_thread_history(&grounded_response(), "codex.turn.none").complete);
         // A response that is not a thread says nothing about where the conversation starts.
         assert!(!map_thread_history(&json!({"thread": {}}), "codex.turn.none").complete);
+    }
+
+    /// Review #7. The read leaves out the turn the live tail owns, so it is only the whole
+    /// conversation if the live tail really does hold that turn from its prompt. A session that
+    /// registered mid-turn — its first event a `Stop`, a permission request or a tool hook — has
+    /// neither, and claimed `full` over the hole.
+    #[test]
+    fn a_read_that_leaves_out_a_turn_the_live_tail_never_saw_is_not_whole() {
+        let turn = "019fbfb4-c1db-7242-9196-c260f02c9c9b";
+        let mut response = grounded_response();
+        let mut earlier = response["thread"]["turns"][0].clone();
+        earlier["id"] = json!("019fbfb4-earlier-turn");
+        response["thread"]["turns"] = json!([earlier, response["thread"]["turns"][0].clone()]);
+        let history = map_thread_history(&response, &codex_run_id(turn));
+        assert_eq!(
+            history.entries.len(),
+            2,
+            "precondition: the live turn was left out"
+        );
+        assert!(
+            history.complete,
+            "precondition: every item that was read fits"
+        );
+        let prompt = crate::codex_hook::prompt_source_id(turn);
+        assert!(
+            !complete_with_live_tail(&history, |_| false),
+            "the live tail never saw the excluded turn's prompt"
+        );
+        assert!(complete_with_live_tail(&history, |source| source == prompt));
+        // No turn left out: nothing for the live tail to owe.
+        let history = map_thread_history(&response, "codex.turn.none");
+        assert!(complete_with_live_tail(&history, |_| false));
     }
 
     #[test]

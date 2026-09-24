@@ -624,6 +624,26 @@ pub(crate) fn unheld_snapshot(
     }
 }
 
+/// `unheld_snapshot`, sized to one frame as the open sends it. Fitting drops the oldest entries
+/// and marks older ones available, but nothing pages behind an unheld row — every page request
+/// is refused — so what was dropped is said the only way this row can: the boundary, and no
+/// claim to the whole conversation.
+pub(crate) fn unheld_snapshot_for_wire(
+    row: &UnheldThread,
+    entries: Vec<NormalizedTimelineEntry>,
+) -> crate::agent_protocol::AgentSessionSnapshot {
+    let snapshot = unheld_snapshot(row, entries);
+    let before = snapshot.timeline_window.entries.len();
+    let mut snapshot = crate::agent_protocol::fit_snapshot_to_frame(snapshot);
+    if snapshot.timeline_window.entries.len() < before {
+        snapshot.timeline_window.has_older = false;
+        let (history, boundary) = crate::agent_session::history_coverage(false);
+        history.clone_into(&mut snapshot.capabilities.history);
+        snapshot.timeline_window.history_boundary = boundary;
+    }
+    snapshot
+}
+
 /// The model surface an adopted thread offers, read from the vendor at pickup: which model the
 /// thread runs now, at what effort, and the catalogue `model/list` answers. All of it is the
 /// vendor's — nothing here is compiled in — which is what lets the phone's picker stay
@@ -2373,6 +2393,56 @@ mod tests {
             Some("resume")
         );
         assert!(!snapshot.timeline_window.has_older);
+    }
+
+    /// Review #5. An unheld conversation's open is sized to one frame by dropping its oldest
+    /// entries, which used to leave `has_older` set on a row with no pager behind it (every page
+    /// request is `page_unavailable`) and `full` coverage over a window that no longer starts at
+    /// the beginning. What was dropped is said the only way this row can: the boundary.
+    #[test]
+    fn an_unheld_open_cut_to_its_frame_says_where_the_rest_is() {
+        let listed = json!({"data": [
+            {"id": "thread-frame", "path": "/tmp/rollout-frame.jsonl", "cwd": "/home/user/project",
+             "preview": "hello", "updatedAt": 1_700_000_000_u64, "cliVersion": "0.146.0"},
+        ]});
+        let row = unheld_rows(&listed).into_iter().next().unwrap();
+        let entries: Vec<_> = (0..6)
+            .map(|index| NormalizedTimelineEntry {
+                source_id: format!("codex.item.frame-{index}"),
+                source_revision: 1,
+                timestamp: 1_700_000_000,
+                state: "complete".into(),
+                kind: "assistant_message".into(),
+                body: TimelineBody::Text {
+                    text: "w".repeat(30 * 1024),
+                },
+                truncation: no_truncation(),
+            })
+            .collect();
+        let whole = unheld_snapshot(&row, entries.clone());
+        assert_eq!(
+            whole.capabilities.history, "full",
+            "precondition: everything was read"
+        );
+        let snapshot = unheld_snapshot_for_wire(&row, entries.clone());
+        snapshot.validate().unwrap();
+        assert!(
+            snapshot.timeline_window.entries.len() < entries.len(),
+            "precondition: the frame could not carry every entry"
+        );
+        assert!(
+            !snapshot.timeline_window.has_older,
+            "nothing pages behind an unheld row"
+        );
+        assert_eq!(snapshot.capabilities.history, "live_tail");
+        assert_eq!(
+            snapshot.timeline_window.history_boundary.as_deref(),
+            Some("resume")
+        );
+        // One that fits is sent as it was read.
+        let small = unheld_snapshot_for_wire(&row, entries[..1].to_vec());
+        assert_eq!(small.capabilities.history, "full");
+        assert_eq!(small.timeline_window.history_boundary, None);
     }
 
     #[test]
