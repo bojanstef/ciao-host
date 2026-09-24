@@ -1,5 +1,5 @@
 {
-  "description": "One synthetic Claude Code transcript and the canonical timeline both history mappers must produce from it: the managed worker's canonicalHistory (worker.mjs, fed through the SDK reader's documented filter) and the host's claude_history (fed the raw lines). Records are in file order, one JSONL line each. Expected entries name their source per scheme: `managed_source` is the worker's literal source ID; `attached_source` is the [namespace, key] pair the host digests under the attached hook's domain, so a history row and a live hook row for the same prompt or tool land on one entry. Object keys inside tool inputs are sorted because the two JSON encoders only agree on sorted keys. Synthetic throughout: no real prompt, path, or identifier.",
+  "description": "One synthetic Claude Code transcript and the canonical timeline both history mappers must produce from it: the managed worker's canonicalHistory (worker.mjs, fed through the SDK reader's documented filter) and the host's claude_history (fed the raw lines). Records are in file order, one JSONL line each. Expected entries name their source per scheme: `managed_source` is the worker's literal source ID; `attached_source` is the [namespace, key] pair the host digests under the attached hook's domain, so a history row and a live hook row for the same prompt or tool land on one entry. Object keys inside tool inputs are sorted because the two JSON encoders only agree on sorted keys. Long strings are written as {\"$repeat\": [text, count]} and {\"$concat\": [parts]} and expanded by both test harnesses before use. Synthetic throughout: no real prompt, path, or identifier.",
   "created_at_ms": 1700000000000,
   "records": [
     {"type": "file-history-snapshot", "messageId": "synthetic-snapshot", "snapshot": {"trackedFileBackups": {}}},
@@ -22,6 +22,9 @@
 ,
     {"type": "user", "uuid": "u-17", "parentUuid": "a-16", "promptSource": "typed", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:35.000Z", "message": {"role": "user", "content": "A prompt written before prompt ids existed."}},
     {"type": "user", "uuid": "u-18", "parentUuid": "u-17", "promptId": "p-03", "promptSource": "queued", "isSidechain": false, "sessionId": "synthetic-session", "message": {"role": "user", "content": "A queued follow-up sharing an earlier prompt id, with no timestamp."}}
+,
+    {"type": "assistant", "uuid": "a-19", "parentUuid": "u-18", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:36.000Z", "message": {"role": "assistant", "id": "msg-06", "content": [{"type": "text", "text": {"$repeat": ["t", 50000]}}, {"type": "tool_use", "id": "toolu-04", "name": "Write", "input": {"content": {"$repeat": ["a", 17000]}, "file_path": "big.txt"}}]}},
+    {"type": "user", "uuid": "u-20", "parentUuid": "a-19", "promptId": "p-03", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:37.000Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu-04", "content": {"$repeat": ["r", 33000]}}]}}
   ],
   "expected": [
     {
@@ -143,6 +146,26 @@
       "kind": "user_message",
       "body": {"type": "text", "text": "A queued follow-up sharing an earlier prompt id, with no timestamp."},
       "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "assistant-msg-06",
+      "attached_source": ["reply", "msg-06"],
+      "source_revision": 1,
+      "timestamp": 1700000016,
+      "state": "complete",
+      "kind": "assistant_message",
+      "body": {"type": "text", "text": {"$repeat": ["t", 50000]}},
+      "truncation": {"truncated": false}
+    },
+    {
+      "managed_source": "tool-toolu-04",
+      "attached_source": ["tool", "toolu-04"],
+      "source_revision": 2,
+      "timestamp": 1700000017,
+      "state": "complete",
+      "kind": "tool",
+      "body": {"type": "tool", "tool": {"name": "Write", "status": "complete", "input_preview": {"$concat": ["{\"content\":\"", {"$repeat": ["a", 2048]}, "\",\"file_path\":\"big.txt\"}"]}, "result_preview": {"$repeat": ["r", 32768]}}},
+      "truncation": {"truncated": true, "reason_code": "preview_bounded", "original_bytes": 35084}
     }
   ]
 }

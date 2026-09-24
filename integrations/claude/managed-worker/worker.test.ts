@@ -456,14 +456,61 @@ test("JSON expansion cannot silently overflow or punch a hole in history frames"
 	await eventually(() => frames.some((frame) => frame.type === "snapshot_end"));
 
 	const registration = frames.find((frame) => frame.type === "register") as Record<string, any>;
-	expect(registration.history_complete).toBe(false);
-	const entries = frames
-		.filter((frame) => frame.type === "snapshot_entry")
-		.map((frame) => (frame as any).entry);
-	// The fallback is a contiguous newest tail, so the boundary stays truthful rather than
-	// pretending an omitted middle row was merely older than everything visible.
-	expect(entries.map((entry) => entry.source_id)).toEqual(["user-after-escaped-frame"]);
-	expect(entries[0].body.text).toBe("Newest safe entry.");
+	// Nothing is missing, so the history is complete: the escape-heavy row is cut to what its
+	// frame holds and says so, instead of taking every older row down with it.
+	expect(registration.history_complete).toBe(true);
+	const snapshot = frames.filter((frame) => frame.type === "snapshot_entry") as any[];
+	expect(snapshot.map((frame) => frame.entry.source_id)).toEqual([
+		"user-before-escaped-frame",
+		"user-escaped-frame",
+		"user-after-escaped-frame",
+	]);
+	const escaped = snapshot[1];
+	expect(Buffer.byteLength(JSON.stringify(escaped))).toBeLessThanOrEqual(64 * 1024);
+	expect(escaped.entry.body.text.length).toBeGreaterThan(0);
+	expect(escaped.entry.truncation).toEqual({
+		truncated: true,
+		reason_code: "adapter_bound",
+		original_bytes: 16 * 1024,
+	});
+	expect(snapshot[2].entry.body.text).toBe("Newest safe entry.");
+});
+
+/// Resumed history is mapped before `registered` says which daemon this is. A daemon that keeps
+/// whole messages gets them whole, exactly as it does live; one that granted nothing larger
+/// gets the head it validates, with the loss named.
+test("resumed history is whole for a granting daemon and a named head for one that is not", async () => {
+	const long = "h".repeat(100 * 1024);
+	const history = (): HistoryFixture => ({
+		sessionID: "11111111-2222-4333-8444-555555555555",
+		fileSize: 256 * 1024,
+		messages: [
+			{
+				type: "assistant",
+				uuid: "long-reply",
+				message: { role: "assistant", id: "msg-long", content: [{ type: "text", text: long }] },
+			},
+		],
+	});
+	const granting = await startWorker([], undefined, history(), undefined, undefined, false, {
+		grant: 2 * 1024 * 1024,
+	});
+	await eventually(() => granting.frames.some((frame) => frame.type === "snapshot_end"));
+	const whole = granting.frames.find((frame) => frame.type === "snapshot_entry") as any;
+	expect(whole.entry.body.text).toBe(long);
+	expect(whole.entry.truncation).toEqual({ truncated: false });
+
+	const older = await startWorker([], undefined, history());
+	await eventually(() => older.frames.some((frame) => frame.type === "snapshot_end"));
+	const head = older.frames.find((frame) => frame.type === "snapshot_entry") as any;
+	expect(head.entry.body.text).toBe(long.slice(0, 48 * 1024));
+	expect(head.entry.truncation).toEqual({
+		truncated: true,
+		reason_code: "adapter_bound",
+		original_bytes: 100 * 1024,
+	});
+	const registration = older.frames.find((frame) => frame.type === "register") as any;
+	expect(registration.history_complete).toBe(true);
 });
 
 test(
@@ -532,11 +579,24 @@ test("canonical history keeps its newest entries inside the independent byte bou
 /// tests read the same file. The reader filter here is the pinned SDK's documented one for a
 /// linear chain: user and assistant records that are neither meta, sidechain nor team traffic,
 /// projected to its SessionMessage shape.
+/// The fixture writes long strings compactly; the host's harness expands them identically.
+function expandFixture(value: any): any {
+	if (Array.isArray(value)) return value.map(expandFixture);
+	if (value !== null && typeof value === "object") {
+		if (Array.isArray(value.$repeat)) return String(value.$repeat[0]).repeat(value.$repeat[1]);
+		if (Array.isArray(value.$concat)) return value.$concat.map(expandFixture).join("");
+		return Object.fromEntries(Object.entries(value).map(([key, field]) => [key, expandFixture(field)]));
+	}
+	return value;
+}
+
 test("canonical history matches the shared Claude transcript fixture", async () => {
-	const fixture = JSON.parse(
-		fs.readFileSync(
-			path.join(import.meta.dir, "../../../protocol/fixtures/phase5/claude-history-v1.json"),
-			"utf8",
+	const fixture = expandFixture(
+		JSON.parse(
+			fs.readFileSync(
+				path.join(import.meta.dir, "../../../protocol/fixtures/phase5/claude-history-v1.json"),
+				"utf8",
+			),
 		),
 	);
 	const messages = fixture.records
@@ -557,12 +617,22 @@ test("canonical history matches the shared Claude transcript fixture", async () 
 			parent_agent_id: null,
 			timestamp: record.timestamp,
 		}));
-	const { frames } = await startWorker([], undefined, {
-		sessionID: "11111111-2222-4333-8444-555555555555",
-		fileSize: 16_384,
-		createdAt: fixture.created_at_ms,
-		messages,
-	});
+	// A granting daemon, so what arrives is the mapping itself rather than a head cut for an
+	// older one: the fixture pins the mapping.
+	const { frames } = await startWorker(
+		[],
+		undefined,
+		{
+			sessionID: "11111111-2222-4333-8444-555555555555",
+			fileSize: 256 * 1024,
+			createdAt: fixture.created_at_ms,
+			messages,
+		},
+		undefined,
+		undefined,
+		false,
+		{ grant: 2 * 1024 * 1024 },
+	);
 	await eventually(() => frames.some((frame) => frame.type === "snapshot_end"));
 
 	const registration = frames.find((frame) => frame.type === "register") as Record<string, any>;

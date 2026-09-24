@@ -296,6 +296,35 @@ function textBody(text, limit = MAX_TEXT_BYTES) {
 	};
 }
 
+/// A resumed message's text, mapped before `registered` says which daemon this is: whole, as
+/// live text is for a daemon that keeps it. `forDaemon` cuts it to the head at send for one
+/// that granted nothing larger.
+function historyTextBody(text) {
+	return textBody(text, MAX_RETAINED_TEXT_BYTES);
+}
+
+/// A resumed entry as this worker's daemon will read it: whole text for a daemon that keeps it,
+/// the head (loss named) for one that granted nothing larger, and in either case fitted to the
+/// frame so an escape-heavy body is cut rather than refused.
+function forDaemon(entry) {
+	let head = entry;
+	if (!granted() && entry.body?.type === "text") {
+		const bounded = boundedText(entry.body.text, MAX_TEXT_BYTES);
+		if (bounded.truncated) {
+			head = {
+				...entry,
+				body: { type: "text", text: bounded.text },
+				truncation: truncation(
+					true,
+					"adapter_bound",
+					Math.max(entry.truncation?.original_bytes ?? 0, bounded.originalBytes),
+				),
+			};
+		}
+	}
+	return fitEntry("snapshot_entry", head);
+}
+
 /// A live message's text: whole for a daemon that keeps it, the head for one that granted
 /// nothing larger.
 function liveTextBody(text) {
@@ -512,7 +541,7 @@ function canonicalHistory(messages, createdAt) {
 		if (historical?.type === "user") {
 			const text = textFromContent(content);
 			if (text && !isSyntheticPrompt(text)) {
-				upsert(sourceID("user", historical.uuid), timestamp, "user_message", textBody(text));
+				upsert(sourceID("user", historical.uuid), timestamp, "user_message", historyTextBody(text));
 			}
 			if (Array.isArray(content)) {
 				for (const [blockIndex, block] of content.entries()) {
@@ -562,7 +591,7 @@ function canonicalHistory(messages, createdAt) {
 				sourceID("assistant", message?.id ?? historical.uuid),
 				timestamp,
 				"assistant_message",
-				textBody(text),
+				historyTextBody(text),
 			);
 		}
 		if (!Array.isArray(content)) {
@@ -606,26 +635,14 @@ function canonicalHistory(messages, createdAt) {
 		}
 	}
 
-	// Raw-text bounds are not frame bounds: JSON escaping can expand one control character sixfold.
-	// Preflight the exact envelope writeFrame will encode, or a single hostile entry would be
-	// silently skipped while registration still claimed the history was complete.
-	let firstFrameSafe = 0;
-	for (const [index, entry] of entries.entries()) {
-		const bytes = Buffer.byteLength(
-			JSON.stringify({ v: PROTOCOL_VERSION, type: "snapshot_entry", entry }),
-		);
-		if (bytes <= MAX_FRAME_BYTES) continue;
-		// Keep one contiguous newest tail. Dropping only this row would hide a hole in the middle
-		// while the boundary marker incorrectly claimed that everything missing was earlier.
-		firstFrameSafe = index + 1;
-		truncated = true;
-	}
-	const frameEntries = firstFrameSafe === 0 ? entries : entries.slice(firstFrameSafe);
-	const entryBytes = frameEntries.map((entry) => Buffer.byteLength(JSON.stringify(entry)));
+	// No frame preflight here: history is mapped before `registered` says how large a frame this
+	// worker's daemon reads, so each entry is fitted to that frame as it is sent (`fitEntry`),
+	// cut under a named loss rather than dropped with everything older than it.
+	const entryBytes = entries.map((entry) => Buffer.byteLength(JSON.stringify(entry)));
 	let bytes = entryBytes.reduce((total, size) => total + size, 0);
 	let firstRetained = 0;
 	while (
-		frameEntries.length - firstRetained > MAX_HISTORY_ENTRIES ||
+		entries.length - firstRetained > MAX_HISTORY_ENTRIES ||
 		bytes > MAX_HISTORY_CANONICAL_BYTES
 	) {
 		bytes -= entryBytes[firstRetained] ?? 0;
@@ -633,7 +650,7 @@ function canonicalHistory(messages, createdAt) {
 		truncated = true;
 	}
 	return {
-		entries: firstRetained === 0 ? frameEntries : frameEntries.slice(firstRetained),
+		entries: firstRetained === 0 ? entries : entries.slice(firstRetained),
 		truncated,
 	};
 }
@@ -961,7 +978,7 @@ inboundHandlers.push((frame) => {
 			}
 			writeFrame({ type: "snapshot_start" });
 			for (const entry of resumedHistory.entries) {
-				writeFrame({ type: "snapshot_entry", entry });
+				writeFrame({ type: "snapshot_entry", entry: forDaemon(entry) });
 			}
 			writeFrame({ type: "snapshot_end" });
 			// The mode this worker actually started in, so the phone shows the session's own

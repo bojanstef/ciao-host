@@ -36,8 +36,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     agent_adapter::WireTimelineEntry,
     agent_protocol::{
-        MAX_AGENT_FRAME_BYTES, MAX_TIMELINE_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES,
-        MAX_TOOL_RESULT_PREVIEW_BYTES, TimelineBody, ToolTimelineBody, Truncation,
+        MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
+        TimelineBody, ToolTimelineBody, Truncation,
     },
     agent_session::{AgentSessionSupervisor, NormalizedTimelineEntry},
     claude_hook::{is_synthetic_prompt, opaque_digest},
@@ -56,12 +56,11 @@ const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 /// The worker's canonical output bounds, which are also the host's per-session timeline bounds.
 const MAX_HISTORY_ENTRIES: usize = 4096;
 const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
-/// The worker's `MAX_TEXT_BYTES`. Named separately so a change to one side of the fixture's
-/// contract is a change to a named constant here, not an accident of sharing.
-const HISTORY_TEXT_BYTES: usize = MAX_TIMELINE_TEXT_BYTES;
-/// `{"v":1,"type":"snapshot_entry","entry":` and the closing brace: the envelope the worker
-/// preflights each entry in.
-const SNAPSHOT_ENTRY_ENVELOPE_BYTES: usize = 40;
+/// A history message is kept whole up to the host's retained bound, as a live one is; only the
+/// copy sent to the phone is cut to a head, by the host, at send. The worker's history mapping
+/// uses the same bound (`historyTextBody`). Named separately so a change to one side of the
+/// fixture's contract is a change to a named constant here, not an accident of sharing.
+const HISTORY_TEXT_BYTES: usize = MAX_RETAINED_TEXT_BYTES;
 
 /// Record types this build reads past on purpose: conversation metadata, not conversation.
 /// Grounded against Claude Code's own transcripts on the owner's machine; a type outside this
@@ -672,16 +671,8 @@ impl HistoryMapper {
                 "unknown".clone_into(&mut tool.status);
             }
         }
-        // The worker's frame preflight: an entry whose snapshot frame cannot fit takes the
-        // older part with it, so what remains is one contiguous newest tail.
-        let unfit = self
-            .slots
-            .iter()
-            .rposition(|slot| slot.bytes + SNAPSHOT_ENTRY_ENVELOPE_BYTES > MAX_AGENT_FRAME_BYTES);
-        if let Some(unfit) = unfit {
-            self.slots.drain(..=unfit);
-            self.truncated = true;
-        }
+        // No frame preflight: these entries go into the host's history, and the host fits each
+        // wire copy to its frame when it sends it (`fit_entry_to_frame`), naming the cut.
         let mut entries = Vec::with_capacity(self.slots.len());
         for slot in self.slots {
             if slot.entry.validate().is_ok() {
@@ -714,19 +705,64 @@ struct MappedBody {
     truncation: Truncation,
 }
 
-fn content_bound(truncated: bool) -> Truncation {
+/// The worker's `truncation(truncated, reason, originalBytes)`: a cut names its reason and, when
+/// it knows one, the size of what was cut.
+fn named_cut(truncated: bool, reason: &str, original_bytes: usize) -> Truncation {
+    if !truncated {
+        return crate::hook_common::no_truncation();
+    }
     Truncation {
+        truncated: true,
+        reason_code: Some(reason.to_owned()),
+        original_bytes: (original_bytes > 0).then_some(original_bytes as u64),
+    }
+}
+
+/// `boundedText`: a prefix on a character boundary, whether it was cut, and the whole size.
+struct Bounded {
+    text: Option<String>,
+    truncated: bool,
+    original_bytes: usize,
+}
+
+fn bounded_prose(text: &str, limit: usize) -> Bounded {
+    let (cut, truncated) = crate::hook_common::truncate_utf8(text, limit);
+    Bounded {
+        text: Some(cut),
         truncated,
-        reason_code: truncated.then(|| "content_bound".to_owned()),
-        original_bytes: None,
+        original_bytes: text.len(),
+    }
+}
+
+/// `jsonPreview`: a tool argument the phone can still parse to name the step — whole when it
+/// fits, its strings capped otherwise (the host's own `bounded_preview`), omitted rather than
+/// cut through. Text that is not JSON is cut like prose.
+fn bounded_json(serialized: &str, limit: usize) -> Bounded {
+    let Ok(document) = serde_json::from_str::<Value>(serialized) else {
+        return bounded_prose(serialized, limit);
+    };
+    if serialized.len() <= limit {
+        return Bounded {
+            text: Some(serialized.to_owned()),
+            truncated: false,
+            original_bytes: serialized.len(),
+        };
+    }
+    let (text, _) = crate::hook_common::bounded_preview(Some(&document), limit);
+    Bounded {
+        text,
+        truncated: true,
+        original_bytes: serialized.len(),
     }
 }
 
 fn text_body(text: &str) -> MappedBody {
-    let (text, truncated) = crate::hook_common::truncate_utf8(text, HISTORY_TEXT_BYTES);
+    let bounded = bounded_prose(text, HISTORY_TEXT_BYTES);
     MappedBody {
-        body: TimelineBody::Text { text },
-        truncation: content_bound(truncated),
+        body: TimelineBody::Text {
+            text: bounded.text.unwrap_or_default(),
+        },
+        truncation: named_cut(bounded.truncated, "adapter_bound", bounded.original_bytes),
     }
 }
 
@@ -736,22 +772,23 @@ fn tool_body(
     input: Option<String>,
     result: Option<String>,
 ) -> MappedBody {
-    let input =
-        input.map(|input| crate::hook_common::truncate_utf8(&input, MAX_TOOL_INPUT_PREVIEW_BYTES));
-    let result = result
-        .map(|result| crate::hook_common::truncate_utf8(&result, MAX_TOOL_RESULT_PREVIEW_BYTES));
-    let truncated =
-        input.as_ref().is_some_and(|(_, cut)| *cut) || result.as_ref().is_some_and(|(_, cut)| *cut);
+    let input = input.map(|input| bounded_json(&input, MAX_TOOL_INPUT_PREVIEW_BYTES));
+    let result = result.map(|result| bounded_prose(&result, MAX_TOOL_RESULT_PREVIEW_BYTES));
+    let truncated = input.as_ref().is_some_and(|bounded| bounded.truncated)
+        || result.as_ref().is_some_and(|bounded| bounded.truncated);
+    // The size of both documents behind the previews, as the worker and the host report it.
+    let original_bytes = input.as_ref().map_or(0, |bounded| bounded.original_bytes)
+        + result.as_ref().map_or(0, |bounded| bounded.original_bytes);
     MappedBody {
         body: TimelineBody::Tool {
             tool: ToolTimelineBody {
                 name,
                 status,
-                input_preview: input.map(|(text, _)| text),
-                result_preview: result.map(|(text, _)| text),
+                input_preview: input.and_then(|bounded| bounded.text),
+                result_preview: result.and_then(|bounded| bounded.text),
             },
         },
-        truncation: content_bound(truncated),
+        truncation: named_cut(truncated, "preview_bounded", original_bytes),
     }
 }
 
@@ -760,7 +797,7 @@ fn unsupported_body(reason_code: &str) -> MappedBody {
         body: TimelineBody::Unsupported {
             reason_code: reason_code.into(),
         },
-        truncation: content_bound(false),
+        truncation: crate::hook_common::no_truncation(),
     }
 }
 
@@ -912,10 +949,44 @@ mod tests {
     use super::*;
 
     fn fixture() -> Value {
-        serde_json::from_str(include_str!(
-            "../../../protocol/fixtures/phase5/claude-history-v1.json"
-        ))
-        .expect("the shared fixture parses")
+        expand(
+            serde_json::from_str(include_str!(
+                "../../../protocol/fixtures/phase5/claude-history-v1.json"
+            ))
+            .expect("the shared fixture parses"),
+        )
+    }
+
+    /// The fixture writes long strings compactly; worker.test.ts expands them identically.
+    fn expand(value: Value) -> Value {
+        match value {
+            Value::Array(items) => Value::Array(items.into_iter().map(expand).collect()),
+            Value::Object(fields) => {
+                if let Some(Value::Array(repeat)) = fields.get("$repeat") {
+                    let text = repeat[0].as_str().expect("$repeat text");
+                    let count = repeat[1].as_u64().expect("$repeat count");
+                    return Value::String(text.repeat(usize::try_from(count).unwrap()));
+                }
+                if let Some(Value::Array(parts)) = fields.get("$concat") {
+                    return Value::String(
+                        parts
+                            .iter()
+                            .map(|part| match expand(part.clone()) {
+                                Value::String(text) => text,
+                                other => panic!("$concat part is not text: {other}"),
+                            })
+                            .collect(),
+                    );
+                }
+                Value::Object(
+                    fields
+                        .into_iter()
+                        .map(|(key, field)| (key, expand(field)))
+                        .collect(),
+                )
+            }
+            other => other,
+        }
     }
 
     fn map_records(
