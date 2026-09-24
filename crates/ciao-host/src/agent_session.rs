@@ -2450,12 +2450,40 @@ fn enforce_history_bound(session: &mut LiveSession) {
 
 fn refresh_snapshot_window(session: &mut LiveSession) {
     // The snapshot is the phone's copy, so it holds wire entries: heads, not retained bodies.
+    // Sizing a large entry means encoding it, and this runs on every live append, so an entry
+    // the window already sized is reused while nothing that identifies its content moved:
+    // every content change bumps the revision, and a renumbering moves the sequence.
+    let sized: HashMap<(&str, u64, u64), &TimelineEntry> = session
+        .snapshot
+        .timeline_window
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                (
+                    entry.entry_id.as_str(),
+                    entry.entry_revision,
+                    entry.sequence,
+                ),
+                entry,
+            )
+        })
+        .collect();
     let mut entries: Vec<_> = session
         .history
         .iter()
         .rev()
         .take(MAX_TIMELINE_PAGE_ENTRIES)
-        .map(fit_entry_alone)
+        .map(|entry| {
+            match sized.get(&(
+                entry.entry_id.as_str(),
+                entry.entry_revision,
+                entry.sequence,
+            )) {
+                Some(wire) if still_sized_for(wire, entry) => (*wire).clone(),
+                _ => fit_entry_alone(entry),
+            }
+        })
         .collect();
     entries.reverse();
     session.snapshot.timeline_window = TimelineWindow {
@@ -2466,6 +2494,26 @@ fn refresh_snapshot_window(session: &mut LiveSession) {
         truncated: session.history.len() > entries.len(),
         entries,
     };
+}
+
+/// Whether a window entry sized earlier is still the wire form of this history entry. The key
+/// already matched identity, revision, and sequence; this rechecks what the phone would see
+/// change, and the length the head stands for.
+fn still_sized_for(wire: &TimelineEntry, entry: &TimelineEntry) -> bool {
+    wire.state == entry.state
+        && wire.kind == entry.kind
+        && wire.timestamp == entry.timestamp
+        && match (&wire.body, &entry.body) {
+            (TimelineBody::Text { text: head }, TimelineBody::Text { text }) => {
+                if wire.truncation.reason_code.as_deref() == Some(TRUNCATION_BODY_AVAILABLE) {
+                    wire.truncation.original_bytes == Some(text.len() as u64)
+                        && text.starts_with(head.as_str())
+                } else {
+                    wire.truncation == entry.truncation && head == text
+                }
+            }
+            _ => wire == entry,
+        }
 }
 
 fn snapshot_for_wire(session: &LiveSession) -> AgentSessionSnapshot {

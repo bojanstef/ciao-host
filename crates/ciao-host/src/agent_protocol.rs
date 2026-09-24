@@ -2428,7 +2428,23 @@ pub fn fit_entry_to_frame(
         TimelineBody::Text { text } => text.len(),
         _ => 0,
     };
-    let mut wire = entry.clone();
+    // Copy only the head of a long body: this runs for every large window entry on every live
+    // append, and a retained body can be a megabyte.
+    let mut wire = match &entry.body {
+        TimelineBody::Text { text } if text.len() > MAX_TIMELINE_TEXT_BYTES => TimelineEntry {
+            entry_id: entry.entry_id.clone(),
+            entry_revision: entry.entry_revision,
+            sequence: entry.sequence,
+            timestamp: entry.timestamp,
+            state: entry.state.clone(),
+            kind: entry.kind.clone(),
+            body: TimelineBody::Text {
+                text: text[..text.floor_char_boundary(MAX_TIMELINE_TEXT_BYTES)].to_owned(),
+            },
+            truncation: entry.truncation.clone(),
+        },
+        _ => entry.clone(),
+    };
     if whole > MAX_TIMELINE_TEXT_BYTES {
         cut_to_head(&mut wire, whole, MAX_TIMELINE_TEXT_BYTES);
     }
