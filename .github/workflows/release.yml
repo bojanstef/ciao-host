@@ -13,6 +13,11 @@ name: Release artifacts
 # record off their Mac on 2026-09-19. The linux job builds inside manylinux_2_28 so the binary keeps
 # the glibc 2.28 floor the cross-compiled channel binaries have always had; a plain ubuntu-24.04
 # build would raise it to 2.39 and strand Debian 12 and Ubuntu 22.04 hosts.
+#
+# The manifest job signs each archive as `<archive>.sig` (`ssh-keygen -Y sign -n ciao-release`) with
+# the CIAO_RELEASE_SIGNING_KEY secret, the only job that sees it, and binds the signatures in the
+# check run beside everything else. install.sh and `ciao install`/`ciao update` refuse an archive
+# without a good signature from the key committed at scripts/release-signing.pub.
 
 on:
   push:
@@ -190,8 +195,18 @@ jobs:
           pattern: ciao-*
           merge-multiple: true
           path: dist
-      - name: Verify both platforms, write release.json and the check-run body
-        run: python3 scripts/release_build.py manifest --dist dist --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --run-id "$GITHUB_RUN_ID"
+      - name: Verify both platforms, sign the archives, write release.json and the check-run body
+        # A missing secret leaves the path unset and `release_build.py` refuses by name
+        # (release_signing_key_required): the channel never gets an archive installers refuse.
+        env:
+          CIAO_RELEASE_SIGNING_KEY: ${{ secrets.CIAO_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -n "$CIAO_RELEASE_SIGNING_KEY" ]; then
+            (umask 077 && printf '%s\n' "$CIAO_RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/release-signing.key")
+            export CIAO_RELEASE_SIGNING_KEY_PATH="$RUNNER_TEMP/release-signing.key"
+          fi
+          python3 scripts/release_build.py manifest --dist dist --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --run-id "$GITHUB_RUN_ID"
+          rm -f "$RUNNER_TEMP/release-signing.key"
       - name: Bind the digests to this commit (check run release-artifacts)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -202,5 +217,6 @@ jobs:
           path: |
             dist/release.json
             dist/check-run.json
+            dist/*.sig
           if-no-files-found: error
           retention-days: 30

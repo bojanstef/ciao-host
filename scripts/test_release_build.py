@@ -27,8 +27,10 @@ class FakeRunner:
     def __init__(self, root, *, dirty=False, tests=GREEN, fail=None, binary=b"\x7fELF fixture binary"):
         self.root, self.dirty, self.tests, self.fail, self.binary, self.calls = Path(root), dirty, tests, fail, binary, []
 
-    def __call__(self, argv, *, cwd=None, timeout, env=None):
+    def __call__(self, argv, *, cwd=None, timeout, env=None, stdin=None):
         self.calls.append({"argv": list(argv), "env": env})
+        if argv[:1] == ["ssh-keygen"]:
+            return rb.run(argv, cwd=self.root, timeout=timeout, stdin=stdin)  # the real tool, a throwaway key
         if argv[:1] == ["git"] and argv[3:] == ["rev-parse", "HEAD"]:
             return 0, (HEAD + "\n").encode()
         if argv[:1] == ["git"] and argv[3] == "status":
@@ -213,6 +215,14 @@ class NotarizeTests(unittest.TestCase):
                 rb.notarize(self.runner(status)[0], Path("/tmp/ciao"), DARWIN, self.KEYS, emit=lambda _line: None)
 
 
+def keygen(path):
+    """A throwaway ed25519 key; its public half is what the fixture checkout commits."""
+    code, out = rb.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", rb.SIGNING_PRINCIPAL, "-f", str(path)],
+                       timeout=60)
+    assert code == 0, out
+    return path
+
+
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -220,6 +230,12 @@ class ManifestTests(unittest.TestCase):
         self.root = fixture_root(Path(self.tmp.name).resolve() / "host")
         self.dist = self.root.parent / "dist"
         self.dist.mkdir()
+        keys = self.root.parent / "keys"
+        keys.mkdir()
+        self.key, self.other_key = keygen(keys / "release"), keygen(keys / "other")
+        (self.root / "scripts").mkdir()
+        (self.root / rb.SIGNING_PUBLIC_KEY).write_text((keys / "release.pub").read_text())
+        self.environ = {"CIAO_RELEASE_SIGNING_KEY_PATH": str(self.key)}
         for target in sorted(rb.RELEASE_TARGETS):
             archive = rb.deterministic_tar(rb.archive_members(b"binary for " + target.encode(), "0.1.2", target, self.root))
             name = f"ciao-0.1.2-{target}.tar"
@@ -229,7 +245,34 @@ class ManifestTests(unittest.TestCase):
                 rb.native_record(FakeRunner(self.root), self.root, self.dist / f"native-{rb.PLATFORMS[target]}.json", emit=lambda _line: None)
 
     def manifest(self, **kwargs):
+        kwargs.setdefault("environ", self.environ)
         return rb.manifest(FakeRunner(self.root), self.root, self.dist, emit=lambda _line: None, **kwargs)
+
+    def test_each_archive_is_signed_by_the_committed_key_and_the_signature_is_bound(self):
+        record = self.manifest()
+        allowed = self.root.parent / "allowed_signers"
+        public = " ".join((self.root / rb.SIGNING_PUBLIC_KEY).read_text().split()[:2])
+        allowed.write_text(f'release@ciaooo.app namespaces="ciao-release" {public}\n')
+        for target in sorted(rb.RELEASE_TARGETS):
+            name = f"ciao-0.1.2-{target}.tar"
+            signature = self.dist / f"{name}.sig"
+            self.assertEqual(record["files"][signature.name], hashlib.sha256(signature.read_bytes()).hexdigest())
+            # Exactly the command install.sh runs.
+            code, out = rb.run(["ssh-keygen", "-Y", "verify", "-f", str(allowed), "-I", "release@ciaooo.app",
+                                "-n", "ciao-release", "-s", str(signature)], timeout=60, stdin=self.dist / name)
+            self.assertEqual(code, 0, out)
+        release = json.loads((self.dist / "release.json").read_text())
+        self.assertEqual(set(release["artifacts"][0]), {"version", "target", "file", "sha256", "bytes"},
+                         "release.json keeps its shape: every binary in the field parses it")
+
+    def test_without_the_key_or_with_a_key_that_is_not_the_committed_one_nothing_is_bound(self):
+        for environ, category in (({}, "release_signing_key_required"),
+                                  ({"CIAO_RELEASE_SIGNING_KEY_PATH": str(self.root / "absent")}, "release_signing_key_required"),
+                                  ({"CIAO_RELEASE_SIGNING_KEY_PATH": str(self.other_key)}, "release_signature_does_not_verify")):
+            with self.subTest(category=category), self.assertRaisesRegex(rb.Refused, category):
+                self.manifest(environ=environ)
+            self.assertFalse((self.dist / "check-run.json").exists())
+            self.assertEqual(list(self.dist.glob("*.sig")), [], "a signature the committed key refuses is not left behind")
 
     def test_the_manifest_binds_every_file_to_the_head_and_writes_the_check_run_body(self):
         record = self.manifest(run_url="https://github.com/bojanstef/ciao-host/actions/runs/1", run_id="35477571308")
@@ -285,7 +328,8 @@ class ManifestTests(unittest.TestCase):
         (self.dist / f"ciao-0.1.2-{LINUX}.tar").unlink()
         err = io.StringIO()
         with patch("sys.stderr", err), patch("sys.stdout", io.StringIO()):
-            code = rb.main(["--root", str(self.root), "manifest", "--dist", str(self.dist)], runner=FakeRunner(self.root))
+            code = rb.main(["--root", str(self.root), "manifest", "--dist", str(self.dist)], runner=FakeRunner(self.root),
+                           environ=self.environ)
         self.assertEqual(code, 2)
         self.assertEqual(err.getvalue().strip(), "::error::release_build: artifact_missing: linux-x64")
 

@@ -47,6 +47,7 @@ pub(crate) mod pty;
 pub mod qr;
 pub mod relay;
 pub(crate) mod release_meta;
+pub mod release_signature;
 pub mod service;
 pub(crate) mod slash_commands;
 pub mod storage;

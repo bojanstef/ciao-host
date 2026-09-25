@@ -20,7 +20,7 @@ curl -fsSL https://ciaooo.app/install.sh | sh
 
 This downloads and runs an installer; read [the script](scripts/install.sh) first if you prefer. It installs per-user, without root. Follow its setup/pairing prompt, or run `ciao pair`, then scan the QR with Ciao. `ciao update` explicitly updates an existing install through the same official channel, preserving identity and pairings with a rollback slot.
 
-**Distribution limits:** the official channel remains `https://ciaooo.app/dist`. Its checksums detect corruption but travel through the same channel as the artifacts; they are not independent release signatures. macOS artifacts are ad-hoc signed, not Developer ID signed/notarized. This source export does not change those limitations or establish reproducible binary equivalence with a released build.
+**Distribution:** the official channel is `https://ciaooo.app/dist`. Each release archive carries `<archive>.sig`, an OpenSSH signature made in the release workflow with a key that lives in neither the channel's storage nor the site; its public half is [scripts/release-signing.pub](scripts/release-signing.pub), fingerprint `SHA256:S4mAFd8JKny6Z/5V3b/ZNEY6vABypJAq6Pszn7bKF4k`. `install.sh` (with `ssh-keygen -Y verify`, OpenSSH 8.1+), `ciao install` and `ciao update` refuse an archive without a good one; the checksums beside the archives only detect corruption. The macOS binary is Developer ID signed and notarized. This source export does not establish reproducible binary equivalence with a released build.
 
 ### Platforms and integrations
 

@@ -4,14 +4,29 @@
 #     curl -fsSL https://ciaooo.app/install.sh | sh
 #
 # Downloads the latest release archive for this machine from the release
-# base, verifies its SHA-256 against the sidecar checksum, and installs the
-# `ciao` binary to ~/.local/bin (the same stable path `ciao install` uses).
-# Updates after this are handled by the binary itself:
+# base, verifies its SHA-256 against the sidecar checksum and its signature
+# against Ciao's release key with `ssh-keygen -Y verify` (OpenSSH 8.1+), and
+# installs the `ciao` binary to ~/.local/bin (the same stable path `ciao
+# install` uses). Updates after this are handled by the binary itself, which
+# checks the same signature:
 #
-#     ciao install --release-base https://ciaooo.app/dist
+#     ciao update
 #
-# Site layout expected: /install.sh, /dist/release.json, /dist/ciao-<v>-<t>.tar{,.sha256}
+# Site layout expected: /install.sh, /dist/release.json, /dist/ciao-<v>-<t>.tar{,.sha256,.sig}
+#
+# To verify a release by hand, with the key below (fingerprint
+# SHA256:S4mAFd8JKny6Z/5V3b/ZNEY6vABypJAq6Pszn7bKF4k; check it with
+# `ssh-keygen -lf` on a file holding the key line):
+#
+#     echo 'release@ciaooo.app namespaces="ciao-release" <key>' > allowed_signers
+#     ssh-keygen -Y verify -f allowed_signers -I release@ciaooo.app -n ciao-release \
+#         -s ciao-<v>-<t>.tar.sig < ciao-<v>-<t>.tar
 set -eu
+
+# The public half of the key the release workflow signs with. It lives in neither the bucket nor
+# the site, so whoever can rewrite an archive and its checksum still cannot sign it. One owner:
+# scripts/release-signing.pub in ciao-host; a host test keeps this line equal to it.
+RELEASE_SIGNING_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKioW5PIIK3Qf2Jl0JzYK1iIawBdTAy3CZRQStcC4CW+ release@ciaooo.app'
 
 BASE="${CIAO_BASE_URL:-https://ciaooo.app/dist}"
 
@@ -86,6 +101,14 @@ if [ -n "$installed" ]; then
     exec "$HOME/.local/bin/ciao" update --release-base "$BASE"
 fi
 
+# Checked before anything downloads: without it the signature below cannot be verified, and an
+# install that skipped it would be the checksum-only install this exists to end.
+if ! command -v ssh-keygen >/dev/null 2>&1; then
+    echo "ciao: ssh-keygen is needed to verify the release signature and was not found." >&2
+    echo "ciao: install OpenSSH's client (Debian/Ubuntu: openssh-client, Fedora/RHEL: openssh-clients) and run this again." >&2
+    exit 1
+fi
+
 file="ciao-$version-$target.tar"
 tmp="$(mktemp -d)"
 stage=""
@@ -103,6 +126,21 @@ if command -v sha256sum >/dev/null 2>&1; then
     (cd "$tmp" && sha256sum -c "$file.sha256" >/dev/null)
 else
     (cd "$tmp" && shasum -a 256 -c "$file.sha256" >/dev/null)
+fi
+
+# The checksum came from the same place as the archive, so it proves the download is whole, not
+# who built it. The signature does.
+if ! curl -fsSL -o "$tmp/$file.sig" "$BASE/$file.sig"; then
+    echo "ciao: $file has no signature at $BASE/$file.sig; refusing to install an unsigned release." >&2
+    exit 1
+fi
+printf 'release@ciaooo.app namespaces="ciao-release" %s\n' "$RELEASE_SIGNING_KEY" > "$tmp/allowed_signers"
+if ! ssh-keygen -Y verify -f "$tmp/allowed_signers" -I release@ciaooo.app -n ciao-release \
+        -s "$tmp/$file.sig" < "$tmp/$file" >/dev/null 2>&1; then
+    echo "ciao: $file is not signed by Ciao's release key; refusing to install it." >&2
+    echo "ciao: verifying needs ssh-keygen from OpenSSH 8.1 or later; this machine has: $(ssh -V 2>&1 || echo unknown)" >&2
+    echo "ciao: the commands to check it by hand are at the top of https://ciaooo.app/install.sh" >&2
+    exit 1
 fi
 
 tar -xf "$tmp/$file" -C "$tmp" ciao

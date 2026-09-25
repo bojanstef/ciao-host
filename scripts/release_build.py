@@ -14,8 +14,9 @@ green: a file whose presence means "passed" is never written on a red run. `pack
 the platform) with the relay token from CIAO_RELAY_TOKEN, and packs exactly the `ciao` binary, the
 license and notice files and `install.json` into a deterministic ustar archive plus its sha256
 sidecar, byte-identical for equal inputs. `manifest` runs once both platforms have uploaded: it
-verifies every file in `dist/`, writes `release.json` (the channel's manifest shape, artifacts only)
-and the body of the `release-artifacts` check run that binds every file's digest to this head, so a
+verifies every file in `dist/`, signs each archive as `<archive>.sig` with the release key (the
+only step that holds it), writes `release.json` (the channel's manifest shape, artifacts only) and
+the body of the `release-artifacts` check run that binds every file's digest to this head, so a
 consumer can verify what it downloads against what the runners built rather than trust the
 artifact store.
 
@@ -35,6 +36,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,17 +58,23 @@ SHA256 = re.compile(r"[a-f0-9]{64}")
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 MAX_ARCHIVE = 128 * 1024 * 1024
 MAX_RECORD = 16 * 1024
+# The release signature (ROADMAP "Pre-launch distribution security", item 1). The public half is
+# committed; install.sh and the binary's installer both verify against it.
+SIGNING_PUBLIC_KEY = "scripts/release-signing.pub"
+SIGNING_PRINCIPAL, SIGNING_NAMESPACE = "release@ciaooo.app", "ciao-release"
 
 
 class Refused(Exception):
     """One categorical reason, safe for a job log; never a token, a path or raw tool output."""
 
 
-def run(argv, *, cwd=ROOT, timeout, env=None):
-    """The one runner: argv, never a shell; (exit, stdout+stderr). Tests inject their own."""
+def run(argv, *, cwd=ROOT, timeout, env=None, stdin=None):
+    """The one runner: argv, never a shell; (exit, stdout+stderr); `stdin` is a file path or
+    nothing. Tests inject their own."""
     try:
-        done = subprocess.run(argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              stdin=subprocess.DEVNULL, timeout=timeout, env=env)
+        with open(stdin, "rb") if stdin else open(os.devnull, "rb") as source:
+            done = subprocess.run(argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  stdin=source, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return 124, b""
     except OSError:
@@ -289,7 +297,31 @@ def read_record(path, head):
     return value
 
 
-def manifest(runner, root, dist, *, run_url=None, run_id=None, emit=print):
+def sign(runner, root, archive, environ=os.environ):
+    """`<archive>.sig` by the key at CIAO_RELEASE_SIGNING_KEY_PATH (the workflow writes it from the
+    CIAO_RELEASE_SIGNING_KEY secret), then verified against the committed public half: a secret
+    that is not that key's other half would publish signatures every installer refuses, so it is
+    refused here, before anything is bound. Returns the signature's path."""
+    key = environ.get("CIAO_RELEASE_SIGNING_KEY_PATH", "").strip()
+    if not key or not Path(key).is_file():
+        raise Refused("release_signing_key_required")
+    signature = archive.with_name(archive.name + ".sig")
+    code, _ = runner(["ssh-keygen", "-q", "-Y", "sign", "-f", key, "-n", SIGNING_NAMESPACE, str(archive)], timeout=60)
+    if code or not signature.is_file():
+        raise Refused("release_signing_failed")
+    fields = (Path(root) / SIGNING_PUBLIC_KEY).read_text().split()
+    with tempfile.TemporaryDirectory() as scratch:
+        allowed = Path(scratch) / "allowed_signers"
+        allowed.write_text(f'{SIGNING_PRINCIPAL} namespaces="{SIGNING_NAMESPACE}" {" ".join(fields[:2])}\n')
+        code, _ = runner(["ssh-keygen", "-Y", "verify", "-f", str(allowed), "-I", SIGNING_PRINCIPAL,
+                          "-n", SIGNING_NAMESPACE, "-s", str(signature)], timeout=60, stdin=archive)
+    if code:
+        signature.unlink()
+        raise Refused("release_signature_does_not_verify")
+    return signature
+
+
+def manifest(runner, root, dist, *, run_url=None, run_id=None, environ=os.environ, emit=print):
     """Both platforms' archives, sidecars and records in `dist/`, verified, then `release.json` and
     the check-run body. Anything missing, extra or disagreeing is a refusal by name. `run_id` is this
     workflow run's, carried on the check run as `external_id`: GitHub files a check run created with
@@ -327,6 +359,9 @@ def manifest(runner, root, dist, *, run_url=None, run_id=None, emit=print):
     extra = sorted(p.name for p in dist.iterdir() if p.name not in files and p.name != "release.json")
     if extra:
         raise Refused("unexpected_files_in_dist")
+    for artifact in artifacts:
+        signature = sign(runner, root, dist / artifact["file"], environ)
+        files[signature.name] = sha256(signature.read_bytes())
     release = json.dumps({"v": 1, "artifacts": artifacts}, indent=2) + "\n"
     (dist / "release.json").write_text(release)
     files["release.json"] = sha256(release.encode())
@@ -383,7 +418,8 @@ def main(argv=None, *, runner=run, environ=None):
         elif args.command == "pack":
             print(canonical(pack(runner, args.root, args.out, environ)))
         else:
-            print(canonical(manifest(runner, args.root, args.dist, run_url=args.run_url, run_id=args.run_id)))
+            print(canonical(manifest(runner, args.root, args.dist, run_url=args.run_url, run_id=args.run_id,
+                                     environ=environ)))
         return 0
     except Refused as error:
         print(f"::error::release_build: {error}", file=sys.stderr)
