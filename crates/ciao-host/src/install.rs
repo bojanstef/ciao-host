@@ -22,6 +22,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::release_signature::{
+    MAX_SIGNATURE_BYTES, RELEASE_SIGNING_KEY, signature_file_name, verify_signed_by,
+};
 use crate::storage::CiaoPaths;
 
 pub const ARCHIVE_ENTRY_BINARY: &str = "ciao";
@@ -307,12 +310,38 @@ pub fn parse_install_metadata(bytes: &[u8]) -> Result<InstallMetadata> {
 // Verified staging and atomic swap
 // ---------------------------------------------------------------------------
 
-/// Reads and fully verifies a local archive: size cap, declared digest, strict layout, and
-/// install metadata matching the requested version and this machine's release target.
+/// Where an archive's signature lives: beside it, as `<archive>.sig`, whether the archive was
+/// downloaded (`fetch_archive` puts it there) or handed over with `--archive`.
+pub fn signature_path(archive: &Path) -> PathBuf {
+    let mut path = archive.as_os_str().to_owned();
+    path.push(".sig");
+    PathBuf::from(path)
+}
+
+/// Reads and fully verifies a local archive: size cap, declared digest, the release signature at
+/// `signature`, strict layout, and install metadata matching the requested version and this
+/// machine's release target.
 pub fn read_verified_archive(
     archive: &Path,
     expected_version: &str,
     expected_sha256: &[u8; 32],
+    signature: &Path,
+) -> Result<Vec<ArchiveEntry>> {
+    read_verified_archive_signed_by(
+        archive,
+        expected_version,
+        expected_sha256,
+        signature,
+        RELEASE_SIGNING_KEY,
+    )
+}
+
+fn read_verified_archive_signed_by(
+    archive: &Path,
+    expected_version: &str,
+    expected_sha256: &[u8; 32],
+    signature: &Path,
+    trusted_key: &str,
 ) -> Result<Vec<ArchiveEntry>> {
     let target = current_release_target()
         .ok_or_else(|| anyhow!("this OS/architecture has no released Ciao artifact"))?;
@@ -340,6 +369,10 @@ pub fn read_verified_archive(
     if &digest != expected_sha256 {
         bail!("archive digest does not match the declared SHA-256");
     }
+    // The digest is declared by the same channel that served the archive, so it proves only that
+    // the bytes are whole. The signature says who built them, and it is checked before any
+    // parsing too. Releases published before signing began carry none and are refused.
+    verify_signed_by(&bytes, &read_signature(signature)?, trusted_key)?;
 
     let entries = parse_release_archive(&bytes)?;
     let metadata_entry = entries
@@ -361,6 +394,24 @@ pub fn read_verified_archive(
         );
     }
     Ok(entries)
+}
+
+fn read_signature(signature: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(signature).map_err(|_| {
+        anyhow!(
+            "the release has no signature ({}); Ciao installs only signed releases",
+            signature
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SIGNATURE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SIGNATURE_BYTES {
+        bail!("the release signature exceeds {MAX_SIGNATURE_BYTES} bytes");
+    }
+    Ok(bytes)
 }
 
 /// Stages the verified binary beside the stable path, validates the staged binary's reported
@@ -505,7 +556,8 @@ pub fn refuse_if_terminal_active(active_terminals: Option<usize>) -> Result<()> 
 }
 
 /// Downloads `ciao-<version>-<target>.tar` from an explicitly supplied HTTPS release base
-/// using fixed argv with size and time bounds. There is no default or hardcoded origin.
+/// using fixed argv with size and time bounds, and its `.sig` to `signature_path(dest)`. There is
+/// no default or hardcoded origin.
 pub fn fetch_archive(
     release_base: &str,
     version: &str,
@@ -513,12 +565,12 @@ pub fn fetch_archive(
     dest: &Path,
     expected_bytes: Option<u64>,
 ) -> Result<()> {
-    fetch_release_file(
-        release_base,
-        &archive_file_name(version, target),
-        dest,
-        expected_bytes,
-    )
+    let archive = archive_file_name(version, target);
+    fetch_release_file(release_base, &archive, dest, expected_bytes)?;
+    let signature = signature_file_name(&archive);
+    fetch_release_file(release_base, &signature, &signature_path(dest), None).with_context(|| {
+        format!("{signature} is missing from the release; Ciao installs only signed releases")
+    })
 }
 
 /// Downloads one named file from an explicitly supplied HTTPS release base. Same bounds and
@@ -786,11 +838,37 @@ mod tests {
         ]
     }
 
+    /// Writes the archive and, beside it, a release-namespace signature by `signing_key()`.
     fn write_archive(dir: &Path, entries: &[(&str, u32, Vec<u8>)]) -> (PathBuf, [u8; 32]) {
         let bytes = build_archive(entries);
         let path = dir.join("release.tar");
         fs::write(&path, &bytes).unwrap();
+        fs::write(
+            signature_path(&path),
+            signing_key().sign(&bytes, crate::release_signature::SIGNING_NAMESPACE),
+        )
+        .unwrap();
         (path, Sha256::digest(&bytes).into())
+    }
+
+    fn signing_key() -> crate::release_signature::test_signer::TestKey {
+        crate::release_signature::test_signer::TestKey::new(3)
+    }
+
+    /// `read_verified_archive` with the test key trusted in place of the release key, whose
+    /// private half no test can have.
+    fn read_test_archive(
+        archive: &Path,
+        version: &str,
+        digest: &[u8; 32],
+    ) -> Result<Vec<ArchiveEntry>> {
+        read_verified_archive_signed_by(
+            archive,
+            version,
+            digest,
+            &signature_path(archive),
+            &signing_key().public_line(),
+        )
     }
 
     fn target() -> &'static str {
@@ -802,7 +880,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let golden = golden_entries("0.2.0", target());
         let (path, digest) = write_archive(temp.path(), &golden);
-        let entries = read_verified_archive(&path, "0.2.0", &digest).unwrap();
+        let entries = read_test_archive(&path, "0.2.0", &digest).unwrap();
         assert_eq!(entries.len(), 5);
         assert!(
             entries
@@ -812,14 +890,54 @@ mod tests {
 
         // Wrong digest fails before parsing.
         assert!(
-            read_verified_archive(&path, "0.2.0", &[0u8; 32])
+            read_test_archive(&path, "0.2.0", &[0u8; 32])
                 .unwrap_err()
                 .to_string()
                 .contains("digest")
         );
 
         // Wrong requested version fails after metadata validation.
-        assert!(read_verified_archive(&path, "0.3.0", &digest).is_err());
+        assert!(read_test_archive(&path, "0.3.0", &digest).is_err());
+
+        // The signature is required, must be over these bytes, and must be from the trusted key:
+        // the release key itself refuses an archive the test key signed.
+        let signature = fs::read(signature_path(&path)).unwrap();
+        assert!(
+            read_verified_archive(&path, "0.2.0", &digest, &signature_path(&path))
+                .unwrap_err()
+                .to_string()
+                .contains("does not verify")
+        );
+        fs::write(
+            signature_path(&path),
+            signing_key().sign(
+                b"some other archive",
+                crate::release_signature::SIGNING_NAMESPACE,
+            ),
+        )
+        .unwrap();
+        assert!(
+            read_test_archive(&path, "0.2.0", &digest)
+                .unwrap_err()
+                .to_string()
+                .contains("does not verify")
+        );
+        fs::remove_file(signature_path(&path)).unwrap();
+        let missing = read_test_archive(&path, "0.2.0", &digest).unwrap_err();
+        assert!(
+            missing.to_string().contains("release.tar.sig")
+                && missing.to_string().contains("only signed releases"),
+            "{missing}"
+        );
+        fs::write(signature_path(&path), vec![b'A'; 8 * 1024]).unwrap();
+        assert!(
+            read_test_archive(&path, "0.2.0", &digest)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+        fs::write(signature_path(&path), signature).unwrap();
+        read_test_archive(&path, "0.2.0", &digest).unwrap();
 
         // Traversal, links, extra entries, extra executables, and oversized entries fail.
         let traversal = build_archive(&[("../ciao", 0o755, b"x".to_vec())]);

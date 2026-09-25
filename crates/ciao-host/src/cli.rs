@@ -18,7 +18,8 @@ use crate::{
     install::{
         ProgressLine, Spinner, decode_sha256_hex, fetch_archive, fetch_release_file,
         parse_manifest, read_verified_archive, refuse_if_active_work, restore_previous,
-        stable_binary_path, stage_and_swap, swap_with_previous, valid_release_version,
+        signature_path, stable_binary_path, stage_and_swap, swap_with_previous,
+        valid_release_version,
     },
     ipc,
     ipc::{
@@ -83,7 +84,7 @@ enum Command {
         /// Exact release version to install (for example 0.2.0)
         #[arg(long)]
         version: Option<String>,
-        /// Local release archive (ciao-<version>-<target>.tar)
+        /// Local release archive (ciao-<version>-<target>.tar); its signature is read from <archive>.sig
         #[arg(long)]
         archive: Option<PathBuf>,
         /// Owner-configured HTTPS release base to download from
@@ -819,6 +820,7 @@ async fn install_command(paths: &CiaoPaths, arguments: InstallArguments) -> Resu
 
     let result = run_verified_install(paths, &archive_path, &version, &expected_sha256).await;
     if let Some(downloaded) = downloaded {
+        let _ = std::fs::remove_file(signature_path(&downloaded));
         let _ = std::fs::remove_file(downloaded);
     }
     result
@@ -832,7 +834,8 @@ async fn install_command(paths: &CiaoPaths, arguments: InstallArguments) -> Resu
 /// already takes when it reads the manifest and verifies the published sidecar, so the update
 /// path is exactly as strong as the install path that preceded it — and never weaker than the
 /// binary already on disk, because the archive is still verified against a declared digest and
-/// the previous version is still preserved for rollback.
+/// the release key's signature, and the previous version is still preserved for rollback. The
+/// channel can name a version; only the release key can vouch for its bytes.
 /// ` (cb4abbec84, 6941982a89)` for the devices holding terminals open, or nothing at all when
 /// there are none or the daemon is too old to say. Printed beside the count because the count
 /// alone cannot answer the only question anyone asks of it: which one is that?
@@ -1031,6 +1034,7 @@ async fn update_command(paths: &CiaoPaths, release_base: Option<String>) -> Resu
             Err(error)
         }
     };
+    let _ = std::fs::remove_file(signature_path(&destination));
     let _ = std::fs::remove_file(&destination);
     result
 }
@@ -1042,7 +1046,12 @@ async fn run_verified_install(
     expected_sha256: &[u8; 32],
 ) -> Result<()> {
     let entries = spinning("Verifying archive", || {
-        read_verified_archive(archive_path, version, expected_sha256)
+        read_verified_archive(
+            archive_path,
+            version,
+            expected_sha256,
+            &signature_path(archive_path),
+        )
     })?;
     // Captured after verification, because a bad archive never restarts anything, and before the
     // swap, because that is the last moment the old daemon can still be asked what was live.
