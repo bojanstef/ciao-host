@@ -24,7 +24,7 @@ use crate::{
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
 
-pub(crate) const PINNED_CLAUDE_SDK_VERSION: &str = "0.3.233";
+pub(crate) const PINNED_CLAUDE_SDK_VERSION: &str = "0.3.283";
 /// The CLI the pinned SDK bundles, checked **exactly** — Ciao installs this pair itself into
 /// its own prefix and SHA-256-verifies the binary before spawning it, so the version is one
 /// Ciao chose rather than one the user's updater did. It ratchets forward with the SDK by
@@ -33,7 +33,7 @@ pub(crate) const PINNED_CLAUDE_SDK_VERSION: &str = "0.3.233";
 /// Separate from `PINNED_CLAUDE_VERSION`, which is the attached floor and must not move when
 /// this does. They named the same value until 2026-08-16 only because the two pins happened to
 /// be bumped together; the coupling was accidental and actively harmful.
-pub(crate) const PINNED_MANAGED_CLI_VERSION: &str = "2.1.233";
+pub(crate) const PINNED_MANAGED_CLI_VERSION: &str = "2.1.283";
 pub(crate) const CLAUDE_MANAGED_PROTOCOL_VERSION: u8 = 1;
 
 /// The pinned SDK's own `EffortLevel` union (`sdk.d.ts`), which lives here rather than in
