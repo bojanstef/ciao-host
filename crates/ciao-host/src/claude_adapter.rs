@@ -68,6 +68,10 @@ pub(crate) enum ClaudeHookEventFrame {
         /// decode only ever rejects the one transient event that had something to say.
         #[serde(skip_serializing_if = "Option::is_none")]
         unrecognized_event: Option<String>,
+        /// `SessionStart` from anything but a fresh start (Spec 025). Absent when false, for the
+        /// same canonical-bytes reason as the drift name above.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        context_reset: bool,
     },
     UpsertEntry {
         v: u8,
@@ -94,9 +98,9 @@ pub(crate) enum ClaudeHookEventFrame {
     },
 }
 
-/// The heartbeat with its optional drift payload. Strict like every hook frame — the one field
-/// beyond the unit shape is the sanitized name of an unrecognized vendor event.
-fn decode_heartbeat_frame(value: &Value) -> Result<Option<String>, AgentProtocolError> {
+/// The heartbeat with its optional payloads. Strict like every hook frame — the fields beyond the
+/// unit shape are the sanitized name of an unrecognized vendor event and the context-reset flag.
+fn decode_heartbeat_frame(value: &Value) -> Result<(Option<String>, bool), AgentProtocolError> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Frame {
@@ -105,6 +109,8 @@ fn decode_heartbeat_frame(value: &Value) -> Result<Option<String>, AgentProtocol
         message_type: String,
         #[serde(default)]
         unrecognized_event: Option<String>,
+        #[serde(default)]
+        context_reset: bool,
     }
     let frame: Frame =
         serde_json::from_value(value.clone()).map_err(|_| AgentProtocolError::MalformedJson)?;
@@ -114,7 +120,7 @@ fn decode_heartbeat_frame(value: &Value) -> Result<Option<String>, AgentProtocol
         &frame.message_type,
         "heartbeat",
     )?;
-    Ok(frame.unrecognized_event)
+    Ok((frame.unrecognized_event, frame.context_reset))
 }
 
 impl AttachedAgentAdapter for ClaudeAttachedAdapter {
@@ -179,10 +185,15 @@ impl AttachedAgentAdapter for ClaudeAttachedAdapter {
                 NormalizedAdapterEvent::Registration
             }
             "heartbeat" => {
-                if let Some(name) = decode_heartbeat_frame(&value)? {
+                let (unrecognized, context_reset) = decode_heartbeat_frame(&value)?;
+                if let Some(name) = unrecognized {
                     crate::drift::note("claude", "hook_event", "unknown_event", &name, None);
                 }
-                NormalizedAdapterEvent::Heartbeat
+                if context_reset {
+                    NormalizedAdapterEvent::ContextReset
+                } else {
+                    NormalizedAdapterEvent::Heartbeat
+                }
             }
             "upsert_entry" => NormalizedAdapterEvent::UpsertEntry(
                 decode_entry_frame(value, CLAUDE_HOOK_PROTOCOL_VERSION, "upsert_entry")?
@@ -218,8 +229,11 @@ impl AttachedAgentAdapter for ClaudeAttachedAdapter {
         Err(AgentProtocolError::UnexpectedMessage)
     }
 
-    fn event_applied_frame(&self) -> Result<Option<Value>, AgentProtocolError> {
-        AttachedHookOutbound::event_applied_frame(CLAUDE_HOOK_PROTOCOL_VERSION)
+    fn event_applied_frame(
+        &self,
+        additional_context: Option<String>,
+    ) -> Result<Option<Value>, AgentProtocolError> {
+        AttachedHookOutbound::event_applied_frame(CLAUDE_HOOK_PROTOCOL_VERSION, additional_context)
     }
 
     fn shutdown_frame(&self, reason_code: &str) -> Result<Value, AgentProtocolError> {
@@ -479,7 +493,7 @@ mod tests {
             AdapterConnectionKind::TransientEvent
         );
         assert_eq!(
-            ClaudeAttachedAdapter.event_applied_frame().unwrap(),
+            ClaudeAttachedAdapter.event_applied_frame(None).unwrap(),
             Some(json!({"type": "event_applied", "v": 1}))
         );
     }

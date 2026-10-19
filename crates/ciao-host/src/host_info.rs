@@ -142,6 +142,12 @@ fn normalized_architecture() -> Result<String> {
     }
 }
 
+/// This host's human name — the one the phone shows — read fresh rather than from a cached
+/// `HostInfoResult`, for callers that never see one.
+pub(crate) fn display_name() -> Option<String> {
+    platform_display_name()
+}
+
 #[cfg(target_os = "macos")]
 fn platform_display_name() -> Option<String> {
     // `scutil` is the platform-native Computer Name accessor. Invocation is fixed argv, has no

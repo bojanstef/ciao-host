@@ -22,7 +22,7 @@ use crate::{
         AdapterConnectionKind, AttachedAgentAdapter, AttachedHookDialect, AttachedHookOutbound,
         AttachedHookRegister, NormalizedAdapterEvent, RestartRecovery, VendorRecord,
         WireTimelineEntry, decode_entry_frame, decode_notification_frame, decode_turn_frame,
-        decode_unit_frame, frame_type, readopted_hook_registration,
+        decode_unit_frame, frame_type, readopted_hook_registration, validate_frame_header,
     },
     agent_protocol::{AgentCommand, AgentProtocolError, TurnState},
     agent_route::AgentSighting,
@@ -120,6 +120,10 @@ pub(crate) struct CodexAttachedAdapter;
 pub(crate) enum CodexHookEventFrame {
     Heartbeat {
         v: u8,
+        /// `SessionStart` from anything but a fresh start (Spec 025). Absent when false, so every
+        /// other heartbeat keeps its canonical unit bytes.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        context_reset: bool,
     },
     UpsertEntry {
         v: u8,
@@ -141,6 +145,30 @@ pub(crate) enum CodexHookEventFrame {
     SessionEnd {
         v: u8,
     },
+}
+
+/// The heartbeat, whose one field beyond the unit shape is the context-reset flag (Spec 025).
+/// Strict like every hook frame. Unlike Claude's it carries no drift name: Codex hook novelty is
+/// tallied in the hook process, never dispatched.
+fn decode_heartbeat_frame(value: &Value) -> Result<bool, AgentProtocolError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Frame {
+        v: u8,
+        #[serde(rename = "type")]
+        message_type: String,
+        #[serde(default)]
+        context_reset: bool,
+    }
+    let frame: Frame =
+        serde_json::from_value(value.clone()).map_err(|_| AgentProtocolError::MalformedJson)?;
+    validate_frame_header(
+        frame.v,
+        CODEX_HOOK_PROTOCOL_VERSION,
+        &frame.message_type,
+        "heartbeat",
+    )?;
+    Ok(frame.context_reset)
 }
 
 impl AttachedAgentAdapter for CodexAttachedAdapter {
@@ -211,8 +239,11 @@ impl AttachedAgentAdapter for CodexAttachedAdapter {
                 NormalizedAdapterEvent::Registration
             }
             "heartbeat" => {
-                decode_unit_frame(&value, CODEX_HOOK_PROTOCOL_VERSION, "heartbeat")?;
-                NormalizedAdapterEvent::Heartbeat
+                if decode_heartbeat_frame(&value)? {
+                    NormalizedAdapterEvent::ContextReset
+                } else {
+                    NormalizedAdapterEvent::Heartbeat
+                }
             }
             "upsert_entry" => NormalizedAdapterEvent::UpsertEntry(
                 decode_entry_frame(value, CODEX_HOOK_PROTOCOL_VERSION, "upsert_entry")?
@@ -246,8 +277,11 @@ impl AttachedAgentAdapter for CodexAttachedAdapter {
         Err(AgentProtocolError::UnexpectedMessage)
     }
 
-    fn event_applied_frame(&self) -> Result<Option<Value>, AgentProtocolError> {
-        AttachedHookOutbound::event_applied_frame(CODEX_HOOK_PROTOCOL_VERSION)
+    fn event_applied_frame(
+        &self,
+        additional_context: Option<String>,
+    ) -> Result<Option<Value>, AgentProtocolError> {
+        AttachedHookOutbound::event_applied_frame(CODEX_HOOK_PROTOCOL_VERSION, additional_context)
     }
 
     fn shutdown_frame(&self, reason_code: &str) -> Result<Value, AgentProtocolError> {
@@ -481,7 +515,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            CodexAttachedAdapter.event_applied_frame().unwrap(),
+            CodexAttachedAdapter.event_applied_frame(None).unwrap(),
             Some(json!({"type": "event_applied", "v": 1}))
         );
     }

@@ -41,6 +41,7 @@ use crate::{
     notify::NotificationFacts,
     process::exists as process_exists,
     storage::{atomic_write_private, validate_private_file},
+    whereabouts::{Announced, Whereabouts},
     workspace::WorkspaceConfig,
 };
 
@@ -235,6 +236,9 @@ pub(crate) struct AgentSessionSupervisor {
     metadata: Arc<Mutex<AgentMetadataStore>>,
     registration_gate: Arc<AsyncMutex<()>>,
     routes: TerminalRouteResolver,
+    /// Where the person is, as the daemon last observed it (Spec 025). One per daemon: the
+    /// evidence is about the host and its paired devices, not about any one session.
+    whereabouts: Whereabouts,
 }
 
 #[derive(Debug)]
@@ -286,6 +290,8 @@ struct LiveSession {
     route_id: Option<String>,
     in_flight_commands: HashSet<String>,
     updates: broadcast::Sender<AgentServerFrame>,
+    /// What this conversation's agent was last told about where its person is (Spec 025).
+    whereabouts: Announced,
 }
 
 /// An attached session that can become a managed one, resolved before any worker is spawned.
@@ -335,6 +341,7 @@ impl AgentSessionSupervisor {
             metadata: Arc::new(Mutex::new(metadata)),
             registration_gate: Arc::new(AsyncMutex::new(())),
             routes: TerminalRouteResolver::new(workspace),
+            whereabouts: Whereabouts::default(),
         })
     }
 
@@ -699,7 +706,11 @@ impl AgentSessionSupervisor {
             let mut source_entries = HashMap::new();
             let mut history = Vec::new();
             let mut next_sequence = 1;
+            let mut whereabouts = Announced::default();
             if let Some(mut previous) = inner.sessions.remove(&session_id) {
+                // What the agent was told belongs to the conversation, not the process: a resumed
+                // Claude carries its old notes in its history, so a new process inherits them.
+                whereabouts = std::mem::take(&mut previous.whereabouts);
                 if let Some(route_id) = previous.route_id.take() {
                     inner.routes.remove(&route_id);
                 }
@@ -732,6 +743,7 @@ impl AgentSessionSupervisor {
                 route_id: None,
                 in_flight_commands: HashSet::new(),
                 updates,
+                whereabouts,
             };
             refresh_snapshot_window(&mut session);
             inner.sessions.insert(session_id.clone(), session);
@@ -1103,6 +1115,41 @@ impl AgentSessionSupervisor {
     /// Where the timeline stood when a turn ended: every row created after this belongs to what
     /// came next. Taken when the turn edge is applied, before the reconcile it starts reads
     /// anything, so a prompt that lands in between is not mistaken for part of the ended turn.
+    pub(crate) fn whereabouts(&self) -> &Whereabouts {
+        &self.whereabouts
+    }
+
+    /// Spec 025: the note this session's agent should read with the prompt it is about to answer,
+    /// when where its person is has changed since the agent was last told. Locates first, outside
+    /// the lock, because the host probe is a subprocess.
+    pub(crate) async fn whereabouts_context(&self, session_id: &str) -> Option<String> {
+        let evidence = self.whereabouts.observe().await;
+        let location = evidence.location();
+        let announced = {
+            let mut inner = self.inner.lock();
+            let session = inner.sessions.get_mut(session_id)?;
+            location.and_then(|location| session.whereabouts.on_prompt(location))
+        };
+        tracing::info!(
+            session = %session_id,
+            host_input = evidence.host.token(),
+            host_idle_ms = ?evidence.host.idle_ms(),
+            device_idle_ms = ?evidence.device_idle.map(|idle| idle.as_millis()),
+            location = location.map_or("unknown", |location| location.token()),
+            announced = announced.is_some(),
+            "agent whereabouts evaluated"
+        );
+        announced.map(crate::whereabouts::note)
+    }
+
+    /// Spec 025: the agent's context was rebuilt, so the next prompt says where its person is
+    /// again.
+    pub(crate) fn reset_whereabouts(&self, session_id: &str) {
+        if let Some(session) = self.inner.lock().sessions.get_mut(session_id) {
+            session.whereabouts.reset();
+        }
+    }
+
     pub(crate) fn turn_mark(&self, session_id: &str) -> Option<TurnMark> {
         let inner = self.inner.lock();
         let session = inner.sessions.get(session_id)?;

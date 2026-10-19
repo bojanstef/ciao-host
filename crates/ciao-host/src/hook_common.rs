@@ -5,8 +5,9 @@
 //! where drift means a privacy bound that holds for one vendor and not the other. Vendor payload
 //! mapping deliberately stays in each adapter's own hook module.
 //!
-//! Every function here is silent and fail-open by contract: a hook that cannot reach Ciao must
-//! leave the user's terminal session exactly as it was.
+//! Every function here is fail-open by contract, and silent but for `emit_prompt_context`
+//! (Spec 025): a hook that cannot reach Ciao must leave the user's terminal session exactly as it
+//! was.
 
 use std::{
     fs,
@@ -253,12 +254,14 @@ fn cap_strings(value: &Value, cap: usize, clipped: &mut bool) -> Value {
 
 /// The register/registered/event/applied handshake on the local agent socket. One connection
 /// carries exactly one event, which is what makes a hook process disposable.
+///
+/// Returns the text the daemon asked to be handed to the agent with this event (Spec 025), if any.
 pub(crate) async fn deliver(
     paths: &CiaoPaths,
     protocol_version: u8,
     registration: &Value,
     event: &Value,
-) -> Result<()> {
+) -> Result<Option<String>> {
     // Every step is named and timed, and a failure carries the times of the steps that already
     // succeeded. `deadline has elapsed` said only that *a* step went over, which is not enough to
     // act on: a slow `connect` means the daemon is not accepting, while a slow `read` means it
@@ -307,7 +310,64 @@ pub(crate) async fn deliver(
         write_agent_frame_within(&mut stream, &event, bound)
     );
     let applied = step!("read-applied", read_agent_frame(&mut stream));
-    validate_response(&applied, protocol_version, "event_applied").map(|_| ())
+    let applied = validate_response(&applied, protocol_version, "event_applied")?;
+    match applied.get("additional_context") {
+        None => Ok(None),
+        Some(Value::String(text))
+            if !text.is_empty() && text.len() <= MAX_ADDITIONAL_CONTEXT_BYTES =>
+        {
+            Ok(Some(text.clone()))
+        }
+        Some(_) => bail!("hook acknowledgement carried invalid additional context"),
+    }
+}
+
+/// Far above any note the daemon writes, far below what a vendor would let a hook add.
+const MAX_ADDITIONAL_CONTEXT_BYTES: usize = 8 * 1024;
+
+/// Hands `context` to the agent alongside the prompt it is about to read (Spec 025). Claude Code
+/// and Codex spell `UserPromptSubmit` output identically — Codex's own
+/// `user-prompt-submit.command.output` schema, read from the 0.163 binary, is Claude's shape — so
+/// one writer serves both. The only thing either hook ever prints.
+pub(crate) fn emit_prompt_context(context: &str) -> Result<()> {
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    });
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &output)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// The `SessionStart` sources both vendors name. Anything but a fresh start rebuilt the agent's
+/// context from a summary or a stored history, so what Ciao last told it may be gone (Spec 025).
+const SESSION_START_SOURCES: [&str; 5] = ["startup", "resume", "clear", "compact", "fork"];
+
+pub(crate) fn session_start_resets_context(
+    vendor: &str,
+    object: &Map<String, Value>,
+    adapter_version: &str,
+) -> bool {
+    match object.get("source").and_then(Value::as_str) {
+        None | Some("startup") => false,
+        Some(source) => {
+            // An unfamiliar source still resets: saying where the person is once more is cheap,
+            // and a context Ciao cannot name is not one it can vouch for. Spec 017: tallied.
+            if !SESSION_START_SOURCES.contains(&source) {
+                crate::drift::note(
+                    vendor,
+                    "session_start",
+                    "unknown_source",
+                    source,
+                    Some(adapter_version),
+                );
+            }
+            true
+        }
+    }
 }
 
 fn validate_response(body: &[u8], protocol_version: u8, expected_type: &str) -> Result<Value> {
@@ -1086,6 +1146,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Spec 025: what the daemon puts in `event_applied` is what the hook hands its agent, and an
+    /// acknowledgement that carries something malformed is refused rather than half-read.
+    #[tokio::test]
+    async fn delivery_returns_the_context_the_daemon_attached() {
+        use crate::agent_protocol::{read_agent_frame_within, write_agent_frame};
+        for (attached, expected) in [
+            (None, Ok(None)),
+            (
+                Some(json!("Where the user is: away.")),
+                Ok(Some("Where the user is: away.")),
+            ),
+            (Some(json!("")), Err(())),
+            (Some(json!(7)), Err(())),
+            (
+                Some(json!("x".repeat(MAX_ADDITIONAL_CONTEXT_BYTES + 1))),
+                Err(()),
+            ),
+        ] {
+            let home = tempfile::tempdir_in("/tmp").unwrap();
+            let paths = CiaoPaths::for_home(home.path());
+            std::fs::create_dir_all(paths.agent_socket_file.parent().unwrap()).unwrap();
+            let listener = tokio::net::UnixListener::bind(&paths.agent_socket_file).unwrap();
+            let daemon = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_agent_frame_within(&mut stream, MAX_BRIDGE_FRAME_BYTES)
+                    .await
+                    .unwrap();
+                write_agent_frame(
+                    &mut stream,
+                    &json!({
+                        "v": 1,
+                        "type": "registered",
+                        "session_id": "session-a",
+                        "process_generation": 1,
+                        "snapshot_epoch": 1
+                    }),
+                )
+                .await
+                .unwrap();
+                read_agent_frame_within(&mut stream, MAX_BRIDGE_FRAME_BYTES)
+                    .await
+                    .unwrap();
+                let mut applied = json!({"v": 1, "type": "event_applied"});
+                if let Some(attached) = attached {
+                    applied["additional_context"] = attached;
+                }
+                write_agent_frame(&mut stream, &applied).await.unwrap();
+            });
+            let delivered = deliver(
+                &paths,
+                1,
+                &json!({"v": 1, "type": "register"}),
+                &prompt_event("Synthetic."),
+            )
+            .await;
+            daemon.await.unwrap();
+            match expected {
+                Ok(context) => assert_eq!(delivered.unwrap().as_deref(), context),
+                Err(()) => assert!(delivered.is_err()),
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_rebuilt_context_resets_and_an_unknown_source_still_does() {
+        let start = |source: Option<&str>| {
+            let mut object = Map::new();
+            if let Some(source) = source {
+                object.insert("source".into(), Value::String(source.into()));
+            }
+            session_start_resets_context("claude", &object, "2.1.282")
+        };
+        assert!(!start(None));
+        assert!(!start(Some("startup")));
+        for source in ["resume", "clear", "compact", "fork"] {
+            assert!(start(Some(source)), "{source}");
+        }
+        assert!(start(Some("teleport")), "unfamiliar is not vouched for");
     }
 
     #[test]

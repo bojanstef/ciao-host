@@ -1,6 +1,7 @@
 //! Ciao-owned Claude command-hook entry point.
 //!
-//! The command is deliberately silent and fail-open: when Ciao is unavailable or rejects an
+//! The command is fail-open and silent but for one thing: the Spec 025 whereabouts note it prints
+//! on `UserPromptSubmit` when the daemon returns one. When Ciao is unavailable or rejects an
 //! observation, Claude's terminal session continues unchanged. Only whitelisted, bounded fields
 //! are converted to the local Claude adapter protocol; transcript paths are never forwarded or
 //! persisted.
@@ -33,9 +34,10 @@ use crate::{
     claude_adapter::{CLAUDE_HOOK_PROTOCOL_VERSION, ClaudeHookEventFrame, PINNED_CLAUDE_VERSION},
     claude_integration::parse_claude_version_output,
     hook_common::{
-        HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, keyed_digest, no_truncation,
-        object, preview_truncation, read_bounded_stdin, required_bool, required_string,
-        required_u64, trace_outcome, unix_now, workspace_display,
+        HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, emit_prompt_context,
+        keyed_digest, no_truncation, object, preview_truncation, read_bounded_stdin, required_bool,
+        required_string, required_u64, session_start_resets_context, trace_outcome, unix_now,
+        workspace_display,
     },
     storage::{CiaoPaths, atomic_write_private, validate_private_file},
 };
@@ -152,8 +154,9 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
             })
         })
         .transpose()?;
-    timeout(HOOK_DELIVERY_TIMEOUT, async {
-        deliver(paths, CLAUDE_HOOK_PROTOCOL_VERSION, &registration, &event).await?;
+    let mut context = None;
+    let delivered = timeout(HOOK_DELIVERY_TIMEOUT, async {
+        context = deliver(paths, CLAUDE_HOOK_PROTOCOL_VERSION, &registration, &event).await?;
         // Second connection, after the event: one connection carries one event. The event goes
         // first so a turn that says "working" is never on screen before the prompt that caused
         // it, and so losing the second delivery costs a turn state rather than a message. The
@@ -163,8 +166,15 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
         }
         Ok(())
     })
-    .await
-    .map_err(|_| anyhow!("Ciao hook delivery timed out"))?
+    .await;
+    // Spec 025. Only a prompt can carry context, and it is handed over even when the turn
+    // delivery after it lost the race: the note is about the prompt, not the turn.
+    if hook_event_name == "UserPromptSubmit"
+        && let Some(context) = context
+    {
+        emit_prompt_context(&context)?;
+    }
+    delivered.map_err(|_| anyhow!("Ciao hook delivery timed out"))?
 }
 
 async fn adapter_version_for_process(
@@ -377,15 +387,28 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 v: CLAUDE_HOOK_PROTOCOL_VERSION,
                 // A gated version is refused, not novel; the gate already reports itself.
                 unrecognized_event: None,
+                context_reset: false,
             }
         } else {
             match event_name {
                 // `SessionStart` deliberately reports no turn, where Codex's reports `Idle`: it
                 // also fires for `--resume` and `--continue`, into a conversation whose state
                 // Ciao never watched. `Idle` there would be a claim rather than an observation.
-                "SessionStart" | "PreCompact" | "PostCompact" => ClaudeHookEventFrame::Heartbeat {
+                "SessionStart" => ClaudeHookEventFrame::Heartbeat {
                     v: CLAUDE_HOOK_PROTOCOL_VERSION,
                     unrecognized_event: None,
+                    // Spec 025. `compact` fires here after a compaction, so the summary that
+                    // replaced the agent's history is covered without a `PostCompact` reading.
+                    context_reset: session_start_resets_context(
+                        "claude",
+                        object,
+                        &facts.adapter_version,
+                    ),
+                },
+                "PreCompact" | "PostCompact" => ClaudeHookEventFrame::Heartbeat {
+                    v: CLAUDE_HOOK_PROTOCOL_VERSION,
+                    unrecognized_event: None,
+                    context_reset: false,
                 },
                 // The turn closes. Claude repeats the opening `prompt_id` here — verified
                 // against a real 2.1.222 payload — so the close names the exact run it closes
@@ -401,6 +424,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                     ClaudeHookEventFrame::Heartbeat {
                         v: CLAUDE_HOOK_PROTOCOL_VERSION,
                         unrecognized_event: None,
+                        context_reset: false,
                     }
                 }
                 "UserPromptSubmit" => {
@@ -412,6 +436,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                         ClaudeHookEventFrame::Heartbeat {
                             v: CLAUDE_HOOK_PROTOCOL_VERSION,
                             unrecognized_event: None,
+                            context_reset: false,
                         }
                     } else {
                         let prompt_id = required_string(object, "prompt_id")?;
@@ -511,6 +536,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 _ => ClaudeHookEventFrame::Heartbeat {
                     v: CLAUDE_HOOK_PROTOCOL_VERSION,
                     unrecognized_event: Some(crate::drift::sanitize_name(event_name)),
+                    context_reset: false,
                 },
             }
         };
@@ -643,6 +669,37 @@ mod tests {
         })
     }
 
+    /// Spec 025: `SessionStart` says whether the agent's context was rebuilt, and nothing else
+    /// about it changes — it is still the heartbeat it always was, with no turn.
+    #[test]
+    fn session_start_carries_a_context_reset_only_when_the_context_was_rebuilt() {
+        for (source, reset) in [
+            (None, false),
+            (Some("startup"), false),
+            (Some("resume"), true),
+            (Some("clear"), true),
+            (Some("compact"), true),
+        ] {
+            let mut start = common("SessionStart");
+            if let Some(source) = source {
+                start["source"] = json!(source);
+            }
+            let mapped = map_hook_input(&start, &facts()).unwrap().unwrap();
+            assert_eq!(
+                mapped.event,
+                ClaudeHookEventFrame::Heartbeat {
+                    v: CLAUDE_HOOK_PROTOCOL_VERSION,
+                    unrecognized_event: None,
+                    context_reset: reset,
+                },
+                "{source:?}"
+            );
+            assert_eq!(mapped.turn, None);
+            let encoded = serde_json::to_value(&mapped.event).unwrap();
+            assert_eq!(encoded.get("context_reset").is_some(), reset, "{source:?}");
+        }
+    }
+
     #[test]
     fn user_and_display_events_forward_only_the_working_directory() {
         let mut user = common("UserPromptSubmit");
@@ -736,6 +793,7 @@ mod tests {
             ClaudeHookEventFrame::Heartbeat {
                 v: CLAUDE_HOOK_PROTOCOL_VERSION,
                 unrecognized_event: Some("EventFromAFutureClaude".into()),
+                context_reset: false,
             }
         );
 
@@ -747,6 +805,7 @@ mod tests {
             ClaudeHookEventFrame::Heartbeat {
                 v: CLAUDE_HOOK_PROTOCOL_VERSION,
                 unrecognized_event: Some("invalid".into()),
+                context_reset: false,
             },
             "a name that fails vendor-vocabulary grammar is never repeated verbatim"
         );
@@ -1133,6 +1192,7 @@ mod tests {
             ClaudeHookEventFrame::Heartbeat {
                 v: CLAUDE_HOOK_PROTOCOL_VERSION,
                 unrecognized_event: None,
+                context_reset: false,
             },
             "a major is gated, and a gated version is refused, not novel"
         );

@@ -138,6 +138,8 @@ struct AdapterEventContext<'a> {
     snapshot_bytes: usize,
     snapshot_open: bool,
     unknown_sequence: u64,
+    /// Text for the hook to hand its agent with the event it just delivered (Spec 025).
+    additional_context: Option<String>,
 }
 
 /// The one place an alert is raised. Every source funnels through here so that what a phone is
@@ -245,12 +247,22 @@ async fn apply_adapter_event(
             }
         }
         NormalizedAdapterEvent::UpsertEntry(entry) if !ctx.snapshot_open => {
+            // A hook delivering a person's prompt is the one moment an agent can be told where
+            // that person is (Spec 025): the hook is still running, and can hand it over before
+            // the agent reads the prompt. Only a hook connection has a hook to hand it to.
+            let prompted = ctx.agent.is_some() && entry.kind == "user_message";
             ctx.sessions.upsert_bridge_entry(session_id, entry)?;
+            if prompted {
+                ctx.additional_context = ctx.sessions.whereabouts_context(session_id).await;
+            }
         }
         NormalizedAdapterEvent::AppendText(delta) if !ctx.snapshot_open => {
             ctx.sessions.append_bridge_text(session_id, delta)?;
         }
         NormalizedAdapterEvent::Heartbeat if !ctx.snapshot_open => {}
+        NormalizedAdapterEvent::ContextReset if !ctx.snapshot_open => {
+            ctx.sessions.reset_whereabouts(session_id);
+        }
         // Capability, turn, and receipt events are session-level and may interleave
         // with a paged snapshot burst; they are not ordered timeline content.
         NormalizedAdapterEvent::Turn(turn) => {
@@ -561,6 +573,7 @@ pub(crate) async fn handle_agent_bridge(
         snapshot_bytes: 0,
         snapshot_open: false,
         unknown_sequence: 0,
+        additional_context: None,
     };
     let mut process_exited = false;
     // Not `read_agent_frame`: a command or shutdown winning this select! drops the read future,
@@ -802,6 +815,7 @@ async fn handle_transient_agent_event(
         snapshot_bytes: 0,
         snapshot_open: false,
         unknown_sequence: 0,
+        additional_context: None,
     };
     match apply_adapter_event(event, &mut context).await? {
         EventOutcome::Continue => {}
@@ -811,7 +825,7 @@ async fn handle_transient_agent_event(
         }
     }
     let acknowledgement = codec
-        .event_applied_frame()
+        .event_applied_frame(context.additional_context.take())
         .map_err(|_| anyhow!("agent event acknowledgement mapping failed"))?
         .ok_or_else(|| anyhow!("transient adapter has no event acknowledgement"))?;
     write_agent_frame(&mut stream, &acknowledgement).await?;
@@ -1692,5 +1706,132 @@ mod tests {
         ] {
             assert_eq!(attention_kind_for_turn(&quiet), None, "{quiet:?}");
         }
+    }
+
+    /// One disposable hook connection, the way `ciao __claude-hook` makes it: register, one event,
+    /// and the acknowledgement that answers it.
+    async fn claude_hook_round_trip(
+        sessions: &AgentSessionSupervisor,
+        managed: &crate::managed_session::ManagedSessionDirectory,
+        notifier: &Notifier,
+        event: Value,
+    ) -> Value {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        let task = tokio::spawn(handle_agent_bridge(
+            server,
+            sessions.clone(),
+            std::sync::Arc::new(crate::managed_worker::WorkerTable::default()),
+            managed.clone(),
+            std::sync::Arc::new(crate::codex_adopted::AdoptionRegistry::default()),
+            notifier.clone(),
+            shutdown,
+        ));
+        write_agent_frame(
+            &mut client,
+            &serde_json::json!({
+                "v": 1,
+                "type": "register",
+                "adapter": "claude",
+                "adapter_version": PINNED_CLAUDE_VERSION,
+                "mode": "tui_hook",
+                "session_id": "fixture-claude-session",
+                "process_nonce": "0123456789abcdef0123456789abcdef",
+                "process_id": std::process::id(),
+                "workspace_display": "Fixture workspace",
+                "workspace_path": "/private/synthetic/Fixture workspace"
+            }),
+        )
+        .await
+        .unwrap();
+        let registered: Value =
+            decode_agent_body(&read_agent_frame(&mut client).await.unwrap()).unwrap();
+        assert_eq!(registered["type"], "registered");
+        write_agent_frame(&mut client, &event).await.unwrap();
+        let applied: Value =
+            decode_agent_body(&read_agent_frame(&mut client).await.unwrap()).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(applied["type"], "event_applied");
+        applied
+    }
+
+    fn prompt_event(source: &str) -> Value {
+        serde_json::json!({
+            "v": 1,
+            "type": "upsert_entry",
+            "entry": {
+                "source_id": format!("claude.prompt.{source}"),
+                "source_revision": 1,
+                "timestamp": 1,
+                "state": "complete",
+                "kind": "user_message",
+                "body": { "type": "text", "text": "Synthetic prompt." },
+                "truncation": { "truncated": false }
+            }
+        })
+    }
+
+    /// Spec 025 end to end at the bridge: the acknowledgement of a prompt carries the note exactly
+    /// when where the person is changed, a context reset makes the next prompt say it again, and
+    /// nothing but a prompt ever carries one.
+    #[tokio::test]
+    async fn a_prompt_hears_where_its_person_is_only_when_that_changes() {
+        use crate::whereabouts::HostInput;
+        use std::time::Duration;
+
+        let temporary = tempdir().unwrap();
+        let sessions = AgentSessionSupervisor::load(
+            &temporary.path().join("agent-metadata.json"),
+            WorkspaceConfig::with_binary_dirs(Vec::new()),
+        )
+        .unwrap();
+        let managed = crate::managed_session::ManagedSessionDirectory::load(
+            &temporary.path().join("agent-managed.json"),
+            temporary.path(),
+            crate::managed_session::ManagedLauncher::Fake(Default::default()),
+        )
+        .unwrap();
+        let notifier = Notifier::new(
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::storage::PairedDeviceStore::load(temporary.path().join("paired.json"))
+                    .unwrap(),
+            )),
+            "fixture-host".into(),
+        );
+        let round_trip = |event| claude_hook_round_trip(&sessions, &managed, &notifier, event);
+        let note = |applied: &Value| applied["additional_context"].as_str().map(str::to_owned);
+
+        // Typed at the Mac: what every agent assumes already, so the acknowledgement is unchanged.
+        sessions
+            .whereabouts()
+            .set_host_input(HostInput::IdleFor(Duration::ZERO));
+        let applied = round_trip(prompt_event("one")).await;
+        assert_eq!(
+            applied,
+            serde_json::json!({"type": "event_applied", "v": 1})
+        );
+
+        // The Mac went idle and a device typed: the agent hears it once.
+        sessions
+            .whereabouts()
+            .set_host_input(HostInput::IdleFor(Duration::from_secs(600)));
+        sessions.whereabouts().note_device_input();
+        let away = note(&round_trip(prompt_event("two")).await).expect("the switch is announced");
+        assert!(away.contains("away from this Mac"), "{away}");
+        assert_eq!(note(&round_trip(prompt_event("three")).await), None);
+
+        // Nothing but a prompt carries a note, even while one would be owed.
+        let reset = serde_json::json!({"v": 1, "type": "heartbeat", "context_reset": true});
+        assert_eq!(note(&round_trip(reset).await), None);
+        let away_again = note(&round_trip(prompt_event("four")).await)
+            .expect("a reset context hears where its person is again");
+        assert_eq!(away_again, away);
+
+        // Back at the Mac.
+        sessions
+            .whereabouts()
+            .set_host_input(HostInput::IdleFor(Duration::ZERO));
+        let back = note(&round_trip(prompt_event("five")).await).expect("the return is announced");
+        assert!(back.contains("at this Mac"), "{back}");
     }
 }

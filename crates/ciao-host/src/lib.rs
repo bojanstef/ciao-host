@@ -52,5 +52,6 @@ pub mod service;
 pub(crate) mod slash_commands;
 pub mod storage;
 pub(crate) mod uploads;
+pub(crate) mod whereabouts;
 pub(crate) mod workspace;
 pub(crate) mod workspace_scan;

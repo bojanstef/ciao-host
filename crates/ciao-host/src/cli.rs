@@ -224,8 +224,9 @@ pub async fn run() -> Result<()> {
         Some(Command::Reset { yes }) => reset_command(&paths, yes).await,
         Some(Command::Daemon) => daemon::run(paths).await,
         Some(Command::ClaudeHook) => {
-            // Observation hooks must fail open and remain silent so a local Ciao outage cannot
-            // alter or add noise to the attached Claude terminal session.
+            // Observation hooks must fail open so a local Ciao outage cannot alter or add noise to
+            // the attached Claude terminal session. Their only output is the daemon's Spec 025
+            // whereabouts note on a prompt, which a failure never produces.
             let _ = crate::claude_hook::run(&paths).await;
             Ok(())
         }

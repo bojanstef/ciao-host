@@ -1,6 +1,7 @@
 //! Ciao-owned Codex command-hook entry point (Spec 012 §5).
 //!
-//! The command is deliberately silent and fail-open: when Ciao is unavailable or rejects an
+//! The command is fail-open and silent but for one thing: the Spec 025 whereabouts note it prints
+//! on `UserPromptSubmit` when the daemon returns one. When Ciao is unavailable or rejects an
 //! observation, the Codex terminal session continues unchanged. Only whitelisted, bounded fields
 //! are converted to the local Codex adapter protocol; `transcript_path` is never forwarded or
 //! persisted.
@@ -31,9 +32,9 @@ use crate::{
         PINNED_CODEX_VERSION, codex_run_id,
     },
     hook_common::{
-        HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, keyed_digest, object,
-        preview_truncation, read_bounded_stdin, required_string, trace_outcome, unix_now,
-        workspace_display,
+        HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, emit_prompt_context,
+        keyed_digest, object, preview_truncation, read_bounded_stdin, required_string,
+        session_start_resets_context, trace_outcome, unix_now, workspace_display,
     },
     process::{command as process_command, parent as process_parent},
     storage::CiaoPaths,
@@ -124,8 +125,9 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
             })
         })
         .transpose()?;
-    timeout(HOOK_DELIVERY_TIMEOUT, async {
-        deliver(paths, CODEX_HOOK_PROTOCOL_VERSION, &registration, &event)
+    let mut context = None;
+    let delivered = timeout(HOOK_DELIVERY_TIMEOUT, async {
+        context = deliver(paths, CODEX_HOOK_PROTOCOL_VERSION, &registration, &event)
             .await
             .context("Codex event delivery")?;
         // Second connection, after the entry: one connection carries one event. The entry goes
@@ -138,8 +140,14 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
         }
         Ok(())
     })
-    .await
-    .map_err(|_| anyhow!("Ciao hook delivery timed out"))?
+    .await;
+    // Spec 025, as in the Claude hook: only a prompt carries context, even past a lost turn.
+    if hook_event_name == "UserPromptSubmit"
+        && let Some(context) = context
+    {
+        emit_prompt_context(&context)?;
+    }
+    delivered.map_err(|_| anyhow!("Ciao hook delivery timed out"))?
 }
 
 /// Walks up from this process until it finds the Codex binary that invoked the hook.
@@ -313,6 +321,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
         (
             CodexHookEventFrame::Heartbeat {
                 v: CODEX_HOOK_PROTOCOL_VERSION,
+                context_reset: false,
             },
             None,
         )
@@ -321,6 +330,13 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
             "SessionStart" => (
                 CodexHookEventFrame::Heartbeat {
                     v: CODEX_HOOK_PROTOCOL_VERSION,
+                    // Spec 025: a resumed, cleared, compacted or forked thread rebuilt its
+                    // context, so the next prompt says where the person is again.
+                    context_reset: session_start_resets_context(
+                        "codex",
+                        object,
+                        &facts.adapter_version,
+                    ),
                 },
                 Some(TurnState::Idle),
             ),
@@ -627,6 +643,41 @@ pub(crate) mod tests {
             process_id: 42,
             process_nonce: "0123456789abcdef0123456789abcdef".into(),
             adapter_version: PINNED_CODEX_VERSION.into(),
+        }
+    }
+
+    /// Spec 025: a resumed, cleared, compacted or forked thread tells the daemon so; a fresh one
+    /// keeps the canonical unit heartbeat.
+    #[test]
+    fn session_start_carries_a_context_reset_only_when_the_context_was_rebuilt() {
+        for (source, reset) in [
+            ("startup", false),
+            ("resume", true),
+            ("clear", true),
+            ("compact", true),
+            ("fork", true),
+        ] {
+            let mut start = common("SessionStart");
+            start["source"] = json!(source);
+            let mapped = map_hook_input(&start, &facts()).unwrap().unwrap();
+            assert_eq!(
+                mapped.event,
+                CodexHookEventFrame::Heartbeat {
+                    v: CODEX_HOOK_PROTOCOL_VERSION,
+                    context_reset: reset,
+                },
+                "{source}"
+            );
+            assert_eq!(mapped.turn, Some(TurnState::Idle));
+            use crate::agent_adapter::{AttachedAgentAdapter, NormalizedAdapterEvent};
+            let decoded = crate::codex_adapter::CodexAttachedAdapter
+                .decode_event(&serde_json::to_vec(&mapped.event).unwrap())
+                .unwrap();
+            assert_eq!(
+                matches!(decoded, NormalizedAdapterEvent::ContextReset),
+                reset,
+                "{source}"
+            );
         }
     }
 

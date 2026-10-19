@@ -70,6 +70,10 @@ pub(crate) enum NormalizedAdapterEvent {
     UpsertEntry(NormalizedTimelineEntry),
     AppendText(NormalizedTextDelta),
     Heartbeat,
+    /// The agent's context was rebuilt — compacted, resumed, cleared — so anything Ciao told it
+    /// may be gone (Spec 025). Liveness like a heartbeat; carried on one, so an older daemon
+    /// refuses just this event rather than rendering a new frame type as unsupported content.
+    ContextReset,
     SessionEnded,
     CommandCapabilities(CommandCapabilities),
     /// The permission mode the adapter is now running under. Session-level, and reported by
@@ -183,7 +187,12 @@ pub(crate) trait AttachedAgentAdapter: Send + Sync {
 
     fn command_frame(&self, command: AgentCommand) -> Result<Value, AgentProtocolError>;
 
-    fn event_applied_frame(&self) -> Result<Option<Value>, AgentProtocolError> {
+    /// `additional_context` is text for the hook to hand its agent with the event it just
+    /// delivered (Spec 025). Only a transient hook dialect has anyone to hand it to.
+    fn event_applied_frame(
+        &self,
+        _additional_context: Option<String>,
+    ) -> Result<Option<Value>, AgentProtocolError> {
         Ok(None)
     }
 
@@ -547,6 +556,10 @@ pub(crate) enum AttachedHookOutbound {
     },
     EventApplied {
         v: u8,
+        /// Absent unless the daemon has something for the agent, so the canonical bytes — and an
+        /// older hook reading them — are unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        additional_context: Option<String>,
     },
     Shutdown {
         v: u8,
@@ -570,9 +583,11 @@ impl AttachedHookOutbound {
 
     pub(crate) fn event_applied_frame(
         protocol_version: u8,
+        additional_context: Option<String>,
     ) -> Result<Option<Value>, AgentProtocolError> {
         serde_json::to_value(Self::EventApplied {
             v: protocol_version,
+            additional_context,
         })
         .map(Some)
         .map_err(|_| AgentProtocolError::MalformedJson)

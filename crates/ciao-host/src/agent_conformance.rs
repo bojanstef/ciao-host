@@ -50,6 +50,7 @@ enum EventKind {
     UpsertEntry,
     AppendText,
     Heartbeat,
+    ContextReset,
     SessionEnded,
     CommandCapabilities,
     PermissionMode,
@@ -73,6 +74,7 @@ fn kind_of(event: &NormalizedAdapterEvent) -> Option<EventKind> {
         NormalizedAdapterEvent::UpsertEntry(_) => EventKind::UpsertEntry,
         NormalizedAdapterEvent::AppendText(_) => EventKind::AppendText,
         NormalizedAdapterEvent::Heartbeat => EventKind::Heartbeat,
+        NormalizedAdapterEvent::ContextReset => EventKind::ContextReset,
         NormalizedAdapterEvent::SessionEnded => EventKind::SessionEnded,
         NormalizedAdapterEvent::CommandCapabilities(_) => EventKind::CommandCapabilities,
         NormalizedAdapterEvent::PermissionMode(_) => EventKind::PermissionMode,
@@ -335,6 +337,10 @@ fn claude_events() -> Vec<(EventKind, Vec<u8>)> {
             frame(json!({ "v": 1, "type": "heartbeat" })),
         ),
         (
+            EventKind::ContextReset,
+            frame(json!({ "v": 1, "type": "heartbeat", "context_reset": true })),
+        ),
+        (
             EventKind::UpsertEntry,
             frame(json!({ "v": 1, "type": "upsert_entry", "entry": entry_payload() })),
         ),
@@ -380,6 +386,10 @@ fn codex_events() -> Vec<(EventKind, Vec<u8>)> {
         (
             EventKind::Heartbeat,
             frame(json!({ "v": 1, "type": "heartbeat" })),
+        ),
+        (
+            EventKind::ContextReset,
+            frame(json!({ "v": 1, "type": "heartbeat", "context_reset": true })),
         ),
         (
             EventKind::UpsertEntry,
@@ -607,8 +617,12 @@ fn contracts() -> [ParityContract; 4] {
             commands: CommandCapabilities::none(),
             interactions: &[],
             encodes: &[],
+            // Spec 025: the two hook dialects alone carry ContextReset, because only a hook can
+            // hand an agent the note it resets — and only theirs see `SessionStart`'s source.
+            // GAP(parity): Pi and the managed worker carry no whereabouts note yet.
             speaks: &[
                 EventKind::Heartbeat,
+                EventKind::ContextReset,
                 EventKind::UpsertEntry,
                 EventKind::AppendText,
                 EventKind::Notification,
@@ -713,6 +727,7 @@ fn contracts() -> [ParityContract; 4] {
             // GAP(parity): no AppendText — a Codex answer arrives whole at Stop, never streamed.
             speaks: &[
                 EventKind::Heartbeat,
+                EventKind::ContextReset,
                 EventKind::UpsertEntry,
                 EventKind::Notification,
                 EventKind::Turn,
@@ -1343,7 +1358,7 @@ fn topology_flags_and_service_frames_match_the_ledger() {
         assert!(registered.is_object(), "{id}: registered frame is a frame");
         assert_eq!(
             adapter
-                .event_applied_frame()
+                .event_applied_frame(None)
                 .unwrap_or_else(|error| panic!("{id}: event_applied must encode, got {error}"))
                 .is_some(),
             contract.connection == AdapterConnectionKind::TransientEvent,

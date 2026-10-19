@@ -3812,6 +3812,7 @@ async fn handle_terminal_stream(
         &terminal_id,
         &mut session,
         tmux_detach_binary.as_deref(),
+        state.agent_sessions.whereabouts(),
         state.shutdown.subscribe(),
     )
     .await;
@@ -3826,6 +3827,7 @@ async fn handle_terminal_stream(
     result
 }
 
+#[allow(clippy::too_many_arguments)] // one call site; a params struct would be ceremony
 async fn bridge_terminal(
     connection: &Connection,
     send: &mut iroh::endpoint::SendStream,
@@ -3833,6 +3835,7 @@ async fn bridge_terminal(
     terminal_id: &str,
     session: &mut PtySession,
     tmux_detach_binary: Option<&std::path::Path>,
+    whereabouts: &crate::whereabouts::Whereabouts,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     enum Event {
@@ -3887,6 +3890,9 @@ async fn bridge_terminal(
                 };
                 match frame {
                     TerminalFrame::Input(bytes) => {
+                        // Spec 025: the only evidence that a prompt was typed on a device rather
+                        // than at this machine's own keyboard.
+                        whereabouts.note_device_input();
                         let input = tokio::select! {
                             result = session.send_input(bytes) => result,
                             _ = connection.closed() => {
