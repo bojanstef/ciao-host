@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use crate::{
     agent_adapter::{
         AdapterConnectionKind, AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery,
-        VendorRecord,
+        VendorRecord, WhereaboutsDelivery,
     },
     agent_bridge::{AgentAdapterRegistry, PRODUCTION_ADAPTERS},
     agent_protocol::{
@@ -51,6 +51,7 @@ enum EventKind {
     AppendText,
     Heartbeat,
     ContextReset,
+    WhereaboutsQuery,
     SessionEnded,
     CommandCapabilities,
     PermissionMode,
@@ -75,6 +76,7 @@ fn kind_of(event: &NormalizedAdapterEvent) -> Option<EventKind> {
         NormalizedAdapterEvent::AppendText(_) => EventKind::AppendText,
         NormalizedAdapterEvent::Heartbeat => EventKind::Heartbeat,
         NormalizedAdapterEvent::ContextReset => EventKind::ContextReset,
+        NormalizedAdapterEvent::WhereaboutsQuery { .. } => EventKind::WhereaboutsQuery,
         NormalizedAdapterEvent::SessionEnded => EventKind::SessionEnded,
         NormalizedAdapterEvent::CommandCapabilities(_) => EventKind::CommandCapabilities,
         NormalizedAdapterEvent::PermissionMode(_) => EventKind::PermissionMode,
@@ -197,6 +199,9 @@ struct ParityContract {
     encodes: &'static [CommandName],
     /// Normalized events this dialect has a spelling for. Exactly — no more, no fewer.
     speaks: &'static [EventKind],
+    /// How the integration tells its agent where its person is (Spec 025). Every row has one;
+    /// `every_integration_tells_its_agent_where_its_person_is` proves the carriage works.
+    whereabouts: WhereaboutsDelivery,
     registration: fn() -> Vec<u8>,
     events: fn() -> Vec<(EventKind, Vec<u8>)>,
 }
@@ -260,7 +265,8 @@ fn pi_registration() -> Vec<u8> {
         "process_nonce": "0123456789abcdef0123456789abcdef",
         "process_id": CONFORMANCE_PROCESS,
         "workspace_display": "Conformance workspace",
-        "commands": { "prompt": true, "steer": true, "follow_up": true, "interrupt": true }
+        "commands": { "prompt": true, "steer": true, "follow_up": true, "interrupt": true },
+        "whereabouts": true
     }))
 }
 
@@ -311,6 +317,16 @@ fn pi_events() -> Vec<(EventKind, Vec<u8>)> {
         (
             EventKind::Shutdown,
             frame(json!({ "v": 1, "type": "shutdown", "reason": "process_exit" })),
+        ),
+        (
+            EventKind::ContextReset,
+            frame(json!({ "v": 1, "type": "context_reset" })),
+        ),
+        (
+            EventKind::WhereaboutsQuery,
+            frame(
+                json!({ "v": 1, "type": "whereabouts_query", "query_id": "conformance-query-a" }),
+            ),
         ),
     ]
 }
@@ -596,7 +612,11 @@ fn contracts() -> [ParityContract; 4] {
                 EventKind::CommandCapabilities,
                 EventKind::CommandReceipt,
                 EventKind::Shutdown,
+                // Spec 025: compaction or a branch move, and the query before each run.
+                EventKind::ContextReset,
+                EventKind::WhereaboutsQuery,
             ],
+            whereabouts: WhereaboutsDelivery::BridgeQuery,
             registration: pi_registration,
             events: pi_events,
         },
@@ -617,9 +637,8 @@ fn contracts() -> [ParityContract; 4] {
             commands: CommandCapabilities::none(),
             interactions: &[],
             encodes: &[],
-            // Spec 025: the two hook dialects alone carry ContextReset, because only a hook can
-            // hand an agent the note it resets — and only theirs see `SessionStart`'s source.
-            // GAP(parity): Pi and the managed worker carry no whereabouts note yet.
+            // Spec 025: ContextReset is how a dialect whose agent can rebuild its context behind
+            // the daemon's back says so; the managed worker's cannot, so it never speaks it.
             speaks: &[
                 EventKind::Heartbeat,
                 EventKind::ContextReset,
@@ -629,6 +648,7 @@ fn contracts() -> [ParityContract; 4] {
                 EventKind::Turn,
                 EventKind::SessionEnded,
             ],
+            whereabouts: WhereaboutsDelivery::HookAcknowledgement,
             registration: claude_registration,
             events: claude_events,
         },
@@ -692,6 +712,7 @@ fn contracts() -> [ParityContract; 4] {
                 EventKind::Notification,
                 EventKind::SessionEnded,
             ],
+            whereabouts: WhereaboutsDelivery::PromptCommand,
             registration: claude_managed_registration,
             events: claude_managed_events,
         },
@@ -733,6 +754,7 @@ fn contracts() -> [ParityContract; 4] {
                 EventKind::Turn,
                 EventKind::SessionEnded,
             ],
+            whereabouts: WhereaboutsDelivery::HookAcknowledgement,
             registration: codex_registration,
             events: codex_events,
         },
@@ -1127,13 +1149,118 @@ fn foreign_dialect_frames_are_never_misread_and_never_widen_a_vocabulary() {
     }
 }
 
+/// Spec 025, for every integration there is and every one still to come: each one declares how
+/// its agent hears where its person is, and this proves the declared carriage actually carries
+/// the note through the dialect's own codec — and that a dialect whose agent can rebuild its
+/// context unseen says so with `ContextReset`. There is no row without an answer, because the
+/// trait method has no default and the enum has no "none".
+#[test]
+fn every_integration_tells_its_agent_where_its_person_is() {
+    const NOTE: &str = "Where the user is: conformance.";
+    for contract in contracts() {
+        let adapter = contract.adapter();
+        assert_eq!(
+            adapter.whereabouts_delivery(),
+            contract.whereabouts,
+            "{}: delivery disagrees with the ledger",
+            contract.id
+        );
+        let speaks_reset = contract.speaks.contains(&EventKind::ContextReset);
+        match contract.whereabouts {
+            WhereaboutsDelivery::HookAcknowledgement => {
+                assert_eq!(
+                    contract.connection,
+                    AdapterConnectionKind::TransientEvent,
+                    "{}: only a hook has an acknowledgement to carry it",
+                    contract.id
+                );
+                let applied = adapter
+                    .event_applied_frame(Some(NOTE.into()))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{}: no acknowledgement frame", contract.id));
+                assert_eq!(applied["additional_context"], NOTE, "{}", contract.id);
+                let bare = adapter.event_applied_frame(None).unwrap().unwrap();
+                assert!(bare.get("additional_context").is_none(), "{}", contract.id);
+                assert!(
+                    speaks_reset,
+                    "{}: a hook dialect must report resets",
+                    contract.id
+                );
+            }
+            WhereaboutsDelivery::BridgeQuery => {
+                assert_eq!(
+                    contract.connection,
+                    AdapterConnectionKind::PersistentBridge,
+                    "{}: only a persistent bridge can be answered",
+                    contract.id
+                );
+                assert!(
+                    adapter.whereabouts_asked(&(contract.registration)()),
+                    "{}: the canonical registration must ask",
+                    contract.id
+                );
+                assert!(
+                    contract.speaks.contains(&EventKind::WhereaboutsQuery),
+                    "{}: a querying dialect must speak the query",
+                    contract.id
+                );
+                let answer = adapter
+                    .whereabouts_frame("conformance-query-a", Some(NOTE.into()))
+                    .unwrap();
+                assert_eq!(answer["query_id"], "conformance-query-a", "{}", contract.id);
+                assert_eq!(answer["note"], NOTE, "{}", contract.id);
+                let silent = adapter
+                    .whereabouts_frame("conformance-query-a", None)
+                    .unwrap();
+                assert!(silent.get("note").is_none(), "{}", contract.id);
+                assert!(
+                    speaks_reset,
+                    "{}: a querying dialect must report resets",
+                    contract.id
+                );
+            }
+            WhereaboutsDelivery::PromptCommand => {
+                let registration = normalized(&contract);
+                assert!(
+                    permits(&registration, CommandName::Prompt),
+                    "{}: the note rides a prompt the registration must permit",
+                    contract.id
+                );
+                let carried = adapter
+                    .command_frame(command(CommandName::Prompt), Some(NOTE.into()))
+                    .unwrap();
+                assert!(
+                    serde_json::to_string(&carried).unwrap().contains(NOTE),
+                    "{}: the prompt must carry the note",
+                    contract.id
+                );
+                let bare = adapter
+                    .command_frame(command(CommandName::Prompt), None)
+                    .unwrap();
+                assert!(
+                    !serde_json::to_string(&bare).unwrap().contains(NOTE),
+                    "{}",
+                    contract.id
+                );
+            }
+        }
+        if contract.whereabouts != WhereaboutsDelivery::BridgeQuery {
+            assert!(
+                !adapter.whereabouts_asked(&(contract.registration)()),
+                "{}: only a querying dialect is confirmed in `registered`",
+                contract.id
+            );
+        }
+    }
+}
+
 /// The command ledger, both directions, plus the one law that must hold everywhere: nothing a
 /// registration permits may be unencodable by its own codec.
 #[test]
 fn every_codec_encodes_exactly_its_ledger_commands() {
     for contract in contracts() {
         for name in ALL_COMMANDS {
-            let encoded = contract.adapter().command_frame(command(name));
+            let encoded = contract.adapter().command_frame(command(name), None);
             assert_eq!(
                 encoded.is_ok(),
                 contract.encodes.contains(&name),

@@ -16,11 +16,11 @@ use tokio::{
 use crate::{
     agent_adapter::{
         ADAPTER_COMMAND_CHANNEL_CAPACITY, AdapterConnectionKind, AttachedAgentAdapter,
-        NormalizedAdapterEvent, RestartRecovery, VendorRecord,
+        NormalizedAdapterEvent, RestartRecovery, VendorRecord, WhereaboutsDelivery,
     },
     agent_protocol::{
-        AgentProtocolError, MAX_BRIDGE_FRAME_BYTES, TimelineBody, Truncation, TurnState,
-        decode_bridge_body, read_agent_frame_within, valid_token, write_agent_frame,
+        AgentCommandKind, AgentProtocolError, MAX_BRIDGE_FRAME_BYTES, TimelineBody, Truncation,
+        TurnState, decode_bridge_body, read_agent_frame_within, valid_token, write_agent_frame,
     },
     agent_route::{AgentSighting, process_looks_like_tui, process_start_fingerprint},
     agent_session::{
@@ -140,6 +140,8 @@ struct AdapterEventContext<'a> {
     unknown_sequence: u64,
     /// Text for the hook to hand its agent with the event it just delivered (Spec 025).
     additional_context: Option<String>,
+    /// A frame owed straight back to a persistent peer — the answer to its `WhereaboutsQuery`.
+    reply: Option<Value>,
 }
 
 /// The one place an alert is raised. Every source funnels through here so that what a phone is
@@ -247,10 +249,14 @@ async fn apply_adapter_event(
             }
         }
         NormalizedAdapterEvent::UpsertEntry(entry) if !ctx.snapshot_open => {
-            // A hook delivering a person's prompt is the one moment an agent can be told where
+            // A hook delivering a person's prompt is the one moment its agent can be told where
             // that person is (Spec 025): the hook is still running, and can hand it over before
-            // the agent reads the prompt. Only a hook connection has a hook to hand it to.
-            let prompted = ctx.agent.is_some() && entry.kind == "user_message";
+            // the agent reads the prompt. The other deliveries meet the prompt elsewhere — a
+            // query before the run, the command that starts it — and a second note here would
+            // be one too many.
+            let prompted = ctx.codec.whereabouts_delivery()
+                == WhereaboutsDelivery::HookAcknowledgement
+                && entry.kind == "user_message";
             ctx.sessions.upsert_bridge_entry(session_id, entry)?;
             if prompted {
                 ctx.additional_context = ctx.sessions.whereabouts_context(session_id).await;
@@ -262,6 +268,14 @@ async fn apply_adapter_event(
         NormalizedAdapterEvent::Heartbeat if !ctx.snapshot_open => {}
         NormalizedAdapterEvent::ContextReset if !ctx.snapshot_open => {
             ctx.sessions.reset_whereabouts(session_id);
+        }
+        // Session-level and answered at once: the peer's run is waiting on it.
+        NormalizedAdapterEvent::WhereaboutsQuery { query_id } => {
+            if ctx.codec.whereabouts_delivery() != WhereaboutsDelivery::BridgeQuery {
+                bail!("agent bridge asked for whereabouts it does not query for");
+            }
+            let note = ctx.sessions.whereabouts_context(session_id).await;
+            ctx.reply = Some(ctx.codec.whereabouts_frame(&query_id, note)?);
         }
         // Capability, turn, and receipt events are session-level and may interleave
         // with a paged snapshot burst; they are not ordered timeline content.
@@ -554,9 +568,12 @@ pub(crate) async fn handle_agent_bridge(
         .register(selected.registration, command_sender)
         .await?;
     log_registration("stream", &adapter_family, &adapter_version, &registered);
-    let registered_frame = granting_frame_bound(
-        selected.codec.registered_frame(&registered)?,
-        selected.codec.frame_grant(&first),
+    let registered_frame = confirming_whereabouts(
+        granting_frame_bound(
+            selected.codec.registered_frame(&registered)?,
+            selected.codec.frame_grant(&first),
+        ),
+        selected.codec.whereabouts_asked(&first),
     );
     write_agent_frame(&mut stream, &registered_frame).await?;
 
@@ -574,6 +591,7 @@ pub(crate) async fn handle_agent_bridge(
         snapshot_open: false,
         unknown_sequence: 0,
         additional_context: None,
+        reply: None,
     };
     let mut process_exited = false;
     // Not `read_agent_frame`: a command or shutdown winning this select! drops the read future,
@@ -599,10 +617,29 @@ pub(crate) async fn handle_agent_bridge(
                     }
                     Err(error) => break Err(error),
                 }
+                if let Some(reply) = context.reply.take()
+                    && let Err(error) = write_agent_frame(&mut stream, &reply).await
+                {
+                    break Err(anyhow!(error));
+                }
             }
             command = command_receiver.recv() => {
                 let Some(command) = command else { break Ok(()); };
-                let outbound = selected.codec.command_frame(command.command)
+                // Spec 025: a `PromptCommand` dialect hears where its person is with the words
+                // that start or feed its run — and only then, so a mode switch says nothing.
+                let whereabouts = if selected.codec.whereabouts_delivery()
+                    == WhereaboutsDelivery::PromptCommand
+                    && matches!(
+                        command.command.kind,
+                        AgentCommandKind::Prompt { .. }
+                            | AgentCommandKind::Steer { .. }
+                            | AgentCommandKind::FollowUp { .. }
+                    ) {
+                    sessions.whereabouts_context(&registered.session_id).await
+                } else {
+                    None
+                };
+                let outbound = selected.codec.command_frame(command.command, whereabouts)
                     .map_err(|_| anyhow!("agent command mapping failed"))?;
                 if let Err(error) = write_agent_frame(&mut stream, &outbound).await {
                     break Err(anyhow!(error));
@@ -630,6 +667,15 @@ pub(crate) async fn handle_agent_bridge(
 fn granting_frame_bound(mut registered: Value, grant: Option<usize>) -> Value {
     if let (Some(bytes), Some(frame)) = (grant, registered.as_object_mut()) {
         frame.insert("frame_bytes".into(), bytes.into());
+    }
+    registered
+}
+
+/// Confirms Spec 025 queries to a peer that asked for them, the same way a frame grant is only
+/// ever told to a peer that asked: a peer that did not ask refuses any key it does not know.
+fn confirming_whereabouts(mut registered: Value, asked: bool) -> Value {
+    if let (true, Some(frame)) = (asked, registered.as_object_mut()) {
+        frame.insert("whereabouts".into(), true.into());
     }
     registered
 }
@@ -816,6 +862,7 @@ async fn handle_transient_agent_event(
         snapshot_open: false,
         unknown_sequence: 0,
         additional_context: None,
+        reply: None,
     };
     match apply_adapter_event(event, &mut context).await? {
         EventOutcome::Continue => {}
@@ -1833,5 +1880,146 @@ mod tests {
             .set_host_input(HostInput::IdleFor(Duration::ZERO));
         let back = note(&round_trip(prompt_event("five")).await).expect("the return is announced");
         assert!(back.contains("at this Mac"), "{back}");
+    }
+
+    /// Spec 025 over Pi's persistent bridge: confirmed in `registered` only to an extension that
+    /// asked, every query answered under its own ID, the note only on a change, and a reset
+    /// that makes the next query say it again.
+    #[tokio::test]
+    async fn a_pi_that_asked_is_answered_where_its_person_is_before_each_run() {
+        use crate::whereabouts::HostInput;
+        use std::time::Duration;
+
+        let temporary = tempdir().unwrap();
+        let sessions = AgentSessionSupervisor::load(
+            &temporary.path().join("agent-metadata.json"),
+            WorkspaceConfig::with_binary_dirs(Vec::new()),
+        )
+        .unwrap();
+        let managed = crate::managed_session::ManagedSessionDirectory::load(
+            &temporary.path().join("agent-managed.json"),
+            temporary.path(),
+            crate::managed_session::ManagedLauncher::Fake(Default::default()),
+        )
+        .unwrap();
+        let notifier = Notifier::new(
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::storage::PairedDeviceStore::load(temporary.path().join("paired.json"))
+                    .unwrap(),
+            )),
+            "fixture-host".into(),
+        );
+        let connect = |asked: bool| {
+            let sessions = sessions.clone();
+            let managed = managed.clone();
+            let notifier = notifier.clone();
+            async move {
+                let (server, mut client) = UnixStream::pair().unwrap();
+                let (shutdown_sender, shutdown) = watch::channel(false);
+                let task = tokio::spawn(handle_agent_bridge(
+                    server,
+                    sessions,
+                    std::sync::Arc::new(crate::managed_worker::WorkerTable::default()),
+                    managed,
+                    std::sync::Arc::new(crate::codex_adopted::AdoptionRegistry::default()),
+                    notifier,
+                    shutdown,
+                ));
+                let mut register: Value =
+                    serde_json::from_slice(&pi_registration(Some("pi"))).unwrap();
+                if asked {
+                    register["whereabouts"] = true.into();
+                }
+                write_agent_frame(&mut client, &register).await.unwrap();
+                let registered: Value =
+                    decode_agent_body(&read_agent_frame(&mut client).await.unwrap()).unwrap();
+                (client, registered, shutdown_sender, task)
+            }
+        };
+
+        // An extension that did not ask is never told: it would refuse the unknown key.
+        let (_client, registered, shutdown_sender, task) = connect(false).await;
+        assert_eq!(registered["type"], "registered");
+        assert!(registered.get("whereabouts").is_none());
+        shutdown_sender.send(true).unwrap();
+        task.await.unwrap().unwrap();
+
+        let (mut client, registered, _shutdown_sender, _task) = connect(true).await;
+        assert_eq!(registered["whereabouts"], true);
+        async fn ask(client: &mut UnixStream, query_id: &str) -> Value {
+            write_agent_frame(
+                client,
+                &serde_json::json!({"v": 1, "type": "whereabouts_query", "query_id": query_id}),
+            )
+            .await
+            .unwrap();
+            decode_agent_body(&read_agent_frame(client).await.unwrap()).unwrap()
+        }
+
+        sessions
+            .whereabouts()
+            .set_host_input(HostInput::IdleFor(Duration::ZERO));
+        let at_mac = ask(&mut client, "query-one").await;
+        assert_eq!(
+            at_mac,
+            serde_json::json!({"v": 1, "type": "whereabouts", "query_id": "query-one"})
+        );
+
+        sessions
+            .whereabouts()
+            .set_host_input(HostInput::IdleFor(Duration::from_secs(600)));
+        sessions.whereabouts().note_device_input();
+        let away = ask(&mut client, "query-two").await;
+        assert_eq!(away["query_id"], "query-two");
+        assert!(
+            away["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("away from this Mac")),
+            "{away}"
+        );
+        assert!(ask(&mut client, "query-three").await.get("note").is_none());
+
+        write_agent_frame(
+            &mut client,
+            &serde_json::json!({"v": 1, "type": "context_reset"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ask(&mut client, "query-four").await["note"], away["note"]);
+    }
+
+    /// Spec 025: a command from the phone is evidence the person is on it, whether or not the
+    /// session it names can take it.
+    #[tokio::test]
+    async fn a_phone_command_counts_as_device_input() {
+        use crate::whereabouts::HostInput;
+        let temporary = tempdir().unwrap();
+        let sessions = AgentSessionSupervisor::load(
+            &temporary.path().join("agent-metadata.json"),
+            WorkspaceConfig::with_binary_dirs(Vec::new()),
+        )
+        .unwrap();
+        sessions
+            .whereabouts()
+            .set_host_input(HostInput::IdleFor(std::time::Duration::from_secs(600)));
+        assert_eq!(sessions.whereabouts().observe().await.location(), None);
+        let receipt = sessions
+            .submit_command(crate::agent_protocol::AgentCommand {
+                v: 1,
+                command_id: "command-a".into(),
+                session_id: "session-a".into(),
+                snapshot_epoch: 1,
+                expected_generation: 1,
+                expected_revision: None,
+                kind: crate::agent_protocol::AgentCommandKind::Prompt {
+                    text: "Synthetic.".into(),
+                },
+            })
+            .await;
+        assert_eq!(receipt.state, "unavailable");
+        assert_eq!(
+            sessions.whereabouts().observe().await.location(),
+            Some(crate::whereabouts::Location::Away)
+        );
     }
 }

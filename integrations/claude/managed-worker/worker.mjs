@@ -719,6 +719,10 @@ const input = (() => {
 // command_id -> the uuid streamed for it, so the SDK's replay echo is the
 // delivery acknowledgement (grounded: requires --replay-user-messages).
 const promptsAwaitingReplay = new Map();
+/// Spec 025: one slot per prompt the daemon sent, in order, holding what Claude should be told
+/// about where its person is with that prompt — or null when nothing is owed. Every prompt takes
+/// a slot so a note can never slide onto a later prompt than the one it was sent with.
+const whereaboutsPending = [];
 // interaction_id -> { settle, decide } for a pending permission callback.
 const pendingInteractions = new Map();
 
@@ -925,6 +929,26 @@ const query = sdk.query({
 		// map lookup selects, so there is one place for the substitution to stop happening
 		// rather than two.
 		hooks: {
+			// Spec 025. The vendor's own channel for context that rides a prompt without becoming
+			// part of what the person said: the daemon's note, handed over as Claude reads the
+			// prompt it came with. Machinery Claude delivers through the prompt path took no slot.
+			UserPromptSubmit: [
+				{
+					hooks: [
+						async (hookInput) => {
+							if (isSyntheticPrompt(hookInput?.prompt)) return {};
+							const context = whereaboutsPending.shift();
+							if (typeof context !== "string") return {};
+							return {
+								hookSpecificOutput: {
+									hookEventName: "UserPromptSubmit",
+									additionalContext: context,
+								},
+							};
+						},
+					],
+				},
+			],
 			PostToolUse: [
 				{
 					hooks: [
@@ -1167,6 +1191,11 @@ function handleCommand(frame) {
 	if (frame.kind === "prompt") {
 		const uuid = crypto.randomUUID();
 		promptsAwaitingReplay.set(uuid, commandID);
+		whereaboutsPending.push(
+			typeof frame.additional_context === "string" && frame.additional_context.length > 0
+				? frame.additional_context
+				: null,
+		);
 		input.push({
 			type: "user",
 			uuid,

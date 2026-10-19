@@ -21,8 +21,9 @@ use crate::{
     agent_adapter::{
         AdapterConnectionKind, AttachedAgentAdapter, AttachedHookDialect, AttachedHookOutbound,
         AttachedHookRegister, NormalizedAdapterEvent, RestartRecovery, VendorRecord,
-        WireTimelineEntry, decode_entry_frame, decode_notification_frame, decode_turn_frame,
-        decode_unit_frame, frame_type, readopted_hook_registration, validate_frame_header,
+        WhereaboutsDelivery, WireTimelineEntry, decode_entry_frame, decode_notification_frame,
+        decode_turn_frame, decode_unit_frame, frame_type, readopted_hook_registration,
+        validate_frame_header,
     },
     agent_protocol::{AgentCommand, AgentProtocolError, TurnState},
     agent_route::AgentSighting,
@@ -273,8 +274,16 @@ impl AttachedAgentAdapter for CodexAttachedAdapter {
 
     /// Read-only: there is no command this adapter can carry, and there is no version of it
     /// that quietly grows one. A composer for Codex needs ADR 006 §3–§5 accepted first.
-    fn command_frame(&self, _command: AgentCommand) -> Result<Value, AgentProtocolError> {
+    fn command_frame(
+        &self,
+        _command: AgentCommand,
+        _whereabouts: Option<String>,
+    ) -> Result<Value, AgentProtocolError> {
         Err(AgentProtocolError::UnexpectedMessage)
+    }
+
+    fn whereabouts_delivery(&self) -> WhereaboutsDelivery {
+        WhereaboutsDelivery::HookAcknowledgement
     }
 
     fn event_applied_frame(
@@ -503,15 +512,18 @@ mod tests {
         assert!(CodexAttachedAdapter.requires_tui_process());
         assert!(
             CodexAttachedAdapter
-                .command_frame(AgentCommand {
-                    v: 1,
-                    command_id: "fixture-command".into(),
-                    session_id: "fixture-session".into(),
-                    snapshot_epoch: 1,
-                    expected_generation: 1,
-                    expected_revision: None,
-                    kind: AgentCommandKind::Interrupt,
-                })
+                .command_frame(
+                    AgentCommand {
+                        v: 1,
+                        command_id: "fixture-command".into(),
+                        session_id: "fixture-session".into(),
+                        snapshot_epoch: 1,
+                        expected_generation: 1,
+                        expected_revision: None,
+                        kind: AgentCommandKind::Interrupt,
+                    },
+                    None
+                )
                 .is_err()
         );
         assert_eq!(

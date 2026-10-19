@@ -1949,6 +1949,10 @@ impl AgentSessionSupervisor {
         if command.validate().is_err() {
             return rejected_receipt(&command, "rejected", "invalid_command", now);
         }
+        // Spec 025: every agent command comes from a paired device, so it is the same evidence
+        // as a keystroke in one of its terminals — and the only evidence when the person types
+        // in Ciao's composer rather than its terminal.
+        self.whereabouts.note_device_input();
         if let Some(existing) = self.metadata.lock().receipt(&command.command_id) {
             if existing.session_id == command.session_id
                 && existing.snapshot_epoch == command.snapshot_epoch

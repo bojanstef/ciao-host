@@ -9,8 +9,8 @@ use serde_json::Value;
 
 use crate::{
     agent_adapter::{
-        AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery, WireTimelineEntry,
-        decode_unit_frame, validate_frame_header,
+        AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery, WhereaboutsDelivery,
+        WireTimelineEntry, decode_unit_frame, validate_frame_header,
     },
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentCommandKind, AgentProtocolError, CommandCapabilities,
@@ -77,6 +77,11 @@ pub(crate) struct PiBridgeRegister {
     /// — which an older extension does not: it refuses any key it does not know.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_bytes: Option<u64>,
+    /// The extension asking to query whereabouts before each run (Spec 025). Asked rather than
+    /// assumed for the same reason as `frame_bytes`: the confirmation lands in `registered`, and
+    /// an extension that did not ask would refuse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whereabouts: bool,
 }
 
 impl PiBridgeRegister {
@@ -183,6 +188,12 @@ pub(crate) enum PiBridgeInbound {
     },
     Shutdown {
         reason: String,
+    },
+    /// Spec 025: Pi compacted the session or moved to another branch of it.
+    ContextReset,
+    /// Spec 025: Pi is about to start a run and asks what to tell it.
+    WhereaboutsQuery {
+        query_id: String,
     },
     Unknown,
 }
@@ -370,6 +381,32 @@ pub(crate) fn decode_pi_bridge_frame(body: &[u8]) -> Result<PiBridgeInbound, Age
                 reason: frame.reason,
             })
         }
+        "context_reset" => {
+            decode_unit_frame(&value, PI_BRIDGE_PROTOCOL_VERSION, "context_reset")?;
+            Ok(PiBridgeInbound::ContextReset)
+        }
+        "whereabouts_query" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Frame {
+                v: u8,
+                #[serde(rename = "type")]
+                message_type: String,
+                query_id: String,
+            }
+            let frame: Frame =
+                serde_json::from_value(value).map_err(|_| AgentProtocolError::MalformedJson)?;
+            validate_frame_header(
+                frame.v,
+                PI_BRIDGE_PROTOCOL_VERSION,
+                &frame.message_type,
+                "whereabouts_query",
+            )?;
+            valid_opaque_id(&frame.query_id)?;
+            Ok(PiBridgeInbound::WhereaboutsQuery {
+                query_id: frame.query_id,
+            })
+        }
         _ => Ok(PiBridgeInbound::Unknown),
     }
 }
@@ -393,6 +430,13 @@ pub(crate) enum PiBridgeOutbound {
     Shutdown {
         v: u8,
         reason_code: String,
+    },
+    /// The answer to one `whereabouts_query` (Spec 025). No `note` means nothing to say.
+    Whereabouts {
+        v: u8,
+        query_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
 }
 
@@ -497,6 +541,10 @@ impl AttachedAgentAdapter for PiAttachedAdapter {
             PiBridgeInbound::Shutdown { reason: _ } => NormalizedAdapterEvent::Shutdown {
                 process_exited: true,
             },
+            PiBridgeInbound::ContextReset => NormalizedAdapterEvent::ContextReset,
+            PiBridgeInbound::WhereaboutsQuery { query_id } => {
+                NormalizedAdapterEvent::WhereaboutsQuery { query_id }
+            }
             PiBridgeInbound::Unknown => NormalizedAdapterEvent::Unknown,
         })
     }
@@ -509,9 +557,43 @@ impl AttachedAgentAdapter for PiAttachedAdapter {
             .map_err(|_| AgentProtocolError::MalformedJson)
     }
 
-    fn command_frame(&self, command: AgentCommand) -> Result<Value, AgentProtocolError> {
+    fn command_frame(
+        &self,
+        command: AgentCommand,
+        _whereabouts: Option<String>,
+    ) -> Result<Value, AgentProtocolError> {
         serde_json::to_value(PiBridgeOutbound::command(command)?)
             .map_err(|_| AgentProtocolError::MalformedJson)
+    }
+
+    /// Pi starts runs the daemon never sees begin — typed in its own TUI, queued follow-ups — so
+    /// only the extension knows the moment, and it asks then.
+    fn whereabouts_delivery(&self) -> WhereaboutsDelivery {
+        WhereaboutsDelivery::BridgeQuery
+    }
+
+    fn whereabouts_asked(&self, register: &[u8]) -> bool {
+        matches!(
+            decode_pi_bridge_frame(register),
+            Ok(PiBridgeInbound::Register(PiBridgeRegister {
+                whereabouts: true,
+                ..
+            }))
+        )
+    }
+
+    fn whereabouts_frame(
+        &self,
+        query_id: &str,
+        note: Option<String>,
+    ) -> Result<Value, AgentProtocolError> {
+        valid_opaque_id(query_id)?;
+        serde_json::to_value(PiBridgeOutbound::Whereabouts {
+            v: PI_BRIDGE_PROTOCOL_VERSION,
+            query_id: query_id.into(),
+            note,
+        })
+        .map_err(|_| AgentProtocolError::MalformedJson)
     }
 
     fn shutdown_frame(&self, reason_code: &str) -> Result<Value, AgentProtocolError> {
@@ -546,6 +628,7 @@ mod tests {
                 interrupt: true,
             },
             frame_bytes: None,
+            whereabouts: false,
         }
     }
 

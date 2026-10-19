@@ -15,10 +15,10 @@ use serde_json::Value;
 use crate::{
     agent_adapter::{
         AdapterConnectionKind, AttachedAgentAdapter, AttachedHookDialect, AttachedHookOutbound,
-        AttachedHookRegister, NormalizedAdapterEvent, RestartRecovery, VendorRecord, WireTextDelta,
-        WireTimelineEntry, decode_delta_frame, decode_entry_frame, decode_notification_frame,
-        decode_turn_frame, decode_unit_frame, frame_type, readopted_hook_registration,
-        validate_frame_header,
+        AttachedHookRegister, NormalizedAdapterEvent, RestartRecovery, VendorRecord,
+        WhereaboutsDelivery, WireTextDelta, WireTimelineEntry, decode_delta_frame,
+        decode_entry_frame, decode_notification_frame, decode_turn_frame, decode_unit_frame,
+        frame_type, readopted_hook_registration, validate_frame_header,
     },
     agent_protocol::{AgentCommand, AgentProtocolError, TurnState},
     agent_route::AgentSighting,
@@ -225,8 +225,16 @@ impl AttachedAgentAdapter for ClaudeAttachedAdapter {
         AttachedHookOutbound::registered_frame(session, CLAUDE_HOOK_PROTOCOL_VERSION)
     }
 
-    fn command_frame(&self, _command: AgentCommand) -> Result<Value, AgentProtocolError> {
+    fn command_frame(
+        &self,
+        _command: AgentCommand,
+        _whereabouts: Option<String>,
+    ) -> Result<Value, AgentProtocolError> {
         Err(AgentProtocolError::UnexpectedMessage)
+    }
+
+    fn whereabouts_delivery(&self) -> WhereaboutsDelivery {
+        WhereaboutsDelivery::HookAcknowledgement
     }
 
     fn event_applied_frame(

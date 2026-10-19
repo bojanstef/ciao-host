@@ -83,7 +83,7 @@ const TOOL_USE_ID = "toolu_synthetic";
 // The fake records what the worker asked of the SDK, because several of these behaviours are
 // only observable as a call that did or did not happen with a particular argument.
 const JOURNAL = path.join(import.meta.dirname, "journal.json");
-const journal = { options: null, setModel: [], flagSettings: [] };
+const journal = { options: null, setModel: [], flagSettings: [], promptContexts: [] };
 function record() {
 	try { fs.writeFileSync(JOURNAL, JSON.stringify(journal)); } catch {}
 }
@@ -106,6 +106,26 @@ export function query(config) {
 		permissionMode: config.options.permissionMode ?? null,
 	};
 	record();
+	// Each prompt the worker streams in, read the way the real SDK reads it: UserPromptSubmit
+	// hooks run as the prompt is submitted, and what they add is what the model is handed.
+	(async () => {
+		for await (const message of config.prompt) {
+			const content = message && message.message && message.message.content;
+			const text = Array.isArray(content)
+				? content.map((part) => (part && part.text) || "").join("")
+				: String(content ?? "");
+			let context = null;
+			for (const matcher of (config.options.hooks && config.options.hooks.UserPromptSubmit) || []) {
+				for (const hook of matcher.hooks) {
+					const result = await hook({ hook_event_name: "UserPromptSubmit", prompt: text });
+					const added = result && result.hookSpecificOutput && result.hookSpecificOutput.additionalContext;
+					if (added !== undefined) context = added;
+				}
+			}
+			journal.promptContexts.push({ prompt: text, context });
+			record();
+		}
+	})();
 	return {
 		async *[Symbol.asyncIterator]() {
 			// Let registration settle first, so the frame order under test is the real one.
@@ -195,7 +215,12 @@ type Harness = {
 	dropPeer: () => void;
 	/// What the worker actually asked of the SDK. Several of these behaviours are only
 	/// observable as a call that did or did not happen with a particular argument.
-	journal: () => { options: any; setModel: unknown[]; flagSettings: unknown[] };
+	journal: () => {
+		options: any;
+		setModel: unknown[];
+		flagSettings: unknown[];
+		promptContexts: Array<{ prompt: string; context: string | null }>;
+	};
 };
 
 /// One worker, run the way the daemon runs it, with the socket left open so a test can answer
@@ -290,7 +315,7 @@ async function startWorker(
 			try {
 				return JSON.parse(fs.readFileSync(journalPath, "utf8"));
 			} catch {
-				return { options: null, setModel: [], flagSettings: [] };
+				return { options: null, setModel: [], flagSettings: [], promptContexts: [] };
 			}
 		},
 	};
@@ -1749,4 +1774,30 @@ test("a worker whose bridge drops exits instead of running on invisibly", async 
 	dropPeer();
 	await eventually(() => child.exitCode !== null);
 	expect(child.exitCode).toBe(1);
+});
+
+/// Spec 025: the daemon sends the whereabouts note with the prompt it belongs to, and Claude is
+/// handed it through the SDK's own UserPromptSubmit hook as that prompt is read — never as part
+/// of what the person said, and never with a later prompt.
+test("the whereabouts note reaches Claude with its own prompt and no other", async () => {
+	const { frames, send, journal } = await startWorker([], undefined, undefined, undefined, undefined, true);
+	await eventually(() => frames.some((frame) => frame.type === "snapshot_end"));
+
+	send({
+		v: 1,
+		type: "command",
+		command_id: "command-away",
+		kind: "prompt",
+		text: "From the phone.",
+		additional_context: "Where the user is: away from this Mac.",
+	});
+	send({ v: 1, type: "command", command_id: "command-plain", kind: "prompt", text: "Nothing owed." });
+	await eventually(() => journal().promptContexts.length >= 2);
+
+	expect(journal().promptContexts).toEqual([
+		{ prompt: "From the phone.", context: "Where the user is: away from this Mac." },
+		{ prompt: "Nothing owed.", context: null },
+	]);
+	// What the person said is exactly what they said: the note is not in the prompt text.
+	expect(journal().promptContexts[0].prompt).not.toContain("Where the user is");
 });

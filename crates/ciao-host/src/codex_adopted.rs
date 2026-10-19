@@ -866,6 +866,7 @@ pub(crate) async fn adopt(
         thread_id: params.thread_id,
         rollout: rollout.to_path_buf(),
         models,
+        carries_whereabouts: carries_whereabouts(&params.adapter_version),
     }));
     Ok(session_id)
 }
@@ -884,6 +885,33 @@ pub(crate) async fn adopt(
 /// moved, which is the per-method degradation Spec 017 Phase 3 sketches. Not wired here until
 /// the cliVersion evidence lands: tightening a write gate on a field observed unreliable
 /// would refuse threads this machine's own Codex wrote.
+/// The first Codex whose app-server was seen to take `additionalContext` on `turn/start` and
+/// `turn/steer`: present in the experimental schema extracted from 0.163.0 on 2026-10-19, and
+/// Ciao always negotiates `experimentalApi`. An older build's params tolerate unknown keys, so it
+/// would ignore the field rather than fail — but a write needs evidence of the version's own
+/// promise (vendor-version policy), and a note the agent never got must not be recorded as told.
+const FIRST_CODEX_WITH_TURN_CONTEXT: (u32, u32, u32) = (0, 163, 0);
+
+/// The opaque source key the note is filed under in `additionalContext`.
+const WHEREABOUTS_CONTEXT_SOURCE: &str = "ciao.whereabouts";
+
+fn carries_whereabouts(version: &str) -> bool {
+    crate::agent_protocol::parse_version(version)
+        .is_some_and(|version| version >= FIRST_CODEX_WITH_TURN_CONTEXT)
+}
+
+/// `turn/start` or `turn/steer` params, with the Spec 025 note filed as client context when
+/// there is one: the vendor's channel for context that is not part of what the person said.
+fn turn_params(mut params: Value, note: Option<&str>) -> Value {
+    if let (Some(note), Some(object)) = (note, params.as_object_mut()) {
+        object.insert(
+            "additionalContext".into(),
+            json!({ WHEREABOUTS_CONTEXT_SOURCE: { "kind": "application", "value": note } }),
+        );
+    }
+    params
+}
+
 fn adopted_compatible(version: &str) -> bool {
     crate::agent_protocol::version_major_matches(
         version,
@@ -1000,6 +1028,8 @@ struct AdoptedRuntime {
     /// The pickup-time surface, kept current as settings commands succeed: `current` is what
     /// the effort closed-check validates against, and `catalogue` is the closed set itself.
     models: ModelSurface,
+    /// Whether this Codex takes the Spec 025 note on `turn/start` and `turn/steer`.
+    carries_whereabouts: bool,
 }
 
 /// Live state the pump tracks between events.
@@ -1482,7 +1512,14 @@ async fn on_command(
     }
     let outcome = match &command.kind {
         AgentCommandKind::Prompt { text } | AgentCommandKind::Steer { text } => {
-            send_text(runtime, tracking, text).await
+            // Spec 025. Asked only of a Codex that can carry it: asking records the answer as
+            // told, and a note an older build drops would make the next real switch silent.
+            let note = if runtime.carries_whereabouts {
+                runtime.supervisor.whereabouts_context(session).await
+            } else {
+                None
+            };
+            send_text(runtime, tracking, text, note.as_deref()).await
         }
         AgentCommandKind::Interrupt => match tracking.vendor_turn_id.clone() {
             Some(turn) => runtime
@@ -1542,6 +1579,7 @@ async fn send_text(
     runtime: &AdoptedRuntime,
     tracking: &mut TurnTracking,
     text: &str,
+    note: Option<&str>,
 ) -> Result<()> {
     let input = json!([{"type": "text", "text": text}]);
     if let Some(turn) = tracking.vendor_turn_id.clone() {
@@ -1549,11 +1587,14 @@ async fn send_text(
             .connection
             .request(
                 "turn/steer",
-                json!({
-                    "threadId": runtime.thread_id,
-                    "expectedTurnId": turn,
-                    "input": input,
-                }),
+                turn_params(
+                    json!({
+                        "threadId": runtime.thread_id,
+                        "expectedTurnId": turn,
+                        "input": input,
+                    }),
+                    note,
+                ),
             )
             .await;
         if steered.is_ok() {
@@ -1564,7 +1605,7 @@ async fn send_text(
         .connection
         .request(
             "turn/start",
-            json!({"threadId": runtime.thread_id, "input": input}),
+            turn_params(json!({"threadId": runtime.thread_id, "input": input}), note),
         )
         .await
         .map(|_| ())
@@ -1892,6 +1933,29 @@ mod tests {
         );
         registry.remove("thread-a");
         assert!(registry.session_for("thread-a").is_none());
+    }
+
+    /// Spec 025: the note is filed as client context only for a Codex seen to take it, and the
+    /// person's words are never touched.
+    #[test]
+    fn the_whereabouts_note_rides_turn_params_only_where_codex_takes_it() {
+        assert!(!carries_whereabouts("0.157.0"));
+        assert!(!carries_whereabouts("0.162.9"));
+        assert!(carries_whereabouts("0.163.0"));
+        assert!(carries_whereabouts("0.170.1"));
+        assert!(
+            !carries_whereabouts("0.163.0-alpha.1"),
+            "a prerelease promises nothing"
+        );
+
+        let base = json!({"threadId": "thread-a", "input": [{"type": "text", "text": "Hi."}]});
+        assert_eq!(turn_params(base.clone(), None), base);
+        let noted = turn_params(base.clone(), Some("Where the user is: away."));
+        assert_eq!(
+            noted["additionalContext"],
+            json!({"ciao.whereabouts": {"kind": "application", "value": "Where the user is: away."}})
+        );
+        assert_eq!(noted["input"], base["input"]);
     }
 
     #[test]

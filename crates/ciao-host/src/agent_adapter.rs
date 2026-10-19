@@ -71,9 +71,16 @@ pub(crate) enum NormalizedAdapterEvent {
     AppendText(NormalizedTextDelta),
     Heartbeat,
     /// The agent's context was rebuilt — compacted, resumed, cleared — so anything Ciao told it
-    /// may be gone (Spec 025). Liveness like a heartbeat; carried on one, so an older daemon
-    /// refuses just this event rather than rendering a new frame type as unsupported content.
+    /// may be gone (Spec 025). Liveness like a heartbeat. The hook dialects carry it on their
+    /// heartbeat, so an older daemon refuses just this event rather than rendering a new frame
+    /// type as unsupported content; Pi sends its own frame, but only once the daemon confirmed
+    /// it speaks whereabouts.
     ContextReset,
+    /// A `BridgeQuery` peer is about to start its agent and asks what to tell it about where its
+    /// person is (Spec 025). Answered with `whereabouts_frame` under the same `query_id`.
+    WhereaboutsQuery {
+        query_id: String,
+    },
     SessionEnded,
     CommandCapabilities(CommandCapabilities),
     /// The permission mode the adapter is now running under. Session-level, and reported by
@@ -115,6 +122,25 @@ pub(crate) enum NormalizedAdapterEvent {
     /// (`permission_prompt`, `idle_prompt`, …). Session-level, never timeline content.
     Notification(String),
     Unknown,
+}
+
+/// How an integration hands its agent the Spec 025 whereabouts note. Part of the adapter
+/// contract with no default and no "none": an integration that cannot tell its agent where its
+/// person is does not get to be one. The daemon owns *what* is said and *when*
+/// (`AgentSessionSupervisor::whereabouts_context`); a dialect owns only the carriage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WhereaboutsDelivery {
+    /// A transient hook delivers the prompt; the daemon answers its `user_message` upsert with
+    /// the note in `event_applied`, and the hook prints it as the vendor's prompt context. The
+    /// dialect reports `ContextReset` when the vendor rebuilt the agent's context.
+    HookAcknowledgement,
+    /// A persistent bridge whose peer starts the agent itself asks before each run
+    /// (`WhereaboutsQuery`), after the daemon confirmed in `registered` that it answers. The
+    /// dialect reports `ContextReset` too.
+    BridgeQuery,
+    /// The daemon starts every run with a prompt command, so the note rides in the command
+    /// (`command_frame`'s `whereabouts`). Nothing else can rebuild the context behind its back.
+    PromptCommand,
 }
 
 /// A bounded adapter-specific codec selected by the local bridge registry.
@@ -185,10 +211,36 @@ pub(crate) trait AttachedAgentAdapter: Send + Sync {
         Some(MAX_BRIDGE_FRAME_BYTES)
     }
 
-    fn command_frame(&self, command: AgentCommand) -> Result<Value, AgentProtocolError>;
+    /// `whereabouts` is the Spec 025 note for a `PromptCommand` dialect to send with a prompt.
+    /// The bridge hands one only to such a dialect and only with a prompt; every other dialect
+    /// is always given `None`.
+    fn command_frame(
+        &self,
+        command: AgentCommand,
+        whereabouts: Option<String>,
+    ) -> Result<Value, AgentProtocolError>;
+
+    /// How this dialect hands its agent the Spec 025 note. Required: see [`WhereaboutsDelivery`].
+    fn whereabouts_delivery(&self) -> WhereaboutsDelivery;
+
+    /// `BridgeQuery`: whether this peer's `register` asked to be answered. The daemon confirms
+    /// with `whereabouts: true` in `registered`, which a peer that did not ask would refuse.
+    fn whereabouts_asked(&self, _register: &[u8]) -> bool {
+        false
+    }
+
+    /// `BridgeQuery`: the answer to one `WhereaboutsQuery`, with or without a note. Every other
+    /// dialect is never asked.
+    fn whereabouts_frame(
+        &self,
+        _query_id: &str,
+        _note: Option<String>,
+    ) -> Result<Value, AgentProtocolError> {
+        Err(AgentProtocolError::InvalidValue)
+    }
 
     /// `additional_context` is text for the hook to hand its agent with the event it just
-    /// delivered (Spec 025). Only a transient hook dialect has anyone to hand it to.
+    /// delivered (Spec 025). Only a `HookAcknowledgement` dialect has anyone to hand it to.
     fn event_applied_frame(
         &self,
         _additional_context: Option<String>,

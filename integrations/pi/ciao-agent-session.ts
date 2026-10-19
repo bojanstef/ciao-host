@@ -91,6 +91,13 @@ const MAX_PROMPT_BYTES = 32 * 1024;
 const MAX_RECEIPTS = 128;
 const LIVE_EMISSION_INTERVAL_MS = 50;
 const MAX_RECONNECT_DELAY_MS = 5_000;
+/// How long a run waits to hear where its person is (Spec 025). The daemon answers in
+/// milliseconds; this only bounds a daemon that is wedged, and a run that times out starts
+/// exactly as it would have without Ciao.
+const WHEREABOUTS_TIMEOUT_MS = 500;
+/// The custom message the note travels in. Hidden in Pi's TUI and never mirrored to the phone:
+/// it is for the model, which reads every custom message as user-side context.
+export const WHEREABOUTS_MESSAGE_TYPE = "ciao-whereabouts";
 const PROCESS_NONCE_PROPERTY = "__ciaoAgentSessionProcessNonceV1";
 const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
@@ -593,6 +600,14 @@ function mapMessage(message: unknown, stateOverride?: BridgeEntry["state"]): Bri
 		// Thinking-only messages are intentionally omitted; hidden reasoning is never requested.
 		return entries;
 	}
+	// The live mirror of `custom_message` in a stored branch: shown only when Pi shows it. A
+	// hidden one — Ciao's own whereabouts note among them — is context for the model, not
+	// something anyone said, and used to arrive on the phone as an unsupported card.
+	if (message.role === "custom") {
+		if (message.display !== true) return [];
+		const entry = textEntry(identity, "system", message.content, message.timestamp, stateOverride);
+		return entry ? [entry] : [];
+	}
 	if (message.role === "toolResult" && typeof message.toolCallId === "string") {
 		return [
 			toolEntry(message.toolCallId, {
@@ -810,6 +825,11 @@ export class CiaoAgentBridge {
 	/// A socket that never connected says nothing about the daemon: a restart refuses every
 	/// attempt until it listens again, and reading those as refusals cost the grant for good.
 	private askForGrant = true;
+	/// Whether this connection's daemon confirmed it answers whereabouts queries (Spec 025).
+	/// Asked for with the grant, so a daemon too old for either is asked for neither next time.
+	private whereaboutsAnswered = false;
+	private whereaboutsSerial = 0;
+	private whereaboutsQueries = new Map<string, (note: string | undefined) => void>();
 	private connectionSerial = 0;
 	private reconnectAttempt = 0;
 	private reconnectTimer?: NodeJS.Timeout;
@@ -848,6 +868,7 @@ export class CiaoAgentBridge {
 		this.context = undefined;
 		this.sessionIdentity = undefined;
 		this.registered = false;
+		this.settleWhereabouts();
 		this.connectionSerial += 1;
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = undefined;
@@ -988,6 +1009,7 @@ export class CiaoAgentBridge {
 			this.reconnectAttempt = 0;
 			this.registered = false;
 			this.frameBytes = MAX_FRAME_BYTES;
+			this.settleWhereabouts();
 			asked = this.askForGrant;
 			this.lastCapabilities = undefined;
 			this.enqueue({
@@ -1001,7 +1023,7 @@ export class CiaoAgentBridge {
 				process_id: process.pid,
 				workspace_display: workspaceDisplay(this.context?.cwd ?? ""),
 				commands: this.commands(),
-				...(asked ? { frame_bytes: MAX_BRIDGE_FRAME_BYTES } : {}),
+				...(asked ? { frame_bytes: MAX_BRIDGE_FRAME_BYTES, whereabouts: true } : {}),
 			});
 		});
 		socket.on("data", (chunk: Buffer) => {
@@ -1020,6 +1042,7 @@ export class CiaoAgentBridge {
 			if (!this.registered && asked !== undefined) this.askForGrant = !asked;
 			this.socket = undefined;
 			this.registered = false;
+			this.settleWhereabouts();
 			this.clearWrites();
 			this.scheduleReconnect(false);
 		});
@@ -1044,6 +1067,7 @@ export class CiaoAgentBridge {
 		}
 		if (value.type === "registered") {
 			const granted = "frame_bytes" in value;
+			const answers = "whereabouts" in value;
 			if (
 				!strictKeys(value, [
 					"v",
@@ -1052,11 +1076,13 @@ export class CiaoAgentBridge {
 					"process_generation",
 					"snapshot_epoch",
 					...(granted ? ["frame_bytes"] : []),
+					...(answers ? ["whereabouts"] : []),
 				]) ||
 				!validOpaqueID(value.session_id) ||
 				typeof value.process_generation !== "number" ||
 				typeof value.snapshot_epoch !== "number" ||
-				(granted && (typeof value.frame_bytes !== "number" || !Number.isSafeInteger(value.frame_bytes)))
+				(granted && (typeof value.frame_bytes !== "number" || !Number.isSafeInteger(value.frame_bytes))) ||
+				(answers && value.whereabouts !== true)
 			) {
 				this.socket?.destroy();
 				return;
@@ -1065,6 +1091,7 @@ export class CiaoAgentBridge {
 				? Math.min(MAX_BRIDGE_FRAME_BYTES, Math.max(MAX_FRAME_BYTES, value.frame_bytes as number))
 				: MAX_FRAME_BYTES;
 			this.askForGrant = true;
+			this.whereaboutsAnswered = answers;
 			this.registered = true;
 			this.sendSnapshot();
 			this.publishCapabilities();
@@ -1078,12 +1105,64 @@ export class CiaoAgentBridge {
 			this.socket?.destroy();
 			return;
 		}
+		if (value.type === "whereabouts") {
+			const noted = "note" in value;
+			if (
+				!this.whereaboutsAnswered ||
+				!strictKeys(value, ["v", "type", "query_id", ...(noted ? ["note"] : [])]) ||
+				!validOpaqueID(value.query_id) ||
+				(noted && (typeof value.note !== "string" || value.note.length === 0))
+			) {
+				this.socket?.destroy();
+				return;
+			}
+			const resolve = this.whereaboutsQueries.get(value.query_id);
+			this.whereaboutsQueries.delete(value.query_id);
+			resolve?.(noted ? (value.note as string) : undefined);
+			return;
+		}
 		const command = decodeCommand(value);
 		if (!command) {
 			this.socket?.destroy();
 			return;
 		}
 		this.handleCommand(command);
+	}
+
+	/// Spec 025: what to tell the run about to start about where its person is, if anything.
+	/// Asked at the moment Pi starts a run because only Pi knows that moment — a prompt typed in
+	/// its own TUI never passes through the daemon. Fail-open: no daemon, no confirmation, or no
+	/// answer in time means the run starts exactly as it would without Ciao.
+	whereabouts(): Promise<string | undefined> {
+		if (!this.registered || !this.whereaboutsAnswered || !this.socket) {
+			return Promise.resolve(undefined);
+		}
+		const queryID = `whereabouts-${++this.whereaboutsSerial}`;
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => {
+				this.whereaboutsQueries.delete(queryID);
+				resolve(undefined);
+			}, WHEREABOUTS_TIMEOUT_MS);
+			timer.unref();
+			this.whereaboutsQueries.set(queryID, (note) => {
+				clearTimeout(timer);
+				resolve(note);
+			});
+			this.enqueue({ v: BRIDGE_VERSION, type: "whereabouts_query", query_id: queryID });
+		});
+	}
+
+	/// Spec 025: Pi rebuilt the context it sends the model — a compaction summary, another
+	/// branch — so the daemon says where the person is again at the next run.
+	resetContext(): void {
+		if (!this.registered || !this.whereaboutsAnswered) return;
+		this.enqueue({ v: BRIDGE_VERSION, type: "context_reset" });
+	}
+
+	private settleWhereabouts(): void {
+		this.whereaboutsAnswered = false;
+		for (const resolve of this.whereaboutsQueries.values()) resolve(undefined);
+		this.whereaboutsQueries.clear();
 	}
 
 	private sendSnapshot(): void {
@@ -1344,8 +1423,20 @@ export function registerCiaoAgentExtension(pi: ExtensionAPI, socketPath?: string
 
 	pi.on("session_start", (_event, ctx) => bridge.start(ctx));
 	pi.on("session_shutdown", (event) => bridge.stop(event.reason === "quit"));
-	pi.on("session_tree", (_event, ctx) => bridge.reconcile(ctx));
-	pi.on("session_compact", (_event, ctx) => bridge.reconcile(ctx));
+	pi.on("session_tree", (_event, ctx) => {
+		bridge.reconcile(ctx);
+		bridge.resetContext();
+	});
+	pi.on("session_compact", (_event, ctx) => {
+		bridge.reconcile(ctx);
+		bridge.resetContext();
+	});
+	pi.on("before_agent_start", async (_event, ctx) => {
+		bridge.updateContext(ctx);
+		const note = await bridge.whereabouts();
+		if (note === undefined) return undefined;
+		return { message: { customType: WHEREABOUTS_MESSAGE_TYPE, content: note, display: false } };
+	});
 	pi.on("agent_start", (_event, ctx) => bridge.updateContext(ctx));
 	pi.on("agent_end", (_event, ctx) => bridge.updateContext(ctx));
 	pi.on("agent_settled", (_event, ctx) => bridge.updateContext(ctx));

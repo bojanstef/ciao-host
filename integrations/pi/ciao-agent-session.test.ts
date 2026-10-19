@@ -15,6 +15,7 @@ const {
 	mapSessionBranch,
 	registerCiaoAgentExtension,
 	truncateUtf8,
+	WHEREABOUTS_MESSAGE_TYPE,
 } = await import("./ciao-agent-session.ts");
 
 const resources: Array<() => void | Promise<void>> = [];
@@ -780,4 +781,159 @@ test("a daemon that granted nothing never sees the field, and its bound counts w
 	expect(Object.keys(snapshotEnds[0]).sort()).toEqual(["type", "v"]);
 	// Each message reaches it as a 48 KiB head, so all six fit its 4 MiB bound.
 	expect(entries).toBe(6);
+});
+
+/// A stand-in daemon that confirms whereabouts to a register that asked, and answers each query
+/// with whatever `answer` says at the time.
+async function whereaboutsDaemon(socketPath: string, confirm: boolean) {
+	const frames: Record<string, unknown>[] = [];
+	let answer: string | undefined;
+	let peer: net.Socket | undefined;
+	const server = net.createServer((socket) => {
+		peer = socket;
+		socket.on(
+			"data",
+			decodeFrames((frame) => {
+				frames.push(frame);
+				if (frame.type === "register") {
+					socket.write(
+						encodeBridgeFrame({
+							v: 1,
+							type: "registered",
+							session_id: "0123456789abcdef0123456789abcdef",
+							process_generation: 1,
+							snapshot_epoch: 1,
+							...("frame_bytes" in frame ? { frame_bytes: 2 * 1024 * 1024 } : {}),
+							...(confirm && frame.whereabouts === true ? { whereabouts: true } : {}),
+						}),
+					);
+				}
+				if (frame.type === "whereabouts_query") {
+					socket.write(
+						encodeBridgeFrame({
+							v: 1,
+							type: "whereabouts",
+							query_id: frame.query_id,
+							...(answer === undefined ? {} : { note: answer }),
+						}),
+					);
+				}
+			}),
+		);
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(socketPath, resolve);
+	});
+	return {
+		frames,
+		setAnswer(note: string | undefined) {
+			answer = note;
+		},
+		async close() {
+			peer?.destroy();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		},
+	};
+}
+
+function whereaboutsPi() {
+	const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
+	const pi: any = {
+		on(name: string, handler: (event: any, ctx: any) => unknown) {
+			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+		},
+		registerCommand() {},
+	};
+	const emit = async (name: string, event: Record<string, unknown>, ctx: any) => {
+		const results = [];
+		for (const handler of handlers.get(name) ?? []) results.push(await handler({ type: name, ...event }, ctx));
+		return results;
+	};
+	return { pi, emit };
+}
+
+describe("Spec 025: the run hears where its person is", () => {
+	test("asked with the grant, queried before each run, and reset after a compaction", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-pi-whereabouts-"));
+		const socketPath = path.join(root, "agent.sock");
+		const daemon = await whereaboutsDaemon(socketPath, true);
+		const { pi, emit } = whereaboutsPi();
+		const bridge = registerCiaoAgentExtension(pi, socketPath);
+		resources.push(async () => {
+			bridge.stop(true);
+			await daemon.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		});
+		const ctx = piContext();
+		await emit("session_start", { reason: "startup" }, ctx);
+		await eventually(() => bridge.status() === "connected");
+		const registration = daemon.frames.find((frame) => frame.type === "register");
+		expect(registration?.whereabouts).toBe(true);
+
+		// Nothing to say: the run starts untouched.
+		expect(await emit("before_agent_start", { prompt: "hello" }, ctx)).toEqual([undefined]);
+
+		daemon.setAnswer("Where the user is: away from this Mac.");
+		const [result] = await emit("before_agent_start", { prompt: "hello again" }, ctx);
+		expect(result).toEqual({
+			message: {
+				customType: WHEREABOUTS_MESSAGE_TYPE,
+				content: "Where the user is: away from this Mac.",
+				display: false,
+			},
+		});
+		const queries = daemon.frames.filter((frame) => frame.type === "whereabouts_query");
+		expect(queries.map((frame) => frame.query_id)).toEqual(["whereabouts-1", "whereabouts-2"]);
+
+		await emit("session_compact", { reason: "threshold" }, ctx);
+		await eventually(() => daemon.frames.some((frame) => frame.type === "context_reset"));
+	});
+
+	test("a daemon that never confirmed is never asked, and the run never waits", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-pi-whereabouts-"));
+		const socketPath = path.join(root, "agent.sock");
+		const daemon = await whereaboutsDaemon(socketPath, false);
+		const { pi, emit } = whereaboutsPi();
+		const bridge = registerCiaoAgentExtension(pi, socketPath);
+		resources.push(async () => {
+			bridge.stop(true);
+			await daemon.close();
+			fs.rmSync(root, { recursive: true, force: true });
+		});
+		const ctx = piContext();
+		await emit("session_start", { reason: "startup" }, ctx);
+		await eventually(() => bridge.status() === "connected");
+		daemon.setAnswer("Where the user is: away from this Mac.");
+		const began = Date.now();
+		expect(await emit("before_agent_start", { prompt: "hello" }, ctx)).toEqual([undefined]);
+		expect(Date.now() - began).toBeLessThan(100);
+		await emit("session_compact", { reason: "manual" }, ctx);
+		await Bun.sleep(50);
+		expect(daemon.frames.some((frame) => frame.type === "whereabouts_query")).toBe(false);
+		expect(daemon.frames.some((frame) => frame.type === "context_reset")).toBe(false);
+	});
+
+	test("a hidden custom message never reaches the phone; a shown one is a system line", () => {
+		const bridge = new CiaoAgentBridge({} as any, "/nonexistent.sock");
+		const published: unknown[] = [];
+		(bridge as any).publishEntry = (entry: unknown) => published.push(entry);
+		bridge.publishMessage({
+			role: "custom",
+			customType: WHEREABOUTS_MESSAGE_TYPE,
+			content: "Where the user is: away from this Mac.",
+			display: false,
+			timestamp: 1,
+		});
+		expect(published).toEqual([]);
+		bridge.publishMessage({
+			role: "custom",
+			customType: "another-extension",
+			content: "Shown to the person.",
+			display: true,
+			timestamp: 1,
+		});
+		expect(published).toHaveLength(1);
+		expect((published[0] as any).kind).toBe("system");
+	});
 });

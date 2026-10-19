@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use crate::{
     agent_adapter::{
-        AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery, WireTextDelta,
-        WireTimelineEntry,
+        AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery, WhereaboutsDelivery,
+        WireTextDelta, WireTimelineEntry,
     },
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentCommandKind, AgentModelOption, AgentProtocolError,
@@ -355,6 +355,11 @@ pub(crate) enum ClaudeManagedOutbound {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        /// Spec 025: what to tell Claude about where its person is, with this prompt. The worker
+        /// hands it over from its own `UserPromptSubmit` hook, the vendor's channel for exactly
+        /// this, so it never becomes part of what the person said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        additional_context: Option<String>,
     },
     Shutdown {
         v: u8,
@@ -797,7 +802,11 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
 
     /// The outbound vocabulary is fixed to the advertised operations. There is
     /// no generic invocation, slash command, or arbitrary SDK call.
-    fn command_frame(&self, command: AgentCommand) -> Result<Value, AgentProtocolError> {
+    fn command_frame(
+        &self,
+        command: AgentCommand,
+        whereabouts: Option<String>,
+    ) -> Result<Value, AgentProtocolError> {
         let outbound = match command.kind {
             AgentCommandKind::Prompt { text } => ClaudeManagedOutbound::Command {
                 v: CLAUDE_MANAGED_PROTOCOL_VERSION,
@@ -810,6 +819,7 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
                 mode: None,
                 model: None,
                 effort: None,
+                additional_context: whereabouts,
             },
             AgentCommandKind::Interrupt => ClaudeManagedOutbound::Command {
                 v: CLAUDE_MANAGED_PROTOCOL_VERSION,
@@ -822,6 +832,7 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
                 mode: None,
                 model: None,
                 effort: None,
+                additional_context: None,
             },
             AgentCommandKind::InteractionResponse {
                 interaction_id,
@@ -854,6 +865,7 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
                     mode: None,
                     model: None,
                     effort: None,
+                    additional_context: None,
                 }
             }
             AgentCommandKind::SetPermissionMode { mode } => ClaudeManagedOutbound::Command {
@@ -867,6 +879,7 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
                 mode: Some(mode),
                 model: None,
                 effort: None,
+                additional_context: None,
             },
             // The model id is carried as the vendor's own string. It is checked for grammar and
             // bounds upstream, and against the catalogue the SDK actually published by the
@@ -883,6 +896,7 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
                 mode: None,
                 model: Some(model),
                 effort: None,
+                additional_context: None,
             },
             // Effort *is* union-checked here, unlike the model: the levels are the pinned SDK's
             // own fixed set, not a catalogue that grows between releases, so an unknown one is
@@ -902,6 +916,7 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
                     mode: None,
                     model: None,
                     effort: Some(effort),
+                    additional_context: None,
                 }
             }
             AgentCommandKind::Steer { .. }
@@ -909,6 +924,11 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
             | AgentCommandKind::Unknown => return Err(AgentProtocolError::UnexpectedMessage),
         };
         serde_json::to_value(outbound).map_err(|_| AgentProtocolError::MalformedJson)
+    }
+    /// Every managed run starts with a prompt the daemon sends, and nothing else rebuilds the
+    /// worker's context without the daemon knowing — so the note rides the prompt.
+    fn whereabouts_delivery(&self) -> WhereaboutsDelivery {
+        WhereaboutsDelivery::PromptCommand
     }
 
     fn shutdown_frame(&self, reason_code: &str) -> Result<Value, AgentProtocolError> {
@@ -1407,26 +1427,32 @@ mod tests {
             kind,
         };
         let prompt = adapter
-            .command_frame(command(AgentCommandKind::Prompt {
-                text: "Synthetic prompt.".into(),
-            }))
+            .command_frame(
+                command(AgentCommandKind::Prompt {
+                    text: "Synthetic prompt.".into(),
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!(prompt["kind"], "prompt");
         assert_eq!(prompt["text"], "Synthetic prompt.");
         let interrupt = adapter
-            .command_frame(command(AgentCommandKind::Interrupt))
+            .command_frame(command(AgentCommandKind::Interrupt), None)
             .unwrap();
         assert_eq!(interrupt["kind"], "interrupt");
         assert!(interrupt.get("text").is_none());
 
         let response = adapter
-            .command_frame(command(AgentCommandKind::InteractionResponse {
-                interaction_id: "interaction-a".into(),
-                interaction_revision: 1,
-                answer: InteractionAnswer::Choices {
-                    choice_ids: vec!["allow-once".into()],
-                },
-            }))
+            .command_frame(
+                command(AgentCommandKind::InteractionResponse {
+                    interaction_id: "interaction-a".into(),
+                    interaction_revision: 1,
+                    answer: InteractionAnswer::Choices {
+                        choice_ids: vec!["allow-once".into()],
+                    },
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!(response["kind"], "interaction_response");
         assert_eq!(response["choice_id"], "allow-once");
@@ -1435,24 +1461,27 @@ mod tests {
         // A question answer travels as identifiers plus free text. The worker holds the tool's
         // own labels, so nothing the agent wrote has to come back down the wire to be sent up it.
         let answered = adapter
-            .command_frame(command(AgentCommandKind::InteractionResponse {
-                interaction_id: "interaction-b".into(),
-                interaction_revision: 1,
-                answer: InteractionAnswer::Questions {
-                    answers: vec![
-                        crate::agent_protocol::QuestionAnswer {
-                            question_id: "q0".into(),
-                            choice_ids: vec!["q0-o1".into()],
-                            text: None,
-                        },
-                        crate::agent_protocol::QuestionAnswer {
-                            question_id: "q1".into(),
-                            choice_ids: vec![],
-                            text: Some("Something else entirely".into()),
-                        },
-                    ],
-                },
-            }))
+            .command_frame(
+                command(AgentCommandKind::InteractionResponse {
+                    interaction_id: "interaction-b".into(),
+                    interaction_revision: 1,
+                    answer: InteractionAnswer::Questions {
+                        answers: vec![
+                            crate::agent_protocol::QuestionAnswer {
+                                question_id: "q0".into(),
+                                choice_ids: vec!["q0-o1".into()],
+                                text: None,
+                            },
+                            crate::agent_protocol::QuestionAnswer {
+                                question_id: "q1".into(),
+                                choice_ids: vec![],
+                                text: Some("Something else entirely".into()),
+                            },
+                        ],
+                    },
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!(answered["kind"], "interaction_response");
         assert!(answered.get("choice_id").is_none());
@@ -1482,15 +1511,18 @@ mod tests {
                 text: "synthetic".into(),
             },
         ] {
-            assert!(adapter.command_frame(command(unmapped)).is_err());
+            assert!(adapter.command_frame(command(unmapped), None).is_err());
         }
 
         // The model rides as the vendor's own string, brackets and all, with no list of names
         // compiled into this file to go stale.
         let model = adapter
-            .command_frame(command(AgentCommandKind::SetModel {
-                model: "claude-opus-5[1m]".into(),
-            }))
+            .command_frame(
+                command(AgentCommandKind::SetModel {
+                    model: "claude-opus-5[1m]".into(),
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!(model["kind"], "set_model");
         assert_eq!(model["model"], "claude-opus-5[1m]");
@@ -1498,9 +1530,12 @@ mod tests {
         assert!(model.get("effort").is_none());
 
         let effort = adapter
-            .command_frame(command(AgentCommandKind::SetEffort {
-                effort: "xhigh".into(),
-            }))
+            .command_frame(
+                command(AgentCommandKind::SetEffort {
+                    effort: "xhigh".into(),
+                }),
+                None,
+            )
             .unwrap();
         assert_eq!(effort["kind"], "set_effort");
         assert_eq!(effort["effort"], "xhigh");
@@ -1511,9 +1546,12 @@ mod tests {
         for level in ["ludicrous", "LOW", "medium ", ""] {
             assert!(
                 adapter
-                    .command_frame(command(AgentCommandKind::SetEffort {
-                        effort: level.into(),
-                    }))
+                    .command_frame(
+                        command(AgentCommandKind::SetEffort {
+                            effort: level.into(),
+                        }),
+                        None
+                    )
                     .is_err(),
                 "{level} is not a level this pin can run"
             );
