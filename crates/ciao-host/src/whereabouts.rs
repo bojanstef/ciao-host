@@ -69,7 +69,15 @@ pub(crate) enum HostInput {
     )]
     Unobservable,
     /// The probe failed or ran out of time. Says nothing either way.
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        allow(dead_code, reason = "only a host with a local input probe constructs it")
+    )]
     Unreadable,
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        allow(dead_code, reason = "only a host with a local input probe constructs it")
+    )]
     IdleFor(Duration),
 }
 
