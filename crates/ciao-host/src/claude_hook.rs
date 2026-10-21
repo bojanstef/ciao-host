@@ -333,7 +333,12 @@ fn valid_version_cache_name(name: &str) -> bool {
 /// wake-ups, slash-command expansions, injected reminders, and `!` bash echoes. Observed in the
 /// owner's own transcripts rather than guessed — `<task-notification>`, `<command-name>` and
 /// `<local-command-caveat>` each appear dozens of times.
-const SYNTHETIC_PROMPT_ENVELOPES: [&str; 8] = [
+///
+/// The last one is not XML: Claude's cross-session messaging hands a peer session's message to its
+/// recipient as a prompt beginning with that sentence. Seen 2026-10-21 in a coordinator on a
+/// Linux host, where it was read as a person's prompt — drawn as one on the phone, and answered
+/// with Spec 025's whereabouts note as if the owner had typed it.
+const SYNTHETIC_PROMPT_ENVELOPES: [&str; 9] = [
     "<task-notification>",
     "<system-reminder>",
     "<local-command-caveat>",
@@ -342,6 +347,7 @@ const SYNTHETIC_PROMPT_ENVELOPES: [&str; 8] = [
     "<command-message>",
     "<bash-input>",
     "<bash-stdout>",
+    "Another Claude session sent a message:",
 ];
 
 /// Whether a `UserPromptSubmit` payload is machinery rather than something a person said.
@@ -823,6 +829,7 @@ mod tests {
             "<local-command-stdout>output",
             "<system-reminder>remember something",
             "<bash-input>ls",
+            "Another Claude session sent a message:\n\nThe legacy-suites notes are in.",
             "  \n<task-notification>leading whitespace still counts",
         ] {
             let mut user = common("UserPromptSubmit");

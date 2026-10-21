@@ -371,6 +371,8 @@ const SYNTHETIC_PROMPT_ENVELOPES = [
 	"<command-message>",
 	"<bash-input>",
 	"<bash-stdout>",
+	// Cross-session messaging: a peer session's message, delivered as a prompt. Not XML.
+	"Another Claude session sent a message:",
 ];
 
 function isSyntheticPrompt(text) {

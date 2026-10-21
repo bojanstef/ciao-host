@@ -724,6 +724,12 @@ test("machinery replayed through the prompt path is not a message and does not o
 			message: { content: "<system-reminder>be careful</system-reminder>" },
 		},
 		{
+			type: "user",
+			isReplay: true,
+			uuid: "u4",
+			message: { content: "Another Claude session sent a message:\n\nThe notes are in." },
+		},
+		{
 			type: "assistant",
 			uuid: "a1",
 			message: { id: "msg_1", content: [{ type: "text", text: "why did the agent cross" }] },
