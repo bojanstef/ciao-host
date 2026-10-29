@@ -34,7 +34,6 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | aes | 0.8.4 | MIT OR Apache-2.0 |
 | aes-gcm | 0.10.3 | Apache-2.0 OR MIT |
 | aho-corasick | 1.1.4 | Unlicense OR MIT |
-| allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |
 | android_system_properties | 0.1.5 | MIT/Apache-2.0 |
 | anstream | 1.0.0 | MIT OR Apache-2.0 |
 | anstyle | 1.0.14 | MIT OR Apache-2.0 |
@@ -98,7 +97,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
 | crypto-common | 0.2.2 | MIT OR Apache-2.0 |
 | ctr | 0.9.2 | MIT OR Apache-2.0 |
-| ctutils | 0.4.2 | Apache-2.0 OR MIT |
+| ctutils | 0.4.6 | Apache-2.0 OR MIT |
 | curve25519-dalek | 4.1.3 | BSD-3-Clause |
 | curve25519-dalek | 5.0.0-rc.0 | BSD-3-Clause |
 | curve25519-dalek-derive | 0.1.1 | MIT/Apache-2.0 |
@@ -155,14 +154,14 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | getrandom | 0.4.3 | MIT OR Apache-2.0 |
 | ghash | 0.5.1 | Apache-2.0 OR MIT |
 | gloo-timers | 0.3.0 | MIT OR Apache-2.0 |
-| h2 | 0.4.15 | MIT |
+| h2 | 0.4.20 | MIT |
 | hash32 | 0.2.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | heapless | 0.7.17 | MIT OR Apache-2.0 |
 | heck | 0.5.0 | MIT OR Apache-2.0 |
-| hickory-net | 0.26.1 | MIT OR Apache-2.0 |
-| hickory-proto | 0.26.1 | MIT OR Apache-2.0 |
-| hickory-resolver | 0.26.1 | MIT OR Apache-2.0 |
+| hickory-net | 0.26.3 | MIT OR Apache-2.0 |
+| hickory-proto | 0.26.3 | MIT OR Apache-2.0 |
+| hickory-resolver | 0.26.3 | MIT OR Apache-2.0 |
 | http | 1.4.2 | MIT OR Apache-2.0 |
 | http-body | 1.1.0 | MIT |
 | http-body-util | 0.1.4 | MIT |
@@ -214,7 +213,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | lock_api | 0.4.14 | MIT OR Apache-2.0 |
 | log | 0.4.33 | MIT OR Apache-2.0 |
 | loom | 0.7.2 | MIT |
-| lru | 0.18.1 | MIT |
+| lru | 0.18.5 | MIT |
 | lru-slab | 0.1.2 | MIT OR Apache-2.0 OR Zlib |
 | mac-addr | 0.3.0 | MIT |
 | matchers | 0.2.0 | MIT |
@@ -298,12 +297,12 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| rustls | 0.23.42 | Apache-2.0 OR ISC OR MIT |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT |
 | rustls-native-certs | 0.8.4 | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.15.0 | MIT OR Apache-2.0 |
 | rustls-platform-verifier | 0.7.0 | MIT OR Apache-2.0 |
 | rustls-platform-verifier-android | 0.1.1 | MIT OR Apache-2.0 |
-| rustls-webpki | 0.103.13 | ISC |
+| rustls-webpki | 0.103.16 | ISC |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | same-file | 1.0.6 | Unlicense/MIT |
@@ -366,7 +365,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | tinystr | 0.8.3 | Unicode-3.0 |
 | tinyvec | 1.12.0 | Zlib OR Apache-2.0 OR MIT |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib |
-| tokio | 1.53.0 | MIT |
+| tokio | 1.53.3 | MIT |
 | tokio-macros | 2.7.1 | MIT |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 |
 | tokio-stream | 0.1.18 | MIT |
@@ -412,8 +411,8 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | wasm-streams | 0.5.0 | MIT OR Apache-2.0 |
 | web-sys | 0.3.103 | MIT OR Apache-2.0 |
 | web-time | 1.1.0 | MIT OR Apache-2.0 |
-| webpki-root-certs | 1.0.9 | CDLA-Permissive-2.0 |
-| webpki-roots | 1.0.9 | CDLA-Permissive-2.0 |
+| webpki-root-certs | 1.0.11 | CDLA-Permissive-2.0 |
+| webpki-roots | 1.0.11 | CDLA-Permissive-2.0 |
 | widestring | 1.2.1 | MIT OR Apache-2.0 |
 | winapi | 0.3.9 | MIT/Apache-2.0 |
 | winapi-i686-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 |
