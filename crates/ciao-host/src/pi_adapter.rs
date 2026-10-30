@@ -1,4 +1,4 @@
-//! Pi 0.81.1 attached-TUI bridge adapter (Spec 005 §9).
+//! Pi 1.4.0 attached-TUI bridge adapter (Spec 005 §9).
 //!
 //! Pi-owned shapes stop here. The supervisor receives only Ciao canonical registrations, entries,
 //! command capabilities, and categorical receipts. There is no arbitrary invocation, argv, file,
@@ -21,7 +21,7 @@ use crate::{
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
 
-pub(crate) const PINNED_PI_VERSION: &str = "0.81.1";
+pub(crate) const PINNED_PI_VERSION: &str = "1.4.0";
 pub(crate) const PI_BRIDGE_PROTOCOL_VERSION: u8 = 1;
 
 pub(crate) struct PiAttachedAdapter;
@@ -643,14 +643,14 @@ mod tests {
         assert_eq!(accepted.observation.reason_code, "pi_extension_ui_partial");
 
         // A later patch inside the tested minor is still a tested build.
-        let patched = register("0.81.9", "tui").normalize(Some(42)).unwrap();
+        let patched = register("1.4.9", "tui").normalize(Some(42)).unwrap();
         assert!(patched.compatible);
         assert_eq!(patched.observation.reason_code, "pi_extension_ui_partial");
 
         // A minor bump is outside conformance but not outside the API. The bridge only
         // advertises a command after finding the surface for it, so the host honours the
         // advertisement and says plainly that the build is untested.
-        let untested = register("0.82.1", "tui").normalize(Some(42)).unwrap();
+        let untested = register("1.5.0", "tui").normalize(Some(42)).unwrap();
         assert!(untested.compatible);
         assert!(untested.capabilities.commands.prompt);
         assert_eq!(
@@ -660,7 +660,7 @@ mod tests {
 
         // A bridge that detected nothing is honoured just as exactly: an untested build does
         // not invent capability, it forwards whatever the extension found.
-        let mut silent = register("0.82.1", "tui");
+        let mut silent = register("1.5.0", "tui");
         silent.commands = PiBridgeCommandCapabilities {
             prompt: false,
             steer: false,
@@ -683,8 +683,16 @@ mod tests {
                 .is_authoritative_working()
         );
 
+        // Re-grounding to 1.x does not claim that the old major still has the same semantics.
+        let previous_major = register("0.99.1", "tui").normalize(Some(42)).unwrap();
+        assert!(!previous_major.compatible);
+        assert_eq!(
+            previous_major.capabilities.commands,
+            CommandCapabilities::none()
+        );
+
         // A declared breaking change still closes the door outright.
-        let incompatible = register("1.0.0", "tui").normalize(Some(42)).unwrap();
+        let incompatible = register("2.0.0", "tui").normalize(Some(42)).unwrap();
         assert!(!incompatible.compatible);
         assert_eq!(
             incompatible.capabilities.commands,

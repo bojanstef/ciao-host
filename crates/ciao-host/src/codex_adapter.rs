@@ -30,7 +30,7 @@ use crate::{
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
 
-pub(crate) const PINNED_CODEX_VERSION: &str = "0.163.0";
+pub(crate) const PINNED_CODEX_VERSION: &str = "0.166.0";
 pub(crate) const CODEX_HOOK_PROTOCOL_VERSION: u8 = 1;
 
 /// The distilled schema extract this pin was grounded against, embedded so the daemon can tell
@@ -329,6 +329,9 @@ mod tests {
         assert!(known_hook_event("UserPromptSubmit"));
         // Grounded since the 0.154.0 re-grounding; novel names are synthetic on purpose.
         assert!(known_hook_event("Interrupt"));
+        // Grounded at 0.166.0 and deliberately ignored, not novel or turn boundaries.
+        assert!(known_hook_event("PreModelRequest"));
+        assert!(known_hook_event("PostModelRequest"));
         assert!(!known_hook_event("ScopeConformanceFutureHook"));
         for extract in [
             "",

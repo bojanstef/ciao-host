@@ -16,7 +16,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::storage::{CiaoPaths, atomic_write_private, validate_private_file};
 
 const EXTENSION_FILE_NAME: &str = "ciao-agent-session.ts";
-const OWNERSHIP_MARKER: &str = "Ciao attached Agent Session bridge for Pi 0.81.1";
+// Ownership survives a vendor re-grounding, so updates still recognize the old owned file.
+const OWNERSHIP_MARKER: &str = "Ciao attached Agent Session bridge for Pi ";
 const MAX_EXTENSION_BYTES: u64 = 128 * 1024;
 const EXTENSION_SOURCE: &str = include_str!("../../../integrations/pi/ciao-agent-session.ts");
 
@@ -280,6 +281,36 @@ mod tests {
     }
 
     #[test]
+    fn the_previous_major_extension_can_be_updated_or_uninstalled() {
+        let temporary = tempdir().unwrap();
+        let extensions = temporary.path().join("extensions");
+        fs::create_dir(&extensions).unwrap();
+        let target = extensions.join(EXTENSION_FILE_NAME);
+        let previous = EXTENSION_SOURCE
+            .replace(
+                "Ciao attached Agent Session bridge for Pi 1.4.0.",
+                "Ciao attached Agent Session bridge for Pi 0.81.1.",
+            )
+            .replace(
+                "const TESTED_PI_VERSION = \"1.4.0\";",
+                "const TESTED_PI_VERSION = \"0.81.1\";",
+            );
+        assert_ne!(previous, EXTENSION_SOURCE);
+        fs::write(&target, &previous).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            status_at(&target).unwrap(),
+            PiIntegrationStatus::UpdateAvailable
+        );
+        assert_eq!(install_at(&target).unwrap(), PiIntegrationStatus::Installed);
+        assert_eq!(fs::read(&target).unwrap(), EXTENSION_SOURCE.as_bytes());
+
+        fs::write(&target, previous).unwrap();
+        assert!(uninstall_at(&target).unwrap());
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn foreign_files_and_symlinks_are_never_replaced_or_removed() {
         let temporary = tempdir().unwrap();
         let extensions = temporary.path().join("extensions");
@@ -302,6 +333,13 @@ mod tests {
     #[test]
     fn embedded_extension_has_a_small_fixed_command_and_no_ui_interception_surface() {
         validate_embedded_source().unwrap();
+        assert!(
+            EXTENSION_SOURCE.contains(&format!(
+                "const TESTED_PI_VERSION = \"{}\";",
+                crate::pi_adapter::PINNED_PI_VERSION
+            )),
+            "the embedded bridge and its host must ground the same Pi version"
+        );
         assert!(EXTENSION_SOURCE.contains("\"prompt\""));
         assert!(EXTENSION_SOURCE.contains("\"steer\""));
         assert!(EXTENSION_SOURCE.contains("\"follow_up\""));

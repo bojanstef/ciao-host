@@ -4,7 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const PINNED_CLAUDE_VERSION = "2.1.222";
+// Runtime grounding moves independently of the adapter's backwards-compatible install floor.
+const TESTED_CLAUDE_VERSION = "2.1.314";
 const runGrounded = process.env.CIAO_TEST_CLAUDE_CLI === "1";
 const groundedTest = runGrounded ? test : test.skip;
 const temporaryRoots: string[] = [];
@@ -105,7 +106,7 @@ function commandHook(probe: string) {
 }
 
 test("Claude conformance remains pinned explicitly", () => {
-	expect(PINNED_CLAUDE_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+	expect(TESTED_CLAUDE_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
 });
 
 groundedTest("pinned Claude CLI exposes authenticated exec-form hook identity", () => {
@@ -126,7 +127,7 @@ groundedTest("pinned Claude CLI exposes authenticated exec-form hook identity", 
 
 	const version = spawnSync("claude", ["--version"], { encoding: "utf8" });
 	expect(version.status).toBe(0);
-	expect(version.stdout.trim()).toBe(`${PINNED_CLAUDE_VERSION} (Claude Code)`);
+	expect(version.stdout.trim()).toBe(`${TESTED_CLAUDE_VERSION} (Claude Code)`);
 
 	const run = claude(
 		root,

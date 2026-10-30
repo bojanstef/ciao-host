@@ -561,6 +561,8 @@ fn contracts() -> [ParityContract; 4] {
     [
         ParityContract {
             id: "pi",
+            // Re-grounded at 1.4.0: the same four commands, lifecycle events and whereabouts
+            // query run through Pi's actual loader/runner; the major gate remains closed.
             family: "Pi",
             topology: "attached",
             connection: AdapterConnectionKind::PersistentBridge,
@@ -654,6 +656,8 @@ fn contracts() -> [ParityContract; 4] {
         },
         ParityContract {
             id: "claude-managed",
+            // SDK 0.3.314 / CLI 2.1.314 preserve this declaration read-set and the correlated
+            // replay acknowledgement; broader permission/resume probes stay manual.
             family: "Claude",
             topology: "managed",
             connection: AdapterConnectionKind::PersistentBridge,
@@ -719,7 +723,7 @@ fn contracts() -> [ParityContract; 4] {
         ParityContract {
             id: "codex",
             // Hook novelty tallies locally against hookEventNames, without dispatch. The
-            // 0.154.0 re-grounding admits that version and lists Interrupt as deliberately
+            // 0.166.0 re-grounding also lists PreModelRequest/PostModelRequest as deliberately
             // ignored; capability, event and registration sets stay unchanged. See
             // future_shaped_input_codex_hook_novelty_without_dispatch and
             // future_shaped_input_codex_grounded_vocabulary_is_accounted.

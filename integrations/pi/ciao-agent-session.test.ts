@@ -3,7 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-mock.module("@earendil-works/pi-coding-agent", () => ({ VERSION: "0.81.1" }));
+mock.module("@earendil-works/pi-coding-agent", () => ({ VERSION: "1.4.0" }));
 const {
 	CiaoAgentBridge,
 	defaultBridgeSocketPath,
@@ -46,19 +46,20 @@ async function eventually(predicate: () => boolean, timeout = 2_000): Promise<vo
 }
 
 test("a tested build is the conformance minor, not every build that works", () => {
-	expect(isTestedPiVersion("0.81.1")).toBe(true);
+	expect(isTestedPiVersion("1.4.0")).toBe(true);
 	// The routine upgrade that used to strand native control.
-	expect(isTestedPiVersion("0.81.9")).toBe(true);
-	// Older patch: the tested build may need something added after it.
-	expect(isTestedPiVersion("0.81.0")).toBe(false);
-	expect(isTestedPiVersion("0.82.0")).toBe(false);
-	expect(isTestedPiVersion("0.81.2-rc1")).toBe(false);
+	expect(isTestedPiVersion("1.4.9")).toBe(true);
+	// Builds before this grounding are not reported as tested.
+	expect(isTestedPiVersion("1.3.9")).toBe(false);
+	expect(isTestedPiVersion("1.5.0")).toBe(false);
+	expect(isTestedPiVersion("1.4.1-rc1")).toBe(false);
 });
 
 test("only a declared breaking change closes the door", () => {
-	expect(isPiMajorCompatible("0.82.1")).toBe(true);
-	expect(isPiMajorCompatible("0.99.0")).toBe(true);
-	expect(isPiMajorCompatible("1.0.0")).toBe(false);
+	expect(isPiMajorCompatible("1.4.0")).toBe(true);
+	expect(isPiMajorCompatible("1.5.0")).toBe(true);
+	expect(isPiMajorCompatible("0.99.1")).toBe(false);
+	expect(isPiMajorCompatible("2.0.0")).toBe(false);
 	expect(isPiMajorCompatible("garbage")).toBe(false);
 });
 

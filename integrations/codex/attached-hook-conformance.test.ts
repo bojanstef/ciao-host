@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const PINNED_CODEX_VERSION = "0.163.0";
+const PINNED_CODEX_VERSION = "0.166.0";
 const runGrounded = process.env.CIAO_TEST_CODEX_CLI === "1";
 const groundedTest = runGrounded ? test : test.skip;
 const pins = JSON.parse(
@@ -106,9 +106,11 @@ test("the pins record the protocol the adapter was built against", () => {
 	// {Started,Completed}, project/changed, thread/project/updated, thread/queue/changed,
 	// thread/realtime/item/{started,completed,transcript/delta}, thread/reverted); nothing
 	// removed. Before that, 90→95 at 0.146.1→0.147.0 was five additive thread-section methods.
+	// 105→106 at 0.163.0→0.166.0: feedback/save added, no removed client methods; notification
+	// and server-request method sets unchanged (85/10), diffed from both binaries on 2026-10-29.
 	// This literal is the tripwire that makes someone look — if it fails, diff both binaries'
 	// generate-json-schema output before editing the number.
-	expect(pins.counts).toEqual({ clientMethods: 105, serverNotifications: 85 });
+	expect(pins.counts).toEqual({ clientMethods: 106, serverNotifications: 85 });
 	// Without these two the adapter has no join key and no history; their absence is
 	// categorical rather than a degradation.
 	expect(pins.requiredClientMethods).toContain("thread/read");

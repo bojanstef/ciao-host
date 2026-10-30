@@ -286,12 +286,16 @@ pub(crate) fn parse_codex_version_output(output: &std::process::Output) -> Resul
 /// `Interrupt` (0.154.0) ends a turn from the person's side. Riding it on a `Turn` frame is a
 /// proposal, not a repair: an interrupted turn has no `last_assistant_message`, and Codex's
 /// `Stop` still follows and closes the turn, so nothing is lost by observing it silently.
+/// The model-request hooks grounded at 0.166.0 describe requests inside a turn; they cannot
+/// replace the prompt/stop boundaries without clobbering the turn those events established.
 pub(crate) const IGNORED_HOOK_EVENTS: &[&str] = &[
     "PreCompact",
     "PostCompact",
     "SubagentStart",
     "SubagentStop",
     "Interrupt",
+    "PreModelRequest",
+    "PostModelRequest",
 ];
 
 /// Maps one hook payload to a registration plus one event, or to nothing at all.
@@ -780,6 +784,8 @@ pub(crate) mod tests {
             "PostCompact",
             "SubagentStart",
             "SubagentStop",
+            "PreModelRequest",
+            "PostModelRequest",
             "SessionStart",
             "UserPromptSubmit",
             "PreToolUse",

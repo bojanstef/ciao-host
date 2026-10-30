@@ -1,5 +1,5 @@
 /**
- * Ciao attached Agent Session bridge for Pi 0.81.1.
+ * Ciao attached Agent Session bridge for Pi 1.4.0.
  *
  * This extension observes only documented Pi session/lifecycle events and accepts only four
  * fixed native operations. It never intercepts extension UI, terminal input, arbitrary commands,
@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const BRIDGE_VERSION = 1;
-const TESTED_PI_VERSION = "0.81.1";
+const TESTED_PI_VERSION = "1.4.0";
 
 /// Whether the build is one conformance actually covered: the same minor, at or after the
 /// tested patch. Reported to the host so it can say so; no longer what gates control.

@@ -1,8 +1,8 @@
 {
-	"pin": "0.163.0",
+	"pin": "0.166.0",
 	"generatedBy": "integrations/codex/generate-conformance.mjs",
 	"counts": {
-		"clientMethods": 105,
+		"clientMethods": 106,
 		"serverNotifications": 85
 	},
 	"requiredClientMethods": [
@@ -59,8 +59,10 @@
 		"interrupt",
 		"permissionRequest",
 		"postCompact",
+		"postModelRequest",
 		"postToolUse",
 		"preCompact",
+		"preModelRequest",
 		"preToolUse",
 		"sessionEnd",
 		"sessionStart",
@@ -126,5 +128,5 @@
 		"waitingOnApproval",
 		"waitingOnUserInput"
 	],
-	"schemaDigest": "5bc4fe632208c81254f011e59f0a680c4897a85ce6b8c6b7e10b977c57c19ce8"
+	"schemaDigest": "bcb7b1bb6fc2a4519a354161c9bb7baac018d8b710a0b1ec04b47e202682a44a"
 }

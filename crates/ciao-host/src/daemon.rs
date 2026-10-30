@@ -6114,7 +6114,7 @@ mod tests {
                 "v": 1,
                 "type": "register",
                 "adapter": "pi",
-                "adapter_version": "0.81.1",
+                "adapter_version": crate::pi_adapter::PINNED_PI_VERSION,
                 "mode": "tui",
                 "session_id": "fixture-upstream-session",
                 "process_nonce": "0123456789abcdef0123456789abcdef",
@@ -6371,6 +6371,11 @@ mod tests {
         else {
             panic!("expected complete subscription snapshot");
         };
+        assert_eq!(snapshot.adapter.compatibility, "compatible");
+        assert_eq!(
+            snapshot.adapter.version,
+            crate::pi_adapter::PINNED_PI_VERSION
+        );
         assert_eq!(snapshot.timeline_window.entries.len(), 2);
         assert!(!snapshot.turn.is_authoritative_working());
 
@@ -6379,6 +6384,7 @@ mod tests {
         // revalidation, then correlates the adapter's categorical application receipt.
         if std::env::var_os("CIAO_TEST_SYSTEM_TMUX").is_some() {
             assert_eq!(snapshot.terminal_fallback.continuity, "exact_live");
+            assert!(snapshot.capabilities.commands.prompt);
             let command_id = "11111111111111111111111111111111";
             write_agent_frame(
                 &mut subscription_send,

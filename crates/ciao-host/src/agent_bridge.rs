@@ -953,7 +953,7 @@ mod tests {
         let mut value = serde_json::json!({
             "v": 1,
             "type": "register",
-            "adapter_version": "0.81.1",
+            "adapter_version": crate::pi_adapter::PINNED_PI_VERSION,
             "mode": "tui",
             "session_id": "fixture-upstream-session",
             "process_nonce": "0123456789abcdef0123456789abcdef",
@@ -979,6 +979,8 @@ mod tests {
             let selected = registry.select(&body, Some(std::process::id())).unwrap();
             assert_eq!(selected.codec.id(), "pi");
             assert_eq!(selected.registration.adapter_family, "Pi");
+            assert!(selected.registration.compatible);
+            assert!(selected.registration.capabilities.commands.prompt);
             assert_eq!(selected.registration.observation.coverage, "partial");
             assert_eq!(selected.registration.capabilities.history, "full");
         }
