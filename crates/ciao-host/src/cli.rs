@@ -1208,7 +1208,17 @@ async fn reset_command(paths: &CiaoPaths, yes: bool) -> Result<()> {
 
     print!("Removing identity, pairing, and configuration… ");
     io::stdout().flush()?;
+    reset_identity_files(paths)?;
+    println!("done");
+    println!("\nThis host is fully reset. Run `ciao setup --yes` to start again.");
+    Ok(())
+}
+
+fn reset_identity_files(paths: &CiaoPaths) -> Result<()> {
     for file in [
+        // Revoke delegation before removing the identity. If this fails, a later setup
+        // must not give a fresh host identity the old grants.
+        &paths.peers_file,
         &paths.credentials_file,
         &paths.paired_devices_file,
         &paths.agent_metadata_file,
@@ -1224,8 +1234,6 @@ async fn reset_command(paths: &CiaoPaths, yes: bool) -> Result<()> {
             }
         }
     }
-    println!("done");
-    println!("\nThis host is fully reset. Run `ciao setup --yes` to start again.");
     Ok(())
 }
 
@@ -1600,6 +1608,75 @@ fn unix_now() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_never_carries_peer_authority_into_a_new_host_identity() {
+        use crate::peers::{Descriptor, Incoming, Outgoing, Peers, StartRecord};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = [
+            CiaoPaths::for_home(temp.path().join("mac")),
+            CiaoPaths::for_linux_home(temp.path().join("linux"), None, None, None),
+        ];
+        for paths in paths {
+            paths.ensure_layout().unwrap();
+            let peer_id = iroh::SecretKey::generate().public();
+            let peer = Descriptor {
+                endpoint_id: peer_id.to_string(),
+                name: "Source".into(),
+            };
+            let peers = Peers::load(&paths.peers_file).unwrap();
+            peers
+                .change(|store| {
+                    store.incoming.push(Incoming {
+                        peer: peer.clone(),
+                        grant_id: "old-grant".into(),
+                        issuer: iroh::SecretKey::generate().public().to_string(),
+                        workspace_ids: vec!["workspace".into()],
+                    });
+                    store.outgoing.push(Outgoing {
+                        peer,
+                        grant_id: "other-grant".into(),
+                    });
+                    store.starts.push(StartRecord {
+                        grant_id: "old-grant".into(),
+                        request_id: "old-start".into(),
+                        workspace_id: "workspace".into(),
+                        outcome: None,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            drop(peers);
+            assert!(
+                Peers::load(&paths.peers_file)
+                    .unwrap()
+                    .incoming(peer_id, Some("old-grant"))
+                    .is_some()
+            );
+            reset_identity_files(&paths).unwrap();
+            let fresh = Peers::load(&paths.peers_file).unwrap();
+            assert!(
+                fresh.incoming(peer_id, Some("old-grant")).is_none(),
+                "a full reset must revoke the old peer"
+            );
+            assert!(fresh.snapshot().outgoing.is_empty());
+            assert!(fresh.snapshot().starts.is_empty());
+        }
+    }
+
+    #[test]
+    fn reset_keeps_the_identity_when_peer_revocation_cannot_be_persisted() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = CiaoPaths::for_home(temp.path());
+        paths.ensure_layout().unwrap();
+        std::fs::write(&paths.credentials_file, b"original identity").unwrap();
+        std::fs::create_dir(&paths.peers_file).unwrap();
+        assert!(reset_identity_files(&paths).is_err());
+        assert_eq!(
+            std::fs::read(&paths.credentials_file).unwrap(),
+            b"original identity"
+        );
+    }
 
     #[test]
     fn cli_shape_contains_only_accepted_commands() {

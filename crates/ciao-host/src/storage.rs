@@ -38,6 +38,8 @@ pub struct CiaoPaths {
     pub config_file: PathBuf,
     pub credentials_file: PathBuf,
     pub paired_devices_file: PathBuf,
+    /// Directional peer grants and durable start claims, bound to this host identity.
+    pub peers_file: PathBuf,
     /// Metadata-only Agent Session identity/receipt store. It never contains timeline content.
     pub agent_metadata_file: PathBuf,
     /// Metadata-only managed-session lifecycle/ownership store (Spec 006 §8.3). A separate file
@@ -88,6 +90,7 @@ impl CiaoPaths {
             config_file: support_dir.join("config.json"),
             credentials_file: support_dir.join("credentials.json"),
             paired_devices_file: support_dir.join("paired-devices.json"),
+            peers_file: support_dir.join("peers.json"),
             agent_metadata_file: support_dir.join("agent-metadata.json"),
             agent_managed_file: support_dir.join("agent-managed.json"),
             managed_sdk_prefix: support_dir.join("managed/claude-sdk"),
@@ -135,6 +138,7 @@ impl CiaoPaths {
             config_file: support_dir.join("config.json"),
             credentials_file: state_dir.join("credentials.json"),
             paired_devices_file: state_dir.join("paired-devices.json"),
+            peers_file: state_dir.join("peers.json"),
             agent_metadata_file: state_dir.join("agent-metadata.json"),
             agent_managed_file: state_dir.join("agent-managed.json"),
             managed_sdk_prefix: state_dir.join("managed/claude-sdk"),

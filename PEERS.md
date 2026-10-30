@@ -12,7 +12,9 @@ offline. Older hosts refuse the new administration stream and need an update.
 The destination's Linked Computers screen lists incoming grants and can revoke them. Revoking
 blocks new requests and closes peer connections; existing agents continue under your control.
 Unpairing the phone on the destination also revokes incoming grants that phone introduced.
-The source may retain a stale introduction, which the destination will refuse.
+The source may retain a stale introduction, which the destination will refuse. A full `ciao reset`
+removes incoming grants, outgoing links and start claims before discarding the host identity;
+if that removal fails, the identity is retained and the reset reports an error.
 
 ## Use from an agent or terminal
 

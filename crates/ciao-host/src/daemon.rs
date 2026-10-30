@@ -788,7 +788,7 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     )?;
     let paired_devices = Arc::new(Mutex::new(paired_devices));
     let state = Arc::new(RuntimeState {
-        peers: crate::peers::Peers::load(&paths.state_dir.join("peers.json"))?,
+        peers: crate::peers::Peers::load(&paths.peers_file)?,
         host_endpoint_id: identity.endpoint_id,
         online: AtomicBool::new(false),
         relay_known: AtomicBool::new(false),
