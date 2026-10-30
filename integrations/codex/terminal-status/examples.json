@@ -1,0 +1,27 @@
+{
+  "embedded": {
+    "v": 1,
+    "generation": 1,
+    "connection": {"kind": "embedded", "state": "connected", "server": null},
+    "displayed_thread_id": "11111111-1111-4111-8111-111111111111",
+    "attached_thread_ids": ["11111111-1111-4111-8111-111111111111"]
+  },
+  "shared": {
+    "v": 1,
+    "generation": 2,
+    "connection": {
+      "kind": "local_daemon",
+      "state": "connected",
+      "server": {"pid": 1234, "identity": "linux:12345678-1234-1234-1234-123456789abc:5678"}
+    },
+    "displayed_thread_id": "22222222-2222-4222-8222-222222222222",
+    "attached_thread_ids": ["22222222-2222-4222-8222-222222222222"]
+  },
+  "disconnected": {
+    "v": 1,
+    "generation": 3,
+    "connection": {"kind": "local_daemon", "state": "disconnected", "server": null},
+    "displayed_thread_id": null,
+    "attached_thread_ids": []
+  }
+}
