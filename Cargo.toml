@@ -42,7 +42,7 @@ x25519-dalek = "2.0.1"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
-# iroh 1.0.2 plus per-path close/idle controls; see vendor/iroh/CIAO-PATCH.md.
+# iroh 1.0.2 plus per-path close/idle controls and the GHSA-7cq4-mhxw-xw78 relay fix; see vendor/iroh/CIAO-PATCH.md.
 [patch.crates-io]
 iroh = { path = "vendor/iroh" }
 # noq-proto 1.0.1 (the version iroh 1.0.2 uses) plus PathStats::pto_count; see vendor/noq-proto/CIAO-PATCH.md.
