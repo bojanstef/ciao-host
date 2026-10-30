@@ -1310,6 +1310,7 @@ mod tests {
             AgentCapabilities, CommandCapabilities, InteractionCapabilities, Observation, TurnState,
         };
         crate::agent_session::NormalizedRegistration {
+            terminal_binding: None,
             history_boundary: None,
             upstream_identity: format!("grounded-session-{index}"),
             process_nonce: format!("grounded-nonce-{index:04}"),

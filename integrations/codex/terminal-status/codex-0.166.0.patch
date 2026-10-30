@@ -1,0 +1,3497 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 1d27abb..0455dff 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -287,7 +287,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+ 
+ [[package]]
+ name = "app_test_support"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -1888,7 +1888,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-core",
+@@ -1900,7 +1900,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-graph-store"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+  "codex-state",
+@@ -1915,7 +1915,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-identity"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -1935,7 +1935,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-message-board-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -1958,7 +1958,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-message-board-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-extension-api",
+  "codex-message-board",
+@@ -1972,7 +1972,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-roles"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-config",
+  "codex-file-system",
+@@ -1985,7 +1985,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-analytics"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-app-server-protocol",
+  "codex-git-utils",
+@@ -2008,7 +2008,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-ansi-escape"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "ansi-to-tui",
+  "pretty_assertions",
+@@ -2019,7 +2019,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-api"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "assert_matches",
+@@ -2057,7 +2057,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -2174,9 +2174,10 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-app-server",
++ "codex-app-server-daemon",
+  "codex-app-server-protocol",
+  "codex-app-server-transport",
+  "codex-arg0",
+@@ -2189,6 +2190,7 @@ dependencies = [
+  "codex-utils-absolute-path",
+  "codex-utils-rustls-provider",
+  "futures",
++ "libc",
+  "pretty_assertions",
+  "serde",
+  "serde_json",
+@@ -2202,7 +2204,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-daemon"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "blake3",
+@@ -2232,7 +2234,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-protocol"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-app-server-protocol-noop-macros",
+@@ -2266,11 +2268,11 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-protocol-noop-macros"
+-version = "0.0.0"
++version = "0.166.0"
+ 
+ [[package]]
+ name = "codex-app-server-test-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2292,7 +2294,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-transport"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "axum",
+  "base64 0.22.1",
+@@ -2335,7 +2337,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-apply-patch"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -2355,7 +2357,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-arg0"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-apply-patch",
+@@ -2378,7 +2380,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-async-utils"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+  "rand 0.9.3",
+@@ -2388,7 +2390,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-attachment-store"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+  "serde",
+@@ -2398,7 +2400,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-aws-auth"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "aws-config",
+  "aws-credential-types",
+@@ -2424,7 +2426,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-backend-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-api",
+@@ -2444,7 +2446,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-backend-openapi-models"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "serde",
+  "serde_json",
+@@ -2453,7 +2455,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-build-info"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-install-context",
+  "pretty_assertions",
+@@ -2466,7 +2468,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-bwrap"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "cc",
+  "libc",
+@@ -2475,7 +2477,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-chatgpt"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2497,7 +2499,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cli"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -2601,7 +2603,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-http-client",
+  "eventsource-stream",
+@@ -2615,7 +2617,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "async-stream",
+@@ -2639,7 +2641,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-config"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
+@@ -2667,7 +2669,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2700,7 +2702,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2715,7 +2717,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks-mock-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "chrono",
+  "codex-cloud-tasks-client",
+@@ -2724,7 +2726,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-code-mode-protocol",
+  "codex-http-client",
+@@ -2748,7 +2750,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-host"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -2779,7 +2781,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-protocol"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+  "glob",
+@@ -2797,7 +2799,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-runtime"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-code-mode-protocol",
+@@ -2816,11 +2818,11 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-collaboration-mode-templates"
+-version = "0.0.0"
++version = "0.166.0"
+ 
+ [[package]]
+ name = "codex-config"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -2874,7 +2876,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-config-schema"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2883,7 +2885,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-connectors"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -2905,7 +2907,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-connectors-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-connectors",
+  "codex-core-plugins",
+@@ -2919,7 +2921,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-context-fragments"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+  "codex-protocol-test-support",
+@@ -2930,7 +2932,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3080,7 +3082,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core-api"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-analytics",
+  "codex-app-server-protocol",
+@@ -3103,7 +3105,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core-plugin-common"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "semver",
+@@ -3114,7 +3116,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core-plugins"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3171,7 +3173,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-diagnostics"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "libc",
+  "pretty_assertions",
+@@ -3179,7 +3181,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-direct-tool-timing"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-utils-critical-path",
+  "pretty_assertions",
+@@ -3190,7 +3192,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -3243,7 +3245,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3316,7 +3318,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server-cli"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "assert_matches",
+@@ -3356,7 +3358,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server-protocol"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-file-system",
+@@ -3374,7 +3376,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server-test-support"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-exec-server",
+@@ -3389,7 +3391,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-execpolicy"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3407,7 +3409,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-experimental-api-macros"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -3416,7 +3418,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-extension-api"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-api",
+  "codex-config",
+@@ -3439,7 +3441,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-extension-items"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "pretty_assertions",
+@@ -3451,7 +3453,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-external-agent-migration"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "chrono",
+  "codex-analytics",
+@@ -3482,7 +3484,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-features"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-network-proxy",
+  "codex-protocol",
+@@ -3496,7 +3498,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-feedback"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -3524,7 +3526,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-search"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3540,7 +3542,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-system"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "bytes",
+  "codex-protocol",
+@@ -3554,7 +3556,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-watcher"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "notify",
+  "pretty_assertions",
+@@ -3565,7 +3567,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-git-attribution"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-backend-client",
+  "codex-extension-api",
+@@ -3578,7 +3580,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-git-utils"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3606,7 +3608,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-goal-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3631,7 +3633,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-guardian-context"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-context-fragments",
+  "codex-history",
+@@ -3645,7 +3647,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-guardian-reviewer"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-analytics",
+@@ -3681,7 +3683,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-guardian-v2"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-analytics",
+@@ -3720,7 +3722,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-guardian-v3"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-message-board",
+  "codex-protocol",
+@@ -3729,7 +3731,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-history"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-protocol",
+@@ -3741,7 +3743,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-history-notes-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-analytics",
+  "codex-client",
+@@ -3767,7 +3769,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-home"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-extension-api",
+  "codex-utils-absolute-path",
+@@ -3779,7 +3781,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-hooks"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "async-channel",
+@@ -3808,7 +3810,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-http-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "bytes",
+  "codex-utils-cargo-bin",
+@@ -3848,7 +3850,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-image-generation-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-api",
+@@ -3880,7 +3882,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-install-context"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "codex-utils-home-dir",
+@@ -3893,7 +3895,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-keyring-store"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "keyring",
+  "pretty_assertions",
+@@ -3904,7 +3906,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-linux-sandbox"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "clap",
+  "codex-core",
+@@ -3933,7 +3935,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-lmstudio"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-core",
+  "codex-http-client",
+@@ -3947,7 +3949,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-login"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -3993,7 +3995,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mcp"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -4037,7 +4039,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mcp-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4070,7 +4072,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-core",
+  "codex-extension-api",
+@@ -4092,7 +4094,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-read"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+  "codex-shell-command",
+@@ -4102,7 +4104,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-write"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4139,7 +4141,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mermaid"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "insta",
+  "pretty_assertions",
+@@ -4148,7 +4150,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-message-board"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "caseless",
+@@ -4171,7 +4173,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-message-history"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-config",
+  "memchr",
+@@ -4185,7 +4187,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-model-provider"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
+@@ -4224,7 +4226,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-model-provider-info"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-client",
+  "codex-http-client",
+@@ -4242,7 +4244,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-models-manager"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "chrono",
+  "codex-http-client",
+@@ -4261,7 +4263,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-multi-env-copy-file"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-config",
+@@ -4287,7 +4289,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mxc-sandbox"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-network-proxy",
+@@ -4308,7 +4310,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-network-proxy"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "aws-credential-types",
+@@ -4359,7 +4361,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-ollama"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "assert_matches",
+  "async-stream",
+@@ -4379,7 +4381,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-otel"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "bytes",
+  "chrono",
+@@ -4418,7 +4420,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-otel-trace-websocket"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4429,7 +4431,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-plugin"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-config",
+  "codex-core-plugin-common",
+@@ -4444,7 +4446,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-plugin-host"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-utils-cargo-bin",
+  "codex-utils-process",
+@@ -4461,7 +4463,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-process-hardening"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "libc",
+  "pretty_assertions",
+@@ -4469,7 +4471,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-prompts"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-collaboration-mode-templates",
+@@ -4487,7 +4489,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-protocol"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chardetng",
+@@ -4533,14 +4535,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-protocol-test-support"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+ ]
+ 
+ [[package]]
+ name = "codex-queue-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-core",
+@@ -4561,7 +4563,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-realtime-webrtc"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-build-info",
+@@ -4580,7 +4582,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-response-debug-context"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-api",
+@@ -4591,7 +4593,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-responses-api-proxy"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -4615,7 +4617,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rmcp-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4666,7 +4668,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rollout"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4699,7 +4701,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rollout-trace"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-code-mode",
+@@ -4716,7 +4718,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-runtime-agent-instance"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-agent-identity",
+@@ -4742,7 +4744,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-sandboxing"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-mxc-sandbox",
+@@ -4770,7 +4772,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-secrets"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "age",
+  "anyhow",
+@@ -4791,7 +4793,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-shell-command"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -4814,7 +4816,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-skills"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+  "codex-shell-command",
+@@ -4831,7 +4833,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-skills-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "assert_matches",
+  "blake3",
+@@ -4871,7 +4873,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-state"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4900,7 +4902,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-stdio-to-uds"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-uds",
+@@ -4912,7 +4914,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-tcp-tunnel"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -4933,7 +4935,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-terminal-detection"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+  "tracing",
+@@ -4941,7 +4943,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-test-binary-support"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-arg0",
+  "tempfile",
+@@ -4949,7 +4951,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-thread-manager-sample"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4960,7 +4962,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-thread-store"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "chrono",
+  "codex-app-server-protocol",
+@@ -4991,7 +4993,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-tools"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "bitflags 2.13.1",
+  "codex-attachment-store",
+@@ -5017,7 +5019,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-tui"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -5145,7 +5147,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-uds"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "async-io",
+  "libc",
+@@ -5159,7 +5161,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-user-verification"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "block2",
+@@ -5180,7 +5182,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-absolute-path"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "dirs",
+  "dunce",
+@@ -5194,14 +5196,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-approval-presets"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-audio"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-protocol",
+@@ -5215,7 +5217,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cache"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "lru",
+  "sha1 0.10.6",
+@@ -5224,7 +5226,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cargo-bin"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "assert_cmd",
+  "runfiles",
+@@ -5233,7 +5235,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cli"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "clap",
+  "codex-protocol",
+@@ -5245,22 +5247,22 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-critical-path"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-elapsed"
+-version = "0.0.0"
++version = "0.166.0"
+ 
+ [[package]]
+ name = "codex-utils-fuzzy-match"
+-version = "0.0.0"
++version = "0.166.0"
+ 
+ [[package]]
+ name = "codex-utils-git-discovery"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-git-utils",
+  "codex-utils-absolute-path",
+@@ -5273,14 +5275,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-head-tail-buffer"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-home-dir"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dirs",
+@@ -5290,7 +5292,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-image"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-utils-cache",
+@@ -5304,7 +5306,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-json-to-toml"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+  "serde_json",
+@@ -5313,7 +5315,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-oss"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-core",
+  "codex-lmstudio",
+@@ -5323,7 +5325,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-output-truncation"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-string",
+@@ -5333,7 +5335,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-path"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dunce",
+@@ -5344,7 +5346,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-path-uri"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-utils-absolute-path",
+@@ -5360,7 +5362,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-plugins"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-exec-server",
+  "codex-exec-server-protocol",
+@@ -5374,7 +5376,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-process"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+  "tokio",
+@@ -5382,7 +5384,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-pty"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-utils-cargo-bin",
+@@ -5401,7 +5403,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-readiness"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "assert_matches",
+  "thiserror 2.0.18",
+@@ -5411,7 +5413,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-redacted-string"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "schemars 0.8.22",
+  "serde",
+@@ -5419,14 +5421,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-rustls-provider"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "rustls",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-sandbox-summary"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-absolute-path",
+@@ -5436,7 +5438,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-sleep-inhibitor"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "core-foundation 0.9.4",
+  "libc",
+@@ -5446,14 +5448,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-stream-parser"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-string"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+  "regex-lite",
+@@ -5463,14 +5465,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-template"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-v8-poc"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "pretty_assertions",
+  "v8",
+@@ -5478,7 +5480,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-voice-host"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-install-context",
+@@ -5505,7 +5507,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-web-search-extension"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-api",
+  "codex-core",
+@@ -5527,7 +5529,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-websocket-auth"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -5546,7 +5548,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-websocket-client"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-http-client",
+  "codex-utils-rustls-provider",
+@@ -5562,7 +5564,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-windows-sandbox"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -5592,7 +5594,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-windows-sandbox-service"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-cloud-config",
+@@ -5610,14 +5612,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-windows-sandbox-test-support"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "dirs",
+ ]
+ 
+ [[package]]
+ name = "codex-workload-identity"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "codex-http-client",
+  "pretty_assertions",
+@@ -5632,7 +5634,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-worktree"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "codex-git-utils",
+@@ -5885,7 +5887,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "core_test_support"
+-version = "0.0.0"
++version = "0.166.0"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+diff --git a/codex-rs/app-server-client/Cargo.toml b/codex-rs/app-server-client/Cargo.toml
+index 272173b..8c695ab 100644
+--- a/codex-rs/app-server-client/Cargo.toml
++++ b/codex-rs/app-server-client/Cargo.toml
+@@ -14,6 +14,7 @@ workspace = true
+ 
+ [dependencies]
+ codex-app-server = { workspace = true }
++codex-app-server-daemon = { workspace = true }
+ codex-app-server-protocol = { workspace = true }
+ codex-app-server-transport = { workspace = true }
+ codex-arg0 = { workspace = true }
+@@ -26,6 +27,7 @@ codex-uds = { workspace = true }
+ codex-utils-absolute-path = { workspace = true }
+ codex-utils-rustls-provider = { workspace = true }
+ futures = { workspace = true }
++libc = { workspace = true }
+ serde = { workspace = true }
+ serde_json = { workspace = true }
+ tokio = { workspace = true, features = ["sync", "time", "rt"] }
+diff --git a/codex-rs/app-server-client/src/lib.rs b/codex-rs/app-server-client/src/lib.rs
+index e7df794..f862209 100644
+--- a/codex-rs/app-server-client/src/lib.rs
++++ b/codex-rs/app-server-client/src/lib.rs
+@@ -23,6 +23,8 @@
+ mod cloud;
+ mod path;
+ mod remote;
++pub use remote::LocalServerIdentity;
++pub use remote::RemoteAppServerStatus;
+ mod remote_websocket;
+ pub use cloud::CloudClient;
+ pub use cloud::CloudCommand;
+@@ -862,6 +864,7 @@ mod tests {
+     use codex_app_server_protocol::AccountUpdatedNotification;
+     use codex_app_server_protocol::ConfigRequirementsReadResponse;
+     use codex_app_server_protocol::GetAccountResponse;
++    use codex_app_server_protocol::JSONRPCError;
+     use codex_app_server_protocol::JSONRPCMessage;
+     use codex_app_server_protocol::JSONRPCRequest;
+     use codex_app_server_protocol::JSONRPCResponse;
+@@ -1547,6 +1550,20 @@ mod tests {
+         .await
+         .expect("remote client should connect");
+ 
++        #[cfg(any(target_os = "linux", target_os = "macos"))]
++        {
++            let peer = client
++                .local_server_identity()
++                .expect("kernel-authenticated Unix peer");
++            assert_eq!(peer.pid, std::process::id());
++            assert_eq!(
++                peer.identity,
++                codex_app_server_daemon::process_identity(peer.pid)
++                    .await
++                    .expect("process identity")
++            );
++        }
++
+         let response: GetAccountResponse = client
+             .request_typed(ClientRequest::GetAccount {
+                 request_id: RequestId::Integer(1),
+@@ -1561,6 +1578,89 @@ mod tests {
+         client.shutdown().await.expect("shutdown should complete");
+     }
+ 
++    #[tokio::test]
++    async fn remote_terminal_binding_tracks_acknowledged_attachment_and_refuses_stale_unsubscribe()
++    {
++        let thread = "00000000-0000-0000-0000-000000000001";
++        let url = start_test_remote_server(move |mut websocket| async move {
++            expect_remote_initialize(&mut websocket).await;
++            for method in ["thread/resume", "thread/read", "thread/unsubscribe"] {
++                let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
++                else {
++                    panic!("request");
++                };
++                assert_eq!(request.method, method);
++                let message = if method == "thread/unsubscribe" {
++                    JSONRPCMessage::Error(JSONRPCError {
++                        id: request.id,
++                        error: JSONRPCErrorError {
++                            code: -32602,
++                            message: "refused".to_owned(),
++                            data: None,
++                        },
++                    })
++                } else {
++                    JSONRPCMessage::Response(JSONRPCResponse {
++                        id: request.id,
++                        result: serde_json::json!({"thread":{"id":thread}}),
++                    })
++                };
++                write_websocket_message(&mut websocket, message).await;
++            }
++            websocket.close(None).await.expect("close");
++        })
++        .await;
++        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(url))
++            .await
++            .expect("connect");
++        assert!(
++            client.local_server_identity().is_none(),
++            "TCP metadata cannot authenticate a local daemon"
++        );
++        assert!(client.attached_thread_ids().is_empty());
++        let handle = client.request_handle();
++        for (id, method) in [(1, "thread/resume"), (2, "thread/read")] {
++            handle
++                .request_json_rpc(JSONRPCRequest {
++                    id: RequestId::Integer(id),
++                    method: method.to_owned(),
++                    params: Some(serde_json::json!({"threadId":thread})),
++                    trace: None,
++                })
++                .await
++                .expect("transport")
++                .expect("response");
++            assert_eq!(
++                client.attached_thread_ids(),
++                std::collections::HashSet::from([thread.to_owned()])
++            );
++        }
++        assert!(
++            handle
++                .request_json_rpc(JSONRPCRequest {
++                    id: RequestId::Integer(3),
++                    method: "thread/unsubscribe".to_owned(),
++                    params: Some(serde_json::json!({"threadId":thread})),
++                    trace: None
++                })
++                .await
++                .expect("transport")
++                .is_err()
++        );
++        assert!(
++            client.attached_thread_ids().is_empty(),
++            "even a refused unsubscribe cannot leave a stale status claim"
++        );
++        tokio::time::timeout(Duration::from_secs(2), async {
++            while client.is_connected() {
++                let _ = client.next_event().await;
++            }
++        })
++        .await
++        .expect("disconnect reaches status without UI dispatch");
++        client.shutdown().await.expect("shutdown");
++    }
++
+     #[tokio::test]
+     async fn remote_typed_request_accepts_large_single_frame_response() {
+         let padding = "x".repeat((17 << 20) + 1024);
+diff --git a/codex-rs/app-server-client/src/remote.rs b/codex-rs/app-server-client/src/remote.rs
+index ad8d28b..030637f 100644
+--- a/codex-rs/app-server-client/src/remote.rs
++++ b/codex-rs/app-server-client/src/remote.rs
+@@ -11,10 +11,15 @@ higher-level session logic.
+ */
+ 
+ use std::collections::HashMap;
++use std::collections::HashSet;
+ use std::collections::VecDeque;
+ use std::io::Error as IoError;
+ use std::io::ErrorKind;
+ use std::io::Result as IoResult;
++use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::AtomicU64;
++use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ 
+ use crate::AppServerEvent;
+@@ -160,7 +165,100 @@ struct RemoteServerMetadata {
+     platform_os: Option<String>,
+ }
+ 
++#[derive(Clone, Debug, serde::Serialize)]
++pub struct LocalServerIdentity {
++    pub pid: u32,
++    pub identity: String,
++}
++
++static CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
++
++#[derive(Clone)]
++/// Transport facts shared with read-only status queries. UI foreground/live-channel state is
++/// owned by the TUI and must be checked separately from these acknowledged subscriptions.
++pub struct RemoteAppServerStatus {
++    attached_threads: Arc<std::sync::Mutex<HashSet<String>>>,
++    local_server: Option<LocalServerIdentity>,
++    connected: Arc<AtomicBool>,
++    connection_generation: u64,
++}
++
++impl RemoteAppServerStatus {
++    pub fn attached_thread_ids(&self) -> HashSet<String> {
++        if !self.is_connected() {
++            return HashSet::new();
++        }
++        let threads = self
++            .attached_threads
++            .lock()
++            .map(|threads| threads.clone())
++            .unwrap_or_default();
++        if self.is_connected() {
++            threads
++        } else {
++            HashSet::new()
++        }
++    }
++
++    pub fn local_server_identity(&self) -> Option<&LocalServerIdentity> {
++        self.local_server.as_ref()
++    }
++    pub fn is_connected(&self) -> bool {
++        self.connected.load(Ordering::Acquire)
++    }
++    pub fn connection_generation(&self) -> u64 {
++        self.connection_generation
++    }
++}
++
++enum PendingAttachment {
++    Existing(String),
++    New,
++}
++
++fn canonical_thread_id(thread_id: &str) -> Option<&str> {
++    (thread_id.len() == 36
++        && codex_protocol::ThreadId::from_string(thread_id)
++            .is_ok_and(|id| id.to_string() == thread_id))
++    .then_some(thread_id)
++}
++
++fn remove_attachment(
++    thread_id: &str,
++    pending: &mut HashMap<RequestId, PendingAttachment>,
++    attached: &std::sync::Mutex<HashSet<String>>,
++) {
++    // A late load response must not restore a claim withdrawn by a later detach. New/forked
++    // IDs are unknown until the response, so invalidate those pending claims conservatively.
++    pending.retain(|_, request| matches!(request, PendingAttachment::Existing(expected) if expected != thread_id));
++    if let Ok(mut threads) = attached.lock()
++        && threads.len() < 65
++    {
++        threads.remove(thread_id);
++    }
++}
++
++fn acknowledge_attachment(
++    pending: PendingAttachment,
++    thread_id: &str,
++    attached: &std::sync::Mutex<HashSet<String>>,
++) {
++    let Some(thread_id) = canonical_thread_id(thread_id) else {
++        return;
++    };
++    if matches!(pending, PendingAttachment::Existing(expected) if expected != thread_id) {
++        return;
++    }
++    if let Ok(mut threads) = attached.lock()
++        && threads.len() < 65
++    {
++        // 65 is a sticky overflow sentinel: status refuses rather than truncating ownership.
++        threads.insert(thread_id.to_owned());
++    }
++}
++
+ pub struct RemoteAppServerClient {
++    status: RemoteAppServerStatus,
+     command_tx: mpsc::Sender<RemoteClientCommand>,
+     event_rx: mpsc::UnboundedReceiver<AppServerEvent>,
+     pending_events: VecDeque<AppServerEvent>,
+@@ -214,14 +312,41 @@ impl RemoteAppServerClient {
+                     .await
+             }
+             RemoteAppServerEndpoint::UnixSocket { socket_path } => {
+-                let (endpoint, stream) =
++                let (endpoint, stream, local_server) =
+                     connect_unix_socket_endpoint(socket_path, peer_policy).await?;
+-                Self::connect_with_stream(channel_capacity, endpoint, stream, initialize_params)
+-                    .await
++                let mut client = Self::connect_with_stream(
++                    channel_capacity,
++                    endpoint,
++                    stream,
++                    initialize_params,
++                )
++                .await?;
++                client.status.local_server = local_server;
++                Ok(client)
+             }
+         }
+     }
+ 
++    pub fn attached_thread_ids(&self) -> HashSet<String> {
++        self.status.attached_thread_ids()
++    }
++
++    pub fn local_server_identity(&self) -> Option<&LocalServerIdentity> {
++        self.status.local_server_identity()
++    }
++
++    pub fn is_connected(&self) -> bool {
++        self.status.is_connected()
++    }
++
++    pub fn connection_generation(&self) -> u64 {
++        self.status.connection_generation()
++    }
++
++    pub fn status_handle(&self) -> RemoteAppServerStatus {
++        self.status.clone()
++    }
++
+     pub fn server_version(&self) -> Option<&str> {
+         self.metadata.server_version.as_deref()
+     }
+@@ -259,14 +384,27 @@ impl RemoteAppServerClient {
+ 
+         let (command_tx, mut command_rx) = mpsc::channel::<RemoteClientCommand>(channel_capacity);
+         let (event_tx, event_rx) = mpsc::unbounded_channel::<AppServerEvent>();
++        let attached_threads = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
++        let worker_attachments = Arc::clone(&attached_threads);
++        let connected = Arc::new(AtomicBool::new(true));
++        let worker_connected = Arc::clone(&connected);
+         let worker_handle = tokio::spawn(async move {
++            struct DisconnectOnDrop(Arc<AtomicBool>);
++            impl Drop for DisconnectOnDrop {
++                fn drop(&mut self) {
++                    self.0.store(false, Ordering::Release);
++                }
++            }
++            let _connected_guard = DisconnectOnDrop(Arc::clone(&worker_connected));
+             let mut pending_requests =
+                 HashMap::<RequestId, oneshot::Sender<IoResult<RequestResult>>>::new();
++            let mut pending_attachments = HashMap::<RequestId, PendingAttachment>::new();
+             let mut worker_exit_error: Option<(ErrorKind, String)> = None;
+             loop {
+                 tokio::select! {
+                     command = command_rx.recv() => {
+                         let Some(command) = command else {
++                            worker_connected.store(false, Ordering::Release);
+                             let _ = stream.close().await;
+                             break;
+                         };
+@@ -280,6 +418,16 @@ impl RemoteAppServerClient {
+                                     )));
+                                     continue;
+                                 }
++                                if matches!(request.method.as_str(), "thread/start" | "thread/fork") {
++                                    pending_attachments.insert(request_id.clone(), PendingAttachment::New);
++                                } else if request.method == "thread/resume"
++                                    && let Some(thread_id) = request.params.as_ref().and_then(|p| p.get("threadId")).and_then(serde_json::Value::as_str).and_then(canonical_thread_id) {
++                                    pending_attachments.insert(request_id.clone(), PendingAttachment::Existing(thread_id.to_owned()));
++                                } else if request.method == "thread/unsubscribe"
++                                    && let Some(thread_id) = request.params.as_ref().and_then(|p| p.get("threadId")).and_then(serde_json::Value::as_str).and_then(canonical_thread_id) {
++                                    // A failed unsubscribe may understate attachment; it must never leave a stale claim.
++                                    remove_attachment(thread_id, &mut pending_attachments, &worker_attachments);
++                                }
+                                 pending_requests.insert(request_id.clone(), response_tx);
+                                 if let Err(err) = write_jsonrpc_message(
+                                     &mut stream,
+@@ -288,6 +436,7 @@ impl RemoteAppServerClient {
+                                 )
+                                 .await
+                                 {
++                                    worker_connected.store(false, Ordering::Release);
+                                     let err_message = err.to_string();
+                                     let message = format!(
+                                         "remote app server at `{endpoint}` write failed: {err_message}"
+@@ -314,6 +463,7 @@ impl RemoteAppServerClient {
+                                     &endpoint,
+                                 )
+                                 .await;
++                                if result.is_err() { worker_connected.store(false, Ordering::Release); }
+                                 let _ = response_tx.send(result);
+                             }
+                             RemoteClientCommand::ResolveServerRequest {
+@@ -330,6 +480,7 @@ impl RemoteAppServerClient {
+                                     &endpoint,
+                                 )
+                                 .await;
++                                if result.is_err() { worker_connected.store(false, Ordering::Release); }
+                                 let _ = response_tx.send(result);
+                             }
+                             RemoteClientCommand::RejectServerRequest {
+@@ -346,9 +497,11 @@ impl RemoteAppServerClient {
+                                     &endpoint,
+                                 )
+                                 .await;
++                                if result.is_err() { worker_connected.store(false, Ordering::Release); }
+                                 let _ = response_tx.send(result);
+                             }
+                             RemoteClientCommand::Shutdown { response_tx } => {
++                                worker_connected.store(false, Ordering::Release);
+                                 let close_result = stream.close().await.or_else(|err| {
+                                     if websocket_close_error_is_already_closed(&err) {
+                                         Ok(())
+@@ -368,16 +521,25 @@ impl RemoteAppServerClient {
+                             Some(Ok(Message::Text(text))) => {
+                                 match serde_json::from_str::<JSONRPCMessage>(&text) {
+                                     Ok(JSONRPCMessage::Response(response)) => {
++                                        if let Some(pending) = pending_attachments.remove(&response.id)
++                                            && let Some(thread_id) = response.result.get("thread").and_then(|thread| thread.get("id")).and_then(serde_json::Value::as_str) {
++                                            acknowledge_attachment(pending, thread_id, &worker_attachments);
++                                        }
+                                         if let Some(response_tx) = pending_requests.remove(&response.id) {
+                                             let _ = response_tx.send(Ok(Ok(response.result)));
+                                         }
+                                     }
+                                     Ok(JSONRPCMessage::Error(error)) => {
++                                        pending_attachments.remove(&error.id);
+                                         if let Some(response_tx) = pending_requests.remove(&error.id) {
+                                             let _ = response_tx.send(Ok(Err(error.error)));
+                                         }
+                                     }
+                                     Ok(JSONRPCMessage::Notification(notification)) => {
++                                        if matches!(notification.method.as_str(), "thread/closed" | "thread/archived" | "thread/deleted")
++                                            && let Some(thread_id) = notification.params.as_ref().and_then(|params| params.get("threadId")).and_then(serde_json::Value::as_str).and_then(canonical_thread_id) {
++                                            remove_attachment(thread_id, &mut pending_attachments, &worker_attachments);
++                                        }
+                                         if let Some(event) =
+                                             app_server_event_from_notification(notification)
+                                             && let Err(err) = deliver_event(
+@@ -385,6 +547,7 @@ impl RemoteAppServerClient {
+                                                 event,
+                                             )
+                                             {
++                                                worker_connected.store(false, Ordering::Release);
+                                                 warn!(%err, "failed to deliver remote app-server event");
+                                                 break;
+                                             }
+@@ -399,6 +562,7 @@ impl RemoteAppServerClient {
+                                                     AppServerEvent::ServerRequest(Box::new(request)),
+                                                 )
+                                                 {
++                                                    worker_connected.store(false, Ordering::Release);
+                                                     warn!(%err, "failed to deliver remote app-server server request");
+                                                     break;
+                                                 }
+@@ -421,6 +585,7 @@ impl RemoteAppServerClient {
+                                                 )
+                                                 .await
+                                                 {
++                                                    worker_connected.store(false, Ordering::Release);
+                                                     let err_message = reject_err.to_string();
+                                                     let message = format!(
+                                                         "remote app server at `{endpoint}` write failed: {err_message}"
+@@ -439,6 +604,7 @@ impl RemoteAppServerClient {
+                                         }
+                                     }
+                                     Err(err) => {
++                                        worker_connected.store(false, Ordering::Release);
+                                         let message = format!(
+                                             "remote app server at `{endpoint}` sent invalid JSON-RPC: {err}"
+                                         );
+@@ -455,6 +621,7 @@ impl RemoteAppServerClient {
+                                 }
+                             }
+                             Some(Ok(Message::Close(frame))) => {
++                                worker_connected.store(false, Ordering::Release);
+                                 let reason = frame
+                                     .as_ref()
+                                     .map(|frame| frame.reason.to_string())
+@@ -480,6 +647,7 @@ impl RemoteAppServerClient {
+                             | Some(Ok(Message::Pong(_)))
+                             | Some(Ok(Message::Frame(_))) => {}
+                             Some(Err(err)) => {
++                                worker_connected.store(false, Ordering::Release);
+                                 let message = format!(
+                                     "remote app server at `{endpoint}` transport failed: {err}"
+                                 );
+@@ -493,6 +661,7 @@ impl RemoteAppServerClient {
+                                 break;
+                             }
+                             None => {
++                                worker_connected.store(false, Ordering::Release);
+                                 let message = format!(
+                                     "remote app server at `{endpoint}` closed the connection"
+                                 );
+@@ -522,6 +691,12 @@ impl RemoteAppServerClient {
+         });
+ 
+         Ok(Self {
++            status: RemoteAppServerStatus {
++                attached_threads,
++                local_server: None,
++                connected,
++                connection_generation: CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed),
++            },
+             command_tx,
+             event_rx,
+             pending_events: pending_events.into(),
+@@ -600,6 +775,7 @@ impl RemoteAppServerClient {
+ 
+     pub async fn shutdown(self) -> IoResult<()> {
+         let Self {
++            status: _,
+             command_tx,
+             event_rx,
+             pending_events: _pending_events,
+@@ -784,7 +960,11 @@ async fn connect_websocket_endpoint(
+ async fn connect_unix_socket_endpoint(
+     socket_path: AbsolutePathBuf,
+     peer_policy: SocketPeerPolicy,
+-) -> IoResult<(String, WebSocketHandshake<UnixStream>)> {
++) -> IoResult<(
++    String,
++    WebSocketHandshake<UnixStream>,
++    Option<LocalServerIdentity>,
++)> {
+     let endpoint = format!("unix://{}", socket_path.display());
+     let request = websocket_request(UDS_WEBSOCKET_HANDSHAKE_URL).map_err(|err| {
+         IoError::new(
+@@ -805,6 +985,30 @@ async fn connect_unix_socket_endpoint(
+                 "failed to connect to remote app server at `{endpoint}`: {err}"
+             ))
+         })?;
++    #[cfg(any(target_os = "linux", target_os = "macos"))]
++    // SAFETY: geteuid has no pointer or lifetime requirements.
++    let local_uid = unsafe { libc::geteuid() };
++    #[cfg(any(target_os = "linux", target_os = "macos"))]
++    let local_server = match stream.peer_cred() {
++        Ok(credentials) if credentials.uid() == local_uid => match credentials
++            .pid()
++            .and_then(|pid| u32::try_from(pid).ok())
++            .filter(|pid| *pid != 0)
++        {
++            Some(pid) => timeout(
++                Duration::from_millis(100),
++                codex_app_server_daemon::process_identity(pid),
++            )
++            .await
++            .ok()
++            .and_then(Result::ok)
++            .map(|identity| LocalServerIdentity { pid, identity }),
++            None => None,
++        },
++        _ => None,
++    };
++    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
++    let local_server = None;
+     match peer_policy {
+         SocketPeerPolicy::ExplicitEndpoint => {}
+         #[cfg(windows)]
+@@ -828,7 +1032,7 @@ async fn connect_unix_socket_endpoint(
+         ))
+     })?;
+ 
+-    Ok((endpoint, stream))
++    Ok((endpoint, stream, local_server))
+ }
+ 
+ fn websocket_request(url: &str) -> Result<Request, TungsteniteError> {
+@@ -1066,6 +1270,220 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use futures::SinkExt;
++    use futures::StreamExt;
++
++    const THREAD_A: &str = "00000000-0000-0000-0000-000000000001";
++    const THREAD_B: &str = "00000000-0000-0000-0000-000000000002";
++
++    #[test]
++    fn terminal_status_attachment_claims_are_bounded_canonical_and_causal() {
++        let attached = std::sync::Mutex::new(HashSet::new());
++        acknowledge_attachment(PendingAttachment::New, THREAD_A, &attached);
++        assert!(attached.lock().unwrap().contains(THREAD_A));
++        for invalid in [
++            "bad".to_owned(),
++            "x".repeat(1 << 20),
++            "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA".to_owned(),
++        ] {
++            acknowledge_attachment(PendingAttachment::New, &invalid, &attached);
++        }
++        acknowledge_attachment(
++            PendingAttachment::Existing(THREAD_A.to_owned()),
++            THREAD_B,
++            &attached,
++        );
++        assert_eq!(attached.lock().unwrap().len(), 1);
++        let mut pending = HashMap::from([
++            (
++                RequestId::Integer(1),
++                PendingAttachment::Existing(THREAD_A.to_owned()),
++            ),
++            (
++                RequestId::Integer(2),
++                PendingAttachment::Existing(THREAD_B.to_owned()),
++            ),
++            (RequestId::Integer(3), PendingAttachment::New),
++        ]);
++        remove_attachment(THREAD_A, &mut pending, &attached);
++        assert!(!pending.contains_key(&RequestId::Integer(1)));
++        assert!(pending.contains_key(&RequestId::Integer(2)));
++        assert!(!pending.contains_key(&RequestId::Integer(3)));
++        assert!(attached.lock().unwrap().is_empty());
++        for index in 0..66 {
++            acknowledge_attachment(
++                PendingAttachment::New,
++                &format!("00000000-0000-0000-0000-{index:012x}"),
++                &attached,
++            );
++        }
++        assert_eq!(attached.lock().unwrap().len(), 65);
++        remove_attachment(THREAD_A, &mut pending, &attached);
++        assert_eq!(
++            attached.lock().unwrap().len(),
++            65,
++            "overflow remains fail-closed"
++        );
++    }
++
++    #[test]
++    fn terminal_status_handle_observes_worker_liveness_without_ui_dispatch() {
++        let status = RemoteAppServerStatus {
++            attached_threads: Arc::new(std::sync::Mutex::new(HashSet::from([THREAD_A.to_owned()]))),
++            local_server: None,
++            connected: Arc::new(AtomicBool::new(true)),
++            connection_generation: 7,
++        };
++        let observer = status.clone();
++        assert!(observer.is_connected());
++        assert!(observer.attached_thread_ids().contains(THREAD_A));
++        assert_eq!(observer.connection_generation(), 7);
++        status.connected.store(false, Ordering::Release);
++        assert!(!observer.is_connected());
++        assert!(observer.attached_thread_ids().is_empty());
++        assert!(
++            status.attached_threads.lock().unwrap().contains(THREAD_A),
++            "stale storage must not become a live claim"
++        );
++    }
++
++    type TestWebSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
++
++    async fn test_read(websocket: &mut TestWebSocket) -> JSONRPCMessage {
++        loop {
++            let message = websocket.next().await.expect("frame").expect("decode");
++            if let Message::Text(text) = message {
++                return serde_json::from_str(&text).expect("JSON-RPC");
++            }
++            assert!(!matches!(message, Message::Close(_)), "unexpected close");
++        }
++    }
++
++    async fn test_reply(websocket: &mut TestWebSocket, id: RequestId, result: serde_json::Value) {
++        websocket
++            .send(Message::Text(
++                serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse { id, result }))
++                    .unwrap()
++                    .into(),
++            ))
++            .await
++            .expect("reply");
++    }
++
++    #[tokio::test]
++    async fn terminal_status_late_resume_cannot_undo_unsubscribe_and_disconnect_is_immediate() {
++        timeout(Duration::from_secs(5), async {
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let address = listener.local_addr().unwrap();
++            let (resume_seen, resume_ready) = oneshot::channel();
++            let (close_sender, close_receiver) = oneshot::channel();
++            let server = tokio::spawn(async move {
++                let (stream, _) = listener.accept().await.unwrap();
++                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
++                let JSONRPCMessage::Request(initialize) = test_read(&mut websocket).await else {
++                    panic!("initialize request");
++                };
++                assert_eq!(initialize.method, "initialize");
++                test_reply(
++                    &mut websocket,
++                    initialize.id,
++                    serde_json::json!({"userAgent":"status-test","codexHome":"/server/.codex"}),
++                )
++                .await;
++                assert!(matches!(
++                    test_read(&mut websocket).await,
++                    JSONRPCMessage::Notification(_)
++                ));
++                let JSONRPCMessage::Request(resume) = test_read(&mut websocket).await else {
++                    panic!("resume request");
++                };
++                assert_eq!(resume.method, "thread/resume");
++                resume_seen.send(()).unwrap();
++                let JSONRPCMessage::Request(unsubscribe) = test_read(&mut websocket).await else {
++                    panic!("unsubscribe request");
++                };
++                assert_eq!(unsubscribe.method, "thread/unsubscribe");
++                test_reply(&mut websocket, unsubscribe.id, serde_json::json!({})).await;
++                test_reply(
++                    &mut websocket,
++                    resume.id,
++                    serde_json::json!({"thread":{"id":THREAD_A}}),
++                )
++                .await;
++                let JSONRPCMessage::Request(fresh_resume) = test_read(&mut websocket).await else {
++                    panic!("fresh resume request");
++                };
++                test_reply(
++                    &mut websocket,
++                    fresh_resume.id,
++                    serde_json::json!({"thread":{"id":THREAD_A}}),
++                )
++                .await;
++                close_receiver.await.unwrap();
++                websocket.close(None).await.unwrap();
++            });
++            let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
++                endpoint: RemoteAppServerEndpoint::WebSocket {
++                    websocket_url: format!("ws://{address}"),
++                    auth_token: None,
++                },
++                client_name: "terminal-status-test".to_owned(),
++                client_version: "0.166.0".to_owned(),
++                experimental_api: true,
++                mcp_server_openai_form_elicitation: false,
++                opt_out_notification_methods: Vec::new(),
++                channel_capacity: 4,
++            })
++            .await
++            .unwrap();
++            let status = client.status_handle();
++            let request = |id, method: &str| JSONRPCRequest {
++                id: RequestId::Integer(id),
++                method: method.to_owned(),
++                params: Some(serde_json::json!({"threadId":THREAD_A})),
++                trace: None,
++            };
++            let handle = client.request_handle();
++            let first = request(1, "thread/resume");
++            let resume =
++                tokio::spawn(async move { handle.request_json_rpc(first).await.unwrap().unwrap() });
++            resume_ready.await.unwrap();
++            client
++                .request_handle()
++                .request_json_rpc(request(2, "thread/unsubscribe"))
++                .await
++                .unwrap()
++                .unwrap();
++            resume.await.unwrap();
++            assert!(
++                status.is_connected(),
++                "empty attachment must not be explained by a disconnected fixture"
++            );
++            assert!(
++                status.attached_thread_ids().is_empty(),
++                "a late old resume response cannot undo detach"
++            );
++            client
++                .request_handle()
++                .request_json_rpc(request(3, "thread/resume"))
++                .await
++                .unwrap()
++                .unwrap();
++            assert!(
++                status.attached_thread_ids().contains(THREAD_A),
++                "a genuinely new resume may reattach"
++            );
++            close_sender.send(()).unwrap();
++            while status.is_connected() {
++                tokio::task::yield_now().await;
++            }
++            assert!(status.attached_thread_ids().is_empty());
++            client.shutdown().await.unwrap();
++            server.await.unwrap();
++        })
++        .await
++        .expect("bounded terminal status lifecycle test");
++    }
+ 
+     #[tokio::test]
+     async fn shutdown_tolerates_worker_exit_after_command_is_queued() {
+@@ -1087,6 +1505,12 @@ mod tests {
+             let _ = delivered_tx.send(result);
+         });
+         let client = RemoteAppServerClient {
++            status: RemoteAppServerStatus {
++                attached_threads: Arc::default(),
++                local_server: None,
++                connected: Arc::new(AtomicBool::new(true)),
++                connection_generation: 1,
++            },
+             command_tx,
+             event_rx,
+             pending_events: VecDeque::new(),
+diff --git a/codex-rs/app-server-daemon/src/backend/mod.rs b/codex-rs/app-server-daemon/src/backend/mod.rs
+index 1c2ea75..dad8639 100644
+--- a/codex-rs/app-server-daemon/src/backend/mod.rs
++++ b/codex-rs/app-server-daemon/src/backend/mod.rs
+@@ -1,4 +1,7 @@
+ mod pid;
++
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++pub(crate) use pid::process_identity;
+ pub(crate) mod stderr_log;
+ #[cfg(windows)]
+ pub(crate) mod windows;
+diff --git a/codex-rs/app-server-daemon/src/backend/pid.rs b/codex-rs/app-server-daemon/src/backend/pid.rs
+index 97738dd..90a17ff 100644
+--- a/codex-rs/app-server-daemon/src/backend/pid.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid.rs
+@@ -4,6 +4,9 @@
+ #[path = "pid_identity.rs"]
+ mod identity;
+ 
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++pub(crate) use identity::process_identity;
++
+ #[cfg(any(unix, windows))]
+ use std::borrow::Cow;
+ use std::collections::BTreeMap;
+diff --git a/codex-rs/app-server-daemon/src/backend/pid_identity.rs b/codex-rs/app-server-daemon/src/backend/pid_identity.rs
+index ea631a3..d1957e5 100644
+--- a/codex-rs/app-server-daemon/src/backend/pid_identity.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid_identity.rs
+@@ -28,6 +28,36 @@ pub(super) enum ProcessIdentity {
+     },
+ }
+ 
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++pub(crate) async fn process_identity(pid: u32) -> Result<String> {
++    let (zombie, identity) = read_process_details(pid).await?;
++    anyhow::ensure!(!zombie, "process has exited");
++    let (platform, boot_id, incarnation) = match identity {
++        ProcessIdentity::Linux {
++            boot_id,
++            start_ticks,
++        } => ("linux", boot_id, start_ticks),
++        ProcessIdentity::MacOsUnique {
++            boot_id, unique_id, ..
++        } => ("macos", boot_id, unique_id),
++        ProcessIdentity::MacOs { .. } => anyhow::bail!("process identity unavailable"),
++    };
++    let boot_id = boot_id.to_ascii_lowercase();
++    anyhow::ensure!(incarnation != 0, "process incarnation is empty");
++    anyhow::ensure!(
++        boot_id.len() == 36
++            && boot_id.bytes().enumerate().all(|(index, byte)| {
++                if [8, 13, 18, 23].contains(&index) {
++                    byte == b'-'
++                } else {
++                    byte.is_ascii_hexdigit()
++                }
++            }),
++        "boot identity is invalid"
++    );
++    Ok(format!("{platform}:{boot_id}:{incarnation}"))
++}
++
+ #[cfg(any(target_os = "linux", target_os = "macos"))]
+ impl ProcessIdentity {
+     pub(super) async fn matches_process(&self, pid: u32) -> Result<(bool, bool)> {
+diff --git a/codex-rs/app-server-daemon/src/backend/pid_identity_tests.rs b/codex-rs/app-server-daemon/src/backend/pid_identity_tests.rs
+index 0454e52..b6ad3d9 100644
+--- a/codex-rs/app-server-daemon/src/backend/pid_identity_tests.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid_identity_tests.rs
+@@ -1,6 +1,23 @@
+ use super::parse_stat;
+ use pretty_assertions::assert_eq;
+ 
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++#[tokio::test]
++async fn terminal_process_identity_is_canonical_and_stable_for_a_live_process() {
++    let pid = std::process::id();
++    let first = super::process_identity(pid).await.expect("native identity");
++    let second = super::process_identity(pid)
++        .await
++        .expect("same live identity");
++    assert_eq!(first, second);
++    assert_eq!(first, first.to_ascii_lowercase());
++    let fields: Vec<_> = first.split(':').collect();
++    assert_eq!(fields.len(), 3);
++    assert_eq!(fields[0], std::env::consts::OS);
++    assert_eq!(fields[1].len(), 36);
++    assert!(fields[2].parse::<u64>().expect("incarnation") > 0);
++}
++
+ #[test]
+ fn parses_start_ticks_after_comm_with_spaces_and_parentheses() {
+     let stat =
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+index 51b9c72..28dd444 100644
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -1,6 +1,12 @@
+ //! Managed app-server lifecycle, serialized across CLI invocations and the updater.
+ 
+ mod backend;
++
++/// Kernel process identity, stable across executable replacement and distinct after PID reuse.
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++pub async fn process_identity(pid: u32) -> anyhow::Result<String> {
++    backend::process_identity(pid).await
++}
+ mod background_command;
+ #[cfg(windows)]
+ pub use backend::windows::DetachedLaunchRestricted;
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index fbc1090..250580c 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -537,6 +537,7 @@ struct InitialHistoryReplayBuffer {
+ }
+ 
+ pub(crate) struct App {
++    terminal_status: Option<crate::tui_status::StatusPublisher>,
+     feature_write_lock: Arc<tokio::sync::Mutex<()>>,
+     config_notification_test_generation: u64,
+     config_notification_test_pending: Option<u64>,
+diff --git a/codex-rs/tui/src/app/agent_picker.rs b/codex-rs/tui/src/app/agent_picker.rs
+index 93c4b53..c5f3afb 100644
+--- a/codex-rs/tui/src/app/agent_picker.rs
++++ b/codex-rs/tui/src/app/agent_picker.rs
+@@ -199,6 +199,9 @@ impl App {
+         visibility: AgentPickerThreadVisibility,
+     ) {
+         if matches!(visibility, AgentPickerThreadVisibility::Hidden) {
++            if self.current_displayed_thread_id() == Some(thread_id) {
++                self.invalidate_tui_status();
++            }
+             self.agent_navigation.mark_stopped(thread_id);
+             if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
+                 channel.mark_replay_only();
+diff --git a/codex-rs/tui/src/app/agents_overview.rs b/codex-rs/tui/src/app/agents_overview.rs
+index 3cb5a42..28408d9 100644
+--- a/codex-rs/tui/src/app/agents_overview.rs
++++ b/codex-rs/tui/src/app/agents_overview.rs
+@@ -90,6 +90,7 @@ impl Drop for AgentsOverviewState {
+ 
+ impl App {
+     pub(super) fn open_agents_overview(&mut self, app_server: &AppServerSession) {
++        self.invalidate_tui_status();
+         if !self.app_server_target.supports_command_center() {
+             let workload_identity_selected = codex_login::is_workload_identity_selected();
+             self.chat_widget.show_selection_view(SelectionViewParams {
+@@ -446,6 +447,7 @@ impl App {
+         started: Option<(Config, crate::app_server_session::AppServerStartedThread)>,
+         mut startup_draft: Option<&mut StartupDraftPump>,
+     ) -> color_eyre::Result<AppRunControl> {
++        self.invalidate_tui_status();
+         if self.windows_sandbox_blocks_thread_switch() {
+             return Ok(AppRunControl::Continue);
+         }
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 550965d..21073b8 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -452,6 +452,7 @@ impl App {
+                 self.chat_widget.show_copy_result(&label, result);
+             }
+             AppEvent::ClearUi { name } => {
++                self.invalidate_tui_status();
+                 if self.reject_pending_permission_root_switch() {
+                     return Ok(AppRunControl::Continue);
+                 }
+@@ -471,6 +472,7 @@ impl App {
+                 self.apply_raw_output_mode(tui, enabled, /*notify*/ false);
+             }
+             AppEvent::ClearUiAndSubmitUserMessage { text } => {
++                self.invalidate_tui_status();
+                 if self.reject_pending_permission_root_switch() {
+                     self.chat_widget.restore_user_message_to_composer(text.into());
+                     return Ok(AppRunControl::Continue);
+@@ -1136,6 +1138,7 @@ impl App {
+                         .is_some_and(|owner| owner.thread_id() == Some(*thread_id)),
+                     _ => false,
+                 };
++                self.publish_tui_status(app_server);
+                 let visible_thread = self.active_thread_id;
+                 if parked_voice
+                     && let Some(owner) = self.background_voice.as_mut()
+diff --git a/codex-rs/tui/src/app/reconnect.rs b/codex-rs/tui/src/app/reconnect.rs
+index 91dde41..c526694 100644
+--- a/codex-rs/tui/src/app/reconnect.rs
++++ b/codex-rs/tui/src/app/reconnect.rs
+@@ -215,6 +215,7 @@ impl App {
+     }
+ 
+     fn begin_reconnect_inner(&mut self, preserve_startup_input: bool) -> bool {
++        self.invalidate_tui_status();
+         if matches!(self.app_server_target, AppServerTarget::Embedded) {
+             return false;
+         }
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index c7dc18d..7c5600d 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -542,6 +542,7 @@ impl App {
+         app_server: &mut AppServerSession,
+         thread_id: ThreadId,
+     ) -> Result<()> {
++        self.invalidate_tui_status();
+         let pending_profile_on_unavailable_thread = self.thread_unavailable(thread_id)
+             && self.pending_server_profiles.contains_key(&thread_id);
+         let cached_session = if self.thread_unavailable(thread_id) {
+@@ -789,6 +790,7 @@ impl App {
+     }
+ 
+     pub(super) async fn reset_thread_event_state(&mut self) {
++        self.invalidate_tui_status();
+         let voice_owner = self.voice_owner_thread_id();
+         let mut previous_pending = std::mem::take(&mut self.pending_app_server_requests);
+         // Move retained tasks' approvals to background routing before clearing request bookkeeping.
+@@ -1000,6 +1002,7 @@ impl App {
+         initial_user_message: Option<crate::chatwidget::UserMessage>,
+         new_thread_name: Option<String>,
+     ) {
++        self.invalidate_tui_status();
+         if self.reject_pending_permission_root_switch() {
+             if let Some(message) = initial_user_message {
+                 self.chat_widget.restore_user_message_to_composer(message);
+@@ -1138,6 +1141,7 @@ impl App {
+         presentation: ThreadAttachPresentation,
+         initial_user_message: Option<crate::chatwidget::UserMessage>,
+     ) -> Result<()> {
++        self.invalidate_tui_status();
+         // Initial messages are for freshly attached primary threads only. Thread switches and
+         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
+         // user turn by accident.
+@@ -1339,6 +1343,7 @@ impl App {
+         app_server: &mut AppServerSession,
+         target_session: SessionTarget,
+     ) -> Result<AppRunControl> {
++        self.invalidate_tui_status();
+         if let Err(error) = target_session.ensure_backend(app_server.backend_id()) {
+             self.add_session_picker_error(error.to_string());
+             return Ok(AppRunControl::Continue);
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+index f1e83e5..146b77f 100644
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -966,6 +966,7 @@ See the Codex keymap documentation for supported actions and examples."
+             agents_overview::AgentsOverviewState::new(local_settings.tui.agents_overview_grouping);
+         let mut app = Self {
+             feature_write_lock: Arc::default(),
++            terminal_status: None,
+             config_notification_test_generation: 0,
+             config_notification_test_pending: None,
+             model_catalog,
+@@ -1275,6 +1276,10 @@ See the Codex keymap documentation for supported actions and examples."
+         let initial_owner = app_server.backend_id();
+         let mut backends =
+             super::backend_sessions::BackendSessions::from_initial(app_server, other_backends);
++        let tui_status = crate::tui_status::StatusService::start(&app.config.codex_home);
++        app.terminal_status = tui_status
++            .as_ref()
++            .map(crate::tui_status::StatusService::publisher);
+ 
+         let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
+             Ok(exit_reason)
+@@ -1291,6 +1296,7 @@ See the Codex keymap documentation for supported actions and examples."
+                 {
+                     app.begin_reconnect();
+                 }
++                app.publish_tui_status(backends.session_at(displayed_session));
+                 // Reconnect can dismiss an overlay from the server-event path.
+                 if app.overlay.is_none() {
+                     if !tui.is_owned_screen() && tui.is_alt_screen_active() {
+@@ -1680,6 +1686,7 @@ See the Codex keymap documentation for supported actions and examples."
+             }
+         };
+         // Let the pending terminal poll unwind while the app server shuts down.
++        drop(tui_status);
+         tui.pause_events();
+         app.chat_widget.mention_usage_mut().flush().await;
+         if let Err(err) = backends.shutdown().await {
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+index a0efb33..b4c301e 100644
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -22,6 +22,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
+ 
+     Box::new(App {
+         feature_write_lock: Arc::default(),
++        terminal_status: None,
+         config_notification_test_generation: 0,
+         config_notification_test_pending: None,
+         model_catalog: chat_widget.model_catalog(),
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index a2d2191..a10fb9f 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -6409,6 +6409,7 @@ async fn make_test_app() -> Box<App> {
+ 
+     Box::new(App {
+         feature_write_lock: Arc::default(),
++        terminal_status: None,
+         config_notification_test_generation: 0,
+         config_notification_test_pending: None,
+         model_catalog: chat_widget.model_catalog(),
+@@ -6535,6 +6536,7 @@ pub(super) async fn make_test_app_with_channels() -> (
+     (
+         Box::new(App {
+             feature_write_lock: Arc::default(),
++            terminal_status: None,
+             config_notification_test_generation: 0,
+             config_notification_test_pending: None,
+             model_catalog: chat_widget.model_catalog(),
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index e4ecae0..ac72f8a 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -86,6 +86,7 @@ impl App {
+     }
+ 
+     pub(super) async fn activate_thread_channel(&mut self, thread_id: ThreadId) {
++        self.invalidate_tui_status();
+         if self.active_thread_id.is_some() {
+             return;
+         }
+@@ -101,6 +102,7 @@ impl App {
+     }
+ 
+     pub(super) async fn store_active_thread_receiver(&mut self) {
++        self.invalidate_tui_status();
+         let Some(active_id) = self.active_thread_id else {
+             return;
+         };
+@@ -155,6 +157,7 @@ impl App {
+     }
+ 
+     pub(super) async fn clear_active_thread(&mut self) {
++        self.invalidate_tui_status();
+         if let Some(active_id) = self.active_thread_id.take() {
+             self.set_thread_active(active_id, /*active*/ false).await;
+         }
+@@ -223,6 +226,70 @@ impl App {
+         self.active_thread_id.or(self.chat_widget.thread_id())
+     }
+ 
++    pub(super) fn invalidate_tui_status(&self) {
++        if let Some(publisher) = &self.terminal_status {
++            publisher.invalidate();
++        }
++    }
++
++    pub(super) fn publish_tui_status(&self, session: &AppServerSession) {
++        if let Some(publisher) = &self.terminal_status {
++            let (generation, snapshot) = self.tui_status(session);
++            publisher.publish(generation, snapshot, session.status_probe());
++        }
++    }
++
++    pub(super) fn tui_status(
++        &self,
++        session: &AppServerSession,
++    ) -> (u64, crate::tui_status::Snapshot) {
++        let (generation, mut connection) = session.status_connection();
++        if matches!(self.app_server_target, AppServerTarget::Remote { .. }) {
++            connection.kind = "remote";
++            connection.server = None;
++        }
++        if self.reconnect.offline {
++            connection.state = "disconnected";
++        }
++        let may_claim = connection.kind != "remote" && connection.state == "connected";
++        let attached = session.status_attached_thread_ids();
++        let mut attached_thread_ids: Vec<_> = if may_claim {
++            self.thread_event_channels
++                .iter()
++                .filter(|(id, channel)| {
++                    channel.attachment() == ThreadEventAttachment::Live
++                        && attached
++                            .as_ref()
++                            .is_none_or(|threads| threads.contains(&id.to_string()))
++                })
++                .take(65)
++                .map(|(id, _)| id.to_string())
++                .collect()
++        } else {
++            Vec::new()
++        };
++        attached_thread_ids.sort();
++        let displayed_thread_id = if may_claim
++            && !self
++                .chat_widget
++                .active_view_is(super::agents_overview::AGENTS_OVERVIEW_VIEW_ID)
++        {
++            self.current_displayed_thread_id().map(|id| id.to_string())
++        } else {
++            None
++        };
++        (
++            generation,
++            crate::tui_status::Snapshot {
++                v: 1,
++                generation: 0,
++                connection,
++                displayed_thread_id,
++                attached_thread_ids,
++            },
++        )
++    }
++
+     pub(super) fn ignore_same_thread_resume(
+         &mut self,
+         target_session: &crate::resume_picker::SessionTarget,
+@@ -2122,6 +2189,45 @@ mod tests {
+     use codex_protocol::models::ActivePermissionProfile;
+     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+ 
++    #[test]
++    fn terminal_status_excludes_displayed_replay_from_live_ownership() -> Result<()> {
++        // App and embedded-server fixtures need the same bounded stack as the upstream lifecycle tests.
++        std::thread::Builder::new()
++            .name("terminal-status-replay".to_owned())
++            .stack_size(16 * 1024 * 1024)
++            .spawn(|| {
++                let runtime = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()?;
++                runtime.block_on(crate::test_support::boxed_future!(async {
++                    let mut app = super::super::test_support::make_test_app().await;
++                    let mut server =
++                        Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
++                    let started = server.start_thread(&app.config).await?;
++                    let thread_id = started.session.thread_id;
++                    app.ensure_thread_channel(thread_id);
++                    app.active_thread_id = Some(thread_id);
++                    let (_, live) = app.tui_status(&server);
++                    assert_eq!(
++                        live.displayed_thread_id.as_deref(),
++                        Some(thread_id.to_string().as_str())
++                    );
++                    assert!(live.attached_thread_ids.contains(&thread_id.to_string()));
++                    app.thread_event_channels
++                        .get_mut(&thread_id)
++                        .expect("live channel")
++                        .mark_replay_only();
++                    let (_, replay) = app.tui_status(&server);
++                    assert_eq!(replay.displayed_thread_id, live.displayed_thread_id);
++                    assert!(replay.attached_thread_ids.is_empty());
++                    server.shutdown().await?;
++                    Ok(())
++                }))
++            })?
++            .join()
++            .expect("terminal status test thread")
++    }
++
+     async fn config_with_workspace_profile() -> Config {
+         let temp_dir = tempfile::tempdir().expect("tempdir");
+         ConfigBuilder::default()
+diff --git a/codex-rs/tui/src/app/voice_owner.rs b/codex-rs/tui/src/app/voice_owner.rs
+index 67ca610..267d419 100644
+--- a/codex-rs/tui/src/app/voice_owner.rs
++++ b/codex-rs/tui/src/app/voice_owner.rs
+@@ -125,6 +125,7 @@ impl App {
+         app_server: &mut AppServerSession,
+         destination: Option<ThreadId>,
+     ) {
++        self.invalidate_tui_status();
+         let thread_ids: Vec<_> = self.thread_event_channels.keys().copied().collect();
+         for thread_id in thread_ids {
+             if self.voice_owner_thread_id() == Some(thread_id)
+diff --git a/codex-rs/tui/src/app/working_directory.rs b/codex-rs/tui/src/app/working_directory.rs
+index b15fb9a..15b8626 100644
+--- a/codex-rs/tui/src/app/working_directory.rs
++++ b/codex-rs/tui/src/app/working_directory.rs
+@@ -154,6 +154,7 @@ impl App {
+         )>,
+         destination_config: DestinationConfig,
+     ) {
++        self.invalidate_tui_status();
+         if self.config.ephemeral || !cwd.as_path().is_dir() {
+             return self.working_directory_error("This task cannot be safely replaced.");
+         }
+@@ -573,6 +574,7 @@ impl App {
+         app_server: &mut AppServerSession,
+         attach: ManagedWorktreeAttach,
+     ) {
++        self.invalidate_tui_status();
+         let ManagedWorktreeAttach {
+             started,
+             config,
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 683e732..37cd5c0 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -639,6 +639,65 @@ impl AppServerSession {
+         matches!(&self.client, AppServerClient::InProcess(_))
+     }
+ 
++    pub(crate) fn status_probe(&self) -> Option<Arc<dyn crate::tui_status::ConnectionProbe>> {
++        match &self.client {
++            AppServerClient::Remote(client) => Some(Arc::new(client.status_handle())),
++            _ => None,
++        }
++    }
++
++    pub(crate) fn status_attached_thread_ids(&self) -> Option<HashSet<String>> {
++        match &self.client {
++            AppServerClient::InProcess(_) => None,
++            AppServerClient::Remote(client) => Some(client.attached_thread_ids()),
++            AppServerClient::Cloud(_) => Some(HashSet::new()),
++        }
++    }
++
++    pub(crate) fn status_connection(&self) -> (u64, crate::tui_status::Connection) {
++        use crate::tui_status::{Connection, ServerIdentity};
++        match &self.client {
++            AppServerClient::InProcess(_) => (
++                0,
++                Connection {
++                    kind: "embedded",
++                    state: "connected",
++                    server: None,
++                },
++            ),
++            AppServerClient::Remote(client) => {
++                let server = client.local_server_identity().map(|server| ServerIdentity {
++                    pid: server.pid,
++                    identity: server.identity.clone(),
++                });
++                (
++                    client.connection_generation(),
++                    Connection {
++                        kind: if server.is_some() {
++                            "local_daemon"
++                        } else {
++                            "remote"
++                        },
++                        state: if client.is_connected() {
++                            "connected"
++                        } else {
++                            "disconnected"
++                        },
++                        server,
++                    },
++                )
++            }
++            AppServerClient::Cloud(_) => (
++                0,
++                Connection {
++                    kind: "remote",
++                    state: "connected",
++                    server: None,
++                },
++            ),
++        }
++    }
++
+     /// Carry capabilities that may exist only in memory when the optional cache is unwritable.
+     pub(crate) fn inherit_task_tool_capabilities(&mut self, previous: &Self) {
+         self.task_tool_threads.extend(&previous.task_tool_threads);
+@@ -4864,3 +4923,12 @@ mod tests {
+         ));
+     }
+ }
++
++impl crate::tui_status::ConnectionProbe for codex_app_server_client::RemoteAppServerStatus {
++    fn connected(&self) -> bool {
++        self.is_connected()
++    }
++    fn attached_thread_ids(&self) -> HashSet<String> {
++        self.attached_thread_ids()
++    }
++}
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 1b0b08c..a9d59b2 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -139,6 +139,7 @@ mod markdown_copy;
+ mod permission_discovery;
+ mod pets;
+ mod security_setup;
++mod tui_status;
+ mod worktree_browser;
+ pub use custom_terminal::Terminal;
+ mod assistant_directives;
+diff --git a/codex-rs/tui/src/tui_status.rs b/codex-rs/tui/src/tui_status.rs
+new file mode 100644
+index 0000000..6c1b5db
+--- /dev/null
++++ b/codex-rs/tui/src/tui_status.rs
+@@ -0,0 +1,513 @@
++//! Read-only, same-user status published by the TUI's lifecycle owner.
++//! No transcript, paths, prompts, or terminal control cross this socket.
++
++use serde::Deserialize;
++use serde::Serialize;
++use std::collections::HashSet;
++use std::sync::{Arc, Mutex};
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++pub(crate) struct ServerIdentity {
++    pub(crate) pid: u32,
++    pub(crate) identity: String,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++pub(crate) struct Connection {
++    pub(crate) kind: &'static str,
++    pub(crate) state: &'static str,
++    pub(crate) server: Option<ServerIdentity>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++pub(crate) struct Snapshot {
++    pub(crate) v: u8,
++    pub(crate) generation: u64,
++    pub(crate) connection: Connection,
++    pub(crate) displayed_thread_id: Option<String>,
++    pub(crate) attached_thread_ids: Vec<String>,
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Request {
++    v: u8,
++    r#type: String,
++}
++
++pub(crate) trait ConnectionProbe: Send + Sync {
++    fn connected(&self) -> bool;
++    fn attached_thread_ids(&self) -> HashSet<String>;
++}
++
++struct Published {
++    snapshot: Snapshot,
++    connection_generation: u64,
++    probe: Option<Arc<dyn ConnectionProbe>>,
++    previous: Option<(u64, Snapshot)>,
++    generation: u64,
++}
++
++impl Published {
++    fn current(&mut self) -> Snapshot {
++        let mut snapshot = self.snapshot.clone();
++        snapshot.generation = 0;
++        if let Some(probe) = &self.probe {
++            if !probe.connected() {
++                snapshot.connection.state = "disconnected";
++            }
++            let attached = probe.attached_thread_ids();
++            if attached.len() > 64 {
++                snapshot.attached_thread_ids = attached.into_iter().take(65).collect();
++            } else {
++                snapshot
++                    .attached_thread_ids
++                    .retain(|id| attached.contains(id));
++            }
++        }
++        if snapshot.connection.state != "connected" {
++            snapshot.connection.server = None;
++        }
++        if snapshot.connection.state != "connected" || snapshot.connection.kind == "remote" {
++            snapshot.displayed_thread_id = None;
++            snapshot.attached_thread_ids.clear();
++        }
++        snapshot.attached_thread_ids.sort();
++        if self.previous.as_ref().is_none_or(|(generation, previous)| {
++            *generation != self.connection_generation || previous != &snapshot
++        }) {
++            self.generation = self.generation.saturating_add(1);
++            self.previous = Some((self.connection_generation, snapshot.clone()));
++        }
++        snapshot.generation = self.generation;
++        snapshot
++    }
++}
++
++#[derive(Clone)]
++pub(crate) struct StatusPublisher(Arc<Mutex<Published>>);
++
++impl StatusPublisher {
++    pub(crate) fn publish(
++        &self,
++        generation: u64,
++        snapshot: Snapshot,
++        probe: Option<Arc<dyn ConnectionProbe>>,
++    ) {
++        if let Ok(mut published) = self.0.lock() {
++            published.connection_generation = generation;
++            published.snapshot = snapshot;
++            published.probe = probe;
++            let _ = published.current();
++        }
++    }
++
++    pub(crate) fn invalidate(&self) {
++        if let Ok(mut published) = self.0.lock() {
++            published.snapshot.displayed_thread_id = None;
++            published.snapshot.attached_thread_ids.clear();
++            let _ = published.current();
++        }
++    }
++}
++
++pub(crate) struct StatusService {
++    published: Arc<Mutex<Published>>,
++    #[cfg(all(test, unix))]
++    permits: Arc<tokio::sync::Semaphore>,
++    #[cfg(unix)]
++    task: tokio::task::JoinHandle<()>,
++    #[cfg(unix)]
++    _socket: SocketGuard,
++}
++
++impl StatusService {
++    pub(crate) fn start(codex_home: &std::path::Path) -> Option<Self> {
++        #[cfg(unix)]
++        match Self::bind(codex_home) {
++            Ok(service) => return Some(service),
++            Err(_) => tracing::warn!("TUI status socket unavailable"),
++        }
++        #[cfg(not(unix))]
++        let _ = codex_home;
++        None
++    }
++
++    pub(crate) fn publisher(&self) -> StatusPublisher {
++        StatusPublisher(Arc::clone(&self.published))
++    }
++
++    #[cfg(unix)]
++    fn bind(codex_home: &std::path::Path) -> std::io::Result<Self> {
++        use std::os::unix::fs::DirBuilderExt;
++        use std::os::unix::fs::MetadataExt;
++        use std::os::unix::fs::PermissionsExt;
++        let directory = codex_home.join("tui-status");
++        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
++            Ok(()) => {}
++            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
++            Err(error) => return Err(error),
++        }
++        let metadata = std::fs::symlink_metadata(&directory)?;
++        // SAFETY: geteuid has no pointer or lifetime requirements.
++        let uid = unsafe { libc::geteuid() };
++        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
++            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
++        }
++        let path = directory.join(format!("{}.sock", std::process::id()));
++        let listener = tokio::net::UnixListener::bind(&path)?;
++        let metadata = std::fs::symlink_metadata(&path)?;
++        let socket = SocketGuard {
++            path,
++            device: metadata.dev(),
++            inode: metadata.ino(),
++        };
++        std::fs::set_permissions(&socket.path, std::fs::Permissions::from_mode(0o600))?;
++        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
++        #[cfg(test)]
++        let retained_permits = Arc::clone(&permits);
++        let published = Arc::new(Mutex::new(Published {
++            snapshot: Snapshot {
++                v: 1,
++                generation: 0,
++                connection: Connection {
++                    kind: "remote",
++                    state: "disconnected",
++                    server: None,
++                },
++                displayed_thread_id: None,
++                attached_thread_ids: Vec::new(),
++            },
++            connection_generation: 0,
++            probe: None,
++            previous: None,
++            generation: 0,
++        }));
++        let status = Arc::clone(&published);
++        let task = tokio::spawn(async move {
++            let mut clients = tokio::task::JoinSet::new();
++            loop {
++                tokio::select! {
++                    result = listener.accept() => {
++                        let Ok((stream, _)) = result else { break; };
++                        let Ok(credentials) = stream.peer_cred() else { continue; };
++                        if credentials.uid() != uid { continue; }
++                        let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
++                        let status = Arc::clone(&status);
++                        clients.spawn(async move {
++                            let _permit = permit;
++                            let _ = tokio::time::timeout(
++                                std::time::Duration::from_millis(500),
++                                serve(stream, status),
++                            ).await;
++                        });
++                    }
++                    _ = clients.join_next(), if !clients.is_empty() => {}
++                }
++            }
++        });
++        Ok(Self {
++            published,
++            #[cfg(test)]
++            permits: retained_permits,
++            task,
++            _socket: socket,
++        })
++    }
++}
++
++#[cfg(unix)]
++async fn serve(
++    stream: tokio::net::UnixStream,
++    published: Arc<Mutex<Published>>,
++) -> std::io::Result<()> {
++    use tokio::io::AsyncBufReadExt;
++    use tokio::io::AsyncReadExt;
++    use tokio::io::AsyncWriteExt;
++    let (reader, mut writer) = stream.into_split();
++    let mut reader = tokio::io::BufReader::new(reader).take(257);
++    let mut line = Vec::with_capacity(64);
++    reader.read_until(b'\n', &mut line).await?;
++    if line.len() > 256 || line.last() != Some(&b'\n') {
++        return Ok(());
++    }
++    let Ok(request) = serde_json::from_slice::<Request>(&line) else {
++        return Ok(());
++    };
++    if request.v != 1 || request.r#type != "status" {
++        return Ok(());
++    }
++    let snapshot = match published.lock() {
++        Ok(mut published) => published.current(),
++        Err(_) => return Ok(()),
++    };
++    let mut response = serde_json::to_vec(&snapshot)?;
++    if response.len() >= 16384 || snapshot.attached_thread_ids.len() > 64 {
++        return Ok(());
++    }
++    response.push(b'\n');
++    writer.write_all(&response).await?;
++    writer.shutdown().await
++}
++
++#[cfg(unix)]
++struct SocketGuard {
++    path: std::path::PathBuf,
++    device: u64,
++    inode: u64,
++}
++
++#[cfg(unix)]
++impl Drop for SocketGuard {
++    fn drop(&mut self) {
++        use std::os::unix::fs::MetadataExt;
++        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
++            && metadata.dev() == self.device
++            && metadata.ino() == self.inode
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++impl Drop for StatusService {
++    fn drop(&mut self) {
++        #[cfg(unix)]
++        self.task.abort();
++    }
++}
++
++#[cfg(all(test, unix))]
++mod tests {
++    use super::*;
++    use std::os::unix::fs::PermissionsExt;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++    fn snapshot(thread: Option<&str>) -> Snapshot {
++        Snapshot {
++            v: 1,
++            generation: 0,
++            connection: Connection {
++                kind: "embedded",
++                state: "connected",
++                server: None,
++            },
++            displayed_thread_id: thread.map(str::to_owned),
++            attached_thread_ids: thread.map(|id| vec![id.to_owned()]).unwrap_or_default(),
++        }
++    }
++
++    fn directory() -> tempfile::TempDir {
++        tempfile::Builder::new()
++            .prefix("codex-status-")
++            .tempdir_in("/tmp")
++            .expect("home")
++    }
++    fn path(home: &std::path::Path) -> std::path::PathBuf {
++        home.join("tui-status")
++            .join(format!("{}.sock", std::process::id()))
++    }
++    async fn query(path: &std::path::Path, request: &[u8]) -> Vec<u8> {
++        let mut client = tokio::net::UnixStream::connect(path)
++            .await
++            .expect("connect");
++        client.write_all(request).await.expect("request");
++        let mut response = Vec::new();
++        tokio::time::timeout(
++            std::time::Duration::from_secs(2),
++            client.take(16385).read_to_end(&mut response),
++        )
++        .await
++        .expect("deadline")
++        .expect("response");
++        response
++    }
++    fn current(service: &StatusService) -> Snapshot {
++        service.published.lock().expect("status").current()
++    }
++
++    #[tokio::test]
++    async fn status_stays_available_without_polling_the_ui_and_cleans_socket() {
++        let home = directory();
++        let service = StatusService::start(home.path()).expect("bind");
++        service.publisher().publish(
++            1,
++            snapshot(Some("00000000-0000-0000-0000-000000000001")),
++            None,
++        );
++        assert_eq!(
++            std::fs::metadata(path(home.path()))
++                .expect("socket")
++                .permissions()
++                .mode()
++                & 0o777,
++            0o600
++        );
++        assert_eq!(
++            std::fs::metadata(home.path().join("tui-status"))
++                .expect("directory")
++                .permissions()
++                .mode()
++                & 0o777,
++            0o700
++        );
++        // No UI task or query actor is running; a synchronous server hook can still authenticate.
++        let response = query(&path(home.path()), b"{\"v\":1,\"type\":\"status\"}\n").await;
++        let value: serde_json::Value = serde_json::from_slice(&response).expect("status");
++        assert_eq!(
++            value["displayed_thread_id"],
++            "00000000-0000-0000-0000-000000000001"
++        );
++        assert_eq!(
++            value["attached_thread_ids"].as_array().expect("ids").len(),
++            1
++        );
++        drop(service);
++        assert!(!path(home.path()).exists());
++    }
++
++    #[tokio::test]
++    async fn generation_is_stable_until_selection_connection_or_invalidation_changes() {
++        let home = directory();
++        let service = StatusService::start(home.path()).expect("bind");
++        let publisher = service.publisher();
++        publisher.publish(1, snapshot(Some("a")), None);
++        let first = current(&service).generation;
++        publisher.publish(1, snapshot(Some("a")), None);
++        assert_eq!(first, current(&service).generation);
++        publisher.invalidate();
++        assert!(current(&service).displayed_thread_id.is_none());
++        let invalidated = current(&service).generation;
++        assert!(invalidated > first);
++        publisher.publish(1, snapshot(Some("b")), None);
++        let selected = current(&service).generation;
++        assert!(selected > invalidated);
++        publisher.publish(2, snapshot(Some("b")), None);
++        assert!(current(&service).generation > selected);
++    }
++
++    struct Probe {
++        connected: AtomicBool,
++        ids: Mutex<HashSet<String>>,
++    }
++    impl ConnectionProbe for Probe {
++        fn connected(&self) -> bool {
++            self.connected.load(Ordering::Acquire)
++        }
++        fn attached_thread_ids(&self) -> HashSet<String> {
++            self.ids.lock().expect("ids").clone()
++        }
++    }
++
++    #[tokio::test]
++    async fn live_connection_fences_cached_snapshot_and_replay_never_becomes_attached() {
++        let home = directory();
++        let service = StatusService::start(home.path()).expect("bind");
++        let probe = Arc::new(Probe {
++            connected: AtomicBool::new(true),
++            ids: Mutex::new(HashSet::from(["a".to_owned()])),
++        });
++        let mut active = snapshot(Some("a"));
++        active.connection = Connection {
++            kind: "local_daemon",
++            state: "connected",
++            server: Some(ServerIdentity {
++                pid: 1,
++                identity: "server".to_owned(),
++            }),
++        };
++        service
++            .publisher()
++            .publish(1, active.clone(), Some(probe.clone()));
++        let generation = current(&service).generation;
++        probe.ids.lock().expect("ids").clear();
++        assert!(current(&service).attached_thread_ids.is_empty());
++        assert!(current(&service).generation > generation);
++        probe.ids.lock().expect("ids").insert("a".to_owned());
++        active.attached_thread_ids.clear(); // UI marks the displayed channel as saved-history replay.
++        service.publisher().publish(1, active, Some(probe.clone()));
++        assert!(current(&service).attached_thread_ids.is_empty());
++        assert_eq!(current(&service).displayed_thread_id.as_deref(), Some("a"));
++        probe.connected.store(false, Ordering::Release);
++        let disconnected = current(&service);
++        assert_eq!(disconnected.connection.state, "disconnected");
++        assert!(disconnected.connection.server.is_none());
++        assert!(disconnected.displayed_thread_id.is_none());
++    }
++
++    #[tokio::test]
++    async fn malformed_oversized_and_control_requests_are_refused() {
++        let home = directory();
++        let _service = StatusService::start(home.path()).expect("bind");
++        for request in [
++            b"{\"v\":1,\"type\":\"resume\"}\n".to_vec(),
++            b"{\"v\":2,\"type\":\"status\"}\n".to_vec(),
++            b"{\"v\":1,\"type\":\"status\",\"pid\":1}\n".to_vec(),
++            vec![b'x'; 257],
++            b"{\"v\":1".to_vec(),
++        ] {
++            assert!(query(&path(home.path()), &request).await.is_empty());
++        }
++    }
++
++    #[tokio::test]
++    async fn only_four_partial_requests_are_retained_and_large_ownership_is_refused() {
++        let home = directory();
++        let service = StatusService::start(home.path()).expect("bind");
++        let mut clients = Vec::new();
++        for _ in 0..4 {
++            let client = tokio::net::UnixStream::connect(path(home.path()))
++                .await
++                .expect("connect");
++            clients.push(client);
++            tokio::task::yield_now().await;
++        }
++        tokio::time::timeout(std::time::Duration::from_secs(1), async {
++            while service.permits.available_permits() != 0 {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .expect("four accepted requests");
++        let mut fifth = tokio::net::UnixStream::connect(path(home.path()))
++            .await
++            .expect("fifth");
++        let mut response = Vec::new();
++        fifth.read_to_end(&mut response).await.expect("refused");
++        assert!(response.is_empty());
++        assert_eq!(
++            service.permits.available_permits(),
++            0,
++            "fifth closed while all four original requests remain held"
++        );
++        drop(clients);
++        let mut too_many = snapshot(None);
++        too_many.attached_thread_ids = vec!["a".to_owned(); 65];
++        service.publisher().publish(1, too_many, None);
++        assert!(
++            query(&path(home.path()), b"{\"v\":1,\"type\":\"status\"}\n")
++                .await
++                .is_empty()
++        );
++    }
++
++    #[tokio::test]
++    async fn directory_symlinks_broad_permissions_and_live_socket_replacement_are_refused() {
++        let home = directory();
++        let target = directory();
++        let directory_path = home.path().join("tui-status");
++        std::os::unix::fs::symlink(target.path(), &directory_path).expect("link");
++        assert!(StatusService::start(home.path()).is_none());
++        std::fs::remove_file(&directory_path).expect("remove link");
++        std::fs::create_dir(&directory_path).expect("directory");
++        std::fs::set_permissions(&directory_path, std::fs::Permissions::from_mode(0o755))
++            .expect("mode");
++        assert!(StatusService::start(home.path()).is_none());
++        std::fs::set_permissions(&directory_path, std::fs::Permissions::from_mode(0o700))
++            .expect("mode");
++        let _service = StatusService::start(home.path()).expect("bind");
++        assert!(StatusService::start(home.path()).is_none());
++        assert!(path(home.path()).exists());
++    }
++}
+diff --git a/codex-rs/uds/Cargo.toml b/codex-rs/uds/Cargo.toml
+index a985ebd..f732bd5 100644
+--- a/codex-rs/uds/Cargo.toml
++++ b/codex-rs/uds/Cargo.toml
+@@ -31,4 +31,5 @@ tokio = { workspace = true, features = [
+     "io-util",
+     "macros",
+     "rt-multi-thread",
++    "time",
+ ] }
+diff --git a/codex-rs/uds/src/lib.rs b/codex-rs/uds/src/lib.rs
+index 5fecf77..85f3bf0 100644
+--- a/codex-rs/uds/src/lib.rs
++++ b/codex-rs/uds/src/lib.rs
+@@ -59,6 +59,13 @@ pub struct UnixStream {
+ }
+ 
+ impl UnixStream {
++    /// Returns credentials obtained from the connected Unix socket's peer.
++    /// Application messages and client metadata cannot supply these values.
++    #[cfg(unix)]
++    pub fn peer_cred(&self) -> IoResult<tokio::net::unix::UCred> {
++        self.inner.peer_cred()
++    }
++
+     /// Requires the Windows peer to belong to the current user, with neither
+     /// process elevated. Call before sending any application data.
+     #[cfg(windows)]
+diff --git a/codex-rs/uds/src/lib_tests.rs b/codex-rs/uds/src/lib_tests.rs
+index 91040b1..d0b975e 100644
+--- a/codex-rs/uds/src/lib_tests.rs
++++ b/codex-rs/uds/src/lib_tests.rs
+@@ -6,6 +6,50 @@ use tokio::io::AsyncWriteExt;
+ 
+ use super::*;
+ 
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++#[tokio::test]
++async fn peer_credentials_come_from_the_connected_process() {
++    let directory = tempfile::TempDir::new().expect("socket directory");
++    let socket_path = directory.path().join("credentials.sock");
++    let mut listener = UnixListener::bind(&socket_path).await.expect("listen");
++    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
++        .args([
++            "--exact",
++            "lib_tests::peer_credentials_child",
++            "--nocapture",
++        ])
++        .env("CODEX_TEST_PEER_CREDENTIAL_SOCKET", &socket_path)
++        .spawn()
++        .expect("spawn connected process");
++    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
++        .await
++        .expect("connection deadline")
++        .expect("accept");
++    let credentials = stream.peer_cred().expect("kernel credentials");
++    assert_eq!(credentials.pid(), Some(child.id() as libc::pid_t));
++    // SAFETY: geteuid has no pointer or lifetime requirements.
++    assert_eq!(credentials.uid(), unsafe { libc::geteuid() });
++    assert_ne!(credentials.pid(), Some(std::process::id() as libc::pid_t));
++    stream.write_all(&[1]).await.expect("release child");
++    assert!(child.wait().expect("wait for peer").success());
++}
++
++#[cfg(any(target_os = "linux", target_os = "macos"))]
++#[test]
++fn peer_credentials_child() {
++    let Some(socket_path) = std::env::var_os("CODEX_TEST_PEER_CREDENTIAL_SOCKET") else {
++        return;
++    };
++    use std::io::Read;
++    let mut stream = std::os::unix::net::UnixStream::connect(socket_path).expect("connect");
++    stream
++        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
++        .expect("read deadline");
++    let mut released = [0];
++    stream.read_exact(&mut released).expect("wait for release");
++    assert_eq!(released, [1]);
++}
++
+ #[cfg(windows)]
+ #[tokio::test]
+ async fn private_directory_rejects_volume_roots() {

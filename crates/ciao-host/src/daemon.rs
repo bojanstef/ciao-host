@@ -3499,6 +3499,9 @@ async fn adopted_pickup(
         reason_code: Some(reason.into()),
         deduplicated: None,
     };
+    if let Some(reason) = state.agent_sessions.adoption_refusal(session_id) {
+        return refused(reason);
+    }
     // An adoption already holding this conversation answers accepted rather than refusing:
     // the row and the session share one identity, so the phone simply opens it.
     if state
@@ -3519,8 +3522,8 @@ async fn adopted_pickup(
     }
     // The tapped row is either a discovery row (its ID is the conversation's stable identity)
     // or an attached session row — live tail or ended record — that resolves to its thread.
-    // Ownership is not judged here: the adopt preconditions ask the kernel, and a live TUI
-    // answers `terminal_holds_conversation` truthfully.
+    // Resolve aliases before checking thread ownership. A cached discovery row has a
+    // different Ciao identity from an attached row for the same vendor conversation.
     let row = match state
         .codex_adoptions
         .unheld_thread_for_session(session_id)
@@ -3550,6 +3553,9 @@ async fn adopted_pickup(
             row
         }
     };
+    if let Some(reason) = state.agent_sessions.thread_adoption_refusal(&row.thread_id) {
+        return refused(reason);
+    }
     let Some(binary) = state.codex_adoptions.recorded_binary() else {
         return refused("codex_unavailable");
     };
@@ -4742,6 +4748,94 @@ mod tests {
             paired_path,
             WorkspaceConfig::for_home(std::path::Path::new("/nonexistent-test-home")),
         )
+    }
+
+    #[tokio::test]
+    async fn shared_terminal_refuses_pickup_before_any_discovery_or_vendor_spawn() {
+        use crate::agent_adapter::AttachedAgentAdapter;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(
+            iroh::SecretKey::generate().public(),
+            &root.path().join("paired.json"),
+        );
+        assert!(state.codex_adoptions.recorded_binary().is_none());
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "v":1,"type":"register","adapter":"codex",
+            "adapter_version":crate::codex_adapter::PINNED_CODEX_VERSION,
+            "mode":"tui_hook","session_id":thread,"process_nonce":"shared-owner",
+            "process_id":std::process::id(),"workspace_display":"fixture","workspace_path":"/synthetic"
+        })).unwrap();
+        let mut registration = crate::codex_adapter::CodexAttachedAdapter
+            .decode_registration(&frame, Some(std::process::id()))
+            .unwrap();
+        registration.terminal_binding = Some(crate::codex_terminal_status::TerminalBinding {
+            tui_pid: std::process::id(),
+            tui_identity: "fixture-tui".into(),
+            server_pid: std::process::id().saturating_add(1),
+            server_identity: "fixture-backend".into(),
+            generation: 1,
+            thread_id: thread.into(),
+            status_directory: "/synthetic/tui-status".into(),
+        });
+        let registered = state
+            .agent_sessions
+            .register_observer(registration)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .agent_sessions
+                .adoption_refusal(&registered.session_id),
+            Some("terminal_holds_conversation")
+        );
+        let outcome = adopted_pickup(&state, &registered.session_id, "fixture-pickup").await;
+        assert_eq!(outcome.state, "refused");
+        assert_eq!(
+            outcome.reason_code.as_deref(),
+            Some("terminal_holds_conversation")
+        );
+        assert!(outcome.session_id.is_none());
+        assert!(state.codex_adoptions.recorded_binary().is_none());
+        assert!(crate::process::exists(std::process::id()));
+
+        // A previously discovered directory row uses another Ciao ID. The thread guard
+        // must refuse before the binary or rollout-FD preconditions can be consulted.
+        let alias = crate::codex_adopted::codex_conversation_session_id(thread);
+        assert_ne!(alias, registered.session_id);
+        let never_spawn = root.path().join("never-spawn");
+        std::fs::write(&never_spawn, b"not an executable").unwrap();
+        state.codex_adoptions.record_binary_evidence(never_spawn);
+        state
+            .codex_adoptions
+            .cache_unheld_thread_for_test(crate::codex_adopted::UnheldThread {
+                session_id: alias.clone(),
+                thread_id: thread.into(),
+                rollout: None,
+                cwd: None,
+                preview: None,
+                updated_at: 1,
+                cli_version: crate::codex_adapter::PINNED_CODEX_VERSION.into(),
+            })
+            .await;
+        assert!(state.agent_sessions.adoption_refusal(&alias).is_none());
+        assert_eq!(
+            state
+                .codex_adoptions
+                .unheld_thread_for_session(&alias)
+                .await
+                .unwrap()
+                .thread_id,
+            thread
+        );
+        let aliased = adopted_pickup(&state, &alias, "fixture-aliased-pickup").await;
+        assert_eq!(aliased.state, "refused");
+        assert_eq!(
+            aliased.reason_code.as_deref(),
+            Some("terminal_holds_conversation")
+        );
+        assert!(aliased.session_id.is_none());
+        assert!(crate::process::exists(std::process::id()));
     }
 
     fn test_state_with_workspace(

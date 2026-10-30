@@ -93,6 +93,9 @@ pub(crate) struct NormalizedRegistration {
     pub(crate) upstream_identity: String,
     pub(crate) process_nonce: String,
     pub(crate) process_id: u32,
+    /// A separately authenticated terminal for a shared Codex event producer. Host-only and
+    /// ephemeral: a PID or a cached route alone cannot preserve this association.
+    pub(crate) terminal_binding: Option<crate::codex_terminal_status::TerminalBinding>,
     pub(crate) adapter_family: String,
     pub(crate) adapter_version: String,
     /// `attached` for user-owned TUI bridges; `managed` for daemon-owned workers; `adopted`
@@ -142,6 +145,14 @@ impl NormalizedRegistration {
             || self.capabilities.terminal_continuity != "unavailable"
             || (!self.observation.is_authoritative() && self.turn.is_authoritative_working())
             || (!self.compatible && self.capabilities.commands != CommandCapabilities::none())
+            || self.terminal_binding.as_ref().is_some_and(|binding| {
+                self.adapter_family != "Codex"
+                    || !self.compatible
+                    || self.topology != "attached"
+                    || binding.tui_pid != self.process_id
+                    || binding.thread_id != self.upstream_identity
+                    || self.capabilities.commands != CommandCapabilities::none()
+            })
         {
             return Err(AgentProtocolError::InvalidValue);
         }
@@ -271,6 +282,7 @@ struct LiveSession {
     upstream_identity: String,
     bridge_disconnect_token: String,
     process_id: u32,
+    terminal_binding: Option<crate::codex_terminal_status::TerminalBinding>,
     compatible: bool,
     offered_commands: CommandCapabilities,
     bridge_sender: Option<mpsc::Sender<BridgeCommandEnvelope>>,
@@ -292,6 +304,12 @@ struct LiveSession {
     updates: broadcast::Sender<AgentServerFrame>,
     /// What this conversation's agent was last told about where its person is (Spec 025).
     whereabouts: Announced,
+}
+
+impl LiveSession {
+    fn blocks_adoption(&self) -> bool {
+        self.terminal_binding.is_some()
+    }
 }
 
 /// An attached session that can become a managed one, resolved before any worker is spawned.
@@ -494,6 +512,7 @@ impl AgentSessionSupervisor {
                 || drift_identity_changed;
 
             session.process_id = registration.process_id;
+            session.terminal_binding = registration.terminal_binding.clone();
             session.snapshot.drift = drift;
             session.compatible = registration.compatible;
             session.offered_commands = CommandCapabilities::none();
@@ -731,6 +750,7 @@ impl AgentSessionSupervisor {
                 upstream_identity: registration.upstream_identity.clone(),
                 bridge_disconnect_token: bridge_disconnect_token.clone(),
                 process_id: registration.process_id,
+                terminal_binding: registration.terminal_binding,
                 compatible: registration.compatible,
                 offered_commands: registration.capabilities.commands,
                 bridge_sender: sender,
@@ -1616,6 +1636,26 @@ impl AgentSessionSupervisor {
         })
     }
 
+    /// A live shared terminal's binding is positive ownership evidence even if a vendor
+    /// stops holding rollout files. Presentation capabilities never authorize adoption.
+    pub(crate) fn adoption_refusal(&self, session_id: &str) -> Option<&'static str> {
+        self.inner
+            .lock()
+            .sessions
+            .get(session_id)
+            .filter(|session| session.blocks_adoption())
+            .map(|_| "terminal_holds_conversation")
+    }
+
+    pub(crate) fn thread_adoption_refusal(&self, thread_id: &str) -> Option<&'static str> {
+        self.inner
+            .lock()
+            .sessions
+            .values()
+            .any(|session| session.upstream_identity == thread_id && session.blocks_adoption())
+            .then_some("terminal_holds_conversation")
+    }
+
     /// The live list, with attached rows told which managed session already owns their
     /// conversation.
     ///
@@ -2240,7 +2280,13 @@ impl AgentSessionSupervisor {
         {
             return None;
         }
+        if !self.revalidate_terminal_binding(&record.session_id).await {
+            return None;
+        }
         let plan = self.routes.terminal_plan(&record.proof).await;
+        if !self.revalidate_terminal_binding(&record.session_id).await {
+            return None;
+        }
         if plan.is_none() {
             self.downgrade_if_current(
                 route_id,
@@ -2250,6 +2296,52 @@ impl AgentSessionSupervisor {
             );
         }
         plan
+    }
+
+    /// A shared hook's writer may outlive its terminal selection. Keep that independently
+    /// authenticated association live only while its complete generation still agrees.
+    pub(crate) async fn revalidate_terminal_binding(&self, session_id: &str) -> bool {
+        let binding = {
+            let inner = self.inner.lock();
+            let Some(session) = inner.sessions.get(session_id) else {
+                return false;
+            };
+            session.terminal_binding.clone()
+        };
+        let Some(binding) = binding else {
+            return true;
+        };
+        if crate::codex_terminal_status::revalidate(&binding).await {
+            return self
+                .inner
+                .lock()
+                .sessions
+                .get(session_id)
+                .is_some_and(|session| session.terminal_binding.as_ref() == Some(&binding));
+        }
+        self.remove_terminal_binding_if_current(session_id, &binding);
+        false
+    }
+
+    fn remove_terminal_binding_if_current(
+        &self,
+        session_id: &str,
+        binding: &crate::codex_terminal_status::TerminalBinding,
+    ) {
+        let mut inner = self.inner.lock();
+        if !inner
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.terminal_binding.as_ref() == Some(binding))
+        {
+            return;
+        }
+        if let Some(old) = inner.sessions.remove(session_id) {
+            if let Some(route) = old.route_id {
+                inner.routes.remove(&route);
+            }
+            record_ended_verdict(&mut inner.ended, session_id);
+        }
     }
 
     /// Removes sessions whose registered process no longer exists. A killed persistent bridge
@@ -2334,6 +2426,29 @@ impl AgentSessionSupervisor {
     /// The daemon calls this periodically so a replaced pane removes native controls even when
     /// no command or terminal request happens to expose the loss first.
     pub(crate) async fn revalidate_live_routes(&self) {
+        // A live TUI can change its displayed thread without exiting or moving panes. Such
+        // a change invalidates the observation itself, including rows with no resolved route.
+        let mut directories: HashMap<PathBuf, Vec<_>> = HashMap::new();
+        for (id, session) in &self.inner.lock().sessions {
+            if let Some(binding) = &session.terminal_binding {
+                directories
+                    .entry(binding.status_directory.clone())
+                    .or_default()
+                    .push((id.clone(), binding.clone()));
+            }
+        }
+        // A single discovery already inspects every TUI in this directory. Sharing it across
+        // this sweep keeps N live conversations from causing N full process/socket scans.
+        for (directory, recorded) in directories {
+            let current = crate::codex_terminal_status::live_bindings(&directory)
+                .await
+                .unwrap_or_default();
+            for (id, binding) in recorded {
+                if !current.contains(&binding) {
+                    self.remove_terminal_binding_if_current(&id, &binding);
+                }
+            }
+        }
         let records: Vec<_> = self
             .inner
             .lock()
@@ -2414,6 +2529,9 @@ impl AgentSessionSupervisor {
     }
 
     async fn refresh_route(&self, session_id: &str) {
+        if !self.revalidate_terminal_binding(session_id).await {
+            return;
+        }
         let route_fence = {
             let inner = self.inner.lock();
             inner
@@ -2436,6 +2554,9 @@ impl AgentSessionSupervisor {
             return;
         };
         let proof = self.routes.resolve(process_id).await;
+        if !self.revalidate_terminal_binding(session_id).await {
+            return;
+        }
         // Kept, at debug: resolution is the one step here that can fail transiently, and its
         // outcome is invisible from the phone — an unresolved route renders as the conversation
         // opening normally. `recover_missing_routes` retries, so a `none` followed by a
@@ -3429,8 +3550,14 @@ fn descriptor_for(session: &LiveSession) -> AgentSessionDescriptor {
         recent_prompt: recent_prompt_for(session),
         // Filled in by the caller, which is the only place that can see both directories.
         managed_session_id: None,
-        takeover: takeover_verb(&session.snapshot.topology, &session.snapshot.adapter.family)
-            .map(str::to_owned),
+        takeover: session
+            .terminal_binding
+            .is_none()
+            .then(|| {
+                takeover_verb(&session.snapshot.topology, &session.snapshot.adapter.family)
+                    .map(str::to_owned)
+            })
+            .flatten(),
         drift: session.snapshot.drift.clone(),
         revision: session.snapshot.revision,
         updated_at: session.updated_at,
@@ -4032,6 +4159,7 @@ mod tests {
 
     fn registration_with(nonce: &str, upstream: &str, process_id: u32) -> NormalizedRegistration {
         NormalizedRegistration {
+            terminal_binding: None,
             history_boundary: None,
             upstream_identity: upstream.into(),
             process_nonce: nonce.into(),
@@ -4316,6 +4444,84 @@ mod tests {
         registration.capabilities.pending_rehydration = "none".into();
         registration.control_owner = "terminal".into();
         registration
+    }
+
+    fn shared_codex_registration() -> NormalizedRegistration {
+        let mut registration = observer_registration("shared-terminal-nonce");
+        registration.adapter_family = "Codex".into();
+        registration.terminal_binding = Some(crate::codex_terminal_status::TerminalBinding {
+            tui_pid: registration.process_id,
+            tui_identity: "fixture-tui-incarnation".into(),
+            server_pid: registration.process_id.saturating_add(1),
+            server_identity: "fixture-server-incarnation".into(),
+            generation: 1,
+            thread_id: registration.upstream_identity.clone(),
+            status_directory: "/synthetic/missing-tui-status".into(),
+        });
+        registration
+    }
+
+    #[tokio::test]
+    async fn missing_shared_binding_closes_the_observation_without_signalling_a_process() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("metadata.json"));
+        let registration = shared_codex_registration();
+        registration.validate().unwrap();
+        // Avoid background route work: the test drives the exact invalidation boundary.
+        let registered = supervisor.register_new(registration, None).unwrap();
+        assert!(supervisor.snapshot(&registered.session_id).is_some());
+        assert!(supervisor.list().sessions[0].takeover.is_none());
+        assert_eq!(
+            supervisor.adoption_refusal(&registered.session_id),
+            Some("terminal_holds_conversation")
+        );
+        assert!(
+            !supervisor
+                .revalidate_terminal_binding(&registered.session_id)
+                .await
+        );
+        assert!(supervisor.snapshot(&registered.session_id).is_none());
+        assert!(process_exists(std::process::id()));
+        assert_eq!(supervisor.active_count(), 0);
+        assert_eq!(supervisor.adoption_refusal(&registered.session_id), None);
+    }
+
+    #[test]
+    fn standalone_codex_keeps_the_existing_kernel_ownership_check() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("metadata.json"));
+        let mut registration = observer_registration("standalone-kernel-owner");
+        registration.adapter_family = "Codex".into();
+        assert!(registration.terminal_binding.is_none());
+        let registered = supervisor.register_new(registration, None).unwrap();
+        assert_eq!(supervisor.adoption_refusal(&registered.session_id), None);
+        assert_eq!(
+            supervisor.list().sessions[0].takeover.as_deref(),
+            Some("pickup")
+        );
+    }
+
+    #[test]
+    fn old_terminal_binding_verdict_cannot_remove_a_new_selection_generation() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("metadata.json"));
+        let registration = shared_codex_registration();
+        let old = registration.terminal_binding.clone().unwrap();
+        let registered = supervisor.register_new(registration, None).unwrap();
+        let mut current = old.clone();
+        current.generation += 1;
+        supervisor
+            .inner
+            .lock()
+            .sessions
+            .get_mut(&registered.session_id)
+            .unwrap()
+            .terminal_binding = Some(current.clone());
+        supervisor.remove_terminal_binding_if_current(&registered.session_id, &old);
+        assert_eq!(supervisor.active_count(), 1);
+        supervisor.remove_terminal_binding_if_current(&registered.session_id, &current);
+        assert_eq!(supervisor.active_count(), 0);
+        assert!(process_exists(std::process::id()));
     }
 
     fn text_delta(

@@ -102,6 +102,7 @@ impl ClaudeManagedRegister {
         let compatible = self.adapter_version == PINNED_MANAGED_CLI_VERSION
             && self.sdk_version == PINNED_CLAUDE_SDK_VERSION;
         Ok(NormalizedRegistration {
+            terminal_binding: None,
             history_boundary: (self.resumed && !self.history_complete).then(|| "resume".to_owned()),
             upstream_identity: self.session_id,
             process_nonce: self.process_nonce,

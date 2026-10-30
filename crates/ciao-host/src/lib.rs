@@ -21,6 +21,7 @@ pub(crate) mod codex_carry;
 pub(crate) mod codex_history;
 pub(crate) mod codex_hook;
 pub mod codex_integration;
+pub(crate) mod codex_terminal_status;
 pub mod daemon;
 pub(crate) mod downloads;
 pub(crate) mod drift;

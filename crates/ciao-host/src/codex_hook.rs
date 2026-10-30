@@ -36,7 +36,7 @@ use crate::{
         keyed_digest, object, preview_truncation, read_bounded_stdin, required_string,
         session_start_resets_context, trace_outcome, unix_now, workspace_display,
     },
-    process::{command as process_command, parent as process_parent},
+    process::{arguments as process_arguments, parent as process_parent},
     storage::CiaoPaths,
 };
 
@@ -111,9 +111,16 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
         process_nonce: process_nonce(process_id),
         adapter_version,
     };
-    let Some(dispatch) = map_hook_input(&value, &facts)? else {
+    let Some(mut dispatch) = map_hook_input(&value, &facts)? else {
         return Ok(());
     };
+    dispatch.registration.terminal_status_directory = Some(
+        crate::codex_integration::codex_home(paths)
+            .join("tui-status")
+            .to_str()
+            .ok_or_else(|| anyhow!("Codex terminal status directory is not UTF-8"))?
+            .to_owned(),
+    );
     let registration = serde_json::to_value(dispatch.registration)?;
     let event = serde_json::to_value(dispatch.event)?;
     let turn = dispatch
@@ -161,9 +168,10 @@ async fn codex_process_id() -> Result<u32> {
         if pid == 0 {
             break;
         }
-        if process_command(pid)
+        if process_arguments(pid)
             .await
-            .is_some_and(|command| command_is_codex(&command))
+            .and_then(|arguments| arguments.into_iter().next())
+            .is_some_and(|binary| crate::codex_adapter::executable_is_codex(&binary))
         {
             return Ok(pid);
         }
@@ -176,17 +184,6 @@ async fn codex_process_id() -> Result<u32> {
         pid = parent;
     }
     bail!("the Codex process that invoked this hook could not be identified")
-}
-
-/// The first word of the command line is the binary. Matching on its file name keeps a `cwd`,
-/// a prompt, or a path that happens to contain "codex" from nominating an unrelated process.
-fn command_is_codex(command: &str) -> bool {
-    command
-        .split_ascii_whitespace()
-        .next()
-        .and_then(|binary| std::path::Path::new(binary).file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "codex")
 }
 
 async fn version_from_sources<F, Fut>(
@@ -452,6 +449,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
             // the whole conversation on disk and the host reads history through the vendor's
             // own protocol instead.
             workspace_path: cwd.to_owned(),
+            terminal_status_directory: None,
         },
         event,
         turn,
@@ -1050,13 +1048,15 @@ pub(crate) mod tests {
 
     #[test]
     fn only_a_binary_named_codex_can_be_the_agent_process() {
-        assert!(command_is_codex(
+        use crate::codex_adapter::executable_is_codex;
+        assert!(executable_is_codex(
             "/Users/x/.local/share/mise/installs/node/24.13.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
         ));
-        assert!(command_is_codex("codex resume --last"));
+        assert!(executable_is_codex("codex"));
+        assert!(executable_is_codex("/owned/path with spaces/codex"));
         // A path or prompt that merely contains the word must not nominate a process.
-        assert!(!command_is_codex("/bin/sh -c 'cd /src/codex && make'"));
-        assert!(!command_is_codex("node /usr/lib/codex/wrapper.js"));
-        assert!(!command_is_codex(""));
+        assert!(!executable_is_codex("/bin/sh"));
+        assert!(!executable_is_codex("node"));
+        assert!(!executable_is_codex(""));
     }
 }

@@ -62,6 +62,31 @@ fn already_read() -> &'static Mutex<HashSet<String>> {
 /// restart the live tail owns no turn yet, so the whole thread is history.
 pub(crate) const NO_LIVE_RUN: &str = "codex.turn.none";
 
+pub(crate) struct HistorySource {
+    pub(crate) process_id: u32,
+    pub(crate) codex_home: Option<PathBuf>,
+}
+
+/// A legacy standalone TUI proves its vendor home through the rollout it actually holds,
+/// without inspecting process environment values or relying on the daemon's configuration.
+pub(crate) async fn home_for_live_rollout(process_id: u32, thread_id: &str) -> Option<PathBuf> {
+    crate::process::open_files(process_id)
+        .await
+        .iter()
+        .find_map(|path| rollout_home(path, thread_id))
+}
+
+fn rollout_home(path: &std::path::Path, thread_id: &str) -> Option<PathBuf> {
+    if !path.is_absolute() || rollout_thread_id(path).as_deref() != Some(thread_id) {
+        return None;
+    }
+    path.ancestors()
+        .skip(1)
+        .find(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_owned)
+}
+
 /// How many running Codexes a restart inspects. Each costs two bounded process reads.
 const MAX_CODEX_SIGHTINGS: usize = 64;
 
@@ -144,14 +169,18 @@ pub(crate) fn spawn_history_read(
     session_id: String,
     thread_id: String,
     live_run_id: String,
-    process_id: u32,
+    source: HistorySource,
     process_generation: u64,
-) {
+) -> bool {
+    let Some(codex_home) = source.codex_home else {
+        tracing::debug!(session = %session_id, "Codex history home is unproved; keeping the live tail");
+        return false;
+    };
     if !claim(&session_id, process_generation) {
-        return;
+        return false;
     }
     tokio::spawn(async move {
-        let Some(binary) = codex_binary_of(process_id).await else {
+        let Some(binary) = codex_binary_of(source.process_id).await else {
             tracing::debug!(
                 session = %session_id,
                 "the Codex binary running this session could not be resolved; keeping the live tail"
@@ -162,13 +191,14 @@ pub(crate) fn spawn_history_read(
         // proven from a live process, persisted so an unheld thread is reachable after every
         // terminal has closed.
         adoptions.record_binary_evidence(binary.clone());
-        let history = match read_thread(&binary, &thread_id, &live_run_id).await {
-            Ok(history) => history,
-            Err(error) => {
-                tracing::debug!(error = %error, "reading Codex thread history failed");
-                return;
-            }
-        };
+        let history =
+            match read_thread_in_home(&binary, &thread_id, &live_run_id, Some(&codex_home)).await {
+                Ok(history) => history,
+                Err(error) => {
+                    tracing::debug!(error = %error, "reading Codex thread history failed");
+                    return;
+                }
+            };
         let count = history.entries.len();
         let complete = complete_with_live_tail(&history, |source| {
             sessions.holds_source(&session_id, source)
@@ -188,6 +218,7 @@ pub(crate) fn spawn_history_read(
             Err(error) => tracing::debug!(error = %error, "prepending Codex history failed"),
         }
     });
+    true
 }
 
 /// The exact binary the observed session is running, taken from the process itself.
@@ -199,19 +230,15 @@ pub(crate) fn spawn_history_read(
 /// Linux asks the kernel which image is mapped rather than trusting argv[0]: a TUI started as
 /// plain `codex` at a shell carries a relative argv[0], and this lookup refused it (grounded
 /// 2026-09-08, 12 of 12 reads), which cost that session its history and this machine its
-/// discovery evidence. Other platforms keep the argv[0] reading until an equivalent kernel
-/// fact is grounded there.
+/// discovery evidence. macOS uses bounded kernel argv, preserving executable paths containing
+/// spaces rather than splitting the flattened presentation returned by ps.
 async fn codex_binary_of(process_id: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     let binary = crate::process::installed_executable(process_id).await?;
     #[cfg(not(target_os = "linux"))]
-    let binary = PathBuf::from(
-        crate::process::command(process_id)
-            .await?
-            .split_ascii_whitespace()
-            .next()?,
-    );
-    (binary.is_absolute() && binary.file_name()? == "codex").then_some(binary)
+    let binary = PathBuf::from(crate::process::arguments(process_id).await?.first()?);
+    (binary.is_absolute() && crate::codex_adapter::executable_is_codex(binary.to_str()?))
+        .then_some(binary)
 }
 
 /// One bounded read of a thread's history for the unheld read-only open (Spec 013 §7).
@@ -234,10 +261,20 @@ async fn read_thread(
     thread_id: &str,
     live_run_id: &str,
 ) -> anyhow::Result<ThreadHistory> {
-    let result = codex_app_server::request(
+    read_thread_in_home(binary, thread_id, live_run_id, None).await
+}
+
+async fn read_thread_in_home(
+    binary: &std::path::Path,
+    thread_id: &str,
+    live_run_id: &str,
+    codex_home: Option<&std::path::Path>,
+) -> anyhow::Result<ThreadHistory> {
+    let result = codex_app_server::request_with_codex_home(
         binary,
         "thread/read",
         json!({"threadId": thread_id, "includeTurns": true}),
+        codex_home,
     )
     .await?;
     Ok(map_thread_history(&result, live_run_id))
@@ -576,6 +613,63 @@ pub(crate) mod tests {
         assert_eq!(
             super::rollout_thread_id(&path(&format!("rollout-{id}.json"))),
             None
+        );
+    }
+
+    #[test]
+    fn vendor_home_comes_only_from_the_exact_live_thread_rollout() {
+        let thread = "0199a8f2-7c3e-7d41-9b2a-5e6f7a8b9c0d";
+        let path = std::path::PathBuf::from(format!(
+            "/owned/custom home/sessions/2026/10/30/rollout-2026-10-30T01-02-03-{thread}.jsonl"
+        ));
+        assert_eq!(
+            super::rollout_home(&path, thread),
+            Some("/owned/custom home".into())
+        );
+        assert_eq!(
+            super::rollout_home(&path, "11111111-1111-4111-8111-111111111111"),
+            None
+        );
+        assert_eq!(
+            super::rollout_home(path.strip_prefix("/").unwrap(), thread),
+            None
+        );
+        assert_eq!(
+            super::rollout_home(
+                std::path::Path::new("/owned/custom home/config.toml"),
+                thread
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_live_home_proof_never_schedules_an_ambient_store_read() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = crate::agent_session::AgentSessionSupervisor::load(
+            &root.path().join("metadata.json"),
+            crate::workspace::WorkspaceConfig::for_home(root.path()),
+        )
+        .unwrap();
+        let adoptions = std::sync::Arc::new(crate::codex_adopted::AdoptionRegistry::default());
+        let session = "unproved-home-must-not-read-another-store";
+        assert!(!super::spawn_history_read(
+            sessions,
+            adoptions.clone(),
+            session.into(),
+            "11111111-1111-4111-8111-111111111111".into(),
+            super::NO_LIVE_RUN.into(),
+            super::HistorySource {
+                process_id: std::process::id(),
+                codex_home: None
+            },
+            1,
+        ));
+        tokio::task::yield_now().await;
+        assert!(adoptions.recorded_binary().is_none());
+        assert!(
+            super::claim(session, 1),
+            "missing proof must not consume the history attempt"
         );
     }
 

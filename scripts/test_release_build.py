@@ -85,6 +85,7 @@ class NativeRecordTests(unittest.TestCase):
         cargo = [c["argv"] for c in runner.calls if c["argv"][0] == "cargo"]
         self.assertEqual([c[1] for c in cargo], ["--version", "fmt", "clippy", "test"])
         self.assertIn("--test-threads=1", cargo[-1], "serial, so the last test line names a hang")
+        self.assertIn("--workspace", cargo[-1], "native identity tests are part of release qualification")
         for fail, category in (("test", "host_tests_failed"), ("clippy", "clippy_failed"), ("fmt", "fmt_failed")):
             with self.subTest(fail=fail):
                 self.out.unlink(missing_ok=True)

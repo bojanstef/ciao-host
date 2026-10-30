@@ -2,9 +2,9 @@
 //!
 //! A Ciao-owned hook command converts Codex hook payloads into this bounded local protocol.
 //! Raw transcript paths and vendor objects never enter the daemon or the canonical phone wire.
-//! Each hook connection carries exactly one event and is authenticated as a descendant of the
-//! registered Codex process by `agent_bridge` — Codex, unlike Claude Code, exports no session
-//! identity in the hook's environment, so process descent is the whole of the proof.
+//! Each hook connection carries exactly one event and authenticates its actual producer by
+//! process ancestry. A shared producer additionally needs a kernel-authenticated local TUI
+//! status binding for the exact displayed thread; the backend is never a terminal owner.
 //!
 //! Read-only by construction: no command frame decodes, and the registration advertises no
 //! command or interaction capability. Writing to a live Codex thread is refused upstream of
@@ -113,6 +113,157 @@ pub(crate) fn codex_run_id(turn_id: &str) -> String {
 }
 
 pub(crate) struct CodexAttachedAdapter;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodexProcessRole {
+    Tui,
+    LocalAppServer,
+    Other,
+    Unknown,
+}
+
+pub(crate) fn executable_is_codex(argument_zero: &str) -> bool {
+    std::path::Path::new(argument_zero)
+        .file_name()
+        .is_some_and(|name| name == "codex")
+}
+
+/// Grounded against 0.166's tui/cli.rs, utils/cli/shared_options.rs and cli/main.rs.
+/// Consume kernel argv: a config value or prompt may name a command without selecting it.
+/// Unknown option arity is refused instead of guessing which following argument is the verb.
+pub(crate) fn process_role(arguments: &[String]) -> CodexProcessRole {
+    use CodexProcessRole::*;
+    if !arguments
+        .first()
+        .is_some_and(|binary| executable_is_codex(binary))
+    {
+        return Unknown;
+    }
+    let mut arguments = arguments.iter().skip(1);
+    let mut interactive_subcommand = false;
+    let mut prompt_seen = false;
+    while let Some(argument) = arguments.next() {
+        let (option, inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), false), |(name, _)| (name, true));
+        if argument == "--" {
+            return Tui;
+        }
+        if matches!(option, "--help" | "-h" | "--version" | "-V") {
+            return Other;
+        }
+        if matches!(
+            option,
+            "--config"
+                | "-c"
+                | "--model"
+                | "-m"
+                | "--profile"
+                | "-p"
+                | "--sandbox"
+                | "-s"
+                | "--ask-for-approval"
+                | "-a"
+                | "--cd"
+                | "-C"
+                | "--add-dir"
+                | "--local-provider"
+                | "--enable"
+                | "--disable"
+                | "--remote"
+                | "--remote-auth-token-env"
+        ) {
+            if !inline_value && arguments.next().is_none() {
+                return Unknown;
+            }
+            continue;
+        }
+        if argument.starts_with('-')
+            && !argument.starts_with("--")
+            && argument.len() > 2
+            && matches!(
+                argument.as_bytes()[1],
+                b'c' | b'm' | b'p' | b's' | b'a' | b'C'
+            )
+        {
+            continue;
+        }
+        if matches!(
+            option,
+            "--no-daemon"
+                | "--no-alt-screen"
+                | "--strict-config"
+                | "--oss"
+                | "--search"
+                | "--worktree"
+                | "--approve-for-me"
+                | "--not-so-yolo"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--yolo"
+                | "--dangerously-bypass-hook-trust"
+        ) && !inline_value
+        {
+            continue;
+        }
+        if interactive_subcommand
+            && matches!(option, "--last" | "--all" | "--include-non-interactive")
+            && !inline_value
+        {
+            continue;
+        }
+        // Image takes 1.. values. Its command boundary is unqualified here, rather than
+        // treating the second image as a prompt or app-server command.
+        if matches!(option, "--image" | "-i")
+            || (argument.starts_with("-i") && !argument.starts_with("--"))
+        {
+            return Unknown;
+        }
+        if argument.starts_with('-') {
+            // Unknown short options may carry private attached values. Only their first
+            // option letter is vocabulary; never send the remaining token to the drift sink.
+            let short_name;
+            let name = if option.starts_with("--") {
+                option
+            } else {
+                short_name = option.chars().take(2).collect::<String>();
+                &short_name
+            };
+            crate::drift::note("codex", "process_arguments", "unknown_option", name, None);
+            return Unknown;
+        }
+        if interactive_subcommand {
+            continue;
+        }
+        if prompt_seen {
+            return Unknown;
+        }
+        match argument.as_str() {
+            "app-server" => return LocalAppServer,
+            "resume" | "fork" | "agents" => interactive_subcommand = true,
+            "exec" | "e" | "review" | "login" | "logout" | "mcp" | "plugin" | "remote-control"
+            | "app" | "completion" | "update" | "doctor" | "sandbox" | "debug" | "apply" | "a"
+            | "queue" | "archive" | "delete" | "migrate-rollouts" | "migrate-nfs-db"
+            | "unarchive" | "cloud" | "cloud-tasks" | "exec-server" | "features" | "help"
+            | "mcp-server" => return Other,
+            _ => prompt_seen = true,
+        }
+    }
+    Tui
+}
+
+pub(crate) async fn process_is_interactive(pid: u32) -> bool {
+    crate::process::arguments(pid)
+        .await
+        .as_ref()
+        .is_some_and(|args| process_role(args) == CodexProcessRole::Tui)
+}
+
+pub(crate) async fn process_is_local_app_server(pid: u32) -> bool {
+    crate::process::arguments(pid)
+        .await
+        .as_ref()
+        .is_some_and(|args| process_role(args) == CodexProcessRole::LocalAppServer)
+}
 
 /// Frames the Codex hook process serializes. This enum is the encode side of the dialect's
 /// vocabulary; the decode side is `decode_frame` below, and the two must name the same set.
@@ -321,6 +472,101 @@ mod tests {
             "workspace_path": "/private/synthetic/Fixture workspace"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn shared_backend_requires_the_native_codex_app_server_command() {
+        use CodexProcessRole::*;
+        for (arguments, expected) in [
+            (
+                vec!["/vendor/codex", "app-server", "--listen", "unix://"],
+                LocalAppServer,
+            ),
+            (
+                vec![
+                    "codex",
+                    "-c",
+                    "developer_instructions=review app-server",
+                    "app-server",
+                ],
+                LocalAppServer,
+            ),
+            (
+                vec!["codex", "--config=model=app-server", "app-server"],
+                LocalAppServer,
+            ),
+            (
+                vec!["codex", "-cmodel=app-server", "app-server"],
+                LocalAppServer,
+            ),
+            (vec!["codex"], Tui),
+            (
+                vec![
+                    "codex",
+                    "--no-daemon",
+                    "-c",
+                    "tui.pet=disabled",
+                    "Explain app-server safely",
+                ],
+                Tui,
+            ),
+            (vec!["codex", "--", "app-server"], Tui),
+            (vec!["codex", "resume", "--last", "app-server"], Tui),
+            (vec!["codex", "fork", "--no-daemon", "--all"], Tui),
+            (vec!["codex", "--yolo"], Tui),
+            (vec!["codex", "--config", "model=app-server", "exec"], Other),
+            (vec!["codex", "--config"], Unknown),
+            (vec!["codex", "--image", "one.png", "app-server"], Unknown),
+            (vec!["python", "app-server"], Unknown),
+            (vec!["codex-helper", "app-server"], Unknown),
+        ] {
+            let arguments: Vec<_> = arguments.into_iter().map(str::to_owned).collect();
+            assert_eq!(process_role(&arguments), expected, "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn future_shaped_input_process_option_never_selects_a_following_server_verb() {
+        let arguments = [
+            "codex",
+            "--ScopeNativeFutureOption",
+            "private-value",
+            "app-server",
+        ]
+        .map(str::to_owned);
+        assert_eq!(process_role(&arguments), CodexProcessRole::Unknown);
+        let ledger = crate::drift::snapshot();
+        let encoded = serde_json::to_string(&ledger).unwrap();
+        assert!(encoded.contains("ScopeNativeFutureOption"));
+        assert!(!encoded.contains("private-value"));
+        let arguments = ["codex", "-kScopeNativePrivateArgument", "app-server"].map(str::to_owned);
+        assert_eq!(process_role(&arguments), CodexProcessRole::Unknown);
+        let encoded = serde_json::to_string(&crate::drift::snapshot()).unwrap();
+        assert!(encoded.contains("\"name\":\"-k\""));
+        assert!(!encoded.contains("ScopeNativePrivateArgument"));
+    }
+
+    #[test]
+    fn custom_status_directory_is_local_bounded_codex_registration_data() {
+        let mut value: Value = serde_json::from_slice(&registration(PINNED_CODEX_VERSION)).unwrap();
+        value["terminal_status_directory"] = "/synthetic/custom-codex/tui-status".into();
+        let adapter = CodexAttachedAdapter;
+        let normalized = adapter
+            .decode_registration(&serde_json::to_vec(&value).unwrap(), Some(42))
+            .unwrap();
+        assert!(normalized.terminal_binding.is_none());
+        for directory in [
+            "relative/tui-status".to_owned(),
+            "/synthetic/wrong-child".to_owned(),
+            "x".repeat(4097),
+        ] {
+            value["terminal_status_directory"] = directory.into();
+            assert!(
+                adapter
+                    .decode_registration(&serde_json::to_vec(&value).unwrap(), Some(42))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

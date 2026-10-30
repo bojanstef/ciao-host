@@ -51,7 +51,7 @@ NATIVE_CHECKS = ("fmt", "clippy", "host_tests")
 # last "test ..." line then names it.
 NATIVE_STEPS = (("fmt", ["cargo", "fmt", "--all", "--check"]),
                 ("clippy", ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"]),
-                ("host_tests", ["cargo", "test", "--locked", "-p", "ciao-host", "--", "--test-threads=1"]))
+                ("host_tests", ["cargo", "test", "--locked", "--workspace", "--", "--test-threads=1"]))
 RESULT = re.compile(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored")
 SHA = re.compile(r"[a-f0-9]{40}")
 SHA256 = re.compile(r"[a-f0-9]{64}")

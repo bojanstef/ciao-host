@@ -390,6 +390,13 @@ impl AdoptionRegistry {
             .find(|row| row.session_id == session_id)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn cache_unheld_thread_for_test(&self, row: UnheldThread) {
+        let mut cache = self.discovery.lock().await;
+        cache.rows = vec![row];
+        cache.refreshed_at = Some(std::time::Instant::now());
+    }
+
     /// The thread an adopted session is holding, for the release-on-close path.
     pub(crate) fn thread_for_session(&self, session_id: &str) -> Option<String> {
         self.inner
@@ -925,6 +932,7 @@ pub(crate) fn adopted_registration(
 ) -> NormalizedRegistration {
     let compatible = adopted_compatible(&params.adapter_version);
     NormalizedRegistration {
+        terminal_binding: None,
         history_boundary: None,
         // The stable conversation identity, shared with the discovery row the person tapped:
         // the session that opens is the row they chose, not a freshly minted ID they must

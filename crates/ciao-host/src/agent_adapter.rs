@@ -52,7 +52,7 @@ pub(crate) enum RestartRecovery {
 pub(crate) enum VendorRecord {
     /// `<claude config>/sessions/<pid>.json`, which Claude Code writes per running process.
     ClaudeSessionFiles,
-    /// The rollout a running Codex holds open, whose file name ends in the thread ID.
+    /// Standalone rollout descriptors and authenticated shared-TUI status endpoints.
     CodexOpenRollout,
 }
 
@@ -475,6 +475,9 @@ pub(crate) struct AttachedHookRegister {
     /// launch a managed worker, and a basename cannot say where that is. It is never copied
     /// into a descriptor, so it does not reach iOS.
     pub workspace_path: String,
+    /// Hook-local vendor home, never forwarded to the phone. Only Codex uses this endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_status_directory: Option<String>,
 }
 
 impl AttachedHookRegister {
@@ -498,6 +501,20 @@ impl AttachedHookRegister {
         if self.workspace_display.is_empty() || self.workspace_display.len() > 256 {
             return Err(AgentProtocolError::InvalidValue);
         }
+        if self
+            .terminal_status_directory
+            .as_ref()
+            .is_some_and(|directory| {
+                dialect.adapter != "codex"
+                    || directory.len() > 4096
+                    || !std::path::Path::new(directory).is_absolute()
+                    || std::path::Path::new(directory).file_name()
+                        != Some(std::ffi::OsStr::new("tui-status"))
+                    || directory.contains('\0')
+            })
+        {
+            return Err(AgentProtocolError::InvalidValue);
+        }
         // Spec 017 §3: one classifier for the install path, the hook path, and this
         // registration — the policy doc's trap #1 demands they never diverge. The pin's own
         // major decides whether a later minor is admitted as `ahead` (2.x Claude) or refused
@@ -518,6 +535,7 @@ impl AttachedHookRegister {
         }
         let compatible = state.admitted();
         Ok(NormalizedRegistration {
+            terminal_binding: None,
             history_boundary: None,
             upstream_identity: self.session_id,
             process_nonce: self.process_nonce,
@@ -591,6 +609,7 @@ pub(crate) fn readopted_hook_registration(
         process_id: sighting.process_id,
         workspace_display: crate::hook_common::workspace_display(&sighting.cwd),
         workspace_path: sighting.cwd.clone(),
+        terminal_status_directory: None,
     }
     .normalize(Some(sighting.process_id), dialect)
 }

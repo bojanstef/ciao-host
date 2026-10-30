@@ -49,21 +49,49 @@ const MAX_SKIPPED_MESSAGES: usize = 512;
 /// binary from the session's own process, which also guarantees the app-server is the same build
 /// as the TUI being observed.
 pub(crate) async fn request(binary: &Path, method: &str, params: Value) -> Result<Value> {
-    timeout(APP_SERVER_TIMEOUT, exchange(binary, method, params))
-        .await
-        .map_err(|_| anyhow!("the Codex app-server did not answer in time"))?
+    request_with_codex_home(binary, method, params, None).await
 }
 
-async fn exchange(binary: &Path, method: &str, params: Value) -> Result<Value> {
-    let mut child = Command::new(binary)
+pub(crate) async fn request_with_codex_home(
+    binary: &Path,
+    method: &str,
+    params: Value,
+    codex_home: Option<&Path>,
+) -> Result<Value> {
+    timeout(
+        APP_SERVER_TIMEOUT,
+        exchange(binary, method, params, codex_home),
+    )
+    .await
+    .map_err(|_| anyhow!("the Codex app-server did not answer in time"))?
+}
+
+fn spawn_with_codex_home(binary: &Path, codex_home: Option<&Path>) -> Result<Child> {
+    let mut command = Command::new(binary);
+    command
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // The vendor's diagnostics are not Ciao's to relay, and a full pipe would wedge it.
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .context("start the Codex app-server")?;
+        .kill_on_drop(true);
+    if let Some(home) = codex_home {
+        if !home.is_absolute() || home.as_os_str().len() > 4096 {
+            bail!("the Codex vendor home is invalid");
+        }
+        // This belongs to the observed vendor process, not the service manager's environment.
+        // Keep the override local to this child; unchanged callers retain their environment.
+        command.env("CODEX_HOME", home);
+    }
+    command.spawn().context("start the Codex app-server")
+}
+
+async fn exchange(
+    binary: &Path,
+    method: &str,
+    params: Value,
+    codex_home: Option<&Path>,
+) -> Result<Value> {
+    let mut child = spawn_with_codex_home(binary, codex_home)?;
     let result = drive(&mut child, method, params).await;
     let _ = child.start_kill();
     result
@@ -236,14 +264,7 @@ impl AppServerConnection {
     /// reason — completes the `initialize` handshake, and returns the connection plus the
     /// event stream the supervisor consumes.
     pub(crate) async fn connect(binary: &Path) -> Result<(Self, mpsc::Receiver<AppServerEvent>)> {
-        let mut child = Command::new(binary)
-            .arg("app-server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .context("start the Codex app-server")?;
+        let mut child = spawn_with_codex_home(binary, None)?;
         let stdin = child
             .stdin
             .take()
@@ -458,6 +479,63 @@ async fn read_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observed_vendor_home_is_child_local_and_wrong_store_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let right = root.path().join("right home");
+        let wrong = root.path().join("wrong home");
+        std::fs::create_dir(&right).unwrap();
+        std::fs::create_dir(&wrong).unwrap();
+        std::fs::write(right.join("fixture-thread-present"), b"").unwrap();
+        let captured = root.path().join("captured-home");
+        let binary_directory = root.path().join("bin with spaces");
+        std::fs::create_dir(&binary_directory).unwrap();
+        let binary = binary_directory.join("codex");
+        let program = r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+home = os.environ.get('CODEX_HOME', '')
+pathlib.Path(__CAPTURE__).write_text(home)
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    response = {'id': request['id']}
+    if request['method'] == 'thread/read' and not (pathlib.Path(home) / 'fixture-thread-present').is_file():
+        response['error'] = {'code': -32000, 'message': 'fixture thread not in selected home'}
+    else:
+        response['result'] = {'home': home, 'thread': {'turns': []}}
+    print(json.dumps(response), flush=True)
+"#.replace("__CAPTURE__", &serde_json::to_string(&captured.to_str().unwrap()).unwrap());
+        std::fs::write(&binary, program).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let original = std::env::var_os("CODEX_HOME");
+        request_with_codex_home(&binary, "thread/read", json!({}), Some(&right))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            right.to_str().unwrap()
+        );
+        assert!(
+            request_with_codex_home(&binary, "thread/read", json!({}), Some(&wrong))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            wrong.to_str().unwrap()
+        );
+        let inherited = request(&binary, "fixture/capture", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            inherited["home"].as_str().unwrap(),
+            original.as_deref().unwrap_or_default().to_str().unwrap()
+        );
+        assert_eq!(std::env::var_os("CODEX_HOME"), original);
+    }
 
     #[test]
     fn classification_separates_requests_notifications_and_answers() {

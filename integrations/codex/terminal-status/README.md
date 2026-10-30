@@ -59,15 +59,59 @@ exactly one supported interactive TUI whose authenticated snapshot:
 
 1. Is connected to that exact backend PID and kernel incarnation.
 2. Displays the hook's exact thread and has it in the live attachment set.
-3. Still names the same TUI incarnation and generation when a route or takeover is used.
+3. Still names the same TUI incarnation and generation when a route is used.
 
 Missing, oversized, malformed, stale, remote, disconnected or ambiguous evidence is refused.
 Unrecognized vocabulary is tallied without recording values or content. Neither cwd, argv
 resume arguments, titles, timestamps, a shared socket nor a rollout holder alone establishes
-this association. Shared-backend hooks remain read-only observations. The backend is never
+this association. Shared-backend hooks remain read-only observations and expose no takeover.
+The backend is never
 a terminal exit target. Foreign rollout ownership continues to refuse adoption, even after
 a TUI exits, until the vendor actually releases it.
 
 Validation must cover standalone and shared mode, two TUIs, same-thread ambiguity, thread
 switches and history, idle resume before hooks, PID reuse, backend and Ciao restarts,
 disconnects, foreign writers, and refusal to target the shared backend during takeover.
+
+## Building a candidate
+
+`codex-0.166.0.patch` applies to the public upstream commit
+`6ff1e1ca3b30fc8b914720681fcf5fe62e95f856` (`rust-v0.166.0`). It adds this read-only endpoint,
+the remote client's acknowledged-attachment/liveness tracking, and native backend identity.
+It changes neither model behavior nor Ciao's app-server method vocabulary. The lockfile part
+normalizes the tag's workspace package versions from `0.0.0` to the manifest's `0.166.0` and
+adds two local dependency edges; third-party dependency versions and checksums are unchanged.
+The upstream Apache-2.0 license and notice are included as `UPSTREAM-LICENSE` and
+`UPSTREAM-NOTICE`.
+
+Use a clean checkout of that exact public commit and a dedicated Cargo cache:
+
+```sh
+python3 integrations/codex/terminal-status/build_vendor.py \
+  --checkout /tmp/codex-terminal-source \
+  --cargo-home /tmp/codex-terminal-cargo \
+  --out /tmp/codex-terminal-candidate --check
+```
+
+Run again without `--check` to apply the patch and build, using at most four jobs. The default
+`dev-small` profile is for validation; `--profile release` selects an optimized candidate.
+The script verifies the complete public source tree, binds source files before/after building,
+uses a fresh target directory, and writes a new `codex` binary plus `provenance.json` outside
+the source checkout. It never installs, replaces a running process, uploads or publishes.
+
+The candidate keeps the numeric `codex-cli 0.166.0` base version so existing admission rules
+remain unchanged. It is **not the official Codex binary**: provenance binds its upstream
+commit, feature version, patch, source inputs and resulting binary digest. Stock standalone
+Codex remains supported; stock shared mode cannot provide this new identity proof. A later
+official update without the endpoint confers no shared terminal association.
+
+Run builder regressions with:
+
+```sh
+python3 -B -m unittest discover -s integrations/codex/terminal-status -p test_build_vendor.py
+```
+
+`rehearse.py --help` describes the opt-in local runtime rehearsal. It uses disposable host and
+Codex homes, an owned foreground backend, exact owned tmux targets and a local mock Responses
+service. It never calls `ciao setup`, writes vendor trust hashes itself, or uses a subscription
+model. Default shared-server reuse and standalone launches are qualified separately.

@@ -807,6 +807,7 @@ mod tests {
     ) -> tokio::sync::mpsc::Receiver<crate::agent_session::BridgeCommandEnvelope> {
         let (sender, receiver) = tokio::sync::mpsc::channel(4);
         let registration = NormalizedRegistration {
+            terminal_binding: None,
             history_boundary: None,
             upstream_identity: session.into(),
             process_nonce: "fixture-worker".into(),

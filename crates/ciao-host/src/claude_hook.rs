@@ -548,6 +548,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
         };
     Ok(Some(HookDispatch {
         registration: AttachedHookRegister {
+            terminal_status_directory: None,
             v: CLAUDE_HOOK_PROTOCOL_VERSION,
             message_type: "register".into(),
             adapter: "claude".into(),

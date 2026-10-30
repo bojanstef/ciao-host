@@ -304,7 +304,10 @@ async fn apply_adapter_event(
                     session_id.clone(),
                     agent.thread_id.clone(),
                     run_id.clone(),
-                    agent.process_id,
+                    crate::codex_history::HistorySource {
+                        process_id: agent.process_id,
+                        codex_home: agent.codex_home.clone(),
+                    },
                     ctx.registered.process_generation,
                 );
             }
@@ -474,12 +477,29 @@ pub(crate) async fn handle_agent_bridge(
         .select(&first, peer_pid)
         .map_err(|_| anyhow!("agent bridge registration was invalid"))?;
     let peer_pid = peer_pid.ok_or_else(|| anyhow!("agent bridge peer process is unavailable"))?;
+    // Authentication always concerns the actual event producer. A separately proven terminal
+    // may own the route, but the hook is not its descendant in shared-server mode.
+    let producer_process_id = selected.registration.process_id;
+    let producer_identity = if selected.codec.id() == "codex" {
+        Some(
+            crate::process::terminal_identity(producer_process_id)
+                .await
+                .ok_or_else(|| anyhow!("Codex producer incarnation is unavailable"))?,
+        )
+    } else {
+        None
+    };
     if !process_descends_from(peer_pid, selected.registration.process_id).await {
         bail!("agent bridge peer is not descended from its claimed process");
     }
-    if selected.codec.requires_tui_process()
-        && !process_looks_like_tui(selected.registration.process_id, selected.codec.id()).await
-    {
+    let interactive = if selected.codec.id() == "codex" {
+        crate::codex_adapter::process_is_interactive(producer_process_id).await
+    } else if selected.codec.requires_tui_process() {
+        process_looks_like_tui(producer_process_id, selected.codec.id()).await
+    } else {
+        true
+    };
+    if !interactive {
         // The refusal is still the foreign-hook watch's signal (Spec 013 §5): this event is
         // same-uid and descent-proven, and a non-TUI Codex process — an app-server, ours or
         // anyone's — writing an adopted thread is exactly the writer the descriptor check
@@ -490,7 +510,35 @@ pub(crate) async fn handle_agent_bridge(
                 selected.registration.process_id,
             );
         }
-        bail!("agent bridge process is not an attached interactive TUI");
+        if selected.codec.id() != "codex" {
+            bail!("agent bridge process is not an attached interactive TUI");
+        }
+        if !crate::codex_adapter::process_is_local_app_server(producer_process_id).await
+            || !selected.registration.compatible
+        {
+            bail!("Codex event producer is not a supported local app-server");
+        }
+        let directory = codex_terminal_status_directory(&first)?;
+        let binding = crate::codex_terminal_status::resolve_shared(
+            &directory,
+            producer_process_id,
+            &selected.registration.upstream_identity,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("Codex shared terminal binding is unavailable or ambiguous"))?;
+        if producer_identity.as_ref() != Some(&binding.server_identity)
+            || crate::process::terminal_identity(producer_process_id).await != producer_identity
+            || !process_descends_from(peer_pid, producer_process_id).await
+        {
+            bail!("Codex event producer changed during terminal authentication");
+        }
+        tracing::debug!(
+            producer_pid = producer_process_id,
+            terminal_pid = binding.tui_pid,
+            selection_generation = binding.generation,
+            "shared Codex terminal authenticated"
+        );
+        bind_shared_codex_registration(&mut selected.registration, binding)?;
     }
     // A managed worker proves it is the process this daemon spawned by
     // presenting its one-time registration token; the token is consumed here so
@@ -500,9 +548,13 @@ pub(crate) async fn handle_agent_bridge(
     {
         bail!("managed worker registration token was not accepted");
     }
-    let process_start = process_start_fingerprint(selected.registration.process_id)
-        .await
-        .ok_or_else(|| anyhow!("agent bridge process identity is unavailable"))?;
+    let process_start = if let Some(binding) = &selected.registration.terminal_binding {
+        binding.tui_identity.clone()
+    } else {
+        process_start_fingerprint(selected.registration.process_id)
+            .await
+            .ok_or_else(|| anyhow!("agent bridge process identity is unavailable"))?
+    };
     selected.registration.process_nonce = authenticated_process_nonce(
         &selected.registration.process_nonce,
         selected.registration.process_id,
@@ -514,7 +566,7 @@ pub(crate) async fn handle_agent_bridge(
 
     if selected.codec.connection_kind() == AdapterConnectionKind::TransientEvent {
         let thread_id = selected.registration.upstream_identity.clone();
-        let agent_process_id = selected.registration.process_id;
+        let agent_process_id = producer_process_id;
         // The foreign-hook watch (Spec 013 §5): every Codex hook event names its thread and
         // its process, and an adopted thread hearing from a process that is not Ciao's own
         // child has a foreign writer — the registry yields the adoption. Our own child's
@@ -525,7 +577,20 @@ pub(crate) async fn handle_agent_bridge(
         // A build whose hook payloads are unestablished reports nothing but its own existence,
         // and its transcript is no better established than its hooks.
         let backfill_claude = selected.codec.id() == "claude" && selected.registration.compatible;
+        let terminal_binding = selected.registration.terminal_binding.clone();
+        let codex_home = if selected.codec.id() == "codex" {
+            codex_terminal_status_directory(&first)?
+                .parent()
+                .map(std::path::Path::to_owned)
+        } else {
+            None
+        };
         let registered = sessions.register_observer(selected.registration).await?;
+        if let Some(binding) = terminal_binding
+            && crate::codex_terminal_status::remember_verified_directory(&binding).is_err()
+        {
+            tracing::debug!("Codex terminal recovery directory could not be retained");
+        }
         log_registration("observer", &adapter_family, &adapter_version, &registered);
         // Claude's transcript is the conversation of record; hooks only ever saw what happened
         // while they were watching. Read once per process incarnation (the claim is inside).
@@ -555,6 +620,7 @@ pub(crate) async fn handle_agent_bridge(
             AgentProcessIdentity {
                 thread_id,
                 process_id: agent_process_id,
+                codex_home,
             },
         )
         .await;
@@ -694,6 +760,38 @@ fn managed_spawn_token(body: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn codex_terminal_status_directory(first: &[u8]) -> Result<std::path::PathBuf> {
+    let value: Value = decode_bridge_body(first)?;
+    if let Some(directory) = value
+        .get("terminal_status_directory")
+        .and_then(Value::as_str)
+    {
+        // The codec has already validated the optional field. The endpoint independently
+        // proves its owner and PID; this path only selects the vendor home's rendezvous.
+        return Ok(std::path::PathBuf::from(directory));
+    }
+    let paths = crate::storage::CiaoPaths::discover()?;
+    Ok(crate::codex_integration::codex_home(&paths).join("tui-status"))
+}
+
+fn bind_shared_codex_registration(
+    registration: &mut crate::agent_session::NormalizedRegistration,
+    binding: crate::codex_terminal_status::TerminalBinding,
+) -> Result<()> {
+    if registration.adapter_family != "Codex"
+        || registration.topology != "attached"
+        || binding.server_pid != registration.process_id
+        || binding.tui_pid == binding.server_pid
+        || binding.thread_id != registration.upstream_identity
+    {
+        bail!("Codex shared terminal binding does not match its authenticated producer");
+    }
+    registration.process_id = binding.tui_pid;
+    registration.process_nonce = crate::codex_hook::process_nonce(binding.tui_pid);
+    registration.terminal_binding = Some(binding);
+    Ok(())
+}
+
 fn authenticated_process_nonce(nonce: &str, process_id: u32, process_start: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"ciao-agent-process-v1\0");
@@ -737,6 +835,35 @@ pub(crate) async fn readopt_attached(
             }
             VendorRecord::CodexOpenRollout => crate::codex_history::live_rollout_sightings().await,
         };
+        let mut shared_bindings = std::collections::HashMap::new();
+        if adapter.id() == "codex"
+            && let Ok(directories) = crate::codex_terminal_status::known_status_directories()
+        {
+            for directory in directories {
+                match crate::codex_terminal_status::live_bindings(&directory).await {
+                    Ok(bindings) => {
+                        for binding in bindings {
+                            let Some(cwd) = crate::process::cwd(binding.tui_pid).await else {
+                                continue;
+                            };
+                            let Some(cwd) = cwd.to_str() else {
+                                continue;
+                            };
+                            sightings.insert(
+                                0,
+                                AgentSighting {
+                                    vendor_session_id: binding.thread_id.clone(),
+                                    process_id: binding.tui_pid,
+                                    cwd: cwd.to_owned(),
+                                },
+                            );
+                            shared_bindings.insert(binding.tui_pid, binding);
+                        }
+                    }
+                    Err(_) => tracing::debug!("Codex terminal recovery inspection unavailable"),
+                }
+            }
+        }
         sightings.extend(sessions.herdr_agent_sightings(adapter.id()).await);
         let mut seen = std::collections::HashSet::new();
         for sighting in sightings {
@@ -750,8 +877,15 @@ pub(crate) async fn readopt_attached(
             let Some(process_start) = process_start_fingerprint(sighting.process_id).await else {
                 continue;
             };
-            if let Some(registered) =
-                readopt_one(sessions, adoptions, adapter, &sighting, &process_start).await
+            if let Some(registered) = readopt_one(
+                sessions,
+                adoptions,
+                adapter,
+                &sighting,
+                &process_start,
+                shared_bindings.remove(&sighting.process_id),
+            )
+            .await
             {
                 readopted.push(registered);
             }
@@ -772,9 +906,16 @@ async fn readopt_one(
     adapter: &dyn AttachedAgentAdapter,
     sighting: &AgentSighting,
     process_start: &str,
+    terminal_binding: Option<crate::codex_terminal_status::TerminalBinding>,
 ) -> Option<RegisteredAgentSession> {
     let hook_nonce = adapter.hook_process_nonce(sighting.process_id)?;
-    let nonce = authenticated_process_nonce(&hook_nonce, sighting.process_id, process_start);
+    let nonce = authenticated_process_nonce(
+        &hook_nonce,
+        sighting.process_id,
+        terminal_binding
+            .as_ref()
+            .map_or(process_start, |binding| binding.tui_identity.as_str()),
+    );
     let (family, adapter_version) =
         sessions.registered_process(&sighting.vendor_session_id, &nonce)?;
     let mut registration = adapter
@@ -785,6 +926,24 @@ async fn readopt_one(
         return None;
     }
     registration.process_nonce = nonce;
+    let history_process_id = terminal_binding
+        .as_ref()
+        .map_or(sighting.process_id, |binding| binding.server_pid);
+    let codex_home = if adapter.id() != "codex" {
+        None
+    } else if let Some(binding) = &terminal_binding {
+        binding
+            .status_directory
+            .parent()
+            .map(std::path::Path::to_owned)
+    } else {
+        crate::codex_history::home_for_live_rollout(
+            sighting.process_id,
+            &sighting.vendor_session_id,
+        )
+        .await
+    };
+    registration.terminal_binding = terminal_binding;
     // The hook path's own rule: an unestablished build's record is no better established than
     // its hooks, so only a compatible one is read.
     let read_history = registration.compatible;
@@ -798,15 +957,20 @@ async fn readopt_one(
                 registered.process_generation,
                 crate::claude_history::SourceScheme::Attached,
             ),
-            "codex" => crate::codex_history::spawn_history_read(
-                sessions.clone(),
-                adoptions.clone(),
-                registered.session_id.clone(),
-                sighting.vendor_session_id.clone(),
-                crate::codex_history::NO_LIVE_RUN.into(),
-                sighting.process_id,
-                registered.process_generation,
-            ),
+            "codex" => {
+                crate::codex_history::spawn_history_read(
+                    sessions.clone(),
+                    adoptions.clone(),
+                    registered.session_id.clone(),
+                    sighting.vendor_session_id.clone(),
+                    crate::codex_history::NO_LIVE_RUN.into(),
+                    crate::codex_history::HistorySource {
+                        process_id: history_process_id,
+                        codex_home,
+                    },
+                    registered.process_generation,
+                );
+            }
             _ => {}
         }
     }
@@ -818,6 +982,7 @@ async fn readopt_one(
 struct AgentProcessIdentity {
     thread_id: String,
     process_id: u32,
+    codex_home: Option<std::path::PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)] // one call site; a params struct would be ceremony
@@ -848,6 +1013,12 @@ async fn handle_transient_agent_event(
     let event = codec
         .decode_event(&body)
         .map_err(|_| anyhow!("agent event was invalid"))?;
+    if !sessions
+        .revalidate_terminal_binding(&registered.session_id)
+        .await
+    {
+        bail!("agent terminal binding changed before event delivery");
+    }
     let mut context = AdapterEventContext {
         sessions: &sessions,
         adoptions: &adoptions,
@@ -973,6 +1144,65 @@ mod tests {
     }
 
     #[test]
+    fn shared_codex_maps_only_a_matching_producer_and_keeps_the_terminal_as_owner() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "v": 1, "type": "register", "adapter": "codex",
+            "adapter_version": crate::codex_adapter::PINNED_CODEX_VERSION,
+            "mode": "tui_hook", "session_id": "019fbfaf-d4fc-7452-99b7-53b47c5e7e8f",
+            "process_nonce": "producer-nonce", "process_id": 42,
+            "workspace_display": "Fixture", "workspace_path": "/synthetic/Fixture"
+        }))
+        .unwrap();
+        let registration = AgentAdapterRegistry::production()
+            .select(&body, Some(43))
+            .unwrap()
+            .registration;
+        assert_eq!(registration.process_id, 42);
+        assert!(registration.terminal_binding.is_none());
+        let binding = crate::codex_terminal_status::TerminalBinding {
+            tui_pid: 84,
+            tui_identity: "fixture-tui".into(),
+            server_pid: 42,
+            server_identity: "fixture-server".into(),
+            generation: 1,
+            thread_id: registration.upstream_identity.clone(),
+            status_directory: "/synthetic/tui-status".into(),
+        };
+        for invalid in [
+            crate::codex_terminal_status::TerminalBinding {
+                server_pid: 41,
+                ..binding.clone()
+            },
+            crate::codex_terminal_status::TerminalBinding {
+                tui_pid: 42,
+                ..binding.clone()
+            },
+            crate::codex_terminal_status::TerminalBinding {
+                thread_id: "another-thread".into(),
+                ..binding.clone()
+            },
+        ] {
+            let mut unchanged = registration.clone();
+            assert!(bind_shared_codex_registration(&mut unchanged, invalid).is_err());
+            assert_eq!(unchanged, registration);
+        }
+        let mut mapped = registration;
+        bind_shared_codex_registration(&mut mapped, binding.clone()).unwrap();
+        assert_eq!(mapped.process_id, binding.tui_pid);
+        assert_ne!(mapped.process_id, binding.server_pid);
+        assert_eq!(
+            mapped.process_nonce,
+            crate::codex_hook::process_nonce(binding.tui_pid)
+        );
+        assert_eq!(mapped.terminal_binding, Some(binding));
+        assert_eq!(
+            mapped.capabilities.commands,
+            crate::agent_protocol::CommandCapabilities::none()
+        );
+        mapped.validate().unwrap();
+    }
+
+    #[test]
     fn registry_selects_explicit_pi_and_bounded_legacy_registration() {
         let registry = AgentAdapterRegistry::production();
         for body in [pi_registration(Some("pi")), pi_registration(None)] {
@@ -1064,7 +1294,7 @@ mod tests {
             let after = load();
             assert_eq!(after.active_count(), 0, "{id}: a restart starts empty");
             assert!(
-                readopt_one(&after, &adoptions, adapter, &sighting, "start-b")
+                readopt_one(&after, &adoptions, adapter, &sighting, "start-b", None)
                     .await
                     .is_none(),
                 "{id}: the same pid started again is a different process"
@@ -1074,7 +1304,7 @@ mod tests {
                 ..sighting.clone()
             };
             assert!(
-                readopt_one(&after, &adoptions, adapter, &stranger, "start-a")
+                readopt_one(&after, &adoptions, adapter, &stranger, "start-a", None)
                     .await
                     .is_none(),
                 "{id}: an ID this daemon never mapped"
@@ -1085,14 +1315,14 @@ mod tests {
                 &CLAUDE_ADAPTER
             };
             assert!(
-                readopt_one(&after, &adoptions, other, &sighting, "start-a")
+                readopt_one(&after, &adoptions, other, &sighting, "start-a", None)
                     .await
                     .is_none(),
                 "{id}: another dialect cannot claim this process"
             );
             assert_eq!(after.active_count(), 0);
 
-            let readopted = readopt_one(&after, &adoptions, adapter, &sighting, "start-a")
+            let readopted = readopt_one(&after, &adoptions, adapter, &sighting, "start-a", None)
                 .await
                 .unwrap_or_else(|| panic!("{id}: the process the metadata knows comes back"));
             assert_eq!(readopted.session_id, first.session_id, "{id}");

@@ -482,40 +482,19 @@ async fn process_tty(pid: u32) -> Option<String> {
 /// A shared list would let `codex exec` in CI register as an attached session on the strength of
 /// Claude's flags not appearing in it.
 pub(crate) async fn process_looks_like_tui(pid: u32, adapter: &str) -> bool {
+    if adapter == "codex" {
+        return crate::codex_adapter::process_is_interactive(pid).await;
+    }
     let Some(command) = process::command(pid).await else {
         return false;
     };
     let mut arguments = command.split_ascii_whitespace().skip(1);
     match adapter {
-        // Codex's non-interactive modes are subcommands, and the first argument is where one
-        // appears. Looking only there keeps a path or prompt containing the word "review" from
-        // disqualifying a real TUI.
-        "codex" => !arguments
-            .next()
-            .is_some_and(is_noninteractive_codex_subcommand),
         "claude" => !arguments.any(is_noninteractive_claude_argument),
         // A dialect this test has never met is refused, not handed Claude's heuristic: a
         // wrong "yes" here registers a batch process as an attached TUI.
         _ => false,
     }
-}
-
-fn is_noninteractive_codex_subcommand(argument: &str) -> bool {
-    matches!(
-        argument,
-        "exec"
-            | "e"
-            | "app-server"
-            | "mcp-server"
-            | "exec-server"
-            | "review"
-            | "apply"
-            | "a"
-            | "cloud"
-            | "debug"
-            | "completion"
-            | "doctor"
-    )
 }
 
 fn is_noninteractive_claude_argument(argument: &str) -> bool {
@@ -1086,6 +1065,13 @@ mod tests {
         // This test's own process is real and carries no Claude headless flags, so the old
         // fallback would have said yes to it.
         assert!(!process_looks_like_tui(std::process::id(), "fixture").await);
+    }
+
+    #[tokio::test]
+    async fn codex_route_guard_uses_the_native_argument_policy() {
+        // A native test process has neither a Codex executable name nor a Codex TUI role.
+        // The old first-argument-only heuristic incorrectly admitted this process.
+        assert!(!process_looks_like_tui(std::process::id(), "codex").await);
     }
 
     #[test]

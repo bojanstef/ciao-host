@@ -115,6 +115,7 @@ impl PiBridgeRegister {
         let tested = version_within_tested_minor(&self.adapter_version, PINNED_PI_VERSION);
         let compatible = version_major_matches(&self.adapter_version, PINNED_PI_VERSION);
         Ok(NormalizedRegistration {
+            terminal_binding: None,
             history_boundary: None,
             upstream_identity: self.session_id,
             process_nonce: self.process_nonce,
