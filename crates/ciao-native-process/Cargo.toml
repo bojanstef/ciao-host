@@ -1,0 +1,13 @@
+[package]
+name = "ciao-native-process"
+version = "0.1.0"
+description = "Bounded native macOS process incarnation inspection for Ciao"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nix.workspace = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

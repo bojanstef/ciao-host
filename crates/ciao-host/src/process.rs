@@ -19,6 +19,10 @@ use nix::{
 use crate::workspace::run_bounded;
 
 const MAX_PROCESS_ANCESTRY: usize = 64;
+const MAX_NAMED_PROCESSES: usize = 256;
+// Linux's comm is limited to 15 bytes. Longer names cannot be selected exactly by pgrep.
+const MAX_PROCESS_NAME_BYTES: usize = 15;
+const NAMED_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long `request_exit` waits for a SIGTERMed process to go away, as a poll interval and a
 /// count rather than a deadline, because the poll is the only way to observe the exit.
@@ -56,27 +60,106 @@ async fn ps_field(pid: u32, extra: &[&str], field: &str, strict: bool) -> Option
 }
 
 /// This account's processes whose executable file is named `name` — the running copies of one
-/// program, whatever launched them. `comm` is the executable's path on macOS and its name on
-/// Linux, so the file name is what is compared. Bounded by `run_bounded`'s output cap.
+/// program, whatever launched them. Select by name before reading executable paths: a global
+/// `ps` listing can exceed the provider output cap even when only one matching process exists.
+/// Unsupported names and incomplete/oversized listings fail closed.
 pub(crate) async fn named(name: &str) -> Vec<u32> {
+    let Some(pattern) = process_name_pattern(name) else {
+        return Vec::new();
+    };
+    tokio::time::timeout(NAMED_DISCOVERY_TIMEOUT, named_with_pattern(name, &pattern))
+        .await
+        .unwrap_or_default()
+}
+
+async fn named_with_pattern(name: &str, pattern: &str) -> Vec<u32> {
+    let Some(pgrep) = [Path::new("/usr/bin/pgrep"), Path::new("/bin/pgrep")]
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return Vec::new();
+    };
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let uid_argument = uid.to_string();
+    let Ok(output) = run_bounded(pgrep, &["-u", &uid_argument, "-x", pattern]).await else {
+        return Vec::new();
+    };
+    if !output.status_success || output.stdout_truncated || !output.stderr.is_empty() {
+        return Vec::new();
+    }
+    let Some(candidates) = parse_process_ids(&output.stdout) else {
+        return Vec::new();
+    };
+    if candidates.is_empty() {
+        return Vec::new();
+    }
     let Some(binary) = ps_binary() else {
         return Vec::new();
     };
-    let uid = nix::unistd::Uid::effective().to_string();
-    let Ok(output) = run_bounded(binary, &["-U", &uid, "-o", "pid=", "-o", "comm="]).await else {
+    let pids = candidates
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let Ok(output) = run_bounded(
+        binary,
+        &["-p", &pids, "-o", "pid=", "-o", "uid=", "-o", "comm="],
+    )
+    .await
+    else {
         return Vec::new();
     };
-    if !output.status_success || output.stdout_truncated {
+    if !output.status_success || output.stdout_truncated || !output.stderr.is_empty() {
         return Vec::new();
     }
-    parse_named(&output.stdout, name)
+    parse_named(&output.stdout, name, uid)
+        .into_iter()
+        .filter(|pid| candidates.contains(pid))
+        .collect()
 }
 
-fn parse_named(stdout: &[u8], name: &str) -> Vec<u32> {
+fn process_name_pattern(name: &str) -> Option<String> {
+    if name.is_empty()
+        || name.len() > MAX_PROCESS_NAME_BYTES
+        || name.starts_with('-')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return None;
+    }
+    Some(name.replace('.', "\\."))
+}
+
+fn parse_process_ids(stdout: &[u8]) -> Option<Vec<u32>> {
+    let mut pids = Vec::new();
+    for line in std::str::from_utf8(stdout).ok()?.lines() {
+        let token = line.trim();
+        let pid: u32 = token.parse().ok()?;
+        if pid == 0
+            || i32::try_from(pid).is_err()
+            || token != pid.to_string()
+            || pids.contains(&pid)
+            || pids.len() == MAX_NAMED_PROCESSES
+        {
+            return None;
+        }
+        pids.push(pid);
+    }
+    Some(pids)
+}
+
+fn parse_named(stdout: &[u8], name: &str, expected_uid: u32) -> Vec<u32> {
     String::from_utf8_lossy(stdout)
         .lines()
         .filter_map(|line| {
-            let (pid, comm) = line.trim_start().split_once(char::is_whitespace)?;
+            let (pid, owner_and_comm) = line.trim_start().split_once(char::is_whitespace)?;
+            let (uid, comm) = owner_and_comm
+                .trim_start()
+                .split_once(char::is_whitespace)?;
+            if uid.parse::<u32>().ok()? != expected_uid {
+                return None;
+            }
             let file_name = Path::new(comm.trim()).file_name()?;
             (file_name == name)
                 .then(|| pid.parse::<u32>().ok())
@@ -183,6 +266,60 @@ pub(crate) async fn command(pid: u32) -> Option<String> {
     ps_field(pid, &["-ww"], "command=", true).await
 }
 
+/// The original argument boundaries of a process, without shell/display quoting or environment
+/// values. Role authentication must use this instead of splitting `command`'s presentation text.
+pub(crate) async fn arguments(pid: u32) -> Option<Vec<String>> {
+    if pid == 0 || i32::try_from(pid).is_err() {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let bytes = read_bounded_proc_record(
+                &std::path::PathBuf::from(format!("/proc/{pid}/cmdline")),
+                MAX_PROCESS_ARGUMENT_BYTES,
+            )
+            .await?;
+            parse_process_arguments(&bytes)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || ciao_native_process::native_arguments(pid)),
+        )
+        .await
+        .ok()?
+        .ok()?
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+const MAX_PROCESS_ARGUMENT_BYTES: usize = 64 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const MAX_PROCESS_ARGUMENTS: usize = 256;
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_process_arguments(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes.is_empty() || bytes.len() > MAX_PROCESS_ARGUMENT_BYTES || bytes.last() != Some(&0) {
+        return None;
+    }
+    let mut arguments = Vec::new();
+    for argument in bytes[..bytes.len() - 1].split(|&byte| byte == 0) {
+        if arguments.len() == MAX_PROCESS_ARGUMENTS {
+            return None;
+        }
+        arguments.push(std::str::from_utf8(argument).ok()?.to_owned());
+    }
+    Some(arguments)
+}
+
 /// An opaque process-start identity component, never a display timestamp. Linux uses the boot
 /// UUID plus `/proc/<pid>/stat` start ticks, fencing both PID reuse and reboot without wall-clock
 /// conversion. Other platforms retain `ps lstart`. Unreadable/malformed Linux records fail closed
@@ -203,31 +340,66 @@ pub(crate) async fn start_fingerprint(pid: u32, max_bytes: usize) -> Option<Stri
     .then_some(value)
 }
 
+/// A kernel process incarnation for the local terminal-status contract. This is separate from
+/// the existing start fingerprint: changing the latter would invalidate persisted route nonces.
+/// Both native reads must agree, so a PID reused during inspection cannot combine incarnations.
+pub(crate) async fn terminal_identity(pid: u32) -> Option<String> {
+    if pid == 0 || i32::try_from(pid).is_err() {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let first = linux_start_fingerprint(Path::new("/proc"), pid).await?;
+            let second = linux_start_fingerprint(Path::new("/proc"), pid).await?;
+            (first == second).then_some(first)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || ciao_native_process::native_identity(pid)),
+        )
+        .await
+        .ok()?
+        .ok()?
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn canonical_boot_uuid(boot: &str) -> Option<String> {
+    (boot.len() == 36
+        && boot.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        }))
+    .then(|| boot.to_ascii_lowercase())
+}
+
 #[cfg(any(target_os = "linux", test))]
 const MAX_PROC_STAT_BYTES: usize = 4096;
 
 #[cfg(any(target_os = "linux", test))]
 async fn linux_start_fingerprint(proc_root: &Path, pid: u32) -> Option<String> {
-    use tokio::io::AsyncReadExt;
-
-    async fn read_bounded(path: &Path, cap: usize) -> Option<Vec<u8>> {
-        let file = tokio::fs::File::open(path).await.ok()?;
-        let mut bytes = Vec::new();
-        file.take((cap + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .ok()?;
-        (bytes.len() <= cap).then_some(bytes)
-    }
-
     if pid == 0 || i32::try_from(pid).is_err() {
         return None;
     }
     // procfs reports zero file lengths; cap the actual reads rather than trusting metadata.
     tokio::time::timeout(Duration::from_secs(1), async {
-        let boot = read_bounded(&proc_root.join("sys/kernel/random/boot_id"), 37).await?;
+        let boot =
+            read_bounded_proc_record(&proc_root.join("sys/kernel/random/boot_id"), 37).await?;
         let stat =
-            read_bounded(&proc_root.join(format!("{pid}/stat")), MAX_PROC_STAT_BYTES).await?;
+            read_bounded_proc_record(&proc_root.join(format!("{pid}/stat")), MAX_PROC_STAT_BYTES)
+                .await?;
         linux_identity_from_records(pid, &boot, &stat)
     })
     .await
@@ -236,19 +408,22 @@ async fn linux_start_fingerprint(proc_root: &Path, pid: u32) -> Option<String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+async fn read_bounded_proc_record(path: &Path, cap: usize) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut bytes = Vec::new();
+    file.take((cap + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    (bytes.len() <= cap).then_some(bytes)
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn linux_identity_from_records(pid: u32, boot: &[u8], stat: &[u8]) -> Option<String> {
     let boot = std::str::from_utf8(boot).ok()?.trim_end_matches('\n');
-    if boot.len() != 36
-        || !boot.bytes().enumerate().all(|(index, byte)| {
-            if [8, 13, 18, 23].contains(&index) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-    {
-        return None;
-    }
+    let boot = canonical_boot_uuid(boot)?;
     // comm is parenthesized, not escaped: it can contain spaces, ')' and non-UTF-8 bytes.
     // The numeric tail contains no ')', so only the final delimiter identifies field 3.
     if !stat.starts_with(format!("{pid} (").as_bytes()) {
@@ -264,7 +439,7 @@ fn linux_identity_from_records(pid: u32, boot: &[u8], stat: &[u8]) -> Option<Str
         return None;
     }
     let ticks: u64 = ticks.parse().ok()?;
-    Some(format!("linux:{}:{ticks}", boot.to_ascii_lowercase()))
+    Some(format!("linux:{boot}:{ticks}"))
 }
 
 /// Linux's executable reference names the *mapped image*, even when argv[0] is relative or
@@ -382,16 +557,91 @@ mod tests {
 
     use super::*;
 
-    /// `ps -o pid= -o comm=` answers a path on macOS and a bare name on Linux; either way the
-    /// program is its file name, never a substring of it.
+    /// `comm` is a path on macOS and a bare name on Linux. Recheck the UID in the targeted
+    /// answer too: a pgrep candidate can exit and its PID can be reused before ps reads it.
     #[test]
     fn named_processes_match_the_executable_file_name_only() {
-        let stdout = b"  101 /usr/local/lib/node_modules/codex/vendor/codex\n\
-                       202 codex\n\
-                       303 node\n\
-                       404 /opt/codex-helper\n\
-                       0 codex\n";
-        assert_eq!(parse_named(stdout, "codex"), vec![101, 202]);
+        let stdout = b"  101 501 /usr/local/lib/node_modules/codex/vendor/codex\n\
+                       202 501 codex\n\
+                       303 501 node\n\
+                       404 501 /opt/codex-helper\n\
+                       505 502 codex\n\
+                       0 501 codex\n";
+        assert_eq!(parse_named(stdout, "codex", 501), vec![101, 202]);
+    }
+
+    #[test]
+    fn named_selection_is_literal_and_refuses_truncated_or_unbounded_names() {
+        assert_eq!(process_name_pattern("codex"), Some("codex".into()));
+        assert_eq!(process_name_pattern("a.b-c_d"), Some("a\\.b-c_d".into()));
+        assert!(process_name_pattern("123456789012345").is_some());
+        for name in [
+            "",
+            "1234567890123456",
+            "-codex",
+            "codex|sh",
+            "/bin/codex",
+            "c odex",
+        ] {
+            assert!(
+                process_name_pattern(name).is_none(),
+                "unexpected name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_pid_lists_are_complete_unique_and_bounded() {
+        assert_eq!(parse_process_ids(b" 42\n123\n"), Some(vec![42, 123]));
+        assert_eq!(parse_process_ids(b""), Some(Vec::new()));
+        for output in [
+            b"0\n".as_slice(),
+            b"4294967295\n",
+            b"42\n42\n",
+            b"42 123\n",
+            b"042\n",
+            b"+42\n",
+            b"42\n\n123\n",
+            b"42\n\xff\n",
+        ] {
+            assert!(parse_process_ids(output).is_none());
+        }
+        let full = (1..=MAX_NAMED_PROCESSES)
+            .map(|pid| format!("{pid}\n"))
+            .collect::<String>();
+        assert_eq!(
+            parse_process_ids(full.as_bytes()).unwrap().len(),
+            MAX_NAMED_PROCESSES
+        );
+        assert!(parse_process_ids(format!("{full}999999\n").as_bytes()).is_none());
+    }
+
+    #[tokio::test]
+    async fn named_discovers_a_real_exact_executable_without_listing_unrelated_commands() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let found = named("sleep").await;
+        let partial = named("slee").await;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            found.contains(&pid),
+            "the exact live executable must be discovered"
+        );
+        assert!(
+            !partial.contains(&pid),
+            "a prefix must never select the executable"
+        );
+        assert!(
+            !named("sleep").await.contains(&pid),
+            "a reaped process is absent"
+        );
     }
 
     /// `lsof -F n` names every open descriptor; only absolute paths are files.
@@ -592,6 +842,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn process_arguments_preserve_exact_tokens_and_refuse_partial_or_oversized_records() {
+        assert_eq!(
+            parse_process_arguments(b"codex\0-c\0notify=[\"a b\"]\0app-server\0\0"),
+            Some(vec![
+                "codex".into(),
+                "-c".into(),
+                "notify=[\"a b\"]".into(),
+                "app-server".into(),
+                "".into()
+            ])
+        );
+        assert_eq!(
+            parse_process_arguments(b"\0\0"),
+            Some(vec!["".into(), "".into()])
+        );
+        for malformed in [b"".as_slice(), b"codex", b"codex\0\xff\0"] {
+            assert!(parse_process_arguments(malformed).is_none());
+        }
+        let mut maximum = vec![b'x'; MAX_PROCESS_ARGUMENT_BYTES - 1];
+        maximum.push(0);
+        assert!(parse_process_arguments(&maximum).is_some());
+        maximum.push(0);
+        assert!(parse_process_arguments(&maximum).is_none());
+        assert_eq!(
+            parse_process_arguments(&vec![0; MAX_PROCESS_ARGUMENTS])
+                .unwrap()
+                .len(),
+            MAX_PROCESS_ARGUMENTS
+        );
+        assert!(parse_process_arguments(&vec![0; MAX_PROCESS_ARGUMENTS + 1]).is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn arguments_read_native_boundaries_without_environment_values() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = Command::new("/bin/sleep")
+            .arg0("a sleep alias with spaces")
+            .arg("30")
+            .env_clear()
+            .env("CIAO_TEST_SECRET", "must_not_be_an_argument")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let actual = arguments(pid).await;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            actual,
+            Some(vec!["a sleep alias with spaces".into(), "30".into()])
+        );
+        assert!(arguments(pid).await.is_none());
+        assert!(arguments(0).await.is_none());
+        assert!(arguments(u32::MAX).await.is_none());
+    }
+
     const BOOT_A: &[u8] = b"12345678-1234-1234-1234-123456789abc\n";
     const BOOT_B: &[u8] = b"12345678-1234-1234-1234-123456789abd\n";
 
@@ -638,6 +949,37 @@ mod tests {
         for stat in [b"".as_slice(), b"42 (broken", b"42 (x) S 0", b"42 (x)S 0"] {
             assert!(linux_identity_from_records(42, BOOT_A, stat).is_none());
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn terminal_identity_tracks_a_real_incarnation_and_refuses_invalid_or_exited_pids() {
+        assert!(terminal_identity(0).await.is_none());
+        assert!(terminal_identity(u32::MAX).await.is_none());
+        let mut child = spawn_sleeper();
+        let pid = child.id();
+        let first = terminal_identity(pid).await;
+        let second = terminal_identity(pid).await;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let first = first.expect("the native kernel must identify a live child");
+        assert_eq!(second, Some(first.clone()), "a live incarnation is stable");
+        #[cfg(target_os = "macos")]
+        assert!(first.starts_with("macos:"));
+        #[cfg(target_os = "linux")]
+        assert!(first.starts_with("linux:"));
+        assert!(first.len() <= 63);
+        let mut fields = first.split(':');
+        assert!(fields.next().is_some());
+        let boot = fields.next().unwrap();
+        assert_eq!(canonical_boot_uuid(boot).as_deref(), Some(boot));
+        let number = fields.next().unwrap();
+        assert_eq!(number.parse::<u64>().unwrap().to_string(), number);
+        assert!(fields.next().is_none());
+        assert!(
+            terminal_identity(pid).await.is_none(),
+            "a reaped process has no identity"
+        );
     }
 
     #[tokio::test]

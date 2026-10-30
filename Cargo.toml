@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ciao-host"]
+members = ["crates/ciao-host", "crates/ciao-native-process"]
 resolver = "2"
 
 [workspace.package]
