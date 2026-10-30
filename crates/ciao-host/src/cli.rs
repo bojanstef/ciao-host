@@ -60,6 +60,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Explicit host links and remote managed-agent work (JSON output)
+    Peers {
+        #[command(subcommand)]
+        action: crate::peer_cli::Command,
+    },
     /// Create or repair the host identity and per-user daemon
     Setup {
         /// Confirm setup without reading standard input
@@ -193,6 +198,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = CiaoPaths::discover()?;
     match cli.command {
+        Some(Command::Peers { action }) => crate::peer_cli::run(action, &paths.socket_file).await,
         Some(Command::Setup { yes }) => setup_command(&paths, yes).await,
         Some(Command::Pair) => pair_command(&paths).await,
         Some(Command::Status { json }) => status_command(&paths, json, true).await,
@@ -1606,6 +1612,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "peers",
                 "setup",
                 "pair",
                 "status",

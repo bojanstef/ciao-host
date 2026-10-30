@@ -26,6 +26,8 @@ pub const STREAM_KIND_DOWNLOAD: u8 = 0x07;
 /// loopback listener accepts, so a WebView on the phone can load a dev server bound to
 /// `127.0.0.1` here. 0x08 is simply the next free byte.
 pub const STREAM_KIND_FORWARD: u8 = 0x08;
+/// Spec 026: paired-phone administration, separate from the restricted peer ALPN.
+pub const STREAM_KIND_PEERS: u8 = 0x09;
 
 pub const MAX_RPC_BODY: usize = 16 * 1024;
 pub const MAX_OPEN_PAYLOAD: usize = 4 * 1024;
@@ -295,6 +297,7 @@ pub const STREAM_FORWARD_LIMIT: u32 = 0x208;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
+    Peers,
     Rpc,
     Terminal,
     Agent,
@@ -306,6 +309,7 @@ pub enum StreamKind {
 impl StreamKind {
     pub const fn byte(self) -> u8 {
         match self {
+            Self::Peers => STREAM_KIND_PEERS,
             Self::Rpc => STREAM_KIND_RPC,
             Self::Terminal => STREAM_KIND_TERMINAL,
             Self::Agent => STREAM_KIND_AGENT,
@@ -317,6 +321,7 @@ impl StreamKind {
 
     pub fn from_byte(value: u8) -> Result<Self, HostProtocolError> {
         match value {
+            STREAM_KIND_PEERS => Ok(Self::Peers),
             STREAM_KIND_RPC => Ok(Self::Rpc),
             STREAM_KIND_TERMINAL => Ok(Self::Terminal),
             STREAM_KIND_AGENT => Ok(Self::Agent),

@@ -1,3 +1,6 @@
+#[path = "peer_daemon.rs"]
+mod peer;
+
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
@@ -236,6 +239,7 @@ impl ConnectionAdmissions {
 
 #[derive(Debug)]
 struct RuntimeState {
+    peers: crate::peers::Peers,
     host_endpoint_id: EndpointId,
     online: AtomicBool,
     relay_known: AtomicBool,
@@ -736,7 +740,11 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     let mode = endpoint_mode(std::env::var_os(RELAY_ONLY_ENV).as_deref());
     let mut endpoint_builder = Endpoint::builder(presets::N0)
         .secret_key(identity.secret_key)
-        .alpns(vec![PAIRING_ALPN.to_vec(), HOST_ALPN.to_vec()])
+        .alpns(vec![
+            PAIRING_ALPN.to_vec(),
+            HOST_ALPN.to_vec(),
+            crate::peers::ALPN.to_vec(),
+        ])
         .transport_config(host_transport_config());
     // Ciao's own relays replace Number 0's for packet relaying. This errors rather than
     // returning `None` in a release build, so a shipped daemon can never quietly relay
@@ -780,6 +788,7 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     )?;
     let paired_devices = Arc::new(Mutex::new(paired_devices));
     let state = Arc::new(RuntimeState {
+        peers: crate::peers::Peers::load(&paths.state_dir.join("peers.json"))?,
         host_endpoint_id: identity.endpoint_id,
         online: AtomicBool::new(false),
         relay_known: AtomicBool::new(false),
@@ -1298,6 +1307,12 @@ async fn process_ipc_operation(
     state: &Arc<RuntimeState>,
 ) -> Result<Value, (&'static str, String)> {
     match operation {
+        IpcOperation::Peers { body } => peer::ipc(body, endpoint, state).await.map_err(|code| {
+            (
+                code,
+                "Peer operation refused; inspect the safe category and local grants.".into(),
+            )
+        }),
         IpcOperation::AgentSessions => {
             let rows: Vec<_> = state
                 .managed_sessions
@@ -1461,6 +1476,9 @@ async fn process_ipc_operation(
             )
         }
         IpcOperation::Unpair { endpoint_id } => {
+            let _effects = state.peers.effects.lock().await;
+            peer::revoke_issuer(state, &endpoint_id)
+                .map_err(|code| (code, "Could not revoke this device's peer grants.".into()))?;
             let removed = state
                 .paired_devices
                 .lock()
@@ -1654,6 +1672,7 @@ async fn handle_authenticated_connection(connection: Connection, state: Arc<Runt
             handle_pairing_connection(connection, state).await;
         }
         HOST_ALPN => handle_host_connection(connection, state).await,
+        crate::peers::ALPN => peer::serve(connection, state).await,
         _ => connection.close(
             VarInt::from_u32(CONNECTION_PROTOCOL_VIOLATION),
             b"host protocol violation",
@@ -1910,6 +1929,12 @@ async fn handle_host_session(
                     }
                 };
                 match kind {
+                    StreamKind::Peers => {
+                        let state = state.clone();
+                        stream_tasks.spawn(async move {
+                            peer::admin_stream(&mut send, &mut recv, remote_id, &state).await;
+                        });
+                    }
                     StreamKind::Rpc => {
                         let state = state.clone();
                         let snapshot_busy = snapshot_busy.clone();
@@ -4708,7 +4733,7 @@ mod tests {
         encode_upload_frame,
     };
 
-    fn test_state(
+    pub(super) fn test_state(
         host_endpoint_id: EndpointId,
         paired_path: &std::path::Path,
     ) -> Arc<RuntimeState> {
@@ -4744,6 +4769,7 @@ mod tests {
         .unwrap();
         let paired_devices = Arc::new(Mutex::new(PairedDeviceStore::load(paired_path).unwrap()));
         Arc::new(RuntimeState {
+            peers: crate::peers::Peers::load(&paired_path.with_file_name("peers.json")).unwrap(),
             codex_adoptions: Arc::new(crate::codex_adopted::AdoptionRegistry::default()),
             host_endpoint_id,
             online: AtomicBool::new(true),

@@ -1,0 +1,22 @@
+{
+  "limits": {"peers": 16, "workspaces": 32, "workspace_label_bytes": 128, "reply_bytes": 66560},
+  "request": {"v": 1, "action": {"op": "describe"}},
+  "response": {
+    "v": 1,
+    "result": {
+      "peer": {"endpoint_id": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "name": "Build Computer"},
+      "incoming": [],
+      "outgoing": [],
+      "workspaces": [{"workspace_id": "workspace-alpha", "display_label": "Alpha"}],
+      "scan_incomplete": false
+    },
+    "error": null
+  },
+  "refusal": {"v": 1, "result": null, "error": "authorization_denied"},
+  "malformed_requests": [
+    {"v": 1, "grant_id": "g", "action": {"op": "workspaces", "shell": "whoami"}},
+    {"v": 1, "grant_id": "g", "action": {"op": "start", "request_id": "r", "workspace_id": "alpha", "path": "/tmp"}},
+    {"v": 1, "grant_id": "g", "action": {"op": "grant", "peer": "another"}},
+    {"v": 1, "grant_id": "g", "action": {"op": "start", "request_id": "bad/id", "workspace_id": "alpha"}}
+  ]
+}

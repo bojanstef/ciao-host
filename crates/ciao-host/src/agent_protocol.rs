@@ -2561,13 +2561,20 @@ pub fn fit_entry_alone(entry: &TimelineEntry) -> TimelineEntry {
 /// entry is never dropped for size alone: if it is the last one standing it is cut to a head
 /// against the snapshot itself, because a conversation whose newest message vanished from the
 /// screen reads as broken where a shorter head with more available does not.
-pub fn fit_snapshot_to_frame(mut snapshot: AgentSessionSnapshot) -> AgentSessionSnapshot {
-    let frame_len = |snapshot: &AgentSessionSnapshot| {
+pub fn fit_snapshot_to_frame(snapshot: AgentSessionSnapshot) -> AgentSessionSnapshot {
+    fit_snapshot_with_envelope(snapshot, |snapshot| {
         encoded_frame_len(&AgentServerFrame::SessionSnapshot {
             v: AGENT_PROTOCOL_VERSION,
             snapshot: Box::new(snapshot.clone()),
         })
-    };
+    })
+}
+
+/// Use the same retention/truncation policy when a bounded transport has a different envelope.
+pub(crate) fn fit_snapshot_with_envelope(
+    mut snapshot: AgentSessionSnapshot,
+    frame_len: impl Fn(&AgentSessionSnapshot) -> usize,
+) -> AgentSessionSnapshot {
     for entry in &mut snapshot.timeline_window.entries {
         *entry = fit_entry_alone(entry);
     }

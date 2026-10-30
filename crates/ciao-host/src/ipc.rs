@@ -12,6 +12,7 @@ use tokio::{
 use crate::protocol::PROTOCOL_VERSION;
 
 pub const MAX_IPC_LINE: usize = 64 * 1024;
+pub const MAX_IPC_REQUEST_ID_BYTES: usize = 128;
 const IPC_TIMEOUT: Duration = Duration::from_secs(3);
 /// Lifecycle verbs spawn a worker and digest-verify a large binary, so they get
 /// a longer ceiling than the conversational status/pairing calls.
@@ -26,6 +27,9 @@ pub struct IpcRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcOperation {
+    Peers {
+        body: Value,
+    },
     Status,
     CreatePairing,
     PairingStatus {
@@ -176,7 +180,7 @@ pub fn parse_request(line: &[u8]) -> Result<IpcRequest, IpcError> {
     let request_id = object
         .get("request_id")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_IPC_REQUEST_ID_BYTES)
         .ok_or_else(|| IpcError::Malformed("request_id must be 1..128 characters".into()))?
         .to_owned();
     let operation = object
@@ -185,6 +189,7 @@ pub fn parse_request(line: &[u8]) -> Result<IpcRequest, IpcError> {
         .ok_or_else(|| IpcError::Malformed("op must be a string".into()))?;
 
     let required: BTreeSet<&str> = match operation {
+        "peers" => ["v", "request_id", "op", "body"].into_iter().collect(),
         "status" | "create_pairing" | "agent_sessions" => {
             ["v", "request_id", "op"].into_iter().collect()
         }
@@ -227,6 +232,12 @@ pub fn parse_request(line: &[u8]) -> Result<IpcRequest, IpcError> {
             .ok_or_else(|| IpcError::Malformed("invalid session_id".into()))
     };
     let operation = match operation {
+        "peers" => IpcOperation::Peers {
+            body: object
+                .get("body")
+                .cloned()
+                .ok_or(IpcError::UnknownOperation)?,
+        },
         "status" => IpcOperation::Status,
         "create_pairing" => IpcOperation::CreatePairing,
         "pairing_status" => {
@@ -365,6 +376,15 @@ pub async fn write_response(stream: &mut UnixStream, response: &Value) -> Result
 
 pub async fn send_request(path: &Path, operation: Value) -> Result<Value, IpcError> {
     send_request_within(path, operation, IPC_TIMEOUT).await
+}
+
+pub(crate) async fn request_peers(path: &Path, body: Value) -> Result<Value, IpcError> {
+    send_request_within(
+        path,
+        json!({"op":"peers", "body":body}),
+        Duration::from_secs(90),
+    )
+    .await
 }
 
 async fn send_request_within(

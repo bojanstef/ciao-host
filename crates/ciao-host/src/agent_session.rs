@@ -1945,14 +1945,27 @@ impl AgentSessionSupervisor {
     }
 
     pub(crate) async fn submit_command(&self, command: AgentCommand) -> CommandReceipt {
+        self.submit_command_from(command, true).await
+    }
+
+    pub(crate) async fn submit_peer_command(&self, command: AgentCommand) -> CommandReceipt {
+        self.submit_command_from(command, false).await
+    }
+
+    async fn submit_command_from(
+        &self,
+        command: AgentCommand,
+        human_device: bool,
+    ) -> CommandReceipt {
         let now = unix_now();
         if command.validate().is_err() {
             return rejected_receipt(&command, "rejected", "invalid_command", now);
         }
-        // Spec 025: every agent command comes from a paired device, so it is the same evidence
-        // as a keystroke in one of its terminals — and the only evidence when the person types
-        // in Ciao's composer rather than its terminal.
-        self.whereabouts.note_device_input();
+        // Spec 025: a paired-device command is the same evidence as a keystroke in one of
+        // its terminals. Peer automation must not claim that the person is using the phone.
+        if human_device {
+            self.whereabouts.note_device_input();
+        }
         if let Some(existing) = self.metadata.lock().receipt(&command.command_id) {
             if existing.session_id == command.session_id
                 && existing.snapshot_epoch == command.snapshot_epoch

@@ -39,6 +39,8 @@ pub(crate) mod managed_worker;
 mod netlab;
 pub(crate) mod notify;
 pub mod pairing;
+pub(crate) mod peer_cli;
+pub(crate) mod peers;
 pub(crate) mod pi_adapter;
 pub(crate) mod pi_integration;
 pub(crate) mod process;
