@@ -138,15 +138,68 @@ mod tests {
 
     const PROBE_ALPN: &[u8] = b"ciao/relay/probe/1";
 
+    fn selected_probe_map(token: &str, selected: Option<&str>) -> Result<RelayMap> {
+        let map = map_with_token(token)?;
+        let Some(url) = selected else {
+            return Ok(map);
+        };
+        anyhow::ensure!(RELAY_URLS.contains(&url), "unknown relay probe target");
+        Ok(map
+            .relays::<Vec<_>>()
+            .into_iter()
+            .filter(|relay| relay.url.to_string().trim_end_matches('/') == url)
+            .collect())
+    }
+
+    fn live_probe_map(token: &str) -> RelayMap {
+        let selected = match std::env::var("CIAO_TEST_RELAY_URL") {
+            Ok(url) => Some(url),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => panic!("invalid relay probe target"),
+        };
+        selected_probe_map(token, selected.as_deref()).expect("build the selected relay probe map")
+    }
+
+    #[test]
+    fn a_selected_probe_cannot_pass_through_the_other_relay() {
+        for url in PINNED_URLS {
+            let map = selected_probe_map("test-token", Some(url)).expect("select relay");
+            assert_eq!(urls_of(&map), vec![url.to_string()]);
+            let relays = map.relays::<Vec<_>>();
+            assert_eq!(relays[0].auth_token.as_deref(), Some("test-token"));
+            assert_eq!(relays[0].quic.as_ref().map(|q| q.port), Some(7842));
+        }
+        assert!(selected_probe_map("test-token", Some("https://unreviewed.invalid")).is_err());
+    }
+
     fn probe_endpoint(token: &str, alpns: Vec<Vec<u8>>) -> iroh::endpoint::Builder {
         // `clear_ip_transports` forces every packet onto a relay, so a direct path can never
         // make these pass while the relays themselves are broken.
         Endpoint::builder(presets::N0)
-            .relay_mode(RelayMode::Custom(
-                map_with_token(token).expect("build the relay map"),
-            ))
+            .relay_mode(RelayMode::Custom(live_probe_map(token)))
             .clear_ip_transports()
             .alpns(alpns)
+    }
+
+    /// Unlike the forced-relay test, this sends actual UDP address-discovery probes.
+    /// A healthy TCP relay cannot conceal a broken or aborting UDP listener.
+    #[tokio::test]
+    #[ignore = "dials the deployed relays; needs CIAO_RELAY_TOKEN and UDP access"]
+    async fn deployed_relays_complete_quic_address_discovery() {
+        let token = std::env::var("CIAO_RELAY_TOKEN").expect("relay probe token is required");
+        let endpoint = Endpoint::builder(presets::N0)
+            .relay_mode(RelayMode::Custom(live_probe_map(&token)))
+            .net_report_config(iroh::NetReportConfig::minimal())
+            .bind()
+            .await
+            .expect("bind the QUIC discovery probe");
+        let report = timeout(Duration::from_secs(45), endpoint.net_report().initialized())
+            .await
+            .expect("QUIC discovery report timed out");
+        let discovered = (report.udp_v4 && report.global_v4.is_some())
+            || (report.udp_v6 && report.global_v6.is_some());
+        endpoint.close().await;
+        assert!(discovered, "no QUIC address-discovery round trip completed");
     }
 
     /// Live validation of the deployed relays. Ignored by default: this requires explicit

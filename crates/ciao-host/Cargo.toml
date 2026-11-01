@@ -37,6 +37,7 @@ x25519-dalek.workspace = true
 ciao-native-process = { path = "../ciao-native-process" }
 
 [dev-dependencies]
+iroh = { workspace = true, features = ["unstable-net-report"] }
 tempfile = "3.23.0"
 
 [lints]
