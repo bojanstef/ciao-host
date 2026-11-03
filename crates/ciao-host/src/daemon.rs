@@ -40,6 +40,7 @@ use crate::{
     },
     agent_session::AgentSessionSupervisor,
     claude_integration::refresh_installed_claude_plugin,
+    claude_managed_integration::refresh_installed_managed_worker,
     host_info,
     host_protocol::{
         CONNECTION_AUTHORIZATION_DENIED, CONNECTION_BUSY, CONNECTION_PROTOCOL_VIOLATION,
@@ -727,6 +728,9 @@ impl PathRxWatch {
 
 pub async fn run(paths: CiaoPaths) -> Result<()> {
     paths.ensure_layout()?;
+    if refresh_installed_managed_worker(&paths)? {
+        tracing::info!("installed managed worker refreshed to this Ciao version");
+    }
     match refresh_installed_claude_plugin(&paths) {
         Ok(true) => tracing::info!("installed Claude hooks refreshed to this Ciao version"),
         Ok(false) => {}

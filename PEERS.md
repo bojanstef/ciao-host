@@ -59,6 +59,9 @@ A grant authorizes the source computer's OS user, not a sandboxed individual age
 destination agent runs tools with the destination's existing credentials and permission
 settings. Managed workers load the destination's user/project/local configuration, including
 its installed integrations, native coding-agent prompt and browser opt-in; explicit saved session choices survive resume.
+Daemon startup refreshes an already installed Ciao worker to the code shipped in that daemon,
+so ordinary updates apply launch-policy fixes without reinstalling the vendor SDK or changing
+the recorded Node/PATH. An absent managed installation remains absent.
 Source-host settings and credentials are never copied. This is the same launch contract used
 by the phone and local CLI, rather than a peers-only mode. A selected project chooses its working directory; it does not contain filesystem
 or network access. Use an appropriate provider/OS sandbox when you need containment.

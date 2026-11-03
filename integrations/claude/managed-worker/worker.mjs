@@ -91,7 +91,6 @@ let catalogue = [];
 // `canonicalModel`.
 const modelResolutions = new Map();
 for (const key of [
-	"configurationSource",
 	"socketPath",
 	"sdkPrefix",
 	"sessionID",
@@ -105,7 +104,11 @@ for (const key of [
 		process.exit(2);
 	}
 }
-if (config.configurationSource !== "destination") {
+// A rollback to a pre-contract daemon reuses this installed worker. Only an absent declaration
+// retains that daemon's isolated behavior; every explicit unknown value still fails closed.
+// Current launchers are fenced by the shared fixture to declare destination explicitly.
+const destinationConfiguration = config.configurationSource === "destination";
+if (config.configurationSource !== undefined && !destinationConfiguration) {
 	process.stderr.write("ciao-managed-worker: unsupported configuration source\n");
 	process.exit(2);
 }
@@ -162,7 +165,7 @@ async function browserLaunchArgs() {
 		}
 	}
 }
-const browserArgs = await browserLaunchArgs();
+const browserArgs = destinationConfiguration ? await browserLaunchArgs() : {};
 
 const sdk = await import(
 	pathToFileURL(
@@ -968,9 +971,9 @@ const query = sdk.query({
 		env: childEnv,
 		// Shared destination-configuration contract: use the vendor's own settings merge.
 		// Ciao supplies protocol hooks and explicit session overrides, never copied settings.
-		settingSources: ["user", "project", "local"],
+		settingSources: destinationConfiguration ? ["user", "project", "local"] : [],
 		// The SDK otherwise supplies only a minimal tool-calling prompt, unlike the CLI.
-		systemPrompt: { type: "preset", preset: "claude_code" },
+		...(destinationConfiguration ? { systemPrompt: { type: "preset", preset: "claude_code" } } : {}),
 		extraArgs: { "replay-user-messages": null, ...browserArgs },
 		includePartialMessages: true,
 		// A worker resuming a conversation continues it in the mode that conversation was

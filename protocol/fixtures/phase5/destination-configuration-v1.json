@@ -13,6 +13,11 @@
     "source_host",
     ""
   ],
+  "legacy_absent_source": {
+    "settingSources": [],
+    "systemPrompt": null,
+    "chrome": false
+  },
   "claude_setting_sources": [
     "user",
     "project",

@@ -6,6 +6,7 @@
 //! used. Nothing here touches the user's own Claude installation, its
 //! configuration, its session files, or the attached integration.
 
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::process::Command;
 
@@ -21,14 +22,38 @@ use crate::{
 /// the prefix; it is Ciao's own code, not vendor material.
 const WORKER_SOURCE: &str = include_str!("../../../integrations/claude/managed-worker/worker.mjs");
 
+fn write_worker_entrypoint(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_private_directory(parent).context("create the managed worker directory")?;
+    }
+    crate::storage::atomic_write_private(path, WORKER_SOURCE.as_bytes())
+        .context("install the managed worker entrypoint")
+}
+
+/// Updating the daemon must also update its installed launch code. Refresh only an existing
+/// opt-in, without npm, vendor files or the shell's recorded Node/PATH. Run before accepting
+/// sessions so a failed refresh cannot launch old worker code under a new host contract.
+pub(crate) fn refresh_installed_managed_worker(paths: &CiaoPaths) -> Result<bool> {
+    let file = match std::fs::File::open(&paths.managed_worker_entrypoint) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("read the installed managed worker"),
+    };
+    let mut installed = Vec::new();
+    file.take(WORKER_SOURCE.len() as u64 + 1)
+        .read_to_end(&mut installed)
+        .context("read the installed managed worker")?;
+    if installed == WORKER_SOURCE.as_bytes() {
+        return Ok(false);
+    }
+    write_worker_entrypoint(&paths.managed_worker_entrypoint)?;
+    Ok(true)
+}
+
 pub(crate) fn install_managed_claude(paths: &CiaoPaths) -> Result<()> {
     let prefix = &paths.managed_sdk_prefix;
     ensure_private_directory(prefix).context("create the managed SDK prefix")?;
-    if let Some(parent) = paths.managed_worker_entrypoint.parent() {
-        ensure_private_directory(parent).context("create the managed worker directory")?;
-    }
-    std::fs::write(&paths.managed_worker_entrypoint, WORKER_SOURCE)
-        .context("install the managed worker entrypoint")?;
+    write_worker_entrypoint(&paths.managed_worker_entrypoint)?;
 
     let Some(node) = which_node() else {
         bail!("{}", missing_node_message());
@@ -116,11 +141,7 @@ pub(crate) fn try_restore_managed_claude_once(sdk_prefix: &Path, worker_entrypoi
 
 fn restore_at(sdk_prefix: &Path, worker_entrypoint: &Path, tool_path: &str) -> Result<()> {
     ensure_private_directory(sdk_prefix).context("create the managed SDK prefix")?;
-    if let Some(parent) = worker_entrypoint.parent() {
-        ensure_private_directory(parent).context("create the managed worker directory")?;
-    }
-    std::fs::write(worker_entrypoint, WORKER_SOURCE)
-        .context("restore the managed worker entrypoint")?;
+    write_worker_entrypoint(worker_entrypoint)?;
     std::fs::write(
         sdk_prefix.join("package.json"),
         serde_json::json!({ "name": "ciao-managed-claude", "private": true }).to_string(),
@@ -274,6 +295,75 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn refresh_updates_only_installed_worker_and_preserves_vendor_and_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        let paths = CiaoPaths::for_home(home.path());
+        assert!(!refresh_installed_managed_worker(&paths).unwrap());
+        assert!(!paths.managed_worker_entrypoint.exists());
+        assert!(!paths.managed_sdk_prefix.exists());
+
+        std::fs::create_dir_all(&paths.managed_sdk_prefix).unwrap();
+        let runtime = crate::managed_worker::runtime_record_file(&paths.managed_sdk_prefix);
+        let vendor = paths.managed_sdk_prefix.join("vendor-fixture");
+        std::fs::write(
+            &runtime,
+            br#"{"node":"/fixture/node","path":"/fixture/bin"}"#,
+        )
+        .unwrap();
+        std::fs::write(&vendor, "vendor bytes").unwrap();
+        let before = (
+            std::fs::read(&runtime).unwrap(),
+            std::fs::read(&vendor).unwrap(),
+        );
+        std::fs::create_dir_all(paths.managed_worker_entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&paths.managed_worker_entrypoint, "// old launch contract").unwrap();
+        assert!(refresh_installed_managed_worker(&paths).unwrap());
+        assert_eq!(
+            std::fs::read(&paths.managed_worker_entrypoint).unwrap(),
+            WORKER_SOURCE.as_bytes()
+        );
+        assert_eq!(
+            (
+                std::fs::read(&runtime).unwrap(),
+                std::fs::read(&vendor).unwrap()
+            ),
+            before
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.managed_worker_entrypoint)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!refresh_installed_managed_worker(&paths).unwrap());
+
+        // A matching prefix with extra bytes is stale too; the comparison is bounded.
+        std::fs::write(
+            &paths.managed_worker_entrypoint,
+            format!("{WORKER_SOURCE}stale"),
+        )
+        .unwrap();
+        assert!(refresh_installed_managed_worker(&paths).unwrap());
+        assert_eq!(
+            std::fs::read(&paths.managed_worker_entrypoint).unwrap(),
+            WORKER_SOURCE.as_bytes()
+        );
+    }
+
+    #[test]
+    fn unreadable_installed_worker_is_an_error_before_sessions_start() {
+        let home = tempdir().unwrap();
+        let paths = CiaoPaths::for_home(home.path());
+        std::fs::create_dir_all(&paths.managed_worker_entrypoint).unwrap();
+        assert!(refresh_installed_managed_worker(&paths).is_err());
+        assert!(paths.managed_worker_entrypoint.is_dir());
+    }
 
     /// The remedy must be runnable where it is read. Homebrew is not on a released Linux host,
     /// and this is the only blocking step in `ciao setup` on a machine without Node.
