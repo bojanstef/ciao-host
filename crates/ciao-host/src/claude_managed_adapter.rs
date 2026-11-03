@@ -657,6 +657,10 @@ fn decode_managed_frame(body: &[u8]) -> Result<ClaudeManagedInbound, AgentProtoc
 }
 
 impl AttachedAgentAdapter for ClaudeManagedAdapter {
+    fn configuration_source(&self) -> crate::agent_adapter::ConfigurationSource {
+        crate::agent_adapter::ConfigurationSource::Destination
+    }
+
     fn id(&self) -> &'static str {
         "claude-managed"
     }

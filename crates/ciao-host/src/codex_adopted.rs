@@ -792,9 +792,12 @@ pub(crate) async fn adopt(
         return Err(AdoptRefusal::TerminalHolds);
     }
 
-    let (mut connection, events) = AppServerConnection::connect(&params.binary)
-        .await
-        .map_err(AdoptRefusal::Vendor)?;
+    let (mut connection, events) = AppServerConnection::connect_in_workspace(
+        &params.binary,
+        params.workspace_path.as_deref().map(Path::new),
+    )
+    .await
+    .map_err(AdoptRefusal::Vendor)?;
     let resumed = match connection
         .request("thread/resume", json!({"threadId": params.thread_id}))
         .await
@@ -2008,9 +2011,10 @@ mod tests {
 
         // Seed: a conversation with one finished turn, then nobody holding it — the shape a
         // closed terminal leaves behind. Model turn one.
-        let (mut seeder, mut seed_events) = AppServerConnection::connect(Path::new("codex"))
-            .await
-            .unwrap();
+        let (mut seeder, mut seed_events) =
+            AppServerConnection::connect_in_workspace(Path::new("codex"), None)
+                .await
+                .unwrap();
         let started = seeder
             .request("thread/start", json!({"cwd": cwd}))
             .await
@@ -2294,7 +2298,9 @@ mod tests {
         // The vendor's own read-back, from a fresh process: the settings write persisted on
         // the thread itself, not merely in the adapter's memory of it.
         let (mut cleaner, _cleaner_events) =
-            AppServerConnection::connect(&which_codex()).await.unwrap();
+            AppServerConnection::connect_in_workspace(&which_codex(), None)
+                .await
+                .unwrap();
         let resumed = cleaner
             .request("thread/resume", json!({"threadId": thread_id}))
             .await

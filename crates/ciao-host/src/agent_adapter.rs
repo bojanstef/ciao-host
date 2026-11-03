@@ -30,6 +30,40 @@ pub(crate) enum AdapterConnectionKind {
     TransientEvent,
 }
 
+/// Configuration belongs to the destination's user and workspace. Observers preserve an
+/// already-running agent; Ciao-owned processes load the vendor's destination defaults. No
+/// remote caller supplies settings, environment, plugins, or a replacement configuration home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigurationSource {
+    ExistingProcess,
+    Destination,
+}
+
+impl ConfigurationSource {
+    pub(crate) const ENVIRONMENT_KEY: &str = "CIAO_AGENT_CONFIGURATION";
+
+    /// Local launch protocol, also consumed by worker runtimes. The workspace has already
+    /// been resolved by the destination; retaining the environment lets the vendor resolve
+    /// its own config home and credentials. This is not a shell-environment synchronizer.
+    pub(crate) fn configure_launch(
+        self,
+        command: &mut tokio::process::Command,
+        workspace: Option<&std::path::Path>,
+    ) -> Result<(), AgentProtocolError> {
+        if self != Self::Destination
+            || workspace.is_some_and(|p| !p.is_absolute() || p.as_os_str().len() > 4096)
+        {
+            return Err(AgentProtocolError::InvalidValue);
+        }
+        command.env(Self::ENVIRONMENT_KEY, "destination");
+        if let Some(workspace) = workspace {
+            command.current_dir(workspace);
+        }
+        Ok(())
+    }
+}
+
 /// How a session on an adapter comes back after the daemon restarts. The product rule is that
 /// every live session returns by itself, without having to speak; this is each integration's
 /// answer to it. Every adapter declares one and the parity ledger holds it there, so a new
@@ -151,6 +185,9 @@ pub(crate) enum WhereaboutsDelivery {
 pub(crate) trait AttachedAgentAdapter: Send + Sync {
     /// Stable machine token used only for local bridge dispatch, never as a capability shortcut.
     fn id(&self) -> &'static str;
+
+    /// Required for every integration, and checked by the cross-adapter parity ledger.
+    fn configuration_source(&self) -> ConfigurationSource;
 
     fn connection_kind(&self) -> AdapterConnectionKind {
         AdapterConnectionKind::PersistentBridge

@@ -66,8 +66,16 @@ pub(crate) async fn request_with_codex_home(
     .map_err(|_| anyhow!("the Codex app-server did not answer in time"))?
 }
 
-fn spawn_with_codex_home(binary: &Path, codex_home: Option<&Path>) -> Result<Child> {
+pub(crate) const CONFIGURATION_SOURCE: crate::agent_adapter::ConfigurationSource =
+    crate::agent_adapter::ConfigurationSource::Destination;
+
+fn spawn_with_codex_home(
+    binary: &Path,
+    codex_home: Option<&Path>,
+    workspace: Option<&Path>,
+) -> Result<Child> {
     let mut command = Command::new(binary);
+    CONFIGURATION_SOURCE.configure_launch(&mut command, workspace)?;
     command
         .arg("app-server")
         .stdin(Stdio::piped())
@@ -91,7 +99,7 @@ async fn exchange(
     params: Value,
     codex_home: Option<&Path>,
 ) -> Result<Value> {
-    let mut child = spawn_with_codex_home(binary, codex_home)?;
+    let mut child = spawn_with_codex_home(binary, codex_home, None)?;
     let result = drive(&mut child, method, params).await;
     let _ = child.start_kill();
     result
@@ -263,8 +271,11 @@ impl AppServerConnection {
     /// Spawns from an absolute binary path — never a `PATH` lookup, for the Spec 012 §2.8
     /// reason — completes the `initialize` handshake, and returns the connection plus the
     /// event stream the supervisor consumes.
-    pub(crate) async fn connect(binary: &Path) -> Result<(Self, mpsc::Receiver<AppServerEvent>)> {
-        let mut child = spawn_with_codex_home(binary, None)?;
+    pub(crate) async fn connect_in_workspace(
+        binary: &Path,
+        workspace: Option<&Path>,
+    ) -> Result<(Self, mpsc::Receiver<AppServerEvent>)> {
+        let mut child = spawn_with_codex_home(binary, None, workspace)?;
         let stdin = child
             .stdin
             .take()
@@ -505,7 +516,7 @@ for line in sys.stdin:
     if request['method'] == 'thread/read' and not (pathlib.Path(home) / 'fixture-thread-present').is_file():
         response['error'] = {'code': -32000, 'message': 'fixture thread not in selected home'}
     else:
-        response['result'] = {'home': home, 'thread': {'turns': []}}
+        response['result'] = {'home': home, 'cwd': os.getcwd(), 'configuration': os.environ.get('CIAO_AGENT_CONFIGURATION'), 'thread': {'turns': []}}
     print(json.dumps(response), flush=True)
 "#.replace("__CAPTURE__", &serde_json::to_string(&captured.to_str().unwrap()).unwrap());
         std::fs::write(&binary, program).unwrap();
@@ -534,6 +545,25 @@ for line in sys.stdin:
             inherited["home"].as_str().unwrap(),
             original.as_deref().unwrap_or_default().to_str().unwrap()
         );
+        // Adoption starts in the thread's workspace, so project-level vendor config is
+        // resolved there rather than in the service manager's working directory.
+        let (mut standing, _) = AppServerConnection::connect_in_workspace(&binary, Some(&right))
+            .await
+            .unwrap();
+        let launched = standing
+            .request("fixture/capture", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            launched["cwd"],
+            right.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(launched["configuration"], "destination");
+        assert_eq!(
+            launched["home"],
+            original.as_deref().unwrap_or_default().to_str().unwrap()
+        );
+        standing.shutdown().await;
         assert_eq!(std::env::var_os("CODEX_HOME"), original);
     }
 
@@ -589,9 +619,10 @@ for line in sys.stdin:
         if std::env::var("CIAO_TEST_CODEX_CLI").as_deref() != Ok("1") {
             return;
         }
-        let (mut connection, mut events) = AppServerConnection::connect(Path::new("codex"))
-            .await
-            .unwrap();
+        let (mut connection, mut events) =
+            AppServerConnection::connect_in_workspace(Path::new("codex"), None)
+                .await
+                .unwrap();
         let listed = connection
             .request("thread/list", json!({"limit": 1}))
             .await

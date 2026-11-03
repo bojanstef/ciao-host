@@ -476,6 +476,10 @@ impl PiBridgeOutbound {
 }
 
 impl AttachedAgentAdapter for PiAttachedAdapter {
+    fn configuration_source(&self) -> crate::agent_adapter::ConfigurationSource {
+        crate::agent_adapter::ConfigurationSource::ExistingProcess
+    }
+
     fn id(&self) -> &'static str {
         "pi"
     }

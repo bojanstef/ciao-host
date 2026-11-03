@@ -1,7 +1,7 @@
 //! Spec 006 §8.2/§9.1: spawning and supervising the pinned managed worker.
 //!
 //! The daemon owns the worker process. It resolves and digest-verifies the
-//! pinned SDK pair, spawns the Ciao-owned worker entrypoint with a minimal
+//! pinned SDK pair, spawns the Ciao-owned worker entrypoint with the destination
 //! environment and a one-time registration token, waits for the worker to
 //! register over the existing agent bridge, and reaps the process afterwards.
 //! Credentials, prompts, and vendor payloads never pass through this module.
@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
 
+use crate::agent_adapter::AttachedAgentAdapter;
 use crate::claude_managed_adapter::{PINNED_CLAUDE_SDK_VERSION, PINNED_MANAGED_CLI_VERSION};
 
 /// Spec 006 §12 worker bounds.
@@ -201,7 +202,7 @@ pub(crate) struct WorkerTable {
 }
 
 impl WorkerTable {
-    /// Spawns the worker with a minimal environment. The registration token
+    /// Spawns with the destination environment and recorded tool PATH. The registration token
     /// travels in the environment rather than argv so it never appears in a
     /// process listing.
     // ponytail: nine spawn parameters, all required by the worker's command line. A parameter
@@ -220,9 +221,11 @@ impl WorkerTable {
     ) -> Result<String> {
         let spawn_token = format!("{:032x}", random::<u128>());
         let mut command = Command::new(&runtime.node_path);
+        crate::claude_managed_adapter::ClaudeManagedAdapter
+            .configuration_source()
+            .configure_launch(&mut command, Some(workspace_path))?;
         command
             .arg(&runtime.worker_entrypoint)
-            .current_dir(workspace_path)
             // The daemon's environment is inherited deliberately. Claude
             // authenticates from the user's own credential state, and clearing
             // the environment strips what it needs to find it: dropping USER
@@ -539,6 +542,58 @@ mod tests {
         assert_eq!(
             ManagedRuntime::resolve(home.path(), &entrypoint).unwrap_err(),
             "runtime_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_launch_preserves_destination_and_resume_overrides() {
+        let workspace = tempdir().unwrap();
+        let entrypoint = workspace.path().join("capture.sh");
+        std::fs::write(&entrypoint, r#"printf '%s\n' "$CIAO_AGENT_CONFIGURATION" "$PWD" "$PATH" "$CIAO_MANAGED_PERMISSION_MODE" "$CIAO_MANAGED_MODEL" > launch.txt"#).unwrap();
+        let runtime = ManagedRuntime {
+            sdk_prefix: workspace.path().to_owned(),
+            worker_entrypoint: entrypoint,
+            cli_path: workspace.path().join("claude"),
+            cli_version: PINNED_MANAGED_CLI_VERSION.into(),
+            sdk_version: PINNED_CLAUDE_SDK_VERSION.into(),
+            node_path: PathBuf::from("/bin/sh"),
+            tool_path: "/fixture/tools:/usr/bin:/bin".into(),
+        };
+        let workers = WorkerTable::default();
+        workers
+            .spawn(
+                &runtime,
+                "configuration-fixture",
+                workspace.path(),
+                "workspace",
+                &workspace.path().join("agent.sock"),
+                Some("saved-session"),
+                Some("plan"),
+                Some("saved-model"),
+            )
+            .unwrap();
+        let exited = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let exited = workers.reap();
+                if !exited.is_empty() {
+                    break exited;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(exited, vec![("configuration-fixture".into(), false)]);
+        let capture = std::fs::read_to_string(workspace.path().join("launch.txt")).unwrap();
+        assert_eq!(
+            capture.lines().collect::<Vec<_>>(),
+            vec![
+                "destination",
+                workspace.path().canonicalize().unwrap().to_str().unwrap(),
+                runtime.tool_path.as_str(),
+                "plan",
+                "saved-model"
+            ]
         );
     }
 

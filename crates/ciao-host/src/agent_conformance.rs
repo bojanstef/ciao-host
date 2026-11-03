@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 
 use crate::{
     agent_adapter::{
-        AdapterConnectionKind, AttachedAgentAdapter, NormalizedAdapterEvent, RestartRecovery,
-        VendorRecord, WhereaboutsDelivery,
+        AdapterConnectionKind, AttachedAgentAdapter, ConfigurationSource, NormalizedAdapterEvent,
+        RestartRecovery, VendorRecord, WhereaboutsDelivery,
     },
     agent_bridge::{AgentAdapterRegistry, PRODUCTION_ADAPTERS},
     agent_protocol::{
@@ -173,6 +173,7 @@ fn permits(registration: &NormalizedRegistration, name: CommandName) -> bool {
 /// dialect's canonical bytes.
 struct ParityContract {
     id: &'static str,
+    configuration_source: ConfigurationSource,
     family: &'static str,
     topology: &'static str,
     connection: AdapterConnectionKind,
@@ -561,6 +562,7 @@ fn contracts() -> [ParityContract; 4] {
     [
         ParityContract {
             id: "pi",
+            configuration_source: ConfigurationSource::ExistingProcess,
             // Re-grounded at 1.4.0: the same four commands, lifecycle events and whereabouts
             // query run through Pi's actual loader/runner; the major gate remains closed.
             family: "Pi",
@@ -624,6 +626,7 @@ fn contracts() -> [ParityContract; 4] {
         },
         ParityContract {
             id: "claude",
+            configuration_source: ConfigurationSource::ExistingProcess,
             family: "Claude",
             topology: "attached",
             connection: AdapterConnectionKind::TransientEvent,
@@ -656,6 +659,7 @@ fn contracts() -> [ParityContract; 4] {
         },
         ParityContract {
             id: "claude-managed",
+            configuration_source: ConfigurationSource::Destination,
             // SDK 0.3.314 / CLI 2.1.314 preserve this declaration read-set and the correlated
             // replay acknowledgement; broader permission/resume probes stay manual.
             family: "Claude",
@@ -722,6 +726,7 @@ fn contracts() -> [ParityContract; 4] {
         },
         ParityContract {
             id: "codex",
+            configuration_source: ConfigurationSource::ExistingProcess,
             // Hook novelty tallies locally against hookEventNames, without dispatch. The
             // 0.166.0 re-grounding also lists PreModelRequest/PostModelRequest as deliberately
             // ignored; capability, event and registration sets stay unchanged. See
@@ -830,6 +835,68 @@ fn the_ledger_covers_exactly_the_production_adapters() {
         ledger, production,
         "every production adapter needs exactly one parity ledger row; update agent_conformance \
          and docs/audits/2026-08-05-adapter-parity-audit.md together"
+    );
+}
+
+/// One shared fixture binds the required adapter declaration to the local launch protocol.
+/// Observers cannot accidentally use that protocol to launch a replacement agent.
+#[tokio::test]
+async fn every_adapter_preserves_destination_configuration() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../protocol/fixtures/phase5/destination-configuration-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        fixture["environment_key"],
+        ConfigurationSource::ENVIRONMENT_KEY
+    );
+    assert_eq!(
+        fixture["adapters"].as_object().unwrap().len(),
+        contracts().len() + 1
+    );
+    for source in fixture["rejected_sources"].as_array().unwrap() {
+        assert!(serde_json::from_value::<ConfigurationSource>(source.clone()).is_err());
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace_path = workspace.path().canonicalize().unwrap();
+    for contract in contracts() {
+        let policy = contract.adapter().configuration_source();
+        assert_eq!(policy, contract.configuration_source, "{}", contract.id);
+        assert_eq!(
+            serde_json::to_value(policy).unwrap(),
+            fixture["adapters"][contract.id]
+        );
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg("printf '%s\\n' \"$CIAO_AGENT_CONFIGURATION\" \"$PWD\" \"$CIAO_CONFIGURATION_FIXTURE\"")
+            .env("CIAO_CONFIGURATION_FIXTURE", "preserved");
+        let result = policy.configure_launch(&mut command, Some(&workspace_path));
+        if policy == ConfigurationSource::ExistingProcess {
+            assert!(
+                result.is_err(),
+                "{} must retain its running process",
+                contract.id
+            );
+        } else {
+            result.unwrap();
+            let output = command.output().await.unwrap();
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            let lines: Vec<_> = text.lines().collect();
+            assert_eq!(
+                lines,
+                vec!["destination", workspace_path.to_str().unwrap(), "preserved"]
+            );
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(crate::codex_app_server::CONFIGURATION_SOURCE).unwrap(),
+        fixture["adapters"]["codex-adopted"]
+    );
+    let mut command = tokio::process::Command::new("/bin/true");
+    assert!(
+        ConfigurationSource::Destination
+            .configure_launch(&mut command, Some(std::path::Path::new("relative")))
+            .is_err()
     );
 }
 

@@ -6,7 +6,9 @@
 // the daemon: everything is mapped to canonical entries, receipts, and
 // interactions here. Nothing is written to stdout/stderr but categorical lines.
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
@@ -39,6 +41,7 @@ const MAX_HISTORY_ENTRIES = 4_096;
 const HEARTBEAT_MS = 15_000;
 
 const config = {
+	configurationSource: process.env.CIAO_AGENT_CONFIGURATION,
 	socketPath: process.env.CIAO_MANAGED_SOCKET,
 	sdkPrefix: process.env.CIAO_MANAGED_SDK_PREFIX,
 	sessionID: process.env.CIAO_MANAGED_SESSION_ID,
@@ -72,7 +75,7 @@ const MAX_EFFORT_LEVELS_PER_MODEL = 8;
 const MODEL_ID_GRAMMAR = /^[A-Za-z0-9._\[\]-]+$/;
 // What this session is running under now. Starts at what the host passed and moves only when
 // the SDK has accepted a change.
-let permissionMode = PERMISSION_MODES.has(config.permissionMode) ? config.permissionMode : "default";
+let permissionMode = PERMISSION_MODES.has(config.permissionMode) ? config.permissionMode : null;
 // What is answering now, and how hard it is thinking. Both start unknown on purpose: the SDK is
 // lazy and names no model until a turn produces one, so anything reported before that would be
 // this worker guessing. The host renders unknown as the vendor's default and never as a model.
@@ -88,6 +91,7 @@ let catalogue = [];
 // `canonicalModel`.
 const modelResolutions = new Map();
 for (const key of [
+	"configurationSource",
 	"socketPath",
 	"sdkPrefix",
 	"sessionID",
@@ -101,12 +105,64 @@ for (const key of [
 		process.exit(2);
 	}
 }
+if (config.configurationSource !== "destination") {
+	process.stderr.write("ciao-managed-worker: unsupported configuration source\n");
+	process.exit(2);
+}
 // The token is consumed once at registration; drop every Ciao variable so the
 // SDK subprocess never inherits worker plumbing.
 const childEnv = { ...process.env };
 for (const key of Object.keys(childEnv)) {
 	if (key.startsWith("CIAO_MANAGED_")) delete childEnv[key];
 }
+delete childEnv.CIAO_AGENT_CONFIGURATION;
+
+// The SDK does not use the interactive CLI's Chrome default in a background launch.
+// Carry only the destination user's existing opt-in through the documented --chrome flag.
+// The vendor still owns authentication, browser selection, MCP policy and site permissions.
+// Every other global-config key is deliberately outside this reader's vocabulary.
+const configurationDiagnostics = [];
+async function browserLaunchArgs() {
+	const explicit = childEnv.CLAUDE_CODE_ENABLE_CFC;
+	if (explicit !== undefined) {
+		return ["1", "true", "yes", "on"].includes(explicit.toLowerCase()) ? { chrome: null } : {};
+	}
+	const file = childEnv.CLAUDE_CONFIG_DIR
+		? path.join(childEnv.CLAUDE_CONFIG_DIR, ".claude.json")
+		: path.join(os.homedir(), ".claude.json");
+	let handle;
+	try {
+		handle = await fs.open(file, "r");
+		// Read at most one byte past the bound, including if the file grows after open.
+		const limit = 1024 * 1024;
+		const bytes = Buffer.alloc(limit + 1);
+		let used = 0;
+		while (used < bytes.length) {
+			const { bytesRead } = await handle.read(bytes, used, bytes.length - used);
+			if (!bytesRead) break;
+			used += bytesRead;
+		}
+		if (used > limit) throw new Error("configuration_bound");
+		const settings = JSON.parse(bytes.subarray(0, used).toString("utf8"));
+		if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+			throw new Error("configuration_shape");
+		}
+		const enabled = settings.claudeInChromeDefaultEnabled;
+		if (enabled !== undefined && typeof enabled !== "boolean") {
+			configurationDiagnostics.push("claudeInChromeDefaultEnabled");
+		}
+		return enabled === true ? { chrome: null } : {};
+	} catch (error) {
+		if (error?.code !== "ENOENT") configurationDiagnostics.push("global_config_unreadable");
+		return {};
+	} finally {
+		if (handle) {
+			try { await handle.close(); }
+			catch { configurationDiagnostics.push("global_config_unreadable"); }
+		}
+	}
+}
+const browserArgs = await browserLaunchArgs();
 
 const sdk = await import(
 	pathToFileURL(
@@ -910,26 +966,26 @@ const query = sdk.query({
 	options: {
 		cwd: process.cwd(),
 		env: childEnv,
-		// Documented SDK isolation: machine-local settings never change managed
-		// behavior. The replay flag is what makes delivery acknowledgeable.
-		settingSources: [],
-		extraArgs: { "replay-user-messages": null },
+		// Shared destination-configuration contract: use the vendor's own settings merge.
+		// Ciao supplies protocol hooks and explicit session overrides, never copied settings.
+		settingSources: ["user", "project", "local"],
+		// The SDK otherwise supplies only a minimal tool-calling prompt, unlike the CLI.
+		systemPrompt: { type: "preset", preset: "claude_code" },
+		extraArgs: { "replay-user-messages": null, ...browserArgs },
 		includePartialMessages: true,
 		// A worker resuming a conversation continues it in the mode that conversation was
 		// already in; the host reads that from Claude's own transcript and passes it, and
 		// validates it against the SDK's union before it gets here. Unset means a fresh
 		// session with nothing to inherit, which starts where a new terminal would.
-		permissionMode,
+		...(permissionMode ? { permissionMode } : {}),
 		// Same inheritance rule as the mode: a resumed conversation continues on the model it
 		// was already being answered by, which the host read from Claude's own transcript.
 		// Unset means a fresh session, which starts wherever the vendor's default is — never
 		// on a model chosen here.
 		...(config.model ? { model: config.model } : {}),
 		canUseTool,
-		// Registered here rather than on disk because managed sessions run `settingSources: []`
-		// and read no filesystem settings at all. No matcher: this runs for every tool and the
-		// map lookup selects, so there is one place for the substitution to stop happening
-		// rather than two.
+		// Ciao's transport hooks coexist with the destination's filesystem hooks. No matcher:
+		// the map lookup selects which question's output this callback owns.
 		hooks: {
 			// Spec 025. The vendor's own channel for context that rides a prompt without becoming
 			// part of what the person said: the daemon's note, handed over as Claude reads the
@@ -1009,7 +1065,8 @@ inboundHandlers.push((frame) => {
 			writeFrame({ type: "snapshot_end" });
 			// The mode this worker actually started in, so the phone shows the session's own
 			// state rather than whatever it last asked for.
-			writeFrame({ type: "permission_mode", mode: permissionMode });
+			if (permissionMode) writeFrame({ type: "permission_mode", mode: permissionMode });
+			for (const name of configurationDiagnostics) reportDrift("configuration", name);
 			// A resumed session was launched onto a model the host named, and this worker put that
 			// name in `Options.model` itself — so it is a fact about the session rather than a
 			// guess at the vendor's default, and the bar can be right from the first paint instead
@@ -1398,6 +1455,12 @@ try {
 			continue;
 		}
 		if (message.type === "system" && message.subtype === "init") {
+			if (PERMISSION_MODES.has(message.permissionMode)) {
+				permissionMode = message.permissionMode;
+				writeFrame({ type: "permission_mode", mode: permissionMode });
+			} else if (message.permissionMode !== undefined) {
+				reportDrift("sdk_init", "permissionMode");
+			}
 			// The SDK is lazy: no session identity exists until the first turn
 			// begins. Report it the moment it does, which is what makes this
 			// session resumable and ownership-checkable.

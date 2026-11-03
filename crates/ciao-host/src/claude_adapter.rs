@@ -124,6 +124,10 @@ fn decode_heartbeat_frame(value: &Value) -> Result<(Option<String>, bool), Agent
 }
 
 impl AttachedAgentAdapter for ClaudeAttachedAdapter {
+    fn configuration_source(&self) -> crate::agent_adapter::ConfigurationSource {
+        crate::agent_adapter::ConfigurationSource::ExistingProcess
+    }
+
     fn id(&self) -> &'static str {
         "claude"
     }

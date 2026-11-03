@@ -1,0 +1,25 @@
+{
+  "v": 1,
+  "environment_key": "CIAO_AGENT_CONFIGURATION",
+  "adapters": {
+    "pi": "existing_process",
+    "claude": "existing_process",
+    "claude-managed": "destination",
+    "codex": "existing_process",
+    "codex-adopted": "destination"
+  },
+  "rejected_sources": [
+    "isolated",
+    "source_host",
+    ""
+  ],
+  "claude_setting_sources": [
+    "user",
+    "project",
+    "local"
+  ],
+  "claude_system_prompt": {
+    "type": "preset",
+    "preset": "claude_code"
+  }
+}

@@ -10,6 +10,9 @@ import path from "node:path";
 // means this exercises the actual file the launcher digests, not a testable copy of it.
 
 const WORKER = path.join(import.meta.dir, "worker.mjs");
+const CONFIGURATION = JSON.parse(fs.readFileSync(
+	path.join(import.meta.dir, "../../../protocol/fixtures/phase5/destination-configuration-v1.json"), "utf8",
+));
 const SESSION_ID = "0123456789abcdef0123456789abcdef";
 
 const resources: Array<() => void | Promise<void>> = [];
@@ -104,6 +107,11 @@ export function query(config) {
 	journal.options = {
 		model: config.options.model ?? null,
 		permissionMode: config.options.permissionMode ?? null,
+		settingSources: config.options.settingSources ?? null,
+		systemPrompt: config.options.systemPrompt ?? null,
+		extraArgs: config.options.extraArgs,
+		hooks: Object.keys(config.options.hooks ?? {}),
+		launchPolicyLeaked: Object.hasOwn(config.options.env, "CIAO_AGENT_CONFIGURATION"),
 	};
 	record();
 	// Each prompt the worker streams in, read the way the real SDK reads it: UserPromptSubmit
@@ -285,6 +293,10 @@ async function startWorker(
 			CIAO_MANAGED_WORKSPACE_LABEL: "workspace",
 			CIAO_MANAGED_CLI_VERSION: "2.1.314",
 			CIAO_MANAGED_SDK_VERSION: "0.3.314",
+			[CONFIGURATION.environment_key]: CONFIGURATION.adapters["claude-managed"],
+			// Tests never consult the developer's settings or browser preference.
+			CLAUDE_CONFIG_DIR: path.join(root, "config"),
+			CLAUDE_CODE_ENABLE_CFC: undefined,
 			...(history ? { CIAO_MANAGED_RESUME_SESSION_ID: history.sessionID } : {}),
 			...(extraEnv ?? {}),
 		},
@@ -320,6 +332,93 @@ async function startWorker(
 		},
 	};
 }
+
+test("destination configuration loads all settings without replacing fresh-session defaults", async () => {
+	const { journal, frames } = await startWorker([], undefined, undefined, undefined, undefined, true);
+	await eventually(() => journal().options !== null);
+	expect(journal().options.settingSources).toEqual(CONFIGURATION.claude_setting_sources);
+	expect(journal().options.systemPrompt).toEqual(CONFIGURATION.claude_system_prompt);
+	expect(journal().options.permissionMode).toBeNull();
+	expect(journal().options.model).toBeNull();
+	expect(journal().options.launchPolicyLeaked).toBe(false);
+	expect(journal().options.hooks).toEqual(["UserPromptSubmit", "PostToolUse"]);
+	// Until the vendor reports its resolved mode, a default would be an invented fact.
+	expect(frames.filter((frame) => frame.type === "permission_mode")).toEqual([]);
+});
+
+test("destination configuration preserves a resumed mode and reports the vendor's resolved mode", async () => {
+	const { journal, frames } = await startWorker(
+		[{ type: "system", subtype: "init", permissionMode: "plan" }],
+		undefined, undefined, undefined, { CIAO_MANAGED_PERMISSION_MODE: "acceptEdits" },
+	);
+	await eventually(() => frames.some((frame: any) => frame.type === "permission_mode" && frame.mode === "plan"));
+	expect(journal().options.permissionMode).toBe("acceptEdits");
+});
+
+test("future_shaped_input_permission_mode_is_tallied_without_inventing_session_state", async () => {
+	const { frames, child } = await startWorker([
+		{ type: "system", subtype: "init", permissionMode: "future-mode" },
+	]);
+	expect(await child.exited).toBe(0);
+	expect(frames.filter((frame) => frame.type === "permission_mode")).toEqual([]);
+	expect(frames.filter((frame) => frame.type === "drift_note").map((frame) => [frame.surface, frame.name]))
+		.toContainEqual(["sdk_init", "permissionMode"]);
+});
+
+test("destination configuration enables only the browser the destination user opted into", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-configuration-"));
+	resources.push(() => fs.rmSync(root, { recursive: true, force: true }));
+	fs.writeFileSync(path.join(root, ".claude.json"), JSON.stringify({ claudeInChromeDefaultEnabled: true }));
+	const { journal } = await startWorker([], undefined, undefined, undefined, { CLAUDE_CONFIG_DIR: root }, true);
+	await eventually(() => journal().options !== null);
+	expect(journal().options.extraArgs.chrome).toBeNull();
+	expect(journal().options.extraArgs["replay-user-messages"]).toBeNull();
+});
+
+test("destination configuration keeps an explicit browser opt-in without global configuration", async () => {
+	const { journal } = await startWorker([], undefined, undefined, undefined,
+		{ CLAUDE_CODE_ENABLE_CFC: "true" }, true);
+	await eventually(() => journal().options !== null);
+	expect(journal().options.extraArgs.chrome).toBeNull();
+});
+
+test("destination configuration keeps an explicit browser opt-out", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-configuration-"));
+	resources.push(() => fs.rmSync(root, { recursive: true, force: true }));
+	fs.writeFileSync(path.join(root, ".claude.json"), JSON.stringify({ claudeInChromeDefaultEnabled: true }));
+	const { journal } = await startWorker([], undefined, undefined, undefined,
+		{ CLAUDE_CONFIG_DIR: root, CLAUDE_CODE_ENABLE_CFC: "0" }, true);
+	await eventually(() => journal().options !== null);
+	expect(Object.hasOwn(journal().options.extraArgs, "chrome")).toBe(false);
+});
+
+test.each(CONFIGURATION.rejected_sources)("destination configuration rejects unsupported launch policy %s before SDK startup", async (source) => {
+	const { child, journal, frames } = await startWorker([], undefined, undefined, undefined,
+		{ [CONFIGURATION.environment_key]: source });
+	expect(await child.exited).toBe(2);
+	expect(journal().options).toBeNull();
+	expect(frames).toEqual([]);
+});
+
+test.each([
+	["opt-out", JSON.stringify({ claudeInChromeDefaultEnabled: false }), null],
+	["absent", "{}", null],
+	["unknown shape", JSON.stringify({ claudeInChromeDefaultEnabled: "future" }), "claudeInChromeDefaultEnabled"],
+	["invalid", "{", "global_config_unreadable"],
+	["invalid root", "null", "global_config_unreadable"],
+	["oversized", " ".repeat(1024 * 1024 + 1), "global_config_unreadable"],
+])("destination configuration handles %s browser preference without inventing an opt-in", async (_, content, diagnostic) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-configuration-"));
+	resources.push(() => fs.rmSync(root, { recursive: true, force: true }));
+	fs.writeFileSync(path.join(root, ".claude.json"), content!);
+	const { journal, frames, child } = await startWorker([], undefined, undefined, undefined,
+		{ CLAUDE_CONFIG_DIR: root });
+	expect(await child.exited).toBe(0);
+	expect(journal().options).not.toBeNull();
+	expect(Object.hasOwn(journal().options.extraArgs, "chrome")).toBe(false);
+	const notes = frames.filter((frame) => frame.type === "drift_note" && frame.surface === "configuration");
+	expect(notes.map((frame) => frame.name)).toEqual(diagnostic ? [diagnostic] : []);
+});
 
 test("a resumed worker snapshots bounded history before any live event", async () => {
 	const history: HistoryFixture = {

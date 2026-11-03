@@ -13,11 +13,9 @@
 //! file, so a picker that opens often leaves no litter; and it costs ~1.5 s, which is why the
 //! answer is cached rather than fetched per keystroke.
 //!
-//! `settingSources` is the one place this deliberately differs from the managed worker. The
-//! worker runs `[]` — documented Spec 006 isolation, so machine-local settings can never change
-//! managed behavior. That is wrong here: this describes a *terminal* pane, where a real Claude
-//! is running with the user's real settings, and `[]` reports 40 commands where the user has
-//! 136. The isolation protects a session Ciao runs; this reads a session the user runs.
+//! Production workers and this terminal catalogue both use destination settings. The separate
+//! built-ins probe below intentionally isolates settings: it computes a set difference, not an
+//! agent launch policy. Conformance probes keep the same deliberate isolation.
 
 use std::{
     path::{Path, PathBuf},
@@ -163,7 +161,7 @@ const query = sdk.query({
   prompt: (async function* () { await new Promise(() => {}); })(),
   options: {
     cwd: process.argv[2],
-    // The user's own settings, on purpose: this describes their terminal, not a managed session.
+    // The same destination-settings policy as a production managed session.
     settingSources: ["user", "project", "local"],
   },
 });

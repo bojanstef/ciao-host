@@ -57,7 +57,10 @@ local introduction does not revoke the destination's grant.
 
 A grant authorizes the source computer's OS user, not a sandboxed individual agent. The
 destination agent runs tools with the destination's existing credentials and permission
-settings. A selected project chooses its working directory; it does not contain filesystem
+settings. Managed workers load the destination's user/project/local configuration, including
+its installed integrations, native coding-agent prompt and browser opt-in; explicit saved session choices survive resume.
+Source-host settings and credentials are never copied. This is the same launch contract used
+by the phone and local CLI, rather than a peers-only mode. A selected project chooses its working directory; it does not contain filesystem
 or network access. Use an appropriate provider/OS sandbox when you need containment.
 
 The peer protocol permits selected-workspace discovery, managed Claude creation, and
