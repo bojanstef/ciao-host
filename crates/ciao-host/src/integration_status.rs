@@ -20,7 +20,7 @@ use crate::{
     agent_integration::AgentIntegration,
     claude_integration::{ClaudeIntegrationStatus, claude_integration_status},
     codex_integration::{CodexIntegrationStatus, codex_integration_status},
-    host_protocol::AgentIntegrationEntry,
+    host_protocol::{AgentIntegrationEntry, IntegrationAgent, IntegrationState},
     pi_integration::{PiIntegrationStatus, pi_integration_status},
     storage::CiaoPaths,
 };
@@ -29,55 +29,51 @@ use crate::{
 /// probes again at once. Five minutes stale is the cost of never making a sweep wait.
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-pub(crate) const STATE_INSTALLED: &str = "installed";
-pub(crate) const STATE_MISSING: &str = "missing";
-pub(crate) const STATE_NEEDS_APPROVAL: &str = "needs_approval";
-pub(crate) const STATE_OUTDATED: &str = "outdated";
-/// Not in Spec 029's first table, and allowed by it ("a host may add states later"): the
-/// integration is installed but the agent runs a version this build refuses, which hides
-/// sessions exactly as a missing integration does. An app that does not know it shows nothing.
-pub(crate) const STATE_UNSUPPORTED_VERSION: &str = "unsupported_version";
-
 /// The attached hooks decide this, not the managed runtime: the hooks are what register a
 /// session the person started in their own terminal. `None` when the status says Claude itself
 /// is gone, which detection would not have reported a moment earlier.
-pub(crate) fn claude_state(status: ClaudeIntegrationStatus) -> Option<&'static str> {
+pub(crate) fn claude_state(status: ClaudeIntegrationStatus) -> Option<IntegrationState> {
     Some(match status {
-        ClaudeIntegrationStatus::NotInstalled => STATE_MISSING,
+        ClaudeIntegrationStatus::NotInstalled => IntegrationState::Missing,
         ClaudeIntegrationStatus::Installed | ClaudeIntegrationStatus::AheadOfTested => {
-            STATE_INSTALLED
+            IntegrationState::Installed
         }
-        ClaudeIntegrationStatus::UpdateAvailable => STATE_OUTDATED,
-        ClaudeIntegrationStatus::UnsupportedClaudeVersion => STATE_UNSUPPORTED_VERSION,
+        ClaudeIntegrationStatus::UpdateAvailable => IntegrationState::Outdated,
+        ClaudeIntegrationStatus::UnsupportedClaudeVersion => IntegrationState::UnsupportedVersion,
         ClaudeIntegrationStatus::ClaudeUnavailable => return None,
     })
 }
 
-pub(crate) fn codex_state(status: CodexIntegrationStatus) -> Option<&'static str> {
+pub(crate) fn codex_state(status: CodexIntegrationStatus) -> Option<IntegrationState> {
     Some(match status {
-        CodexIntegrationStatus::NotInstalled => STATE_MISSING,
+        CodexIntegrationStatus::NotInstalled => IntegrationState::Missing,
         CodexIntegrationStatus::Installed | CodexIntegrationStatus::CarriedVerified => {
-            STATE_INSTALLED
+            IntegrationState::Installed
         }
-        CodexIntegrationStatus::AwaitingTrust => STATE_NEEDS_APPROVAL,
-        CodexIntegrationStatus::UpdateAvailable => STATE_OUTDATED,
-        CodexIntegrationStatus::UnsupportedCodexVersion => STATE_UNSUPPORTED_VERSION,
+        CodexIntegrationStatus::AwaitingTrust => IntegrationState::NeedsApproval,
+        CodexIntegrationStatus::UpdateAvailable => IntegrationState::Outdated,
+        CodexIntegrationStatus::UnsupportedCodexVersion => IntegrationState::UnsupportedVersion,
         CodexIntegrationStatus::CodexUnavailable => return None,
     })
 }
 
-pub(crate) fn pi_state(status: PiIntegrationStatus) -> &'static str {
+pub(crate) fn pi_state(status: PiIntegrationStatus) -> IntegrationState {
     match status {
-        PiIntegrationStatus::NotInstalled => STATE_MISSING,
-        PiIntegrationStatus::Installed => STATE_INSTALLED,
-        PiIntegrationStatus::UpdateAvailable => STATE_OUTDATED,
+        PiIntegrationStatus::NotInstalled => IntegrationState::Missing,
+        PiIntegrationStatus::Installed => IntegrationState::Installed,
+        PiIntegrationStatus::UpdateAvailable => IntegrationState::Outdated,
     }
 }
 
-fn entry(agent: AgentIntegration, state: &str) -> AgentIntegrationEntry {
+fn entry(agent: AgentIntegration, state: IntegrationState) -> AgentIntegrationEntry {
     AgentIntegrationEntry {
-        agent: agent.cli_name().into(),
-        state: state.into(),
+        agent: match agent {
+            // The hidden managed-only alias is the same agent.
+            AgentIntegration::Claude | AgentIntegration::ClaudeManaged => IntegrationAgent::Claude,
+            AgentIntegration::Codex => IntegrationAgent::Codex,
+            AgentIntegration::Pi => IntegrationAgent::Pi,
+        },
+        state,
     }
 }
 
@@ -226,7 +222,7 @@ mod tests {
     use super::*;
 
     fn sample() -> Vec<AgentIntegrationEntry> {
-        vec![entry(AgentIntegration::Claude, STATE_MISSING)]
+        vec![entry(AgentIntegration::Claude, IntegrationState::Missing)]
     }
 
     /// A probe that waits on `gate` and counts how often it was started.
@@ -328,32 +324,56 @@ mod tests {
     #[test]
     fn every_cli_status_maps_to_one_wire_state() {
         use ClaudeIntegrationStatus as C;
-        assert_eq!(claude_state(C::NotInstalled), Some(STATE_MISSING));
-        assert_eq!(claude_state(C::Installed), Some(STATE_INSTALLED));
-        assert_eq!(claude_state(C::AheadOfTested), Some(STATE_INSTALLED));
-        assert_eq!(claude_state(C::UpdateAvailable), Some(STATE_OUTDATED));
+        assert_eq!(
+            claude_state(C::NotInstalled),
+            Some(IntegrationState::Missing)
+        );
+        assert_eq!(
+            claude_state(C::Installed),
+            Some(IntegrationState::Installed)
+        );
+        assert_eq!(
+            claude_state(C::AheadOfTested),
+            Some(IntegrationState::Installed)
+        );
+        assert_eq!(
+            claude_state(C::UpdateAvailable),
+            Some(IntegrationState::Outdated)
+        );
         assert_eq!(
             claude_state(C::UnsupportedClaudeVersion),
-            Some(STATE_UNSUPPORTED_VERSION)
+            Some(IntegrationState::UnsupportedVersion)
         );
         assert_eq!(claude_state(C::ClaudeUnavailable), None);
 
         use CodexIntegrationStatus as X;
-        assert_eq!(codex_state(X::NotInstalled), Some(STATE_MISSING));
-        assert_eq!(codex_state(X::Installed), Some(STATE_INSTALLED));
-        assert_eq!(codex_state(X::CarriedVerified), Some(STATE_INSTALLED));
-        assert_eq!(codex_state(X::AwaitingTrust), Some(STATE_NEEDS_APPROVAL));
-        assert_eq!(codex_state(X::UpdateAvailable), Some(STATE_OUTDATED));
+        assert_eq!(
+            codex_state(X::NotInstalled),
+            Some(IntegrationState::Missing)
+        );
+        assert_eq!(codex_state(X::Installed), Some(IntegrationState::Installed));
+        assert_eq!(
+            codex_state(X::CarriedVerified),
+            Some(IntegrationState::Installed)
+        );
+        assert_eq!(
+            codex_state(X::AwaitingTrust),
+            Some(IntegrationState::NeedsApproval)
+        );
+        assert_eq!(
+            codex_state(X::UpdateAvailable),
+            Some(IntegrationState::Outdated)
+        );
         assert_eq!(
             codex_state(X::UnsupportedCodexVersion),
-            Some(STATE_UNSUPPORTED_VERSION)
+            Some(IntegrationState::UnsupportedVersion)
         );
         assert_eq!(codex_state(X::CodexUnavailable), None);
 
         use PiIntegrationStatus as P;
-        assert_eq!(pi_state(P::NotInstalled), STATE_MISSING);
-        assert_eq!(pi_state(P::Installed), STATE_INSTALLED);
-        assert_eq!(pi_state(P::UpdateAvailable), STATE_OUTDATED);
+        assert_eq!(pi_state(P::NotInstalled), IntegrationState::Missing);
+        assert_eq!(pi_state(P::Installed), IntegrationState::Installed);
+        assert_eq!(pi_state(P::UpdateAvailable), IntegrationState::Outdated);
     }
 
     /// Every token the host can emit passes the wire validation the phone's copy is held to.
@@ -377,17 +397,17 @@ mod tests {
             omitted_sessions: 0,
             agent_integrations: Some(
                 [
-                    STATE_INSTALLED,
-                    STATE_MISSING,
-                    STATE_NEEDS_APPROVAL,
-                    STATE_OUTDATED,
-                    STATE_UNSUPPORTED_VERSION,
+                    IntegrationState::Installed,
+                    IntegrationState::Missing,
+                    IntegrationState::NeedsApproval,
+                    IntegrationState::Outdated,
+                    IntegrationState::UnsupportedVersion,
                 ]
                 .into_iter()
                 .map(|state| entry(AgentIntegration::Codex, state))
                 .chain([
-                    entry(AgentIntegration::Claude, STATE_INSTALLED),
-                    entry(AgentIntegration::Pi, STATE_INSTALLED),
+                    entry(AgentIntegration::Claude, IntegrationState::Installed),
+                    entry(AgentIntegration::Pi, IntegrationState::Installed),
                 ])
                 .collect(),
             ),

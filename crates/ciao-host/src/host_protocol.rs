@@ -1378,14 +1378,108 @@ pub struct WorkspaceProviders {
     pub herdr_core: Option<HerdrProviderSnapshot>,
 }
 
-/// Spec 029: one agent integration as the phone is told it. Both fields are open vocabularies:
-/// a host may name agents and states a deployed app does not know, and the app shows nothing for
-/// them, so validation checks only their shape.
+/// Spec 029: one agent integration as the phone is told it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIntegrationEntry {
-    pub agent: String,
-    pub state: String,
+    pub agent: IntegrationAgent,
+    pub state: IntegrationState,
+}
+
+/// The agent an entry is about. An open vocabulary: a newer host may name an agent this build
+/// does not know, which decodes as `Other` (shape-checked) and is shown as nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum IntegrationAgent {
+    Claude,
+    Codex,
+    Pi,
+    Other(String),
+}
+
+/// What the host found for that agent's integration. Open in the same way as the agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum IntegrationState {
+    Installed,
+    Missing,
+    /// Codex: hooks installed, Codex not yet told to trust them.
+    NeedsApproval,
+    Outdated,
+    /// Installed, but the agent runs a version this build refuses, which hides its sessions
+    /// exactly as a missing integration does.
+    UnsupportedVersion,
+    Other(String),
+}
+
+impl IntegrationAgent {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::Other(token) => token,
+        }
+    }
+}
+
+impl IntegrationState {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Installed => "installed",
+            Self::Missing => "missing",
+            Self::NeedsApproval => "needs_approval",
+            Self::Outdated => "outdated",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::Other(token) => token,
+        }
+    }
+}
+
+impl TryFrom<String> for IntegrationAgent {
+    type Error = HostProtocolError;
+
+    fn try_from(token: String) -> Result<Self, Self::Error> {
+        if !valid_agent_integration_token(&token) {
+            return Err(HostProtocolError::InvalidControlValue);
+        }
+        Ok(match token.as_str() {
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            "pi" => Self::Pi,
+            _ => Self::Other(token),
+        })
+    }
+}
+
+impl TryFrom<String> for IntegrationState {
+    type Error = HostProtocolError;
+
+    fn try_from(token: String) -> Result<Self, Self::Error> {
+        if !valid_agent_integration_token(&token) {
+            return Err(HostProtocolError::InvalidControlValue);
+        }
+        Ok(match token.as_str() {
+            "installed" => Self::Installed,
+            "missing" => Self::Missing,
+            "needs_approval" => Self::NeedsApproval,
+            "outdated" => Self::Outdated,
+            "unsupported_version" => Self::UnsupportedVersion,
+            _ => Self::Other(token),
+        })
+    }
+}
+
+impl From<IntegrationAgent> for String {
+    fn from(agent: IntegrationAgent) -> Self {
+        agent.as_str().to_owned()
+    }
+}
+
+impl From<IntegrationState> for String {
+    fn from(state: IntegrationState) -> Self {
+        state.as_str().to_owned()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1534,8 +1628,8 @@ impl WorkspaceSnapshotResult {
         if let Some(entries) = &self.agent_integrations
             && (entries.len() > MAX_AGENT_INTEGRATION_ENTRIES
                 || !entries.iter().all(|entry| {
-                    valid_agent_integration_token(&entry.agent)
-                        && valid_agent_integration_token(&entry.state)
+                    valid_agent_integration_token(entry.agent.as_str())
+                        && valid_agent_integration_token(entry.state.as_str())
                 }))
         {
             return Err(HostProtocolError::InvalidControlValue);
@@ -4397,10 +4491,22 @@ mod tests {
         assert_eq!(
             entries,
             [
-                ("claude".to_owned(), "missing".to_owned()),
-                ("codex".to_owned(), "needs_approval".to_owned()),
-                ("pi".to_owned(), "outdated".to_owned()),
+                (IntegrationAgent::Claude, IntegrationState::Missing),
+                (IntegrationAgent::Codex, IntegrationState::NeedsApproval),
+                (IntegrationAgent::Pi, IntegrationState::Outdated),
             ]
+        );
+        let future: WorkspaceSnapshotResponse =
+            serde_json::from_value(fixture["future_response"].clone()).unwrap();
+        let future = future.result.agent_integrations.unwrap();
+        assert!(future.contains(&AgentIntegrationEntry {
+            agent: IntegrationAgent::Codex,
+            state: IntegrationState::Other("future_state".into()),
+        }));
+        assert!(
+            future
+                .iter()
+                .any(|entry| entry.agent == IntegrationAgent::Other("future_agent".into()))
         );
         for key in ["pending_response", "v2_response"] {
             let response: WorkspaceSnapshotResponse =
@@ -4416,9 +4522,15 @@ mod tests {
         let base: WorkspaceSnapshotResponse =
             serde_json::from_value(fixture["response"].clone()).unwrap();
         for case in fixture["refused_integrations"].as_array().unwrap() {
+            // A token of the wrong shape is refused as it decodes; a list over the bound decodes
+            // and is refused by validation. Either way nothing malformed reaches the wire.
+            let Ok(entries) = serde_json::from_value::<Vec<AgentIntegrationEntry>>(
+                case["agent_integrations"].clone(),
+            ) else {
+                continue;
+            };
             let mut response = base.clone();
-            response.result.agent_integrations =
-                Some(serde_json::from_value(case["agent_integrations"].clone()).unwrap());
+            response.result.agent_integrations = Some(entries);
             assert!(
                 response.validate().is_err(),
                 "should be refused: {}",
@@ -4429,8 +4541,8 @@ mod tests {
         full.result.agent_integrations = Some(
             (0..MAX_AGENT_INTEGRATION_ENTRIES)
                 .map(|_| AgentIntegrationEntry {
-                    agent: "a".repeat(MAX_AGENT_INTEGRATION_TOKEN_BYTES),
-                    state: "needs_approval".into(),
+                    agent: IntegrationAgent::Other("a".repeat(MAX_AGENT_INTEGRATION_TOKEN_BYTES)),
+                    state: IntegrationState::NeedsApproval,
                 })
                 .collect(),
         );

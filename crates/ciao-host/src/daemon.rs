@@ -4999,8 +4999,8 @@ mod tests {
                 std::sync::Arc::new(|| {
                     Box::pin(async {
                         vec![crate::host_protocol::AgentIntegrationEntry {
-                            agent: "claude".into(),
-                            state: "missing".into(),
+                            agent: crate::host_protocol::IntegrationAgent::Claude,
+                            state: crate::host_protocol::IntegrationState::Missing,
                         }]
                     })
                 }),
@@ -6750,8 +6750,8 @@ mod tests {
         assert_eq!(
             answers[1],
             Some(vec![crate::host_protocol::AgentIntegrationEntry {
-                agent: "claude".into(),
-                state: "missing".into(),
+                agent: crate::host_protocol::IntegrationAgent::Claude,
+                state: crate::host_protocol::IntegrationState::Missing,
             }])
         );
 
