@@ -762,7 +762,9 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
                 state,
                 run_id,
                 activity,
-            } => NormalizedAdapterEvent::Turn(turn_from_bridge_frame(&state, run_id, activity)?),
+            } => NormalizedAdapterEvent::Turn(turn_from_bridge_frame(
+                &state, run_id, activity, None, None,
+            )?),
             ClaudeManagedInbound::VendorSession(vendor_session_id) => {
                 // The vendor ID is opaque to Ciao but must stay bounded and
                 // safe as a lookup key.

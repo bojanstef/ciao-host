@@ -181,7 +181,9 @@ pub(crate) async fn push_attention(
 fn attention_kind_for_turn(turn: &TurnState) -> Option<&'static str> {
     match turn {
         TurnState::Completed { run_id: Some(_) } => Some("idle_prompt"),
-        TurnState::AwaitingInteraction { .. } => Some("permission_prompt"),
+        // Waiting says nothing about permission semantics. Actual permission notifications
+        // retain their explicit vendor/interaction kind through the notification path.
+        TurnState::AwaitingInteraction { .. } => Some("agent_needs_input"),
         TurnState::Idle
         | TurnState::Completed { run_id: None }
         | TurnState::Running { .. }
@@ -634,13 +636,18 @@ pub(crate) async fn handle_agent_bridge(
         .register(selected.registration, command_sender)
         .await?;
     log_registration("stream", &adapter_family, &adapter_version, &registered);
-    let registered_frame = confirming_whereabouts(
+    let mut registered_frame = confirming_whereabouts(
         granting_frame_bound(
             selected.codec.registered_frame(&registered)?,
             selected.codec.frame_grant(&first),
         ),
         selected.codec.whereabouts_asked(&first),
     );
+    if selected.codec.turn_states_asked(&first)
+        && let Some(frame) = registered_frame.as_object_mut()
+    {
+        frame.insert("turn_states".into(), true.into());
+    }
     write_agent_frame(&mut stream, &registered_frame).await?;
 
     let mut context = AdapterEventContext {
@@ -1951,7 +1958,7 @@ mod tests {
             attention_kind_for_turn(&TurnState::AwaitingInteraction {
                 run_id: Some("run-1".into())
             }),
-            Some("permission_prompt")
+            Some("agent_needs_input")
         );
 
         // The one that would have buzzed a phone for nothing. A session registers *into*
@@ -2161,6 +2168,7 @@ mod tests {
                     serde_json::from_slice(&pi_registration(Some("pi"))).unwrap();
                 if asked {
                     register["whereabouts"] = true.into();
+                    register["turn_states"] = true.into();
                 }
                 write_agent_frame(&mut client, &register).await.unwrap();
                 let registered: Value =
@@ -2173,11 +2181,13 @@ mod tests {
         let (_client, registered, shutdown_sender, task) = connect(false).await;
         assert_eq!(registered["type"], "registered");
         assert!(registered.get("whereabouts").is_none());
+        assert!(registered.get("turn_states").is_none());
         shutdown_sender.send(true).unwrap();
         task.await.unwrap().unwrap();
 
         let (mut client, registered, _shutdown_sender, _task) = connect(true).await;
         assert_eq!(registered["whereabouts"], true);
+        assert_eq!(registered["turn_states"], true);
         async fn ask(client: &mut UnixStream, query_id: &str) -> Value {
             write_agent_frame(
                 client,

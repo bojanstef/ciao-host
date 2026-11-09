@@ -825,6 +825,9 @@ export class CiaoAgentBridge {
 	/// A socket that never connected says nothing about the daemon: a restart refuses every
 	/// attempt until it listens again, and reading those as refusals cost the grant for good.
 	private askForGrant = true;
+	/// A separate ask lets a daemon with the older frame/whereabouts grants keep those grants.
+	private askForTurnStates = true;
+	private turnStatesGranted = false;
 	/// Whether this connection's daemon confirmed it answers whereabouts queries (Spec 025).
 	/// Asked for with the grant, so a daemon too old for either is asked for neither next time.
 	private whereaboutsAnswered = false;
@@ -843,11 +846,15 @@ export class CiaoAgentBridge {
 	private receipts = new Map<string, CachedReceipt>();
 	private pendingApplications: PendingApplication[] = [];
 	private lastCapabilities?: string;
-	/// Pi's own idle flag is the turn boundary, and it already decides `interrupt`, so deriving
-	/// both from it is what keeps the stop button and the working row from ever disagreeing.
-	private lastTurnWorking?: boolean;
+	private lastTurn?: string;
 	private turnSequence = 0;
 	private openRunID?: string;
+	private runOutcome: "completed" | "interrupted" | "failed" | "unknown" = "completed";
+	private restingTurn: { state: "idle" | "completed" | "interrupted" | "failed" | "unknown"; run_id?: string; category?: string; reason_code?: string } = { state: "idle" };
+	private completionAnnounced = false;
+	private uiPromptBalance = 0;
+	private uiPromptRunID?: string;
+	private uiPromptSessionIdentity?: string;
 
 	constructor(pi: ExtensionAPI, socketPath = defaultBridgeSocketPath()) {
 		this.pi = pi;
@@ -855,11 +862,24 @@ export class CiaoAgentBridge {
 	}
 
 	start(ctx: ExtensionContext): void {
+		if (ctx.mode !== "tui") {
+			this.stop(false);
+			return;
+		}
+		const identity = upstreamSessionIdentity(ctx);
+		// An earlier extension's session_start handler may already have opened a prompt. Its
+		// native start event can reach us before our own session_start handler does.
+		const promptBalance = identity === this.uiPromptSessionIdentity ? this.uiPromptBalance : 0;
 		this.stop(false);
-		if (ctx.mode !== "tui") return;
 		this.context = ctx;
-		this.sessionIdentity = upstreamSessionIdentity(ctx);
+		this.sessionIdentity = identity;
+		this.uiPromptSessionIdentity = identity;
+		this.uiPromptBalance = promptBalance;
 		this.stopped = false;
+		// Busy can also mean manual compaction. Only agent_start identifies an actual run.
+		if (typeof ctx.isIdle !== "function" || !ctx.isIdle()) {
+			this.restingTurn = { state: "unknown", reason_code: "pi_turn_unobserved" };
+		}
 		this.connect();
 	}
 
@@ -868,6 +888,15 @@ export class CiaoAgentBridge {
 		this.context = undefined;
 		this.sessionIdentity = undefined;
 		this.registered = false;
+		this.turnStatesGranted = false;
+		this.lastTurn = undefined;
+		this.openRunID = undefined;
+		this.runOutcome = "completed";
+		this.restingTurn = { state: "idle" };
+		this.completionAnnounced = false;
+		this.uiPromptBalance = 0;
+		this.uiPromptRunID = undefined;
+		this.uiPromptSessionIdentity = undefined;
 		this.settleWhereabouts();
 		this.connectionSerial += 1;
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -905,19 +934,94 @@ export class CiaoAgentBridge {
 		this.scheduleReconnect(true);
 	}
 
-	updateContext(ctx: ExtensionContext): void {
-		if (ctx.mode !== "tui" || this.stopped) return;
+	updateContext(ctx: ExtensionContext): boolean {
+		if (ctx.mode !== "tui" || this.stopped || upstreamSessionIdentity(ctx) !== this.sessionIdentity) return false;
 		this.context = ctx;
+		if (!this.openRunID && this.restingTurn.reason_code === "pi_turn_unobserved"
+			&& typeof ctx.isIdle === "function" && ctx.isIdle()) {
+			this.restingTurn = { state: "idle" };
+		}
 		this.publishCapabilities();
 		this.publishTurn();
+		return true;
 	}
 
 	reconcile(ctx: ExtensionContext): void {
-		this.updateContext(ctx);
+		if (!this.updateContext(ctx)) return;
 		this.sendSnapshot();
 	}
 
+	beginRun(ctx: ExtensionContext): void {
+		if (!this.updateContext(ctx)) return;
+		if (!this.openRunID) {
+			this.openRunID = `run-${++this.turnSequence}`;
+			this.runOutcome = "completed";
+			this.completionAnnounced = false;
+		}
+		this.publishTurn();
+	}
+
+	settleRun(ctx: ExtensionContext, aborted: unknown): void {
+		if (!this.updateContext(ctx)) return;
+		if (!this.openRunID) return;
+		const state = typeof aborted !== "boolean" ? "unknown" : aborted ? "interrupted" : this.runOutcome;
+		if (typeof aborted !== "boolean") {
+			this.publishEntry(unsupportedEntry("agent_settled.aborted", "pi_settled_aborted_unknown", Date.now()), false);
+		}
+		this.restingTurn = {
+			state,
+			...(state === "unknown" ? { reason_code: "pi_turn_outcome_unknown" } : { run_id: this.openRunID }),
+			...(state === "failed" ? { category: "agent_error" } : {}),
+		};
+		this.openRunID = undefined;
+		this.publishTurn();
+	}
+
+	observeUIPrompt(ctx: ExtensionContext, active: boolean): void {
+		if (ctx.mode !== "tui") return;
+		if (this.stopped) {
+			const identity = upstreamSessionIdentity(ctx);
+			if (identity !== this.uiPromptSessionIdentity) this.uiPromptBalance = 0;
+			this.uiPromptSessionIdentity = identity;
+		} else if (!this.updateContext(ctx)) return;
+		// Pi emits only the outermost pair, but independent async dispatch can deliver end first
+		// if another extension delays start. Preserve that credit so a late start cannot strand
+		// Needs input. No title/kind infers permission semantics or remote response capability.
+		const previous = this.uiPromptBalance;
+		this.uiPromptBalance += active ? 1 : -1;
+		if (previous <= 0 && this.uiPromptBalance > 0) this.uiPromptRunID = this.openRunID;
+		if (this.uiPromptBalance <= 0) this.uiPromptRunID = undefined;
+		this.publishTurn();
+	}
+
+	observeCompactionFailure(ctx: ExtensionContext, aborted: unknown): void {
+		if (!this.updateContext(ctx) || !this.openRunID) return;
+		this.runOutcome = typeof aborted !== "boolean" ? "unknown" : aborted ? "interrupted" : "failed";
+		if (typeof aborted !== "boolean") {
+			this.publishEntry(unsupportedEntry("session_compact_failed.aborted", "pi_compaction_aborted_unknown", Date.now()), false);
+		}
+	}
+
 	publishMessage(message: unknown, state?: BridgeEntry["state"]): void {
+		if (state !== "streaming" && this.openRunID && isRecord(message) && message.role === "assistant") {
+			// Match Pi's reporter: a successful retry replaces the previous failed response.
+			switch (message.stopReason) {
+				case "error": this.runOutcome = "failed"; break;
+				case "aborted": this.runOutcome = "interrupted"; break;
+				case "stop":
+				case "length":
+				case "toolUse":
+				case "deferred": this.runOutcome = "completed"; break;
+				// In the pinned vocabulary, but only an in-progress response. It cannot establish
+				// a terminal outcome; this is uncertainty, not novel vendor input.
+				case "pending": this.runOutcome = "unknown"; break;
+				default:
+					this.runOutcome = "unknown";
+					// The host tallies this categorical unsupported entry at the adapter boundary.
+					// Never carry an unrecognized field value: it might contain private content.
+					this.publishEntry(unsupportedEntry("stopReason", "pi_stop_reason_unknown", message.timestamp), false);
+			}
+		}
 		if (
 			isRecord(message) &&
 			message.role === "toolResult" &&
@@ -1000,6 +1104,7 @@ export class CiaoAgentBridge {
 		// Set only once a daemon is on the other end: whether this socket asked, and so whether
 		// its closing before `registered` can be a refusal of the ask.
 		let asked: boolean | undefined;
+		let askedTurns = false;
 		this.decoder = new FrameDecoder();
 		socket.unref();
 		socket.setTimeout(5_000, () => socket.destroy());
@@ -1008,9 +1113,12 @@ export class CiaoAgentBridge {
 			socket.setTimeout(0);
 			this.reconnectAttempt = 0;
 			this.registered = false;
+			this.turnStatesGranted = false;
+			this.lastTurn = undefined;
 			this.frameBytes = MAX_FRAME_BYTES;
 			this.settleWhereabouts();
 			asked = this.askForGrant;
+			askedTurns = asked && this.askForTurnStates;
 			this.lastCapabilities = undefined;
 			this.enqueue({
 				v: BRIDGE_VERSION,
@@ -1024,6 +1132,7 @@ export class CiaoAgentBridge {
 				workspace_display: workspaceDisplay(this.context?.cwd ?? ""),
 				commands: this.commands(),
 				...(asked ? { frame_bytes: MAX_BRIDGE_FRAME_BYTES, whereabouts: true } : {}),
+				...(askedTurns ? { turn_states: true } : {}),
 			});
 		});
 		socket.on("data", (chunk: Buffer) => {
@@ -1039,7 +1148,10 @@ export class CiaoAgentBridge {
 		});
 		socket.once("close", () => {
 			if (serial !== this.connectionSerial) return;
-			if (!this.registered && asked !== undefined) this.askForGrant = !asked;
+			if (!this.registered && asked !== undefined) {
+				if (askedTurns) this.askForTurnStates = false;
+				else this.askForGrant = !asked;
+			}
 			this.socket = undefined;
 			this.registered = false;
 			this.settleWhereabouts();
@@ -1068,6 +1180,7 @@ export class CiaoAgentBridge {
 		if (value.type === "registered") {
 			const granted = "frame_bytes" in value;
 			const answers = "whereabouts" in value;
+			const turnStates = "turn_states" in value;
 			if (
 				!strictKeys(value, [
 					"v",
@@ -1077,12 +1190,14 @@ export class CiaoAgentBridge {
 					"snapshot_epoch",
 					...(granted ? ["frame_bytes"] : []),
 					...(answers ? ["whereabouts"] : []),
+					...(turnStates ? ["turn_states"] : []),
 				]) ||
 				!validOpaqueID(value.session_id) ||
 				typeof value.process_generation !== "number" ||
 				typeof value.snapshot_epoch !== "number" ||
 				(granted && (typeof value.frame_bytes !== "number" || !Number.isSafeInteger(value.frame_bytes))) ||
-				(answers && value.whereabouts !== true)
+				(answers && value.whereabouts !== true) ||
+				(turnStates && value.turn_states !== true)
 			) {
 				this.socket?.destroy();
 				return;
@@ -1091,10 +1206,13 @@ export class CiaoAgentBridge {
 				? Math.min(MAX_BRIDGE_FRAME_BYTES, Math.max(MAX_FRAME_BYTES, value.frame_bytes as number))
 				: MAX_FRAME_BYTES;
 			this.askForGrant = true;
+			this.askForTurnStates = true;
+			this.turnStatesGranted = turnStates;
 			this.whereaboutsAnswered = answers;
 			this.registered = true;
 			this.sendSnapshot();
 			this.publishCapabilities();
+			this.publishTurn(true);
 			return;
 		}
 		if (value.type === "shutdown") {
@@ -1237,35 +1355,36 @@ export class CiaoAgentBridge {
 		this.enqueue({ v: BRIDGE_VERSION, type: "capabilities", commands });
 	}
 
-	/// Every hook that refreshes the context runs this, so the turn tracks Pi's idle flag without
-	/// a per-event wiring list to keep in step. Deduped like capabilities: only an actual edge is
-	/// sent, so a chatty hook stream cannot churn host revisions.
-	private publishTurn(): void {
+	/// UI waiting outranks the run underneath it. Only settlement chooses the run's outcome:
+	/// agent_end can precede automatic retries, compaction and queued continuation.
+	private publishTurn(replaying = false): void {
 		if (!this.registered) return;
-		const ctx = this.context;
-		if (typeof ctx?.isIdle !== "function") return;
-		const working = ctx.isIdle() === false;
-		if (working === this.lastTurnWorking) return;
-		this.lastTurnWorking = working;
-		if (working) {
-			this.turnSequence += 1;
-			this.openRunID = `run-${this.turnSequence}`;
-			this.enqueue({
-				v: BRIDGE_VERSION,
-				type: "turn",
-				state: "running",
-				run_id: this.openRunID,
-				activity: "thinking",
-			});
-			return;
+		const turn = this.uiPromptBalance > 0
+			? { state: "awaiting_interaction", ...(this.uiPromptRunID ? { run_id: this.uiPromptRunID } : {}) }
+			: this.openRunID
+				? { state: "running", run_id: this.openRunID, activity: "thinking" }
+				: this.restingTurn;
+		const key = JSON.stringify(turn);
+		if (key === this.lastTurn) return;
+		this.lastTurn = key;
+		let reported = turn;
+		if (turn.state === "completed") {
+			// Rehydrating an idle session, or returning from a later dialog, is not another
+			// completion edge. A run ID on completed is what earns a notification on the host.
+			if (replaying || this.completionAnnounced) reported = { state: "completed" };
+			this.completionAnnounced = true;
+		}
+		if (!this.turnStatesGranted && turn.state !== "running" && turn.state !== "completed") {
+			// An old daemon knows only running/completed; its run-less completed means idle,
+			// never "this run succeeded". Withdraw work without fabricating a completion alert.
+			if (turn.state === "idle" && replaying) return;
+			reported = { state: "completed" };
 		}
 		this.enqueue({
 			v: BRIDGE_VERSION,
 			type: "turn",
-			state: "completed",
-			...(this.openRunID ? { run_id: this.openRunID } : {}),
+			...reported,
 		});
-		this.openRunID = undefined;
 	}
 
 	private handleCommand(command: BridgeCommand): void {
@@ -1431,37 +1550,41 @@ export function registerCiaoAgentExtension(pi: ExtensionAPI, socketPath?: string
 		bridge.reconcile(ctx);
 		bridge.resetContext();
 	});
+	pi.on("session_compact_failed", (event, ctx) => bridge.observeCompactionFailure(ctx, event.aborted));
+	pi.on("ui_prompt_start", (_event, ctx) => bridge.observeUIPrompt(ctx, true));
+	pi.on("ui_prompt_end", (_event, ctx) => bridge.observeUIPrompt(ctx, false));
 	pi.on("before_agent_start", async (_event, ctx) => {
-		bridge.updateContext(ctx);
+		// Preparation can fail without agent_settled. agent_start is the observed run boundary.
+		if (!bridge.updateContext(ctx)) return undefined;
 		const note = await bridge.whereabouts();
 		if (note === undefined) return undefined;
 		return { message: { customType: WHEREABOUTS_MESSAGE_TYPE, content: note, display: false } };
 	});
-	pi.on("agent_start", (_event, ctx) => bridge.updateContext(ctx));
+	pi.on("agent_start", (_event, ctx) => bridge.beginRun(ctx));
 	pi.on("agent_end", (_event, ctx) => bridge.updateContext(ctx));
-	pi.on("agent_settled", (_event, ctx) => bridge.updateContext(ctx));
+	pi.on("agent_settled", (event, ctx) => bridge.settleRun(ctx, event.aborted));
 	pi.on("message_update", (event, ctx) => {
-		bridge.updateContext(ctx);
+		if (!bridge.updateContext(ctx)) return;
 		bridge.publishMessage(event.message, "streaming");
 	});
 	pi.on("message_end", (event, ctx) => {
-		bridge.updateContext(ctx);
+		if (!bridge.updateContext(ctx)) return;
 		bridge.publishMessage(event.message);
 	});
 	pi.on("tool_execution_start", (event, ctx) => {
-		bridge.updateContext(ctx);
+		if (!bridge.updateContext(ctx)) return;
 		bridge.publishToolStart(event.toolCallId, event.toolName, event.args);
 	});
 	pi.on("tool_execution_update", (event, ctx) => {
-		bridge.updateContext(ctx);
+		if (!bridge.updateContext(ctx)) return;
 		bridge.publishToolUpdate(event.toolCallId, event.toolName, event.args, event.partialResult);
 	});
 	pi.on("tool_execution_end", (event, ctx) => {
-		bridge.updateContext(ctx);
+		if (!bridge.updateContext(ctx)) return;
 		bridge.publishToolEnd(event.toolCallId, event.toolName, event.result, event.isError);
 	});
 	pi.on("input", (event, ctx) => {
-		bridge.updateContext(ctx);
+		if (!bridge.updateContext(ctx)) return;
 		bridge.observeInput(event);
 	});
 

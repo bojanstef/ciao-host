@@ -2852,7 +2852,7 @@ where
 
 /// The one place that turns a bridge's turn frame into a [`TurnState`].
 ///
-/// Every integration reports the same two edges in the same words, so no adapter gets to invent
+/// Integrations report turn edges in the same words, so no adapter gets to invent
 /// its own vocabulary for "working" and the phone never learns which agent it is talking to. Only
 /// what a bridge can actually prove is accepted: a running turn must name the run it is running,
 /// and a state Ciao never defined is refused rather than shown as unexplained activity.
@@ -2860,13 +2860,31 @@ pub fn turn_from_bridge_frame(
     state: &str,
     run_id: Option<String>,
     activity: Option<String>,
+    category: Option<String>,
+    reason_code: Option<String>,
 ) -> Result<TurnState, AgentProtocolError> {
+    if (state != "running" && activity.is_some())
+        || (state != "failed" && category.is_some())
+        || (state != "unknown" && reason_code.is_some())
+    {
+        return Err(AgentProtocolError::InvalidValue);
+    }
     let turn = match state {
+        "idle" if run_id.is_none() => TurnState::Idle,
         "running" => TurnState::Running {
             run_id: run_id.ok_or(AgentProtocolError::InvalidValue)?,
             activity: activity.ok_or(AgentProtocolError::InvalidValue)?,
         },
         "completed" => TurnState::Completed { run_id },
+        "awaiting_interaction" => TurnState::AwaitingInteraction { run_id },
+        "interrupted" => TurnState::Interrupted { run_id },
+        "failed" => TurnState::Failed {
+            run_id,
+            category: category.ok_or(AgentProtocolError::InvalidValue)?,
+        },
+        "unknown" if run_id.is_none() => TurnState::Unknown {
+            reason_code: reason_code.ok_or(AgentProtocolError::InvalidValue)?,
+        },
         _ => return Err(AgentProtocolError::InvalidValue),
     };
     turn.validate()?;

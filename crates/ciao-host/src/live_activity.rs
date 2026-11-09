@@ -138,8 +138,8 @@ fn state_for(descriptor: &AgentSessionDescriptor) -> &'static str {
         }
         TurnState::Running { .. } => "active",
         TurnState::Stopping { .. } => "stopping",
-        TurnState::Completed { .. } | TurnState::Interrupted { .. } => "done",
-        TurnState::Idle => "idle",
+        TurnState::Completed { .. } => "done",
+        TurnState::Interrupted { .. } | TurnState::Idle => "idle",
         TurnState::Unknown { .. } | TurnState::Unsupported => "unknown",
     }
 }
@@ -257,7 +257,7 @@ mod tests {
                 "stopping",
             ),
             (TurnState::Completed { run_id: None }, "done"),
-            (TurnState::Interrupted { run_id: None }, "done"),
+            (TurnState::Interrupted { run_id: None }, "idle"),
             (TurnState::Idle, "idle"),
             (
                 TurnState::Unknown {
