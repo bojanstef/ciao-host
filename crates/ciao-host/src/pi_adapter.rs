@@ -15,8 +15,8 @@ use crate::{
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentCommandKind, AgentProtocolError, CommandCapabilities,
         InteractionCapabilities, MAX_AGENT_FRAME_BYTES, MAX_BRIDGE_FRAME_BYTES, Observation,
-        TurnState, decode_bridge_body, turn_from_bridge_frame, valid_opaque_id, valid_token,
-        version_major_matches, version_within_tested_minor,
+        TimelineBody, TurnState, decode_bridge_body, turn_from_bridge_frame, valid_opaque_id,
+        valid_token, version_major_matches, version_within_tested_minor,
     },
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
 };
@@ -82,6 +82,8 @@ pub(crate) struct PiBridgeRegister {
     /// an extension that did not ask would refuse it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub whereabouts: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub turn_states: bool,
 }
 
 impl PiBridgeRegister {
@@ -272,6 +274,24 @@ pub(crate) fn decode_pi_bridge_frame(body: &[u8]) -> Result<PiBridgeInbound, Age
                 &frame.message_type,
                 "upsert_entry",
             )?;
+            if let TimelineBody::Unsupported { reason_code } = &frame.entry.body {
+                match reason_code.as_str() {
+                    "pi_stop_reason_unknown" => {
+                        crate::drift::note("pi", "message_end", "unknown_enum", "stopReason", None)
+                    }
+                    "pi_settled_aborted_unknown" => {
+                        crate::drift::note("pi", "agent_settled", "invalid_field", "aborted", None)
+                    }
+                    "pi_compaction_aborted_unknown" => crate::drift::note(
+                        "pi",
+                        "session_compact_failed",
+                        "invalid_field",
+                        "aborted",
+                        None,
+                    ),
+                    _ => {}
+                }
+            }
             Ok(PiBridgeInbound::UpsertEntry(frame.entry))
         }
         // Same frame, same words, same decoder as every other integration: a turn is one
@@ -289,6 +309,10 @@ pub(crate) fn decode_pi_bridge_frame(body: &[u8]) -> Result<PiBridgeInbound, Age
                 run_id: Option<String>,
                 #[serde(default)]
                 activity: Option<String>,
+                #[serde(default)]
+                category: Option<String>,
+                #[serde(default)]
+                reason_code: Option<String>,
             }
             let frame: Frame =
                 serde_json::from_value(value).map_err(|_| AgentProtocolError::MalformedJson)?;
@@ -302,6 +326,8 @@ pub(crate) fn decode_pi_bridge_frame(body: &[u8]) -> Result<PiBridgeInbound, Age
                 &frame.state,
                 frame.run_id,
                 frame.activity,
+                frame.category,
+                frame.reason_code,
             )?))
         }
         "capabilities" => {
@@ -587,6 +613,16 @@ impl AttachedAgentAdapter for PiAttachedAdapter {
         )
     }
 
+    fn turn_states_asked(&self, register: &[u8]) -> bool {
+        matches!(
+            decode_pi_bridge_frame(register),
+            Ok(PiBridgeInbound::Register(PiBridgeRegister {
+                turn_states: true,
+                ..
+            }))
+        )
+    }
+
     fn whereabouts_frame(
         &self,
         query_id: &str,
@@ -634,6 +670,7 @@ mod tests {
             },
             frame_bytes: None,
             whereabouts: false,
+            turn_states: false,
         }
     }
 

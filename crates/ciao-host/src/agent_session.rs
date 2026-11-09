@@ -295,6 +295,9 @@ struct LiveSession {
     /// override borrows the turn instead of ending it. Cleared by any other reported turn, by
     /// session end, and by every downgrade.
     open_run: Option<TurnState>,
+    /// Only a hook-derived wait can be cleared by transcript progress. A native UI wait is
+    /// owned by the adapter until it explicitly reports that the dialog ended.
+    hook_attention: bool,
     source_entries: HashMap<String, SourceEntryMapping>,
     history: Vec<TimelineEntry>,
     next_sequence: u64,
@@ -756,6 +759,7 @@ impl AgentSessionSupervisor {
                 bridge_sender: sender,
                 adapter_active: true,
                 open_run: None,
+                hook_attention: false,
                 source_entries,
                 history,
                 next_sequence,
@@ -1417,6 +1421,7 @@ impl AgentSessionSupervisor {
                 reason_code: "awaiting_worker_state".into(),
             })
         };
+        session.hook_attention = false;
         let delta = AgentSessionDelta {
             v: AGENT_PROTOCOL_VERSION,
             session_id: session.snapshot.session_id.clone(),
@@ -1743,6 +1748,7 @@ impl AgentSessionSupervisor {
         // Recorded before the equality check: an adapter re-reporting the run it already reported
         // is a no-op for the wire and still the freshest proof that the run is open.
         session.open_run = matches!(turn, TurnState::Running { .. }).then(|| turn.clone());
+        session.hook_attention = false;
         if session.snapshot.turn == turn {
             return Ok(false);
         }
@@ -1803,6 +1809,7 @@ impl AgentSessionSupervisor {
         let base_revision = session.snapshot.revision;
         bump_revision(session);
         session.snapshot.turn = TurnState::AwaitingInteraction { run_id: None };
+        session.hook_attention = true;
         let delta = AgentSessionDelta {
             v: AGENT_PROTOCOL_VERSION,
             session_id: session.snapshot.session_id.clone(),
@@ -3591,11 +3598,13 @@ fn record_ended_verdict(ended: &mut HashMap<String, u64>, session_id: &str) {
 }
 
 fn clear_hook_attention(session: &mut LiveSession) -> Option<AgentDeltaChange> {
-    if !matches!(session.snapshot.turn, TurnState::AwaitingInteraction { .. })
+    if !session.hook_attention
+        || !matches!(session.snapshot.turn, TurnState::AwaitingInteraction { .. })
         || !session.snapshot.pending_interactions.is_empty()
     {
         return None;
     }
+    session.hook_attention = false;
     session.snapshot.turn = session.open_run.clone().unwrap_or(TurnState::Unknown {
         reason_code: "awaiting_agent_state".into(),
     });
@@ -3698,6 +3707,7 @@ fn downgrade_session(session: &mut LiveSession, reason: &str) {
     // Whatever run was open belonged to the adapter that just went away. Nothing may hand it
     // back afterwards.
     session.open_run = None;
+    session.hook_attention = false;
     session.snapshot.observation = Observation {
         coverage: "stale".into(),
         reason_code: reason.into(),
@@ -4726,6 +4736,51 @@ mod tests {
                 reason_code: "awaiting_agent_state".into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn native_ui_wait_is_not_released_by_progress_or_a_hook_attention_latch() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let (sender, _receiver) = mpsc::channel(4);
+        let registered = supervisor
+            .register(registration("native-ui-wait"), sender)
+            .await
+            .unwrap();
+        let id = &registered.session_id;
+        let waiting = TurnState::AwaitingInteraction {
+            run_id: Some("native-run".into()),
+        };
+        supervisor
+            .note_bridge_attention(id, "permission_prompt")
+            .unwrap();
+        supervisor.note_bridge_turn(id, waiting.clone()).unwrap();
+        assert!(
+            supervisor
+                .snapshot(id)
+                .unwrap()
+                .pending_interactions
+                .is_empty()
+        );
+        supervisor
+            .upsert_bridge_entry(id, entry("native-progress", 1, "Synthetic progress"))
+            .unwrap();
+        supervisor
+            .append_bridge_text(id, text_delta("native-stream", 1, "Synthetic delta", false))
+            .unwrap();
+        supervisor
+            .note_bridge_attention(id, "agent_needs_input")
+            .unwrap();
+        supervisor
+            .upsert_bridge_entry(id, entry("native-progress", 2, "More progress"))
+            .unwrap();
+        assert_eq!(supervisor.snapshot(id).unwrap().turn, waiting);
+        let resumed = TurnState::Running {
+            run_id: "native-run".into(),
+            activity: "thinking".into(),
+        };
+        supervisor.note_bridge_turn(id, resumed.clone()).unwrap();
+        assert_eq!(supervisor.snapshot(id).unwrap().turn, resumed);
     }
 
     /// Spec 019 §3. A hook's turn edge rides a transient connection that loses roughly one

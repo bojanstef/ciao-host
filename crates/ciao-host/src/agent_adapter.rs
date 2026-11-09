@@ -248,6 +248,12 @@ pub(crate) trait AttachedAgentAdapter: Send + Sync {
         Some(MAX_BRIDGE_FRAME_BYTES)
     }
 
+    /// Pi's legacy flattened turns carried only running/completed. A peer must ask before
+    /// `registered` can confirm it may report waiting, idle, cancellation and failure too.
+    fn turn_states_asked(&self, _register: &[u8]) -> bool {
+        false
+    }
+
     /// `whereabouts` is the Spec 025 note for a `PromptCommand` dialect to send with a prompt.
     /// The bridge hands one only to such a dialect and only with a prompt; every other dialect
     /// is always given `None`.

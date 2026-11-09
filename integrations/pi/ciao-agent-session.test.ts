@@ -427,18 +427,11 @@ test("real framed socket correlates prompt receipts and deduplicates commands", 
 	]);
 	expect(aborts).toBe(1);
 
-	// Turn edges ride Pi's own idle flag, which is the same fact that decides `interrupt`, so the
-	// phone's working row and its stop button can never disagree about whose turn it is.
+	// Only the native settled event closes a turn; an idle flag cannot distinguish its outcome.
 	const turns = () => frames.filter((frame) => frame.type === "turn");
 	const fire = (name: string, event: Record<string, unknown>) => {
 		for (const handler of handlers.get(name) ?? []) handler({ type: name, ...event }, context);
 	};
-
-	// The command exchange above left a turn open. Settle it first, so what follows is a real
-	// transition rather than a repeat — the distinction this dedupe exists to make.
-	idle = true;
-	fire("agent_end", {});
-	await eventually(() => turns().at(-1)?.state === "completed");
 
 	const settled = turns().length;
 	idle = false;
@@ -456,7 +449,7 @@ test("real framed socket correlates prompt receipts and deduplicates commands", 
 	expect(turns()).toHaveLength(afterRunning);
 
 	idle = true;
-	fire("agent_end", {});
+	fire("agent_settled", { aborted: false });
 	await eventually(() => turns().length > afterRunning);
 	const completed = turns().at(-1);
 	expect(completed?.state).toBe("completed");
@@ -552,7 +545,7 @@ describe("whole messages, sized for the daemon they reach", () => {
 		expect(big.truncation.original_bytes).toBeGreaterThan(40 * 1024);
 	});
 
-	test("an extension asks for the larger bound, and falls back once when an old daemon refuses", async () => {
+	test("an extension falls back through turn and frame grants when an old daemon refuses", async () => {
 		const long = "Synthetic long user message, naïve. ".repeat(4_000);
 		for (const daemon of ["current", "old"] as const) {
 			const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-pi-grant-"));
@@ -615,8 +608,9 @@ describe("whole messages, sized for the daemon they reach", () => {
 				expect(registrations).toHaveLength(1);
 				expect(entries[0].body.text).toBe(long);
 			} else {
-				expect(registrations).toHaveLength(2);
-				expect("frame_bytes" in registrations[1]).toBe(false);
+				expect(registrations).toHaveLength(3);
+				expect("turn_states" in registrations[1]).toBe(false);
+				expect("frame_bytes" in registrations[2]).toBe(false);
 				expect(Buffer.byteLength(entries[0].body.text)).toBeLessThanOrEqual(48 * 1024);
 				expect(entries[0].truncation.reason_code).toBe("adapter_bound");
 			}
@@ -853,6 +847,303 @@ function whereaboutsPi() {
 	};
 	return { pi, emit };
 }
+
+async function turnFixture(options: { legacy?: boolean; missingIdle?: boolean; initiallyBusy?: boolean; promptBeforeStart?: boolean } = {}) {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ciao-pi-turn-"));
+	const socketPath = path.join(root, "agent.sock");
+	const frames: Record<string, any>[] = [];
+	const peers = new Set<net.Socket>();
+	const server = net.createServer((socket) => {
+		peers.add(socket);
+		socket.on("close", () => peers.delete(socket));
+		socket.on("data", decodeFrames((frame) => {
+			frames.push(frame);
+			if (frame.type !== "register") return;
+			// The old decoder is deny_unknown_fields. It closes before registered, rather than
+			// silently tolerating the ask as the other protocol fixtures intentionally do.
+			if (options.legacy && "turn_states" in frame) return socket.destroy();
+			socket.write(encodeBridgeFrame({
+				v: 1, type: "registered", session_id: "fixture-session",
+				process_generation: 1, snapshot_epoch: 1,
+				...(frame.frame_bytes ? { frame_bytes: frame.frame_bytes } : {}),
+				...(frame.whereabouts ? { whereabouts: true } : {}),
+				...(!options.legacy && frame.turn_states ? { turn_states: true } : {}),
+			}));
+		}));
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.once("error", reject);
+		server.listen(socketPath, resolve);
+	});
+	const { pi, emit } = whereaboutsPi();
+	pi.sendUserMessage = () => {};
+	let idle = !options.initiallyBusy;
+	let identity = "turn-fixture";
+	const ctx = {
+		...piContext(), abort() {},
+		isIdle: options.missingIdle ? undefined : () => idle,
+		sessionManager: { getSessionId: () => identity, getBranch: () => [] },
+	};
+	const bridge = registerCiaoAgentExtension(pi, socketPath);
+	resources.push(async () => {
+		bridge.stop(true);
+		for (const socket of peers) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+	const fire = (name: string, event: Record<string, unknown> = {}) => emit(name, event, ctx);
+	const flush = async () => {
+		const before = frames.filter((f) => f.type === "snapshot_end").length;
+		bridge.reconcile(ctx);
+		await eventually(() => frames.filter((f) => f.type === "snapshot_end").length > before);
+	};
+	if (options.promptBeforeStart) await fire("ui_prompt_start", { kind: "confirm" });
+	await fire("session_start", { reason: "startup" });
+	await eventually(() => bridge.status() === "connected");
+	await flush();
+	return {
+		bridge, frames, ctx, fire, flush,
+		turns: () => frames.filter((f) => f.type === "turn"),
+		setIdle(value: boolean) { idle = value; },
+		setIdentity(value: string) { identity = value; },
+		async reconnect() {
+			const before = frames.filter((f) => f.type === "register").length;
+			bridge.reconnect();
+			await eventually(() => frames.filter((f) => f.type === "register").length > before && bridge.status() === "connected");
+			await flush();
+		},
+	};
+}
+
+const assistant = (stopReason: string) => ({
+	role: "assistant", content: [{ type: "text", text: "Synthetic response" }],
+	stopReason, timestamp: 1,
+});
+
+describe("native Pi waiting and settlement", () => {
+	test("a native end delivered before its delayed start does not strand waiting", async () => {
+		const f = await turnFixture();
+		await f.fire("ui_prompt_end", { kind: "confirm" });
+		await f.fire("ui_prompt_start", { kind: "confirm" });
+		await f.flush();
+		expect(f.turns().map((t) => t.state)).toEqual(["idle"]);
+		await f.fire("ui_prompt_start", { kind: "input" });
+		await f.flush();
+		expect(f.turns().at(-1)?.state).toBe("awaiting_interaction");
+		await f.fire("ui_prompt_end", { kind: "input" });
+		await f.flush();
+		expect(f.turns().at(-1)?.state).toBe("idle");
+	});
+
+	test("UI opened by an earlier session_start extension stays balanced through Ciao startup", async () => {
+		const f = await turnFixture({ promptBeforeStart: true });
+		expect(f.turns().at(-1)?.state).toBe("awaiting_interaction");
+		await f.fire("ui_prompt_end", { kind: "confirm" });
+		await f.fire("ui_prompt_start", { kind: "input" });
+		await f.flush();
+		expect(f.turns().at(-1)?.state).toBe("awaiting_interaction");
+		await f.fire("ui_prompt_end", { kind: "input" });
+		await f.flush();
+		expect(f.turns().at(-1)?.state).toBe("idle");
+	});
+
+	test("startup during manual compaction does not invent an agent run or a completed outcome", async () => {
+		const f = await turnFixture({ initiallyBusy: true });
+		expect(f.turns().at(-1)?.state).toBe("unknown");
+		f.setIdle(true);
+		await f.fire("session_compact_failed", { aborted: false, reason: "manual" });
+		await f.flush();
+		expect(f.turns().map((t) => t.state)).toEqual(["unknown", "idle"]);
+	});
+
+	test("idle registration, failed preparation and a missing idle API never invent a completed run", async () => {
+		const f = await turnFixture();
+		expect(f.turns().map((t) => t.state)).toEqual(["idle"]);
+		f.setIdle(false);
+		await f.fire("before_agent_start");
+		f.setIdle(true); // _prepareRun can fail without agent_start or agent_settled.
+		await f.flush();
+		expect(f.turns().map((t) => t.state)).toEqual(["idle"]);
+		const missing = await turnFixture({ missingIdle: true });
+		expect(missing.bridge.status()).toBe("connected");
+		expect(missing.frames.find((frame) => frame.type === "register").commands.prompt).toBe(false);
+	});
+
+	test("all native UI prompt kinds report a wait, preserve progress, and restore the same run", async () => {
+		const f = await turnFixture();
+		f.setIdle(false);
+		await f.fire("agent_start");
+		await f.flush();
+		const runID = f.turns().at(-1)?.run_id;
+		expect(runID).toBeString();
+		for (const kind of ["select", "confirm", "input", "editor", "custom", "future_kind"]) {
+			await f.fire("ui_prompt_start", { reason: "ui_prompt", kind, title: "DO_NOT_EXPORT_DIALOG_TITLE" });
+			await f.fire("message_update", { message: assistant("pending") });
+			await f.fire("tool_execution_start", { toolCallId: "fixture-tool", toolName: "fixture", args: {} });
+			await f.flush();
+			expect(f.turns().at(-1)).toMatchObject({ state: "awaiting_interaction", run_id: runID });
+			await f.fire("ui_prompt_end", { reason: "ui_prompt", kind });
+			await f.flush();
+			expect(f.turns().at(-1)).toMatchObject({ state: "running", run_id: runID });
+		}
+		expect(JSON.stringify(f.frames)).not.toContain("DO_NOT_EXPORT_DIALOG_TITLE");
+		expect(f.frames.some((frame) => /interaction|notification/.test(frame.type))).toBe(false);
+	});
+
+	test("settlement distinguishes abort and failure, and a successful retry replaces its earlier error", async () => {
+		const f = await turnFixture();
+		const cases = [
+			{ reasons: ["stop"], aborted: false, expected: "completed" },
+			{ reasons: ["error"], aborted: false, expected: "failed" },
+			{ reasons: ["error", "stop"], aborted: false, expected: "completed" },
+			{ reasons: ["error"], aborted: true, expected: "interrupted" },
+			{ reasons: ["aborted"], aborted: false, expected: "interrupted" },
+			{ reasons: ["deferred"], aborted: false, expected: "completed" },
+			{ reasons: ["pending"], aborted: false, expected: "unknown" },
+		];
+		for (const { reasons, aborted, expected } of cases) {
+			f.setIdle(false);
+			await f.fire("agent_start");
+			await f.flush();
+			const runID = f.turns().at(-1)?.run_id;
+			for (const stopReason of reasons) {
+				await f.fire("message_end", { message: assistant(stopReason) });
+				await f.fire("agent_end");
+				await f.flush();
+				expect(f.turns().at(-1)).toMatchObject({ state: "running", run_id: runID });
+				// Native retries open another low-level agent loop in the same unsettled run.
+				await f.fire("agent_start");
+			}
+			f.setIdle(true);
+			await f.fire("agent_settled", { aborted });
+			await f.flush();
+			expect(f.turns().at(-1)?.state).toBe(expected);
+			if (expected !== "unknown") expect(f.turns().at(-1)?.run_id).toBe(runID);
+			if (expected === "failed") expect(f.turns().at(-1)?.category).toBe("agent_error");
+		}
+		expect(f.frames.some((frame) => frame.entry?.body?.reason_code === "pi_stop_reason_unknown")).toBe(false);
+	});
+
+	test("a cancelled native run never reports successful completion", async () => {
+		const f = await turnFixture();
+		f.setIdle(false);
+		await f.fire("agent_start");
+		await f.fire("message_end", { message: assistant("stop") });
+		f.setIdle(true);
+		await f.fire("agent_settled", { aborted: true });
+		await f.flush();
+		expect(f.turns().at(-1)?.state).toBe("interrupted");
+		expect(f.turns().some((turn) => turn.state === "completed" && turn.run_id)).toBe(false);
+	});
+
+	test("failed recovery compaction is not success and a later response can recover it", async () => {
+		const f = await turnFixture();
+		for (const [aborted, recovers, expected] of [[false, false, "failed"], [true, false, "interrupted"], [false, true, "completed"]] as const) {
+			f.setIdle(false);
+			await f.fire("agent_start");
+			await f.fire("message_end", { message: assistant("stop") });
+			await f.fire("session_compact_failed", { reason: "overflow", aborted, willRetry: false, errorMessage: "PRIVATE_ERROR" });
+			if (recovers) await f.fire("message_end", { message: assistant("stop") });
+			f.setIdle(true);
+			await f.fire("agent_settled", { aborted: false });
+			await f.flush();
+			expect(f.turns().at(-1)?.state).toBe(expected);
+		}
+		expect(JSON.stringify(f.turns())).not.toContain("PRIVATE_ERROR");
+	});
+
+	test("waiting survives settlement and reconnect; idle replay and later dialogs do not repeat completion alerts", async () => {
+		const f = await turnFixture();
+		f.setIdle(false);
+		await f.fire("agent_start");
+		await f.fire("ui_prompt_start", { kind: "custom" });
+		await f.flush();
+		const runID = f.turns().at(-1)?.run_id;
+		await f.reconnect();
+		expect(f.turns().at(-1)).toMatchObject({ state: "awaiting_interaction", run_id: runID });
+		const waitingEdges = f.turns().filter((t) => t.state === "awaiting_interaction").length;
+		await f.fire("message_end", { message: assistant("stop") });
+		f.setIdle(true);
+		await f.fire("agent_settled", { aborted: false });
+		await f.flush();
+		expect(f.turns().at(-1)?.state).toBe("awaiting_interaction");
+		expect(f.turns().filter((t) => t.state === "awaiting_interaction")).toHaveLength(waitingEdges);
+		expect(f.turns().filter((t) => t.state === "completed")).toHaveLength(0);
+		await f.fire("ui_prompt_end", { kind: "custom" });
+		await f.flush();
+		expect(f.turns().at(-1)).toMatchObject({ state: "completed", run_id: runID });
+		await f.reconnect();
+		expect(f.turns().at(-1)).toEqual({ v: 1, type: "turn", state: "completed" });
+		await f.fire("ui_prompt_start", { kind: "input" });
+		await f.fire("ui_prompt_end", { kind: "input" });
+		await f.flush();
+		expect(f.turns().filter((t) => t.state === "completed" && t.run_id)).toHaveLength(1);
+	});
+
+	test("session replacement clears waiting and run outcomes and refuses late old-context events", async () => {
+		const f = await turnFixture();
+		f.setIdle(false);
+		await f.fire("agent_start");
+		await f.fire("ui_prompt_start", { kind: "custom" });
+		await f.flush();
+		const oldContext = { ...f.ctx, sessionManager: { ...f.ctx.sessionManager, getSessionId: () => "turn-fixture" } };
+		f.setIdentity("replacement-fixture");
+		f.setIdle(true);
+		await f.fire("session_start", { reason: "switch" });
+		await eventually(() => f.bridge.status() === "connected");
+		await f.flush();
+		expect(f.turns().at(-1)?.state).toBe("idle");
+		f.bridge.observeUIPrompt(oldContext, true);
+		f.bridge.settleRun(oldContext, true);
+		await f.flush();
+		expect(f.turns().at(-1)?.state).toBe("idle");
+	});
+
+	test("an older strict daemon keeps frame/whereabouts grants while refusing new turns", async () => {
+		const f = await turnFixture({ legacy: true });
+		const registrations = f.frames.filter((frame) => frame.type === "register");
+		expect(registrations).toHaveLength(2);
+		expect(registrations[0].turn_states).toBe(true);
+		expect(registrations[1]).not.toHaveProperty("turn_states");
+		expect(registrations[1].whereabouts).toBe(true);
+		expect(registrations[1].frame_bytes).toBe(2 * 1024 * 1024);
+		f.setIdle(false);
+		await f.fire("agent_start");
+		f.setIdle(true);
+		await f.fire("agent_settled", { aborted: true });
+		await f.flush();
+		expect(f.turns().at(-1)).toEqual({ v: 1, type: "turn", state: "completed" });
+		expect(f.turns().some((t) => t.state === "completed" && t.run_id)).toBe(false);
+	});
+
+	test("future final outcomes remain unknown and report only a categorical drift marker", async () => {
+		const f = await turnFixture();
+		f.setIdle(false);
+		await f.fire("agent_start");
+		await f.fire("message_end", { message: assistant("PRIVATE_FUTURE_STOP_REASON") });
+		f.setIdle(true);
+		await f.fire("agent_settled", { aborted: false });
+		await f.flush();
+		expect(f.turns().at(-1)).toEqual({ v: 1, type: "turn", state: "unknown", reason_code: "pi_turn_outcome_unknown" });
+		expect(f.frames.filter((frame) => frame.entry?.body?.reason_code === "pi_stop_reason_unknown")).toHaveLength(1);
+		expect(JSON.stringify(f.frames)).not.toContain("PRIVATE_FUTURE_STOP_REASON");
+	});
+
+	test("missing or malformed native cancellation evidence never becomes successful completion", async () => {
+		const f = await turnFixture();
+		for (const aborted of [undefined, "PRIVATE_ABORTED_VALUE", null]) {
+			f.setIdle(false);
+			await f.fire("agent_start");
+			await f.fire("message_end", { message: assistant("stop") });
+			f.setIdle(true);
+			await f.fire("agent_settled", { aborted });
+			await f.flush();
+			expect(f.turns().at(-1)?.state).toBe("unknown");
+		}
+		expect(f.frames.filter((frame) => frame.entry?.body?.reason_code === "pi_settled_aborted_unknown")).toHaveLength(3);
+		expect(JSON.stringify(f.frames)).not.toContain("PRIVATE_ABORTED_VALUE");
+	});
+});
 
 describe("Spec 025: the run hears where its person is", () => {
 	test("asked with the grant, queried before each run, and reset after a compaction", async () => {

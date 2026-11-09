@@ -29,7 +29,7 @@ use crate::{
     agent_bridge::{AgentAdapterRegistry, PRODUCTION_ADAPTERS},
     agent_protocol::{
         AGENT_PROTOCOL_VERSION, AgentCommand, AgentCommandKind, CommandCapabilities,
-        InteractionAnswer, InteractionCapabilities,
+        InteractionAnswer, InteractionCapabilities, TurnState,
     },
     agent_session::{NormalizedRegistration, RegisteredAgentSession},
     codex_adopted::{AdoptParams, adopted_registration},
@@ -267,7 +267,8 @@ fn pi_registration() -> Vec<u8> {
         "process_id": CONFORMANCE_PROCESS,
         "workspace_display": "Conformance workspace",
         "commands": { "prompt": true, "steer": true, "follow_up": true, "interrupt": true },
-        "whereabouts": true
+        "whereabouts": true,
+        "turn_states": true
     }))
 }
 
@@ -330,6 +331,90 @@ fn pi_events() -> Vec<(EventKind, Vec<u8>)> {
             ),
         ),
     ]
+}
+
+#[test]
+fn pi_native_turn_states_are_canonical_and_observe_only() {
+    let contract = contracts().into_iter().find(|row| row.id == "pi").unwrap();
+    assert!(contract.interactions.is_empty());
+    assert!(
+        contract
+            .adapter()
+            .turn_states_asked(&(contract.registration)())
+    );
+    for turn in [
+        TurnState::Idle,
+        TurnState::Running {
+            run_id: "run-native".into(),
+            activity: "thinking".into(),
+        },
+        TurnState::AwaitingInteraction {
+            run_id: Some("run-native".into()),
+        },
+        TurnState::Completed {
+            run_id: Some("run-native".into()),
+        },
+        TurnState::Interrupted {
+            run_id: Some("run-native".into()),
+        },
+        TurnState::Failed {
+            run_id: Some("run-native".into()),
+            category: "agent_error".into(),
+        },
+        TurnState::Unknown {
+            reason_code: "pi_turn_outcome_unknown".into(),
+        },
+    ] {
+        let mut value = serde_json::to_value(&turn).unwrap();
+        value["v"] = 1.into();
+        value["type"] = "turn".into();
+        assert_eq!(
+            contract.adapter().decode_event(&frame(value)).unwrap(),
+            NormalizedAdapterEvent::Turn(turn)
+        );
+    }
+    for malformed in [
+        json!({"v": 1, "type": "turn", "state": "failed", "run_id": "run-native"}),
+        json!({"v": 1, "type": "turn", "state": "failed", "category": "private error content"}),
+        json!({"v": 1, "type": "turn", "state": "idle", "run_id": "run-native"}),
+        json!({"v": 1, "type": "turn", "state": "awaiting_interaction", "activity": "thinking"}),
+    ] {
+        assert!(contract.adapter().decode_event(&frame(malformed)).is_err());
+    }
+}
+
+#[test]
+fn future_shaped_input_pi_outcome_is_accounted() {
+    let contract = contracts().into_iter().find(|row| row.id == "pi").unwrap();
+    for (reason, surface, name) in [
+        ("pi_stop_reason_unknown", "message_end", "stopReason"),
+        ("pi_settled_aborted_unknown", "agent_settled", "aborted"),
+        (
+            "pi_compaction_aborted_unknown",
+            "session_compact_failed",
+            "aborted",
+        ),
+    ] {
+        let mut entry = entry_payload();
+        entry["kind"] = "unsupported".into();
+        entry["body"] = json!({"type": "unsupported", "reason_code": reason});
+        let decoded = contract
+            .adapter()
+            .decode_event(&frame(json!({
+                "v": 1, "type": "upsert_entry", "entry": entry,
+            })))
+            .unwrap();
+        assert!(matches!(decoded, NormalizedAdapterEvent::UpsertEntry(_)));
+        let ledger = crate::drift::snapshot();
+        assert!(
+            ledger.vendors["pi"]
+                .signatures
+                .iter()
+                .any(|signature| signature.surface == surface
+                    && signature.name == name
+                    && signature.count > 0)
+        );
+    }
 }
 
 fn claude_registration() -> Vec<u8> {
@@ -563,8 +648,9 @@ fn contracts() -> [ParityContract; 4] {
         ParityContract {
             id: "pi",
             configuration_source: ConfigurationSource::ExistingProcess,
-            // Re-grounded at 1.4.0: the same four commands, lifecycle events and whereabouts
-            // query run through Pi's actual loader/runner; the major gate remains closed.
+            // Pi 1.4.0: native ui_prompt_start/end are observe-only; agent_settled.aborted,
+            // finalized assistant outcomes and failed recovery compaction close runs truthfully.
+            // Rich turn states are negotiated separately from frame/whereabouts grants.
             family: "Pi",
             topology: "attached",
             connection: AdapterConnectionKind::PersistentBridge,
@@ -598,15 +684,12 @@ fn contracts() -> [ParityContract; 4] {
                 CommandName::FollowUp,
                 CommandName::Interrupt,
             ],
-            // GAP(parity): no Notification — Pi has no vendor hook that says "needs you", and no
-            // AppendText — Pi answers arrive as whole entries, never streamed.
-            //
-            // 2026-09-22: this no longer means a Pi session cannot reach the phone, which is what
-            // it used to say. Alerts are owed to the normalized turn edge rather than to a vendor
-            // hook (`agent_bridge::attention_kind_for_turn`), and every adapter here speaks
-            // `Turn`. What Pi still cannot send is the *blocked* half: `interactions` is empty, so
-            // its turn never reaches `AwaitingInteraction` — a Pi session says "awaiting reply"
-            // when a run ends and nothing else. The event vocabulary below is unchanged.
+            // GAP(parity): no separate Notification or AppendText frame. Turn edges carry
+            // Needs input and successful completion alerts; interrupted/failed are silent.
+            // UI waits have no interaction capability or inferred permission semantics.
+            // StopReason membership is grounded on Pi AI 1.4.0: stop/length/toolUse/deferred,
+            // error, aborted; pending remains unknown. Future names are tallied categorically
+            // (future_shaped_input_pi_outcome_is_accounted), never copied as field values.
             speaks: &[
                 EventKind::SnapshotStart,
                 EventKind::SnapshotEntry,
