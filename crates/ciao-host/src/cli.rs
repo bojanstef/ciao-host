@@ -454,7 +454,7 @@ fn parse_setup_answer(answer: &str) -> Option<bool> {
 
 /// Vendor presence, not integration state: the pre-selection a person confirms or edits. A
 /// probe that errors reads as absent — the picker still accepts that name typed explicitly.
-fn detect_agents(paths: &CiaoPaths) -> Vec<AgentIntegration> {
+pub(crate) fn detect_agents(paths: &CiaoPaths) -> Vec<AgentIntegration> {
     let mut detected = Vec::new();
     if installed_claude_version(paths).ok().flatten().is_some() {
         detected.push(AgentIntegration::Claude);

@@ -1,0 +1,181 @@
+{
+  "description": "Spec 029: workspace.snapshot.v3 is workspace.snapshot.v2 plus an optional agent_integrations array, so the phone can say when a host is missing the integration that lets it see an agent. workspace.snapshot and workspace.snapshot.v2 never carry the field (their apps decode results strictly). A v3-aware app retries v2 only on method_unknown. The host omits the field until its first background probe lands, so a snapshot never waits on agent CLIs.",
+  "fields": {
+    "agent_integrations": "Optional, v3 results only. At most 8 entries, one per agent CLI the host detects; an agent that is not installed at all has no entry.",
+    "agent": "Open vocabulary, [a-z_] and at most 32 bytes. Today: claude, codex, pi. An app ignores an entry whose agent it does not know.",
+    "state": "Open vocabulary, [a-z_] and at most 32 bytes. Today: installed, missing, needs_approval (codex hooks not yet trusted in Codex), outdated (an update is available), unsupported_version (installed, but the agent runs a version this host refuses). An app ignores an entry whose state it does not know."
+  },
+  "request": {
+    "v": 1,
+    "type": "request",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "method": "workspace.snapshot.v3",
+    "params": {
+      "tabs": true
+    }
+  },
+  "v2_request": {
+    "v": 1,
+    "type": "request",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "method": "workspace.snapshot.v2",
+    "params": {
+      "tabs": true
+    }
+  },
+  "unsupported_response": {
+    "v": 1,
+    "type": "error",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "error": {
+      "code": "method_unknown",
+      "message": "This method is not supported."
+    }
+  },
+  "response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v": 1,
+      "providers": {
+        "tmux": {
+          "state": "available",
+          "version": "3.7b",
+          "sessions": []
+        },
+        "herdr": {
+          "state": "available",
+          "version": "0.9.0",
+          "sessions": [
+            {
+              "name": "default",
+              "running": true,
+              "is_default": true
+            }
+          ]
+        },
+        "herdr_core": {
+          "state": "not_installed"
+        }
+      },
+      "omitted_sessions": 0,
+      "agent_integrations": [
+        {
+          "agent": "claude",
+          "state": "missing"
+        },
+        {
+          "agent": "codex",
+          "state": "needs_approval"
+        },
+        {
+          "agent": "pi",
+          "state": "outdated"
+        }
+      ]
+    }
+  },
+  "future_response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v": 1,
+      "providers": {
+        "tmux": {
+          "state": "not_installed"
+        },
+        "herdr": {
+          "state": "not_installed"
+        }
+      },
+      "omitted_sessions": 0,
+      "agent_integrations": [
+        {
+          "agent": "claude",
+          "state": "installed"
+        },
+        {
+          "agent": "codex",
+          "state": "future_state"
+        },
+        {
+          "agent": "future_agent",
+          "state": "missing"
+        }
+      ]
+    }
+  },
+  "pending_response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v": 1,
+      "providers": {
+        "tmux": {
+          "state": "not_installed"
+        },
+        "herdr": {
+          "state": "not_installed"
+        }
+      },
+      "omitted_sessions": 0
+    }
+  },
+  "v2_response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v": 1,
+      "providers": {
+        "tmux": {
+          "state": "not_installed"
+        },
+        "herdr": {
+          "state": "not_installed"
+        },
+        "herdr_core": {
+          "state": "not_installed"
+        }
+      },
+      "omitted_sessions": 0
+    }
+  },
+  "refused_integrations": [
+    {
+      "why": "more than 8 entries",
+      "agent_integrations": [
+        {"agent": "a", "state": "installed"},
+        {"agent": "b", "state": "installed"},
+        {"agent": "c", "state": "installed"},
+        {"agent": "d", "state": "installed"},
+        {"agent": "e", "state": "installed"},
+        {"agent": "f", "state": "installed"},
+        {"agent": "g", "state": "installed"},
+        {"agent": "h", "state": "installed"},
+        {"agent": "i", "state": "installed"}
+      ]
+    },
+    {
+      "why": "a token outside [a-z_]",
+      "agent_integrations": [
+        {"agent": "Claude", "state": "installed"}
+      ]
+    },
+    {
+      "why": "a token longer than 32 bytes",
+      "agent_integrations": [
+        {"agent": "claude", "state": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+      ]
+    },
+    {
+      "why": "an empty token",
+      "agent_integrations": [
+        {"agent": "", "state": "installed"}
+      ]
+    }
+  ]
+}

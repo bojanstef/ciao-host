@@ -33,6 +33,7 @@ pub(crate) mod host_info;
 pub mod host_protocol;
 pub mod identity;
 pub mod install;
+pub(crate) mod integration_status;
 pub mod ipc;
 pub(crate) mod live_activity;
 pub(crate) mod managed_session;

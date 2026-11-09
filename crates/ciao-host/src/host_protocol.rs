@@ -159,6 +159,13 @@ pub const PROVIDER_STATE_NOT_INSTALLED: &str = "not_installed";
 pub const PROVIDER_STATE_UNSUPPORTED_VERSION: &str = "unsupported_version";
 pub const PROVIDER_STATE_ERROR: &str = "error";
 
+/// Spec 029: the newest workspace snapshot, `v2`'s result plus `agent_integrations`. The older
+/// methods never carry that field, because the apps that ask them decode results strictly.
+pub const METHOD_WORKSPACE_SNAPSHOT_V3: &str = "workspace.snapshot.v3";
+/// Spec 029 §2 bounds: one entry per agent the host detects, and short `[a-z_]` tokens.
+pub const MAX_AGENT_INTEGRATION_ENTRIES: usize = 8;
+pub const MAX_AGENT_INTEGRATION_TOKEN_BYTES: usize = 32;
+
 /// Spec 003 §5.4: `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, enforced identically in Rust and Swift.
 pub fn valid_session_name(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -873,7 +880,7 @@ impl WorkspaceSnapshotRequest {
         validate_request_id(&self.request_id)?;
         if !matches!(
             self.method.as_str(),
-            "workspace.snapshot" | "workspace.snapshot.v2"
+            "workspace.snapshot" | "workspace.snapshot.v2" | METHOD_WORKSPACE_SNAPSHOT_V3
         ) {
             return Err(HostProtocolError::UnsupportedMethod);
         }
@@ -1371,12 +1378,34 @@ pub struct WorkspaceProviders {
     pub herdr_core: Option<HerdrProviderSnapshot>,
 }
 
+/// Spec 029: one agent integration as the phone is told it. Both fields are open vocabularies:
+/// a host may name agents and states a deployed app does not know, and the app shows nothing for
+/// them, so validation checks only their shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentIntegrationEntry {
+    pub agent: String,
+    pub state: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceSnapshotResult {
     pub v: u8,
     pub providers: WorkspaceProviders,
     pub omitted_sessions: u32,
+    /// Emitted only for `workspace.snapshot.v3`, and only once the host's first integration probe
+    /// has finished (Spec 029 §3). The older results keep exactly their old keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_integrations: Option<Vec<AgentIntegrationEntry>>,
+}
+
+fn valid_agent_integration_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_AGENT_INTEGRATION_TOKEN_BYTES
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1501,6 +1530,15 @@ impl WorkspaceSnapshotResult {
             }) {
                 return Err(HostProtocolError::InvalidControlValue);
             }
+        }
+        if let Some(entries) = &self.agent_integrations
+            && (entries.len() > MAX_AGENT_INTEGRATION_ENTRIES
+                || !entries.iter().all(|entry| {
+                    valid_agent_integration_token(&entry.agent)
+                        && valid_agent_integration_token(&entry.state)
+                }))
+        {
+            return Err(HostProtocolError::InvalidControlValue);
         }
         Ok(())
     }
@@ -1807,7 +1845,7 @@ pub fn decode_rpc_request(body: &[u8]) -> Result<RpcRequest, HostProtocolError> 
             request.validate()?;
             Ok(RpcRequest::HostInfo(request))
         }
-        "workspace.snapshot" | "workspace.snapshot.v2" => {
+        "workspace.snapshot" | "workspace.snapshot.v2" | METHOD_WORKSPACE_SNAPSHOT_V3 => {
             let request: WorkspaceSnapshotRequest =
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             request.validate()?;
@@ -4130,6 +4168,7 @@ mod tests {
                     },
                 },
                 omitted_sessions: 0,
+                agent_integrations: None,
             },
         );
         let (encoded, kept) = encode_snapshot_response_bounded(response).unwrap();
@@ -4196,6 +4235,7 @@ mod tests {
                     },
                 },
                 omitted_sessions: 0,
+                agent_integrations: None,
             },
         );
         let (encoded, kept) = encode_snapshot_response_bounded(response).unwrap();
@@ -4261,6 +4301,7 @@ mod tests {
                     },
                 },
                 omitted_sessions: 0,
+                agent_integrations: None,
             },
         );
         let (_, kept) = encode_snapshot_response_bounded(response).unwrap();
@@ -4297,6 +4338,119 @@ mod tests {
             "/../../protocol/fixtures/phase9/herdr-core-v1.json"
         )))
         .unwrap()
+    }
+
+    fn agent_integrations_fixture() -> Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../protocol/fixtures/phase9/agent-integrations-v1.json"
+        )))
+        .unwrap()
+    }
+
+    /// Spec 029 §2, the contract both languages decode: v3 is accepted beside v2, its result
+    /// carries the integrations, an agent or state this build does not know is still a valid
+    /// answer, and the field is absent until the host's first probe lands.
+    #[test]
+    fn agent_integrations_fixture_round_trips_including_unknown_tokens() {
+        let fixture = agent_integrations_fixture();
+        for (key, method) in [
+            ("request", METHOD_WORKSPACE_SNAPSHOT_V3),
+            ("v2_request", "workspace.snapshot.v2"),
+        ] {
+            let RpcRequest::WorkspaceSnapshot(request) =
+                decode_rpc_request(&serde_json::to_vec(&fixture[key]).unwrap()).unwrap()
+            else {
+                panic!("{key} did not decode as a workspace snapshot request");
+            };
+            assert_eq!(request.method, method);
+            assert_eq!(serde_json::to_value(&request).unwrap(), fixture[key]);
+        }
+        let refusal: RpcErrorResponse =
+            serde_json::from_value(fixture["unsupported_response"].clone()).unwrap();
+        assert_eq!(refusal.error.code, "method_unknown");
+
+        for key in [
+            "response",
+            "future_response",
+            "pending_response",
+            "v2_response",
+        ] {
+            let response: WorkspaceSnapshotResponse =
+                serde_json::from_value(fixture[key].clone()).unwrap();
+            response.validate().unwrap();
+            assert_eq!(
+                serde_json::to_value(&response).unwrap(),
+                fixture[key],
+                "{key} re-encodes to the fixture"
+            );
+        }
+        let response: WorkspaceSnapshotResponse =
+            serde_json::from_value(fixture["response"].clone()).unwrap();
+        let entries: Vec<_> = response
+            .result
+            .agent_integrations
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.agent, entry.state))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("claude".to_owned(), "missing".to_owned()),
+                ("codex".to_owned(), "needs_approval".to_owned()),
+                ("pi".to_owned(), "outdated".to_owned()),
+            ]
+        );
+        for key in ["pending_response", "v2_response"] {
+            let response: WorkspaceSnapshotResponse =
+                serde_json::from_value(fixture[key].clone()).unwrap();
+            assert_eq!(response.result.agent_integrations, None, "{key}");
+        }
+    }
+
+    /// Both bounds and the token shape fail closed, each case named in the fixture with why.
+    #[test]
+    fn agent_integrations_refuses_every_shape_the_fixture_names() {
+        let fixture = agent_integrations_fixture();
+        let base: WorkspaceSnapshotResponse =
+            serde_json::from_value(fixture["response"].clone()).unwrap();
+        for case in fixture["refused_integrations"].as_array().unwrap() {
+            let mut response = base.clone();
+            response.result.agent_integrations =
+                Some(serde_json::from_value(case["agent_integrations"].clone()).unwrap());
+            assert!(
+                response.validate().is_err(),
+                "should be refused: {}",
+                case["why"]
+            );
+        }
+        let mut full = base;
+        full.result.agent_integrations = Some(
+            (0..MAX_AGENT_INTEGRATION_ENTRIES)
+                .map(|_| AgentIntegrationEntry {
+                    agent: "a".repeat(MAX_AGENT_INTEGRATION_TOKEN_BYTES),
+                    state: "needs_approval".into(),
+                })
+                .collect(),
+        );
+        full.validate()
+            .expect("exactly the bounds is a valid answer");
+    }
+
+    /// `workspace.snapshot` and `v2` keep exactly their old keys: without integrations a result
+    /// serializes with no trace of the field, which is what keeps every deployed strict decoder
+    /// reading it.
+    #[test]
+    fn a_result_without_integrations_keeps_the_older_keys_exactly() {
+        let fixture = agent_integrations_fixture();
+        let mut response: WorkspaceSnapshotResponse =
+            serde_json::from_value(fixture["response"].clone()).unwrap();
+        response.result.agent_integrations = None;
+        let encoded = serde_json::to_value(&response).unwrap();
+        let mut keys: Vec<_> = encoded["result"].as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["omitted_sessions", "providers", "v"]);
     }
 
     #[test]
@@ -4453,6 +4607,7 @@ mod tests {
                     },
                 },
                 omitted_sessions: 0,
+                agent_integrations: None,
             },
         );
         assert!(matches!(
