@@ -1,6 +1,6 @@
 //! The one place the host's relay map is defined.
 //!
-//! Both relays are Ciao-operated; see the README's relay-access limitations. This replaces
+//! The relay is Ciao-operated; see the README's relay-access limitations. This replaces
 //! Number 0's relays for packet relaying only — address publication and resolution still go
 //! through their `dns.iroh.link`, because `relay_mode` overrides nothing else.
 
@@ -8,12 +8,9 @@ use anyhow::{Context, Result, bail};
 use iroh::{RelayConfig, RelayMap};
 use iroh_relay::RelayQuicConfig;
 
-/// Region-coded, never provider- or datacenter-coded. These are compiled into shipped clients,
-/// so a hostname here can never be retired once an install has dialled it.
-pub const RELAY_URLS: [&str; 2] = [
-    "https://use1-1.relay.ciaooo.app",
-    "https://usw2-1.relay.ciaooo.app",
-];
+/// Ashburn is the sole relay after Oregon's retirement on 2026-11-09.
+/// Older two-relay clients retain Ashburn as their surviving relay.
+pub const RELAY_URLS: [&str; 1] = ["https://use1-1.relay.ciaooo.app"];
 
 /// `RelayConfig::quic` defaults to `None`, and `None` disables QUIC address discovery for that
 /// relay — silently giving up the exact capability UDP 7842 is open for. Always pass it.
@@ -82,12 +79,9 @@ mod tests {
 
     /// Deliberately literal, not `RELAY_URLS`/`QUIC_PORT`. Asserting against the same constants
     /// the map is built from moves both sides of the comparison together, and a test that
-    /// cannot fail when the constant is wrong is not a fence. These two hostnames and this port
-    /// are a contract with the deployed relays' TLS certificates and firewall rules.
-    const PINNED_URLS: [&str; 2] = [
-        "https://use1-1.relay.ciaooo.app",
-        "https://usw2-1.relay.ciaooo.app",
-    ];
+    /// cannot fail when the constant is wrong is not a fence. This hostname and port are a
+    /// contract with the deployed relay's TLS certificate and firewall rules.
+    const PINNED_URLS: [&str; 1] = ["https://use1-1.relay.ciaooo.app"];
     const PINNED_QUIC_PORT: u16 = 7842;
 
     fn urls_of(map: &RelayMap) -> Vec<String> {
@@ -98,10 +92,10 @@ mod tests {
     }
 
     #[test]
-    fn map_carries_both_relays_with_the_quic_port_and_the_token() {
+    fn map_carries_only_the_remaining_relay_with_the_quic_port_and_the_token() {
         let map = map_with_token("test-token").expect("build the relay map");
         let urls = urls_of(&map);
-        assert_eq!(urls.len(), 2, "expected exactly two relays, got {urls:?}");
+        assert_eq!(urls.len(), 1, "expected exactly one relay, got {urls:?}");
         for expected in PINNED_URLS {
             assert!(
                 urls.iter().any(|url| url == expected),
