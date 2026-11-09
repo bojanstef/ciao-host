@@ -1032,17 +1032,16 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_tui_started_by_bare_name_resolves_to_its_image_and_never_to_a_procfs_reference() {
-        use std::os::unix::process::CommandExt;
         let home = tempfile::tempdir().unwrap();
         let binary = home.path().join("codex");
-        std::fs::copy("/bin/sleep", &binary).unwrap();
+        let mut fixture = crate::process::spawn_executable_fixture(&binary);
+        let child = &mut fixture.0;
         let installed = binary.canonicalize().unwrap();
-        let mut child = std::process::Command::new(&binary)
-            .arg0("codex")
-            .arg("30")
-            .spawn()
-            .unwrap();
         crate::process::settled_executable(child.id());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "fixture must stay alive"
+        );
         let resolved = codex_binary_of(child.id())
             .await
             .expect("a relative argv[0] still names its running image");
@@ -1052,10 +1051,14 @@ pub(crate) mod tests {
             "evidence must outlive the process"
         );
         // An unrelated process keeps its own name; only an image named codex is Codex.
-        let mut other = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut unrelated =
+            crate::process::spawn_executable_fixture(&home.path().join("unrelated"));
+        let other = &mut unrelated.0;
+        crate::process::settled_executable(other.id());
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "fixture must stay alive"
+        );
         assert_eq!(codex_binary_of(other.id()).await, None);
         other.kill().unwrap();
         other.wait().unwrap();

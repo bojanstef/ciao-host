@@ -487,6 +487,35 @@ pub(crate) fn settled_executable(pid: u32) -> std::path::PathBuf {
     panic!("child {pid} never left the spawner's image");
 }
 
+/// An executable whose behavior is independent of argv[0], unlike multicall system tools.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn spawn_executable_fixture(binary: &Path) -> ExecutableFixture {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    std::fs::copy(std::env::current_exe().unwrap(), binary).unwrap();
+    let child = std::process::Command::new(binary)
+        .arg0(binary.file_name().unwrap())
+        .args(["--ignored", "--exact", "process::tests::executable_fixture"])
+        .env("CIAO_TEST_EXECUTABLE_FIXTURE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    ExecutableFixture(child)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ExecutableFixture(pub(crate) std::process::Child);
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ExecutableFixture {
+    fn drop(&mut self) {
+        // Best-effort cleanup also runs when a discovery assertion panics.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 pub(crate) async fn parent(pid: u32) -> Option<u32> {
     ps_field(pid, &[], "ppid=", false).await?.parse().ok()
 }
@@ -547,6 +576,17 @@ pub(crate) async fn request_exit(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "subprocess fixture, launched only by executable-identity tests"]
+    fn executable_fixture() {
+        assert_eq!(
+            std::env::var("CIAO_TEST_EXECUTABLE_FIXTURE").as_deref(),
+            Ok("1")
+        );
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -717,16 +757,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_executable_refers_to_the_running_inode_not_relative_argv_or_replaced_install() {
-        use std::os::unix::{fs::MetadataExt, process::CommandExt};
+        use std::os::unix::fs::MetadataExt;
         let home = tempdir().unwrap();
         let binary = home.path().join("codex");
-        fs::copy("/bin/sleep", &binary).unwrap();
-        let mut child = Command::new(&binary)
-            .arg0("codex")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut fixture = spawn_executable_fixture(&binary);
+        let child = &mut fixture.0;
         let reference = settled_executable(child.id());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "fixture must stay alive"
+        );
         let original = fs::metadata(&reference).unwrap();
         assert_eq!(original.ino(), fs::metadata(&binary).unwrap().ino());
         let replacement = home.path().join("replacement");
@@ -736,7 +776,7 @@ mod tests {
         assert_eq!(fs::metadata(&reference).unwrap().ino(), original.ino());
         assert_eq!(
             fs::read(&reference).unwrap(),
-            fs::read("/bin/sleep").unwrap()
+            fs::read(std::env::current_exe().unwrap()).unwrap()
         );
         child.kill().unwrap();
         child.wait().unwrap();
