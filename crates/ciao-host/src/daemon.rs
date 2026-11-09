@@ -74,13 +74,13 @@ use crate::{
         ProtocolError, WireMessage, base64url, kex_public, kex_shared, notification_key,
         notification_key_fingerprint, pairing_transcript_hash, read_frame, write_frame,
     },
-    pty::{CleanupReason, PtyError, PtyExit, PtySession, resolve_account},
+    pty::{CleanupReason, PtyError, PtyExit, resolve_account},
     qr::{decode_exact, encode_pairing_uri},
     storage::{
         CiaoPaths, LiveActivitySelection, LiveActivitySelectionChange, PairedDeviceStore,
         remove_socket_if_present,
     },
-    workspace::{WorkspaceConfig, capture_snapshot, detach_tmux_client, target_command},
+    workspace::{WorkspaceConfig, capture_snapshot_version, detach_tmux_client, target_command},
 };
 
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -464,6 +464,21 @@ fn target_is_resumable(
 struct AttachedSession {
     kind: crate::host_protocol::ProviderKind,
     name: String,
+    tab: Option<String>,
+}
+
+impl AttachedSession {
+    fn new(kind: crate::host_protocol::ProviderKind, name: &str, tab: Option<&str>) -> Self {
+        Self {
+            kind,
+            name: name.to_owned(),
+            // Legacy tabs are one-shot focus hints. Core's tab is the durable terminal
+            // binding and must participate when overlapping preview leases are compared.
+            tab: (kind == crate::host_protocol::ProviderKind::HerdrCore)
+                .then(|| tab.map(str::to_owned))
+                .flatten(),
+        }
+    }
 }
 
 struct PtyLease {
@@ -1086,9 +1101,11 @@ async fn terminal_slash_commands(
     state: &Arc<RuntimeState>,
     provider: crate::host_protocol::ProviderKind,
     session: &str,
+    tab: Option<&str>,
 ) -> Vec<crate::slash_commands::SlashCommand> {
     let began = Instant::now();
-    let facts = crate::workspace::pane_facts(&state.workspace, provider, session).await;
+    let facts =
+        crate::workspace::selected_pane_facts(&state.workspace, provider, session, tab).await;
     let agent = facts.agent.clone();
     if agent.as_deref() != Some(crate::slash_commands::CLAUDE_AGENT) {
         tracing::info!(
@@ -2267,13 +2284,14 @@ async fn ready_phase_rpc(
                 }
                 Ok(_guard) => {
                     let capture_began = Instant::now();
-                    let result = capture_snapshot(
+                    let result = capture_snapshot_version(
                         &state.workspace,
                         request
                             .params
                             .tabs
                             .then(|| state.agent_sessions.agent_tabs())
                             .as_ref(),
+                        request.method == "workspace.snapshot.v2",
                     )
                     .await;
                     tracing::debug!(
@@ -2335,7 +2353,13 @@ async fn ready_phase_rpc(
                 .await;
                 return Ok(());
             };
-            let commands = terminal_slash_commands(state, provider, &request.params.session).await;
+            let commands = terminal_slash_commands(
+                state,
+                provider,
+                &request.params.session,
+                request.params.tab.as_deref(),
+            )
+            .await;
             let offered = commands.len();
             let response = TerminalCommandsResponse::new(request.request_id.clone(), commands);
             match encode_terminal_commands_response_bounded(response) {
@@ -2681,7 +2705,14 @@ async fn handle_download_stream(
     // delaying previews of absolute paths.
     let session_cwd = match state.sole_attached_session(&remote_id.to_string()) {
         Some(session) => {
-            crate::workspace::session_cwd(&state.workspace, session.kind, &session.name).await
+            crate::workspace::selected_pane_facts(
+                &state.workspace,
+                session.kind,
+                &session.name,
+                session.tab.as_deref(),
+            )
+            .await
+            .cwd
         }
         None => None,
     };
@@ -3718,10 +3749,9 @@ async fn handle_terminal_stream(
     // `None` for `shell` and for `agent_route`, and an agent route's `session` field is a route
     // id rather than a session name, so neither can be mistaken for one here.
     let attached_session = match (open.validated_target().ok(), open.session.as_deref()) {
-        (Some(target), Some(name)) => target.provider().map(|kind| AttachedSession {
-            kind,
-            name: name.to_owned(),
-        }),
+        (Some(target), Some(name)) => target
+            .provider()
+            .map(|kind| AttachedSession::new(kind, name, open.tab.as_deref())),
         _ => None,
     };
     let Some(_pty_lease) = PtyLease::try_new(state.clone(), remote_id, resumable, attached_session)
@@ -3745,6 +3775,7 @@ async fn handle_terminal_stream(
     if let (Some(tab), Ok(target)) = (open.tab.as_deref(), open.validated_target())
         && agent_plan.is_none()
         && let (Some(kind), Some(session)) = (target.provider(), open.session.as_deref())
+        && kind != crate::host_protocol::ProviderKind::HerdrCore
         && !crate::workspace::focus_tab(&state.workspace, kind, session, tab).await
     {
         tracing::debug!(
@@ -3868,14 +3899,14 @@ async fn bridge_terminal(
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
     terminal_id: &str,
-    session: &mut PtySession,
+    session: &mut crate::terminal_session::TerminalSession,
     tmux_detach_binary: Option<&std::path::Path>,
     whereabouts: &crate::whereabouts::Whereabouts,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     enum Event {
         Incoming(Result<TerminalFrame, HostProtocolError>),
-        Output(Option<crate::pty::PtyOutput>),
+        Output(Option<crate::terminal_session::TerminalOutput>),
         Process(Result<PtyExit, PtyError>),
         ConnectionClosed,
         ServerShutdown,
@@ -4060,7 +4091,7 @@ async fn bridge_terminal(
 }
 
 async fn cleanup_terminal(
-    session: &mut PtySession,
+    session: &mut crate::terminal_session::TerminalSession,
     tmux_binary: Option<&std::path::Path>,
     reason: CleanupReason,
 ) {
@@ -4101,8 +4132,14 @@ fn tmux_detach_binary(
     agent_plan: Option<&crate::agent_route::AgentTerminalPlan>,
 ) -> Option<std::path::PathBuf> {
     if let Some(plan) = agent_plan {
-        return (plan.provider == crate::host_protocol::ProviderKind::Tmux)
-            .then(|| plan.program.clone());
+        return match plan {
+            crate::agent_route::AgentTerminalPlan::Command {
+                provider: crate::host_protocol::ProviderKind::Tmux,
+                program,
+                ..
+            } => Some(program.clone()),
+            _ => None,
+        };
     }
     let target = open.validated_target().ok()?;
     matches!(
@@ -4215,6 +4252,12 @@ async fn finish_terminal_error(
 }
 
 fn pty_open_error(error: PtyError) -> (&'static str, &'static str) {
+    if error == PtyError::SessionUnavailable {
+        return (
+            "provider_unavailable",
+            "The selected Herdr Core terminal is no longer available. Refresh the session list and try again.",
+        );
+    }
     match error {
         PtyError::ShellUnavailable => ("shell_unavailable", "The Mac login shell is unavailable."),
         _ => ("pty_open_failed", "The Mac could not open a login shell."),
@@ -4229,7 +4272,7 @@ fn herdr_viewer_child(
     agent_plan: Option<&crate::agent_route::AgentTerminalPlan>,
 ) -> bool {
     if let Some(plan) = agent_plan {
-        return plan.provider == crate::host_protocol::ProviderKind::Herdr;
+        return plan.provider() == crate::host_protocol::ProviderKind::Herdr;
     }
     open.validated_target()
         .is_ok_and(|target| target.provider() == Some(crate::host_protocol::ProviderKind::Herdr))
@@ -4242,7 +4285,10 @@ fn spawn_terminal_child(
     open: &TerminalOpen,
     state: &Arc<RuntimeState>,
     agent_plan: Option<&crate::agent_route::AgentTerminalPlan>,
-) -> Result<tokio::task::JoinHandle<Result<PtySession, PtyError>>, (&'static str, &'static str)> {
+) -> Result<
+    tokio::task::JoinHandle<Result<crate::terminal_session::TerminalSession, PtyError>>,
+    (&'static str, &'static str),
+> {
     let target = open
         .validated_target()
         .map_err(|_| invalid_target_error())?;
@@ -4250,11 +4296,23 @@ fn spawn_terminal_child(
         if target != crate::host_protocol::TerminalTarget::AgentRoute {
             return Err(invalid_target_error());
         }
-        return Ok(tokio::spawn(PtySession::spawn_fixed_argv(
-            open.dimensions,
-            plan.program.clone(),
-            plan.args.clone(),
-        )));
+        return Ok(match plan {
+            crate::agent_route::AgentTerminalPlan::Command { program, args, .. } => {
+                tokio::spawn(crate::terminal_session::TerminalSession::spawn_fixed_argv(
+                    open.dimensions,
+                    program.clone(),
+                    args.clone(),
+                ))
+            }
+            crate::agent_route::AgentTerminalPlan::Core { session, tab } => {
+                tokio::spawn(crate::terminal_session::TerminalSession::attach_core(
+                    state.workspace.core.clone(),
+                    session.clone(),
+                    tab.clone(),
+                    open.dimensions,
+                ))
+            }
+        });
     }
     if target == crate::host_protocol::TerminalTarget::AgentRoute {
         return Err((
@@ -4263,8 +4321,22 @@ fn spawn_terminal_child(
         ));
     }
     let Some(kind) = target.provider() else {
-        return Ok(tokio::spawn(PtySession::spawn_login_shell(open.dimensions)));
+        return Ok(tokio::spawn(
+            crate::terminal_session::TerminalSession::spawn_login_shell(open.dimensions),
+        ));
     };
+    if kind == crate::host_protocol::ProviderKind::HerdrCore {
+        let session = open.session.clone().ok_or_else(invalid_target_error)?;
+        let tab = open.tab.clone().ok_or_else(invalid_target_error)?;
+        return Ok(tokio::spawn(
+            crate::terminal_session::TerminalSession::attach_core(
+                state.workspace.core.clone(),
+                session,
+                tab,
+                open.dimensions,
+            ),
+        ));
+    }
     let Some(binary) = state.workspace.resolve(kind) else {
         return Err((
             "provider_unavailable",
@@ -4276,11 +4348,9 @@ fn spawn_terminal_child(
         .map_err(|_| ("pty_open_failed", "The Mac could not open the session."))?;
     let (program, args) = target_command(target, session, &binary, &account.home)
         .map_err(|_| invalid_target_error())?;
-    Ok(tokio::spawn(PtySession::spawn_fixed_argv(
-        open.dimensions,
-        program,
-        args,
-    )))
+    Ok(tokio::spawn(
+        crate::terminal_session::TerminalSession::spawn_fixed_argv(open.dimensions, program, args),
+    ))
 }
 
 async fn resolve_agent_terminal_plan(
@@ -5076,10 +5146,12 @@ mod tests {
         let other_device = iroh::SecretKey::generate().public();
         let state = test_state(host_id, &temp.path().join("paired-devices.json"));
         let ciao = AttachedSession {
+            tab: None,
             kind: crate::host_protocol::ProviderKind::Herdr,
             name: "ciao".into(),
         };
         let boxes = AttachedSession {
+            tab: None,
             kind: crate::host_protocol::ProviderKind::Tmux,
             name: "boxes".into(),
         };
@@ -5127,6 +5199,40 @@ mod tests {
             state.attached_sessions.lock().is_empty(),
             "a dropped lease takes its session with it"
         );
+    }
+
+    #[test]
+    fn preview_attachment_keeps_core_binding_but_discards_legacy_focus_hint() {
+        use crate::host_protocol::ProviderKind;
+        let temp = tempdir().unwrap();
+        let state = test_state(
+            iroh::SecretKey::generate().public(),
+            &temp.path().join("paired-devices.json"),
+        );
+        let device = iroh::SecretKey::generate().public();
+        let first = AttachedSession::new(ProviderKind::Tmux, "same", Some("@2"));
+        let reconnect = AttachedSession::new(ProviderKind::Tmux, "same", None);
+        let one = PtyLease::try_new(state.clone(), device, true, Some(first.clone())).unwrap();
+        let two = PtyLease::try_new(state.clone(), device, true, Some(reconnect)).unwrap();
+        assert_eq!(
+            state.sole_attached_session(&device.to_string()),
+            Some(first)
+        );
+        drop((one, two));
+        let first = AttachedSession::new(
+            ProviderKind::HerdrCore,
+            "same",
+            Some("0123456789abcdef0123456789abcdef:t1"),
+        );
+        let other = AttachedSession::new(
+            ProviderKind::HerdrCore,
+            "same",
+            Some("0123456789abcdef0123456789abcdef:t2"),
+        );
+        let one = PtyLease::try_new(state.clone(), device, true, Some(first)).unwrap();
+        let two = PtyLease::try_new(state.clone(), device, true, Some(other)).unwrap();
+        assert_eq!(state.sole_attached_session(&device.to_string()), None);
+        drop((one, two));
     }
 
     /// `PathProbeWatch` table: host-side conviction of a one-way blackhole, so the rows are

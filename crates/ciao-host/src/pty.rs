@@ -46,6 +46,8 @@ pub(crate) enum PtyError {
     OpenFailed,
     #[error("the shell could not be spawned")]
     SpawnFailed,
+    #[error("the selected provider session is unavailable")]
+    SessionUnavailable,
     #[error("the PTY input queue is closed")]
     InputClosed,
     #[error("the PTY input frame is invalid")]

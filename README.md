@@ -27,7 +27,8 @@ This downloads and runs an installer; read [the script](scripts/install.sh) firs
 - **macOS, Apple silicon** (`aarch64-apple-darwin`): official artifact; the physically qualified host profile uses launchd.
 - **Linux, x86-64/glibc** (`x86_64-unknown-linux-gnu`): official artifact; bounded Debian/LXC and Rocky installation/service evidence exists. Full Linux PTY, tmux/Herdr and phone acceptance is incomplete, including newer workspace behavior. Compilation is not runtime qualification.
 - No official Intel Mac, Linux ARM, musl or native Windows artifact. WSL is not separately runtime-qualified by this export.
-- Terminals support a login shell, tmux and Herdr. A plain shell is not resumable after actual stream loss; use a multiplexer for durable work. Hosts must remain awake and reachable. iOS does not promise a live connection while suspended.
+- Terminals support a login shell, tmux, the Herdr TUI and Herdr Core (used by the desktop app). A plain shell is not resumable after actual stream loss; use a multiplexer for durable work. Hosts must remain awake and reachable. iOS does not promise a live connection while suspended.
+- Herdr Core requires **0.1.19 or newer, API generation 1**, and a Ciao app that requests `workspace.snapshot.v2`. Ciao discovers existing terminals in the user's standard Core socket locations and reconnects to the selected terminal. It does not start Core or create terminals. Custom socket/state/runtime-directory overrides are outside automatic discovery; the legacy Herdr provider remains separate.
 - Attached **Claude Code and Codex are read-only** in the native conversation view; use the terminal to interact. Managed Claude sessions and adopted Codex threads provide separate write paths with ownership and capability checks. Managed Pi/Codex creation is not supported.
 - Attached **Pi** supports bounded commands only when the host proves the live route. Other extensions' custom UI can be only partially observed. Ciao adds no Pi permission gate or model switch.
 - Integration support is version-gated; unsupported input does not authorize new controls. `ciao agent status` and `ciao drift` explain the local verdict. Do not widen pins to bypass a refusal. Full attached/managed/adopted physical acceptance matrices remain incomplete.
@@ -56,7 +57,7 @@ From this tree, with no private environment files:
 
 ```sh
 unset CIAO_RELAY_TOKEN CIAO_TEST_CLAUDE_CLI CIAO_TEST_CODEX_CLI CIAO_TEST_CODEX_E2E
-unset CIAO_TEST_SYSTEM_TMUX CIAO_TEST_SLASH_PROBE
+unset CIAO_TEST_SYSTEM_TMUX CIAO_TEST_SLASH_PROBE CIAO_TEST_HERDR_CORE_BIN
 cargo metadata --locked --format-version 1 > /dev/null
 cargo build --locked
 cargo fmt --check
@@ -75,6 +76,8 @@ bun test \
 ```
 
 Cargo downloads locked registry dependencies. Local tests use disposable files, loopback listeners, PTYs and synthetic agents; do not enable live-test environment gates or `--ignored` as part of routine checks. Some environment-gated Rust cases return early and still count as passed: a green summary is not live-vendor evidence. Manual managed-Claude conformance probes are deliberately not exported or automated; they can consume model turns and throttle an account.
+
+For an explicit native Core check, set `CIAO_TEST_HERDR_CORE_BIN` to an absolute path to a verified Core executable and run `cargo test --locked -p ciao-host grounded_core_roundtrip_reconnect_and_route_when_explicitly_enabled -- --nocapture`. This test owns a disposable Core server and two synthetic shells; it checks input/output, resize, selected-terminal routing, detach survival, reconnect and cleanup without using existing Core sessions or model turns.
 
 Keep `Cargo.lock`, exact transport pins, and both `[patch.crates-io]` overrides. `vendor/iroh/CIAO-PATCH.md` and `vendor/noq-proto/CIAO-PATCH.md` describe the narrow patches. **Crates alone cannot build:** the host embeds `worker.mjs`, the Pi extension and Codex protocol pins from `integrations/` and tests read `protocol/fixtures/`.
 

@@ -88,6 +88,7 @@ const MAX_HERDR_TAB_QUERIES: usize = 8;
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceConfig {
     binary_dirs: Vec<PathBuf>,
+    pub(crate) core: crate::herdr_core::CoreConfig,
 }
 
 impl WorkspaceConfig {
@@ -101,14 +102,27 @@ impl WorkspaceConfig {
                 .iter()
                 .map(|relative| home.join(relative)),
         );
-        Self { binary_dirs }
+        Self {
+            binary_dirs,
+            core: crate::herdr_core::CoreConfig::for_home(home),
+        }
     }
     #[cfg(test)]
     pub(crate) fn with_binary_dirs(binary_dirs: Vec<PathBuf>) -> Self {
-        Self { binary_dirs }
+        let home = binary_dirs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/nonexistent-ciao-test"));
+        Self {
+            binary_dirs,
+            core: crate::herdr_core::CoreConfig::at(home.join(".local/state/herdr-core")),
+        }
     }
 
     pub(crate) fn resolve(&self, kind: ProviderKind) -> Option<PathBuf> {
+        if kind == ProviderKind::HerdrCore {
+            return None;
+        }
         self.binary_dirs
             .iter()
             .map(|directory| directory.join(kind.wire()))
@@ -152,7 +166,7 @@ pub(crate) fn target_command(
         ],
         TerminalTarget::HerdrAttach => vec!["session".into(), "attach".into(), session.into()],
         TerminalTarget::HerdrCreate => vec!["--session".into(), session.into()],
-        TerminalTarget::Shell | TerminalTarget::AgentRoute => {
+        TerminalTarget::Shell | TerminalTarget::AgentRoute | TerminalTarget::HerdrCoreAttach => {
             return Err(HostProtocolError::UnsupportedTarget);
         }
     };
@@ -371,9 +385,18 @@ pub(crate) async fn existing_tmux_sessions(
 /// `tabs` carries both decisions at once: `None` omits tab listings entirely, `Some(index)`
 /// includes them annotated with the agent sessions that index names. One parameter rather than a
 /// flag beside a map, so annotating tabs nobody asked for is unrepresentable.
+#[cfg(test)]
 pub(crate) async fn capture_snapshot(
     config: &WorkspaceConfig,
     tabs: Option<&AgentTabIndex>,
+) -> WorkspaceSnapshotResult {
+    capture_snapshot_version(config, tabs, false).await
+}
+
+pub(crate) async fn capture_snapshot_version(
+    config: &WorkspaceConfig,
+    tabs: Option<&AgentTabIndex>,
+    include_core: bool,
 ) -> WorkspaceSnapshotResult {
     let deadline = Instant::now() + SNAPSHOT_BUDGET;
     let tmux_config = config.clone();
@@ -384,6 +407,10 @@ pub(crate) async fn capture_snapshot(
         tokio::spawn(async move { snapshot_tmux(&tmux_config, tmux_agents.as_ref()).await });
     let mut herdr_task =
         tokio::spawn(async move { snapshot_herdr(&herdr_config, herdr_agents.as_ref()).await });
+    let mut core_task = include_core.then(|| {
+        let config = config.core.clone();
+        tokio::spawn(async move { crate::herdr_core::discover(&config).await })
+    });
 
     let (tmux, tmux_omitted) = match timeout_at(deadline, &mut tmux_task).await {
         Ok(Ok(outcome)) => outcome,
@@ -403,10 +430,78 @@ pub(crate) async fn capture_snapshot(
         }
     };
 
+    let (herdr_core, core_omitted) = match core_task.as_mut() {
+        None => (None, 0),
+        Some(task) => match timeout_at(deadline, &mut *task).await {
+            Ok(Ok(discovery)) => {
+                let state = if !discovery.sessions.is_empty()
+                    || (!discovery.failed && !discovery.unsupported && discovery.present)
+                {
+                    PROVIDER_STATE_AVAILABLE
+                } else if discovery.unsupported {
+                    PROVIDER_STATE_UNSUPPORTED_VERSION
+                } else if discovery.failed {
+                    PROVIDER_STATE_ERROR
+                } else {
+                    PROVIDER_STATE_NOT_INSTALLED
+                };
+                let version = discovery
+                    .sessions
+                    .first()
+                    .map(|session| session.version.clone());
+                let sessions = discovery
+                    .sessions
+                    .into_iter()
+                    .map(|session| {
+                        let entries = tabs.map(|agents| {
+                            let entries = session
+                                .terminals
+                                .into_iter()
+                                .map(|terminal| SessionTabEntry {
+                                    id: terminal.tab,
+                                    label: terminal.label,
+                                    focused: false,
+                                    status: terminal.status,
+                                    agent: terminal.facts.agent,
+                                    agent_session_id: None,
+                                    workspace: None,
+                                })
+                                .collect();
+                            annotate_agents(ProviderKind::HerdrCore, &session.name, entries, agents)
+                        });
+                        HerdrSessionEntry {
+                            is_default: session.name == "default",
+                            name: session.name,
+                            running: true,
+                            tabs: entries.filter(|entries| !entries.is_empty()),
+                        }
+                    })
+                    .collect();
+                (
+                    Some(HerdrProviderSnapshot {
+                        state: state.into(),
+                        version,
+                        sessions: (state == PROVIDER_STATE_AVAILABLE).then_some(sessions),
+                    }),
+                    discovery.omitted,
+                )
+            }
+            _ => {
+                task.abort();
+                (Some(error_herdr(None)), 0)
+            }
+        },
+    };
     WorkspaceSnapshotResult {
         v: crate::host_protocol::HOST_PROTOCOL_VERSION,
-        providers: WorkspaceProviders { tmux, herdr },
-        omitted_sessions: tmux_omitted.saturating_add(herdr_omitted),
+        providers: WorkspaceProviders {
+            tmux,
+            herdr,
+            herdr_core,
+        },
+        omitted_sessions: tmux_omitted
+            .saturating_add(herdr_omitted)
+            .saturating_add(core_omitted),
     }
 }
 
@@ -1033,6 +1128,7 @@ pub(crate) async fn focus_tab(
         return false;
     };
     match kind {
+        ProviderKind::HerdrCore => false,
         ProviderKind::Tmux => {
             if !tmux_window_id(tab) {
                 return false;
@@ -1065,9 +1161,9 @@ pub(crate) async fn focus_tab(
 pub(crate) struct PaneFacts {
     /// Absolute and validated, or absent. Never a relative or provider-shaped answer.
     pub(crate) cwd: Option<String>,
-    /// The provider's own word for what is running: `claude`, `codex`, `pi`. Carried verbatim
-    /// and never widened here — a caller that cares matches the exact name it supports, so a
-    /// dialect this build has never met reads as "no agent" rather than as the nearest one.
+    /// The provider's word for what is running: `claude`, `codex`, `pi`. Only documented
+    /// aliases are normalized at their provider boundary (Core's `claude-code` is `claude`).
+    /// Callers match the exact supported name; unknown dialects are never guessed.
     ///
     /// Absent on tmux, which is a gap rather than an answer — see `pane_facts`.
     pub(crate) agent: Option<String>,
@@ -1087,6 +1183,7 @@ pub(crate) struct PaneFacts {
 /// Best effort throughout. An absent provider, a wedged one, a session that has since closed,
 /// or an answer that is not an absolute path all return `None`, and the preview then refuses a
 /// relative token exactly as it does today.
+#[cfg(test)]
 pub(crate) async fn session_cwd(
     config: &WorkspaceConfig,
     kind: ProviderKind,
@@ -1117,6 +1214,26 @@ pub(crate) async fn pane_facts(
         .unwrap_or_default()
 }
 
+/// Core has no global focused terminal: all current-directory and command reads must carry
+/// the exact terminal the device selected, including its persistent Core identity.
+pub(crate) async fn selected_pane_facts(
+    config: &WorkspaceConfig,
+    kind: ProviderKind,
+    session: &str,
+    tab: Option<&str>,
+) -> PaneFacts {
+    if kind == ProviderKind::HerdrCore {
+        let Some(tab) = tab else {
+            return PaneFacts::default();
+        };
+        return crate::herdr_core::terminal(&config.core, session, tab)
+            .await
+            .map(|terminal| terminal.facts)
+            .unwrap_or_default();
+    }
+    pane_facts(config, kind, session).await
+}
+
 async fn inner_pane_facts(
     config: &WorkspaceConfig,
     kind: ProviderKind,
@@ -1128,6 +1245,7 @@ async fn inner_pane_facts(
     let binary = config.resolve(kind)?;
     let mut agent = None;
     let reported = match kind {
+        ProviderKind::HerdrCore => return None,
         ProviderKind::Tmux => {
             // The scoped `=session` form for the same reason `focus_tab` uses it: exact-name
             // matching rather than tmux's prefix search, which could answer for a different
@@ -1437,6 +1555,7 @@ pub(crate) fn parse_version_stdout(kind: ProviderKind, stdout: &[u8]) -> Option<
     let prefix = match kind {
         ProviderKind::Tmux => "tmux ",
         ProviderKind::Herdr => "herdr ",
+        ProviderKind::HerdrCore => return None,
     };
     let token = first.strip_prefix(prefix)?.trim();
     let valid = !token.is_empty()
@@ -1453,6 +1572,7 @@ pub(crate) fn version_meets_minimum(kind: ProviderKind, version: &str) -> bool {
         ProviderKind::Tmux => parse_tmux_version(version),
         // Herdr uses a numeric dotted release core and may append a bounded prerelease suffix.
         ProviderKind::Herdr => parse_herdr_version(version),
+        ProviderKind::HerdrCore => return false,
     };
     let Some((major, minor)) = parsed else {
         return false;
@@ -1460,6 +1580,7 @@ pub(crate) fn version_meets_minimum(kind: ProviderKind, version: &str) -> bool {
     match kind {
         ProviderKind::Tmux => major >= TMUX_MIN_MAJOR,
         ProviderKind::Herdr => (major, minor) >= HERDR_MIN_MAJOR_MINOR,
+        ProviderKind::HerdrCore => false,
     }
 }
 

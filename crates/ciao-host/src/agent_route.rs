@@ -68,13 +68,19 @@ pub(crate) enum AgentRouteProof {
         /// stale — so it is deliberately absent from `revalidate` and used only to aim the attach.
         tab_id: Option<String>,
     },
+    HerdrCore {
+        bridge_pid: u32,
+        session_name: String,
+        tab_id: String,
+        terminal_pid: u32,
+    },
 }
 
 impl AgentRouteProof {
     pub(crate) const fn continuity(&self) -> RouteContinuity {
         match self {
             Self::Tmux { .. } => RouteContinuity::ExactLive,
-            Self::HerdrWorkspace { .. } => RouteContinuity::WorkspaceOnly,
+            Self::HerdrWorkspace { .. } | Self::HerdrCore { .. } => RouteContinuity::WorkspaceOnly,
         }
     }
 
@@ -87,6 +93,15 @@ impl AgentRouteProof {
     /// from the tab list, and the caller must leave that tab unannotated rather than guess.
     pub(crate) fn tab_key(&self) -> Option<(ProviderKind, String, String)> {
         match self {
+            Self::HerdrCore {
+                session_name,
+                tab_id,
+                ..
+            } => Some((
+                ProviderKind::HerdrCore,
+                session_name.clone(),
+                tab_id.clone(),
+            )),
             Self::Tmux {
                 session_name,
                 window_id,
@@ -104,10 +119,24 @@ impl AgentRouteProof {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AgentTerminalPlan {
-    pub(crate) program: PathBuf,
-    pub(crate) args: Vec<OsString>,
-    pub(crate) provider: ProviderKind,
+pub(crate) enum AgentTerminalPlan {
+    Command {
+        program: PathBuf,
+        args: Vec<OsString>,
+        provider: ProviderKind,
+    },
+    Core {
+        session: String,
+        tab: String,
+    },
+}
+impl AgentTerminalPlan {
+    pub(crate) fn provider(&self) -> ProviderKind {
+        match self {
+            Self::Command { provider, .. } => *provider,
+            Self::Core { .. } => ProviderKind::HerdrCore,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +162,18 @@ impl TerminalRouteResolver {
     /// provider call an hour in the worst case and not worth a cache that could go stale.
     pub(crate) async fn tab_label(&self, proof: &AgentRouteProof) -> Option<String> {
         match proof {
+            AgentRouteProof::HerdrCore {
+                session_name,
+                tab_id,
+                ..
+            } => crate::herdr_core::terminal(&self.workspace.core, session_name, tab_id)
+                .await
+                .filter(|terminal| {
+                    tab_id
+                        .split_once(':')
+                        .is_none_or(|(_, address)| terminal.label != address)
+                })
+                .map(|terminal| terminal.label),
             AgentRouteProof::Tmux {
                 binary, window_id, ..
             } => {
@@ -193,7 +234,22 @@ impl TerminalRouteResolver {
             if let Some(proof) = self.resolve_tmux(bridge_pid).await {
                 return Some(proof);
             }
-            self.resolve_herdr_workspace(bridge_pid).await
+            // These equally limited workspace routes have independent providers. A stale
+            // Core socket must not consume the legacy Herdr probe's entire request budget.
+            let legacy = self.resolve_herdr_workspace(bridge_pid);
+            let core = self.resolve_core(bridge_pid);
+            tokio::pin!(legacy, core);
+            tokio::select! {
+                biased;
+                proof = &mut legacy => match proof {
+                    Some(proof) => Some(proof),
+                    None => core.await,
+                },
+                proof = &mut core => match proof {
+                    Some(proof) => Some(proof),
+                    None => legacy.await,
+                },
+            }
         })
         .await
         .ok()
@@ -203,6 +259,22 @@ impl TerminalRouteResolver {
     pub(crate) async fn revalidate(&self, proof: &AgentRouteProof) -> bool {
         timeout(ROUTE_RESOLUTION_TIMEOUT, async {
             match proof {
+                AgentRouteProof::HerdrCore {
+                    bridge_pid,
+                    session_name,
+                    tab_id,
+                    terminal_pid,
+                } => {
+                    let Some(terminal) =
+                        crate::herdr_core::terminal(&self.workspace.core, session_name, tab_id)
+                            .await
+                    else {
+                        return false;
+                    };
+                    terminal.pid == Some(*terminal_pid)
+                        && process::exists(*bridge_pid)
+                        && process::descends_from(*bridge_pid, *terminal_pid).await
+                }
                 AgentRouteProof::Tmux {
                     binary,
                     bridge_pid,
@@ -256,6 +328,14 @@ impl TerminalRouteResolver {
             return None;
         }
         match proof {
+            AgentRouteProof::HerdrCore {
+                session_name,
+                tab_id,
+                ..
+            } => Some(AgentTerminalPlan::Core {
+                session: session_name.clone(),
+                tab: tab_id.clone(),
+            }),
             AgentRouteProof::Tmux {
                 binary,
                 session_id,
@@ -273,7 +353,7 @@ impl TerminalRouteResolver {
                 if !selected_pane || !self.revalidate(proof).await {
                     return None;
                 }
-                Some(AgentTerminalPlan {
+                Some(AgentTerminalPlan::Command {
                     program: binary.clone(),
                     args: vec!["attach-session".into(), "-t".into(), session_id.into()],
                     provider: ProviderKind::Tmux,
@@ -293,7 +373,7 @@ impl TerminalRouteResolver {
                 if let Some(tab_id) = tab_id {
                     focus_tab(&self.workspace, ProviderKind::Herdr, session_name, tab_id).await;
                 }
-                Some(AgentTerminalPlan {
+                Some(AgentTerminalPlan::Command {
                     program: binary.clone(),
                     args: vec!["session".into(), "attach".into(), session_name.into()],
                     provider: ProviderKind::Herdr,
@@ -317,6 +397,26 @@ impl TerminalRouteResolver {
                     pane_pid: pane.pane_pid,
                     pane_tty: pane.pane_tty,
                 });
+            }
+        }
+        None
+    }
+
+    async fn resolve_core(&self, bridge_pid: u32) -> Option<AgentRouteProof> {
+        let discovered = crate::herdr_core::discover(&self.workspace.core).await;
+        for session in discovered.sessions {
+            for terminal in session.terminals {
+                let Some(pid) = terminal.pid else {
+                    continue;
+                };
+                if process::descends_from(bridge_pid, pid).await {
+                    return Some(AgentRouteProof::HerdrCore {
+                        bridge_pid,
+                        session_name: session.name,
+                        tab_id: terminal.tab,
+                        terminal_pid: pid,
+                    });
+                }
             }
         }
         None
@@ -930,6 +1030,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthy_legacy_herdr_route_does_not_wait_for_silent_core_sockets() {
+        let temp = tempfile::Builder::new()
+            .prefix("ciao-route-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let herdr = temp.path().join("herdr");
+        executable(
+            &herdr,
+            &format!(
+                r#"#!/bin/sh
+case "$*" in
+  'session list --json') printf '%s' '{{"sessions":[{{"name":"default"}}]}}' ;;
+  '--session default api snapshot') printf '%s' '{{"result":{{"snapshot":{{"panes":[{{"pane_id":"pane1","terminal_id":"term1","tab_id":"tab1"}}]}}}}}}' ;;
+  '--session default pane process-info --pane pane1') printf '%s' '{{"result":{{"process_info":{{"pane_id":"pane1","foreground_processes":[{{"pid":{}}}]}}}}}}' ;;
+  *) exit 1 ;;
+esac
+"#,
+                std::process::id()
+            ),
+        );
+        let mut workspace = WorkspaceConfig::with_binary_dirs(vec![temp.path().to_owned()]);
+        let core_root = temp.path().join("cores");
+        workspace.core = crate::herdr_core::CoreConfig::at(core_root.clone());
+        let mut listeners = Vec::new();
+        for index in 0..6 {
+            let session = format!("silent-{index}");
+            let directory = core_root.join(&session);
+            std::fs::create_dir_all(&directory).unwrap();
+            listeners.push(
+                tokio::net::UnixListener::bind(directory.join(format!("{session}.sock"))).unwrap(),
+            );
+        }
+        let resolver = TerminalRouteResolver::new(workspace);
+        let proof = timeout(Duration::from_secs(2), resolver.resolve(std::process::id()))
+            .await
+            .expect(
+                "healthy legacy route must finish independently of Core's four-second discovery",
+            )
+            .expect("legacy fixture correlates to the test process");
+        assert!(matches!(proof, AgentRouteProof::HerdrWorkspace { .. }));
+        assert_eq!(proof.continuity(), RouteContinuity::WorkspaceOnly);
+    }
+
+    #[tokio::test]
     async fn terminal_plan_uses_only_fixed_tmux_argv_and_rejects_stale_proof() {
         let temp = tempdir().unwrap();
         let log = temp.path().join("argv.log");
@@ -993,9 +1137,12 @@ mod tests {
         let proof = resolver.resolve(pid).await.expect("exact tmux proof");
         assert_eq!(proof.continuity(), RouteContinuity::ExactLive);
         let plan = resolver.terminal_plan(&proof).await.expect("fixed plan");
-        assert_eq!(plan.provider, ProviderKind::Tmux);
+        let AgentTerminalPlan::Command { provider, args, .. } = plan else {
+            panic!("expected tmux plan")
+        };
+        assert_eq!(provider, ProviderKind::Tmux);
         assert_eq!(
-            plan.args,
+            args,
             vec![
                 OsString::from("attach-session"),
                 OsString::from("-t"),
@@ -1028,8 +1175,11 @@ mod tests {
             .terminal_plan(&proof)
             .await
             .expect("live focus plan");
-        assert_eq!(plan.provider, ProviderKind::Tmux);
-        assert_eq!(plan.args.first(), Some(&OsString::from("attach-session")));
+        let AgentTerminalPlan::Command { provider, args, .. } = plan else {
+            panic!("expected tmux plan")
+        };
+        assert_eq!(provider, ProviderKind::Tmux);
+        assert_eq!(args.first(), Some(&OsString::from("attach-session")));
     }
 
     #[test]

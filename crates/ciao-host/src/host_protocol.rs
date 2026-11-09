@@ -185,6 +185,51 @@ pub fn valid_tab_id(id: &str) -> bool {
         })
 }
 
+/// Core resets its terminal counter when its state is wiped. Bind the address to the
+/// persistent core identity so a saved route can never open the replacement `t1`.
+pub fn valid_herdr_core_tab_id(id: &str) -> bool {
+    let Some((core, terminal)) = id.split_once(':') else {
+        return false;
+    };
+    let Some(number) = terminal.strip_prefix('t') else {
+        return false;
+    };
+    if id.len() > MAX_TAB_ID_BYTES || !valid_machine_token(core) {
+        return false;
+    }
+    // Core's counter uses a decimal leading digit and a base-30 tail, not decimal tN.
+    // Count the shorter ranges as well so overflow is refused exactly as upstream does.
+    const SYMBOLS: &[u8] = b"0123456789bcdfghjkmnpqrstvwxyz";
+    let mut digits = number.bytes();
+    let Some(first @ b'1'..=b'9') = digits.next() else {
+        return false;
+    };
+    let mut value = u64::from(first - b'1');
+    let (mut before, mut size) = (0_u64, 9_u64);
+    for digit in digits {
+        let Some(digit) = SYMBOLS.iter().position(|symbol| *symbol == digit) else {
+            return false;
+        };
+        let Some(next) = value
+            .checked_mul(30)
+            .and_then(|v| v.checked_add(digit as u64))
+        else {
+            return false;
+        };
+        let Some(next_before) = before.checked_add(size) else {
+            return false;
+        };
+        let Some(next_size) = size.checked_mul(30) else {
+            return false;
+        };
+        (value, before, size) = (next, next_before, next_size);
+    }
+    before
+        .checked_add(value)
+        .and_then(|v| v.checked_add(1))
+        .is_some_and(|v| u32::try_from(v).is_ok())
+}
+
 /// Labels are display text the host has already sanitized (Spec 021 §4.3): bounded,
 /// control-free UTF-8.
 pub fn valid_tab_label(label: &str) -> bool {
@@ -218,6 +263,7 @@ pub fn valid_tab_agent(agent: &str) -> bool {
 pub enum ProviderKind {
     Tmux,
     Herdr,
+    HerdrCore,
 }
 
 impl ProviderKind {
@@ -225,6 +271,7 @@ impl ProviderKind {
         match self {
             Self::Tmux => "tmux",
             Self::Herdr => "herdr",
+            Self::HerdrCore => "herdr_core",
         }
     }
 }
@@ -236,6 +283,7 @@ pub enum TerminalTarget {
     TmuxCreate,
     HerdrAttach,
     HerdrCreate,
+    HerdrCoreAttach,
     AgentRoute,
 }
 
@@ -247,6 +295,7 @@ impl TerminalTarget {
             "tmux.create" => Some(Self::TmuxCreate),
             "herdr.attach" => Some(Self::HerdrAttach),
             "herdr.create" => Some(Self::HerdrCreate),
+            "herdr_core.attach" => Some(Self::HerdrCoreAttach),
             "agent_route" => Some(Self::AgentRoute),
             _ => None,
         }
@@ -259,6 +308,7 @@ impl TerminalTarget {
             Self::TmuxCreate => "tmux.create",
             Self::HerdrAttach => "herdr.attach",
             Self::HerdrCreate => "herdr.create",
+            Self::HerdrCoreAttach => "herdr_core.attach",
             Self::AgentRoute => "agent_route",
         }
     }
@@ -268,6 +318,7 @@ impl TerminalTarget {
             Self::Shell => None,
             Self::TmuxAttach | Self::TmuxCreate => Some(ProviderKind::Tmux),
             Self::HerdrAttach | Self::HerdrCreate => Some(ProviderKind::Herdr),
+            Self::HerdrCoreAttach => Some(ProviderKind::HerdrCore),
             Self::AgentRoute => None,
         }
     }
@@ -631,6 +682,8 @@ fn is_false(value: &bool) -> bool {
 pub struct TerminalCommandsParams {
     pub target: String,
     pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -654,6 +707,7 @@ impl TerminalCommandsRequest {
             params: TerminalCommandsParams {
                 target: target.wire().into(),
                 session,
+                tab: None,
             },
         }
     }
@@ -672,8 +726,21 @@ impl TerminalCommandsRequest {
         if !valid_session_name(&self.params.session) {
             return Err(HostProtocolError::InvalidControlValue);
         }
-        TerminalTarget::from_wire(&self.params.target)
-            .ok_or(HostProtocolError::UnsupportedTarget)?
+        let target = TerminalTarget::from_wire(&self.params.target)
+            .ok_or(HostProtocolError::UnsupportedTarget)?;
+        if target == TerminalTarget::HerdrCoreAttach {
+            if !self
+                .params
+                .tab
+                .as_deref()
+                .is_some_and(valid_herdr_core_tab_id)
+            {
+                return Err(HostProtocolError::InvalidTarget);
+            }
+        } else if self.params.tab.is_some() {
+            return Err(HostProtocolError::InvalidTarget);
+        }
+        target
             .provider()
             .ok_or(HostProtocolError::UnsupportedTarget)
     }
@@ -804,7 +871,10 @@ impl WorkspaceSnapshotRequest {
             return Err(HostProtocolError::UnexpectedOrder);
         }
         validate_request_id(&self.request_id)?;
-        if self.method != "workspace.snapshot" {
+        if !matches!(
+            self.method.as_str(),
+            "workspace.snapshot" | "workspace.snapshot.v2"
+        ) {
             return Err(HostProtocolError::UnsupportedMethod);
         }
         Ok(())
@@ -1295,6 +1365,10 @@ pub struct HerdrProviderSnapshot {
 pub struct WorkspaceProviders {
     pub tmux: TmuxProviderSnapshot,
     pub herdr: HerdrProviderSnapshot,
+    /// Emitted only for workspace.snapshot.v2. The legacy response must retain exactly
+    /// its old keys because deployed apps decode the provider object strictly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr_core: Option<HerdrProviderSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1410,6 +1484,24 @@ impl WorkspaceSnapshotResult {
             |session: &HerdrSessionEntry| session.name.as_str(),
             |session: &HerdrSessionEntry| session.tabs.as_deref(),
         )?;
+        if let Some(core) = &self.providers.herdr_core {
+            validate_provider_shape(
+                &core.state,
+                core.version.as_deref(),
+                core.sessions.as_deref(),
+                |session: &HerdrSessionEntry| session.name.as_str(),
+                |session: &HerdrSessionEntry| session.tabs.as_deref(),
+            )?;
+            if core.sessions.iter().flatten().any(|session| {
+                session
+                    .tabs
+                    .iter()
+                    .flatten()
+                    .any(|tab| !valid_herdr_core_tab_id(&tab.id))
+            }) {
+                return Err(HostProtocolError::InvalidControlValue);
+            }
+        }
         Ok(())
     }
 }
@@ -1519,13 +1611,20 @@ pub fn encode_terminal_commands_response_bounded(
     }
 }
 
-/// Cuts a quarter off whichever tab listing is longest, herdr before tmux, and reports whether
-/// anything was cut. Order within a listing is the provider's, so the cut comes off the end.
+/// Cuts a quarter off the longest listing across all providers. Order within a listing is
+/// the provider's, so the cut comes off the end.
 fn shorten_longest_tab_list(response: &mut WorkspaceSnapshotResponse) -> bool {
     let providers = &mut response.result.providers;
     let herdr = providers.herdr.sessions.iter_mut().flatten();
     let longest = herdr
         .filter_map(|entry| entry.tabs.as_mut())
+        .chain(
+            providers
+                .herdr_core
+                .iter_mut()
+                .flat_map(|provider| provider.sessions.iter_mut().flatten())
+                .filter_map(|entry| entry.tabs.as_mut()),
+        )
         .chain(
             providers
                 .tmux
@@ -1542,8 +1641,8 @@ fn shorten_longest_tab_list(response: &mut WorkspaceSnapshotResponse) -> bool {
     true
 }
 
-/// Drops sessions deterministically until the encoded response fits `MAX_RPC_BODY`: herdr
-/// sessions from the end of the list first, then the oldest tmux sessions by `created_unix`.
+/// Drops sessions deterministically until the encoded response fits `MAX_RPC_BODY`: Core,
+/// then legacy Herdr, from the end; finally the oldest tmux sessions by `created_unix`.
 /// Every dropped session increments `omitted_sessions`.
 pub fn encode_snapshot_response_bounded(
     mut response: WorkspaceSnapshotResponse,
@@ -1585,6 +1684,19 @@ pub fn encode_snapshot_response_bounded(
                 sessions[index].tabs = None;
                 continue;
             }
+        }
+        // A Core session without its terminal binding cannot be opened. Keep its last tab
+        // until the whole session must go, and count that omission like every other row.
+        if let Some(sessions) = response
+            .result
+            .providers
+            .herdr_core
+            .as_mut()
+            .and_then(|provider| provider.sessions.as_mut())
+            && sessions.pop().is_some()
+        {
+            response.result.omitted_sessions = response.result.omitted_sessions.saturating_add(1);
+            continue;
         }
         let herdr = response.result.providers.herdr.sessions.as_mut();
         if let Some(sessions) = herdr
@@ -1695,7 +1807,7 @@ pub fn decode_rpc_request(body: &[u8]) -> Result<RpcRequest, HostProtocolError> 
             request.validate()?;
             Ok(RpcRequest::HostInfo(request))
         }
-        "workspace.snapshot" => {
+        "workspace.snapshot" | "workspace.snapshot.v2" => {
             let request: WorkspaceSnapshotRequest =
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             request.validate()?;
@@ -1987,9 +2099,8 @@ pub struct TerminalOpen {
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// Spec 021 §3.4: a one-shot focus hint, never part of the target's identity. Only attach
-    /// targets may carry it, and the app only sends it for rows a tabs-capable host produced,
-    /// so a host that predates the field (and would refuse the unknown key) never sees it.
+    /// A one-shot focus hint for legacy providers. For Herdr Core this is instead the
+    /// required, identity-bound terminal address; a stale address must fail closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab: Option<String>,
     #[serde(flatten)]
@@ -2016,7 +2127,11 @@ impl TerminalOpen {
             (Some(session), true) if valid_session_name(session) => {}
             _ => return Err(HostProtocolError::InvalidTarget),
         }
-        if let Some(tab) = &self.tab {
+        if target == TerminalTarget::HerdrCoreAttach {
+            if !self.tab.as_deref().is_some_and(valid_herdr_core_tab_id) {
+                return Err(HostProtocolError::InvalidTarget);
+            }
+        } else if let Some(tab) = &self.tab {
             // A tab hint is meaningful only where there is an existing multiplexer session to
             // focus inside; every other target refuses it rather than ignoring it.
             let attach = matches!(
@@ -4002,6 +4117,7 @@ mod tests {
             WorkspaceSnapshotResult {
                 v: 1,
                 providers: WorkspaceProviders {
+                    herdr_core: None,
                     tmux: TmuxProviderSnapshot {
                         state: PROVIDER_STATE_AVAILABLE.into(),
                         version: Some("3.7b".into()),
@@ -4067,6 +4183,7 @@ mod tests {
             WorkspaceSnapshotResult {
                 v: 1,
                 providers: WorkspaceProviders {
+                    herdr_core: None,
                     tmux: TmuxProviderSnapshot {
                         state: PROVIDER_STATE_AVAILABLE.into(),
                         version: Some("3.7b".into()),
@@ -4131,6 +4248,7 @@ mod tests {
             WorkspaceSnapshotResult {
                 v: 1,
                 providers: WorkspaceProviders {
+                    herdr_core: None,
                     tmux: TmuxProviderSnapshot {
                         state: PROVIDER_STATE_AVAILABLE.into(),
                         version: Some("3.7b".into()),
@@ -4173,6 +4291,131 @@ mod tests {
         validate_capabilities(&vec!["terminal.shell".into(); 16]).unwrap();
     }
 
+    fn herdr_core_fixture() -> Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../protocol/fixtures/phase9/herdr-core-v1.json"
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn herdr_core_shared_contract_keeps_provider_namespaces_distinct() {
+        let fixture = herdr_core_fixture();
+        for key in ["request", "legacy_request", "commands_request"] {
+            decode_rpc_request(&serde_json::to_vec(&fixture[key]).unwrap()).unwrap();
+        }
+        let response: WorkspaceSnapshotResponse =
+            serde_json::from_value(fixture["response"].clone()).unwrap();
+        response.validate().unwrap();
+        let legacy = response.result.providers.herdr.sessions.as_ref().unwrap();
+        let core = response
+            .result
+            .providers
+            .herdr_core
+            .as_ref()
+            .unwrap()
+            .sessions
+            .as_ref()
+            .unwrap();
+        assert_eq!(legacy[0].name, core[0].name);
+        assert_ne!(ProviderKind::Herdr, ProviderKind::HerdrCore);
+        assert_ne!(
+            legacy[0].tabs.as_ref().unwrap()[0].id,
+            core[0].tabs.as_ref().unwrap()[0].id
+        );
+        let open: TerminalOpen = serde_json::from_value(fixture["open"].clone()).unwrap();
+        assert_eq!(
+            open.validated_target().unwrap(),
+            TerminalTarget::HerdrCoreAttach
+        );
+        let mut missing = open.clone();
+        missing.tab = None;
+        assert!(
+            missing.validate().is_err(),
+            "Core has no implicit active terminal"
+        );
+        for id in fixture["invalid_core_tabs"].as_array().unwrap() {
+            let mut invalid = open.clone();
+            invalid.tab = Some(id.as_str().unwrap().into());
+            assert!(invalid.validate().is_err(), "{id}");
+        }
+        for id in fixture["valid_core_tabs"].as_array().unwrap() {
+            assert!(valid_herdr_core_tab_id(id.as_str().unwrap()), "{id}");
+        }
+        let mut legacy_response = response;
+        legacy_response.result.providers.herdr_core = None;
+        assert_eq!(
+            serde_json::to_value(legacy_response).unwrap()["result"]["providers"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        let hello =
+            HostHelloResponse::new(REQUEST_ID.into(), HOST_ID.into(), INSTALLATION_ID.into());
+        hello.validate().unwrap();
+        assert_eq!(hello.result.capabilities.len(), 16);
+    }
+
+    #[test]
+    fn herdr_core_bounds_preserve_an_openable_identity_or_count_the_missing_session() {
+        let fixture = herdr_core_fixture();
+        let mut response: WorkspaceSnapshotResponse =
+            serde_json::from_value(fixture["response"].clone()).unwrap();
+        let core = response.result.providers.herdr_core.as_mut().unwrap();
+        let template = core.sessions.as_ref().unwrap()[0].clone();
+        core.sessions = Some(
+            (0..MAX_SESSIONS_PER_PROVIDER)
+                .map(|index| {
+                    let mut session = template.clone();
+                    session.name = format!("core{index}");
+                    session.tabs = Some(
+                        (1..=MAX_TABS_PER_SESSION)
+                            .map(|index| SessionTabEntry {
+                                id: format!("0123456789abcdef0123456789abcdef:t{index}"),
+                                label: "x".repeat(MAX_TAB_LABEL_BYTES),
+                                focused: false,
+                                status: None,
+                                agent_session_id: None,
+                                agent: None,
+                                workspace: None,
+                            })
+                            .collect(),
+                    );
+                    session
+                })
+                .collect(),
+        );
+        response.validate().unwrap();
+        assert!(matches!(
+            encode_rpc(&response),
+            Err(HostProtocolError::FrameTooLarge)
+        ));
+        let (bytes, kept) = encode_snapshot_response_bounded(response.clone()).unwrap();
+        assert!(bytes.len() <= MAX_RPC_BODY + 4);
+        kept.validate().unwrap();
+        let core = kept
+            .result
+            .providers
+            .herdr_core
+            .as_ref()
+            .unwrap()
+            .sessions
+            .as_ref()
+            .unwrap();
+        assert!(!core.is_empty());
+        assert!(
+            core.iter()
+                .all(|session| session.tabs.as_ref().is_some_and(|tabs| !tabs.is_empty()))
+        );
+        assert_eq!(
+            kept.result.omitted_sessions as usize,
+            MAX_SESSIONS_PER_PROVIDER - core.len()
+        );
+        assert_eq!(bytes, encode_snapshot_response_bounded(response).unwrap().0);
+    }
+
     #[test]
     fn snapshot_truncation_is_deterministic_and_counts_omitted_sessions() {
         let tmux_sessions: Vec<TmuxSessionEntry> = (0..64_u64)
@@ -4197,6 +4440,7 @@ mod tests {
             WorkspaceSnapshotResult {
                 v: 1,
                 providers: WorkspaceProviders {
+                    herdr_core: None,
                     tmux: TmuxProviderSnapshot {
                         state: PROVIDER_STATE_AVAILABLE.into(),
                         version: Some("3.6b".into()),
