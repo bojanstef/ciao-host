@@ -49,9 +49,9 @@ use crate::{
         HostHelloResponse, HostInfoResponse, HostInfoResult, HostProtocolError, HostReceiveState,
         LiveActivityRegisterResponse, MAX_FORWARD_STREAMS, MAX_INCOMING_BIDI_STREAMS,
         MAX_INCOMING_UNI_STREAMS, MAX_NORMAL_CONNECTIONS, MAX_NORMAL_CONNECTIONS_PER_ENDPOINT,
-        MAX_PENDING_HANDSHAKES, NotificationsRegisterResponse, RpcErrorResponse, RpcRequest,
-        STREAM_BACKPRESSURE, STREAM_FORWARD_LIMIT, STREAM_INTERNAL, STREAM_MALFORMED,
-        STREAM_PTY_FAILURE, STREAM_TERMINAL_LIMIT, STREAM_UNEXPECTED, StreamKind,
+        MAX_PENDING_HANDSHAKES, METHOD_WORKSPACE_SNAPSHOT_V3, NotificationsRegisterResponse,
+        RpcErrorResponse, RpcRequest, STREAM_BACKPRESSURE, STREAM_FORWARD_LIMIT, STREAM_INTERNAL,
+        STREAM_MALFORMED, STREAM_PTY_FAILURE, STREAM_TERMINAL_LIMIT, STREAM_UNEXPECTED, StreamKind,
         TerminalCommandsResponse, TerminalError, TerminalExit, TerminalFrame, TerminalOpen,
         TerminalOpened, WorkspaceSnapshotResponse, decode_rpc_request,
         encode_snapshot_response_bounded, encode_terminal_commands_response_bounded, read_rpc_body,
@@ -279,6 +279,9 @@ struct RuntimeState {
     /// Spec 007 upload storage under `state_dir/uploads/`; the daemon owns its TTL/quota
     /// sweeping, never the phone.
     uploads: crate::uploads::UploadStore,
+    /// Spec 029: which agent integrations this host has, probed in the background and read by
+    /// `workspace.snapshot.v3` without ever making a snapshot wait.
+    integrations: crate::integration_status::IntegrationStatusCache,
 }
 
 impl RuntimeState {
@@ -834,6 +837,7 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
         managed_workers,
         host_info,
         uploads: crate::uploads::UploadStore::new(paths.state_dir.join("uploads")),
+        integrations: crate::integration_status::IntegrationStatusCache::for_host(paths.clone()),
     });
 
     let listener = bind_control_socket(&paths).await?;
@@ -846,6 +850,9 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     // Spec 007 §3.6: upload cleanup runs at daemon startup — catching partials orphaned by a
     // hard kill, which no connection teardown can clean — and then periodically.
     state.uploads.sweep();
+    // Spec 029 §3: the first integration probe starts now, so the first v3 snapshot a phone
+    // asks for usually already has an answer. The call itself never waits.
+    let _ = state.integrations.current();
     let monitor = tokio::spawn(monitor_home_relay(endpoint.clone(), state.clone()));
     let route_monitor = tokio::spawn(monitor_agent_routes(state.clone()));
     let upload_sweeper = tokio::spawn(sweep_uploads(state.clone()));
@@ -2284,16 +2291,22 @@ async fn ready_phase_rpc(
                 }
                 Ok(_guard) => {
                     let capture_began = Instant::now();
-                    let result = capture_snapshot_version(
+                    let v3 = request.method == METHOD_WORKSPACE_SNAPSHOT_V3;
+                    let mut result = capture_snapshot_version(
                         &state.workspace,
                         request
                             .params
                             .tabs
                             .then(|| state.agent_sessions.agent_tabs())
                             .as_ref(),
-                        request.method == "workspace.snapshot.v2",
+                        v3 || request.method == "workspace.snapshot.v2",
                     )
                     .await;
+                    // Spec 029: v3 alone carries the integrations, read from the cache so a
+                    // sweep never waits on an agent CLI. Absent until the first probe lands.
+                    if v3 {
+                        result.agent_integrations = state.integrations.current();
+                    }
                     tracing::debug!(
                         remote = %short_endpoint_id(remote_id),
                         ms = capture_began.elapsed().as_millis() as u64,
@@ -4980,6 +4993,18 @@ mod tests {
                     .unwrap_or_else(|| std::path::Path::new("."))
                     .join("uploads"),
             ),
+            // A fixture never runs agent CLIs: its probe answers one fixed entry, so a test can
+            // tell "before the first probe" (no field) from "after it" (this entry).
+            integrations: crate::integration_status::IntegrationStatusCache::with_probe(
+                std::sync::Arc::new(|| {
+                    Box::pin(async {
+                        vec![crate::host_protocol::AgentIntegrationEntry {
+                            agent: crate::host_protocol::IntegrationAgent::Claude,
+                            state: crate::host_protocol::IntegrationState::Missing,
+                        }]
+                    })
+                }),
+            ),
         })
     }
 
@@ -6700,6 +6725,35 @@ mod tests {
             decode_snapshot_response(&rpc_body).unwrap(),
             SnapshotRpcResponse::Snapshot(_)
         ));
+
+        // Spec 029: v3 is dispatched beside the older methods and reads the daemon's cache.
+        // The first ask starts the probe and answers without waiting for it: no field. The
+        // fixture's probe returns at once, so the next ask carries its answer.
+        let mut v3_request = WorkspaceSnapshotRequest::new("AAECAwQFBgcICQoLDA0ODw".into());
+        v3_request.method = crate::host_protocol::METHOD_WORKSPACE_SNAPSHOT_V3.into();
+        let rpc = encode_rpc(&v3_request).unwrap();
+        let mut answers = Vec::new();
+        for _ in 0..2 {
+            let rpc_body = timeout(Duration::from_secs(2), open_rpc_stream(&connection, &rpc))
+                .await
+                .unwrap();
+            let SnapshotRpcResponse::Snapshot(v3) = decode_snapshot_response(&rpc_body).unwrap()
+            else {
+                panic!("a v3 snapshot request was refused");
+            };
+            answers.push(v3.result.agent_integrations);
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(answers[0], None, "the first v3 answer waited on the probe");
+        assert_eq!(
+            answers[1],
+            Some(vec![crate::host_protocol::AgentIntegrationEntry {
+                agent: crate::host_protocol::IntegrationAgent::Claude,
+                state: crate::host_protocol::IntegrationState::Missing,
+            }])
+        );
 
         // One paired device owns at most one live subscription, keeping its queue at 1 MiB —
         // enforced by superseding, not by refusing. The device asking is the one in the user's

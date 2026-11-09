@@ -502,6 +502,9 @@ pub(crate) async fn capture_snapshot_version(
         omitted_sessions: tmux_omitted
             .saturating_add(herdr_omitted)
             .saturating_add(core_omitted),
+        // The daemon adds this for `workspace.snapshot.v3` alone, from its cached probe
+        // (Spec 029 §3); a capture never runs agent CLIs itself.
+        agent_integrations: None,
     }
 }
 
