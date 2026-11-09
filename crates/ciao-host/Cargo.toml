@@ -1,6 +1,6 @@
 [package]
 name = "ciao-host"
-version = "0.1.60"
+version = "0.1.61"
 description = "Ciao host CLI and daemon"
 edition.workspace = true
 rust-version.workspace = true
