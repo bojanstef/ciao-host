@@ -403,8 +403,7 @@ test.each(CONFIGURATION.rejected_sources)("destination configuration rejects uns
 test("rollback to a pre-contract daemon retains its isolated configuration", async () => {
 	const { journal, frames } = await startWorker([], undefined, undefined, undefined,
 		{ [CONFIGURATION.environment_key]: undefined, CLAUDE_CODE_ENABLE_CFC: "1" }, true);
-	await eventually(() => journal().options !== null);
-	expect(frames.some((frame) => frame.type === "register")).toBe(true);
+	await eventually(() => journal().options !== null && frames.some((frame) => frame.type === "register"));
 	expect(journal().options.settingSources).toEqual(CONFIGURATION.legacy_absent_source.settingSources);
 	expect(journal().options.systemPrompt).toBe(CONFIGURATION.legacy_absent_source.systemPrompt);
 	expect(Object.hasOwn(journal().options.extraArgs, "chrome")).toBe(CONFIGURATION.legacy_absent_source.chrome);
