@@ -1,0 +1,20 @@
+{
+  "description": "Opt-in Herdr Core discovery. Legacy workspace.snapshot never emits herdr_core. A v2-aware app retries legacy only on method_unknown. Core terminal ids bind the core generation identity and never fall back to another terminal.",
+  "request": {"v":1,"type":"request","request_id":"AAECAwQFBgcICQoLDA0ODw","method":"workspace.snapshot.v2","params":{"tabs":true}},
+  "legacy_request": {"v":1,"type":"request","request_id":"AAECAwQFBgcICQoLDA0ODw","method":"workspace.snapshot","params":{"tabs":true}},
+  "unsupported_response": {"v":1,"type":"error","request_id":"AAECAwQFBgcICQoLDA0ODw","error":{"code":"method_unknown","message":"This method is not supported."}},
+  "response": {
+    "v":1,"type":"response","request_id":"AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v":1,
+      "providers": {
+        "tmux":{"state":"available","version":"3.7b","sessions":[]},
+        "herdr":{"state":"available","version":"0.9.5","sessions":[{"name":"default","running":true,"is_default":true,"tabs":[{"id":"w1:t1","label":"TUI project","focused":true}]}]},
+        "herdr_core":{"state":"available","version":"0.1.19","sessions":[{"name":"default","running":true,"is_default":true,"tabs":[{"id":"0123456789abcdef0123456789abcdef:t1","label":"App project","focused":false}]}]}
+      },
+      "omitted_sessions":0
+    }
+  },
+  "open": {"v":1,"target":"herdr_core.attach","session":"default","tab":"0123456789abcdef0123456789abcdef:t1","cols":80,"rows":24,"pixel_width":0,"pixel_height":0},
+  "invalid_core_tabs":["t1", "other/t1", "0123456789abcdef0123456789abcdef:t0", "0123456789abcdef0123456789abcdef:t1;exit", "0123456789abcdef0123456789abcdef:t1:extra"]
+}
