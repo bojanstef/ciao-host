@@ -2156,6 +2156,17 @@ async fn hello_phase_rpc(
             let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
             Ok(HelloPhaseOutcome::KeepWaiting)
         }
+        Ok(RpcRequest::TerminalTabCreate(request)) => {
+            send_rpc_error_code(
+                send,
+                Some(request.request_id),
+                "not_ready",
+                "The Ciao host connection is not ready for this request.",
+            )
+            .await;
+            let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
+            Ok(HelloPhaseOutcome::KeepWaiting)
+        }
         Ok(RpcRequest::TerminalCommands(request)) => {
             send_rpc_error_code(
                 send,
@@ -2330,6 +2341,56 @@ async fn ready_phase_rpc(
                         }
                     }
                 }
+            }
+        }
+        Ok(RpcRequest::TerminalTabCreate(request)) => {
+            if require_finished_request(send, recv, Some(request.request_id.clone()))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            if !state.paired_devices.lock().contains(remote_id) {
+                send_rpc_error_code(
+                    send,
+                    Some(request.request_id),
+                    "authorization_denied",
+                    "This installation is no longer authorized.",
+                )
+                .await;
+                return Ok(());
+            }
+            // Share the connection's workspace-operation guard; never queue mutations behind
+            // another request. No retry on a failed/ambiguous provider response.
+            let Ok(_guard) = snapshot_busy.try_lock() else {
+                send_rpc_error_code(
+                    send,
+                    Some(request.request_id),
+                    "busy",
+                    "A workspace operation is already in progress.",
+                )
+                .await;
+                return Ok(());
+            };
+            if let Some(result) =
+                crate::terminal_tabs::create(&state.workspace, &request.params).await
+            {
+                let response = crate::host_protocol::TerminalTabCreateResponse {
+                    v: 1,
+                    message_type: "response",
+                    request_id: request.request_id,
+                    result,
+                };
+                let _ = write_rpc(send, &response).await;
+                finish_rpc_send(send).await;
+            } else {
+                send_rpc_error_code(
+                    send,
+                    Some(request.request_id),
+                    "creation_unconfirmed",
+                    "Could not confirm the new tab. Check the host board before trying again.",
+                )
+                .await;
             }
         }
         Ok(RpcRequest::TerminalCommands(request)) => {

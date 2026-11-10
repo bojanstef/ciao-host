@@ -279,6 +279,56 @@ pub(crate) async fn terminal(
         .find(|terminal| terminal.tab == tab)
 }
 
+/// Create on the verified existing Core only. No argv means Core's configured shell.
+/// A timeout is ambiguous and must never be retried automatically.
+pub(crate) async fn create_terminal(
+    config: &CoreConfig,
+    session: &str,
+    binding: &str,
+) -> Result<String, CoreError> {
+    if !valid_herdr_core_tab_id(binding) {
+        return Err(CoreError::Invalid);
+    }
+    timeout(Duration::from_secs(5), async {
+        let mut stream = BufReader::new(config.connect(session).await?);
+        let hello = plain_call(&mut stream, 1, "hello", json!({"generation":1})).await?;
+        let (identity, version) = parse_hello(&hello)?;
+        let (expected, address) = binding.split_once(':').ok_or(CoreError::Invalid)?;
+        if identity != expected {
+            return Err(CoreError::Invalid);
+        }
+        let selected =
+            plain_call(&mut stream, 2, "terminal.get", json!({"terminal":address})).await?;
+        let selected = parse_terminal(&selected, &identity, &version).ok_or(CoreError::Invalid)?;
+        if selected.tab != binding {
+            return Err(CoreError::Invalid);
+        }
+        let cwd = selected.facts.cwd.ok_or(CoreError::Invalid)?;
+        let created = plain_call(
+            &mut stream,
+            3,
+            "terminal.run",
+            json!({
+                "cwd":cwd, "no_parent":true, "no_notify":true
+            }),
+        )
+        .await?;
+        // RunResult flattens Terminal and adds these two optional fields.
+        let mut terminal = created;
+        if let Some(object) = terminal.as_object_mut() {
+            object.remove("wait");
+            object.remove("output");
+        }
+        let created = parse_terminal(&terminal, &identity, &version).ok_or(CoreError::Invalid)?;
+        if created.tab == binding {
+            return Err(CoreError::Invalid);
+        }
+        Ok(created.tab)
+    })
+    .await
+    .map_err(|_| CoreError::Invalid)?
+}
+
 fn parse_hello(value: &Value) -> Result<(String, String), CoreError> {
     unknown_fields(
         value,
@@ -1063,6 +1113,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_tab_uses_selected_cwd_and_core_shell_on_the_verified_socket() {
+        let (_temp, config, listener) = fixture();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            request(&mut stream).await;
+            reply(stream.get_mut(), 1, hello(false)).await;
+            let get = request(&mut stream).await;
+            assert_eq!(get["method"], "terminal.get");
+            assert_eq!(get["params"], json!({"terminal":"t1"}));
+            reply(stream.get_mut(), 2, row("t1")).await;
+            let run = request(&mut stream).await;
+            assert_eq!(run["method"], "terminal.run");
+            assert_eq!(
+                run["params"],
+                json!({"cwd":"/tmp/current","no_parent":true,"no_notify":true})
+            );
+            reply(stream.get_mut(), 3, row("t2")).await;
+        });
+        assert_eq!(
+            create_terminal(&config, "default", &format!("{ID}:t1"))
+                .await
+                .unwrap(),
+            format!("{ID}:t2")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_tab_refuses_stale_identity_or_missing_terminal_without_running() {
+        for stale_identity in [true, false] {
+            let (_temp, config, listener) = fixture();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                request(&mut stream).await;
+                reply(stream.get_mut(), 1, hello(false)).await;
+                if !stale_identity {
+                    request(&mut stream).await;
+                    reply(stream.get_mut(), 2, row("t2")).await;
+                }
+                let mut line = String::new();
+                assert_eq!(
+                    stream.read_line(&mut line).await.unwrap(),
+                    0,
+                    "must not send terminal.run"
+                );
+            });
+            let binding = if stale_identity {
+                format!("{}:t1", "f".repeat(32))
+            } else {
+                format!("{ID}:t1")
+            };
+            assert!(create_terminal(&config, "default", &binding).await.is_err());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn discovery_is_read_only_and_uses_live_core_identity() {
         let (_temp, config, listener) = fixture();
         let server = tokio::spawn(async move {
@@ -1518,6 +1627,36 @@ mod tests {
                 .find(|terminal| terminal.pid == Some(pid))
                 .unwrap();
             let tab = first.tab.clone();
+            let new_tab = create_terminal(&test_config, "default", &tab)
+                .await
+                .unwrap();
+            let new_terminal = terminal(&test_config, "default", &new_tab).await.unwrap();
+            assert_eq!(new_terminal.facts.cwd.as_deref(), first_cwd.to_str());
+            assert_ne!(new_terminal.pid, Some(pid));
+            let mut new_viewer = CoreSession::attach(
+                test_config.clone(),
+                "default".into(),
+                new_tab.clone(),
+                size(),
+            )
+            .await
+            .unwrap();
+            new_viewer
+                .send_input(b"printf 'CIAO_%s\\n' NEW_TAB_OK\n".to_vec())
+                .await
+                .unwrap();
+            live_output_contains(&mut new_viewer, b"CIAO_NEW_TAB_OK").await;
+            new_viewer
+                .cleanup(CleanupReason::ExplicitClose)
+                .await
+                .unwrap();
+            assert_eq!(
+                terminal(&test_config, "default", &new_tab)
+                    .await
+                    .unwrap()
+                    .pid,
+                new_terminal.pid
+            );
             let mut workspace = crate::workspace::WorkspaceConfig::with_binary_dirs(vec![]);
             workspace.core = test_config.clone();
             let facts = crate::workspace::selected_pane_facts(

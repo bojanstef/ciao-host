@@ -1,0 +1,16 @@
+{
+  "tui_request": {"v":1,"type":"request","request_id":"AAECAwQFBgcICQoLDA0ODw","method":"terminal.tab.create.v1","params":{"target":"herdr.attach","session":"default"}},
+  "core_request": {"v":1,"type":"request","request_id":"AAECAwQFBgcICQoLDA0ODw","method":"terminal.tab.create.v1","params":{"target":"herdr_core.attach","session":"default","tab":"0123456789abcdef0123456789abcdef:t1"}},
+  "tui_response": {"v":1,"type":"response","request_id":"AAECAwQFBgcICQoLDA0ODw","result":{"tab":"w1:t2"}},
+  "core_response": {"v":1,"type":"response","request_id":"AAECAwQFBgcICQoLDA0ODw","result":{"tab":"0123456789abcdef0123456789abcdef:t2"}},
+  "invalid_params": [
+    {"target":"shell","session":"default"},
+    {"target":"tmux.attach","session":"default"},
+    {"target":"herdr.create","session":"default"},
+    {"target":"herdr.attach","session":"../default"},
+    {"target":"herdr.attach","session":"default","tab":"w1:t1"},
+    {"target":"herdr.attach","session":"default","cwd":"/tmp"},
+    {"target":"herdr_core.attach","session":"default"},
+    {"target":"herdr_core.attach","session":"default","tab":"t1"}
+  ]
+}

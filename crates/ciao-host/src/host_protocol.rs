@@ -758,6 +758,68 @@ impl TerminalCommandsRequest {
     }
 }
 
+pub const METHOD_TERMINAL_TAB_CREATE: &str = "terminal.tab.create.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalTabCreateParams {
+    pub target: String,
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalTabCreateRequest {
+    pub v: u8,
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub request_id: String,
+    pub method: String,
+    pub params: TerminalTabCreateParams,
+}
+
+impl TerminalTabCreateRequest {
+    pub fn validate(&self) -> Result<(), HostProtocolError> {
+        validate_request_id(&self.request_id)?;
+        if self.v != HOST_PROTOCOL_VERSION
+            || self.message_type != "request"
+            || self.method != METHOD_TERMINAL_TAB_CREATE
+        {
+            return Err(HostProtocolError::InvalidControlValue);
+        }
+        self.params.validate()
+    }
+}
+
+impl TerminalTabCreateParams {
+    pub fn validate(&self) -> Result<(), HostProtocolError> {
+        if !valid_session_name(&self.session) {
+            return Err(HostProtocolError::InvalidTarget);
+        }
+        match (self.target.as_str(), self.tab.as_deref()) {
+            ("herdr.attach", None) => Ok(()),
+            ("herdr_core.attach", Some(tab)) if valid_herdr_core_tab_id(tab) => Ok(()),
+            _ => Err(HostProtocolError::InvalidTarget),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct TerminalTabCreateResponse {
+    pub v: u8,
+    #[serde(rename = "type")]
+    pub message_type: &'static str,
+    pub request_id: String,
+    pub result: CreatedTerminalTab,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreatedTerminalTab {
+    pub tab: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalCommandsResult {
@@ -1248,6 +1310,7 @@ pub enum RpcRequest {
     NotificationsRegister(NotificationsRegisterRequest),
     LiveActivityRegister(LiveActivityRegisterRequest),
     TerminalCommands(TerminalCommandsRequest),
+    TerminalTabCreate(TerminalTabCreateRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1956,6 +2019,12 @@ pub fn decode_rpc_request(body: &[u8]) -> Result<RpcRequest, HostProtocolError> 
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             request.validate()?;
             Ok(RpcRequest::LiveActivityRegister(request))
+        }
+        METHOD_TERMINAL_TAB_CREATE => {
+            let request: TerminalTabCreateRequest =
+                serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
+            request.validate()?;
+            Ok(RpcRequest::TerminalTabCreate(request))
         }
         CAPABILITY_TERMINAL_COMMANDS => {
             let request: TerminalCommandsRequest =
