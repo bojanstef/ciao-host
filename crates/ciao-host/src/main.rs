@@ -28,6 +28,6 @@ async fn main() {
 
     if let Err(error) = ciao_host::cli::run().await {
         eprintln!("ciao: {error:#}");
-        std::process::exit(1);
+        std::process::exit(ciao_host::cli::error_exit_code(&error));
     }
 }

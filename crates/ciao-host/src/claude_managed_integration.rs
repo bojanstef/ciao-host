@@ -8,7 +8,13 @@
 
 use std::io::{ErrorKind, Read};
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
+
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
+use tokio::process::Command;
 
 use anyhow::{Context, Result, bail};
 
@@ -50,7 +56,7 @@ pub(crate) fn refresh_installed_managed_worker(paths: &CiaoPaths) -> Result<bool
     Ok(true)
 }
 
-pub(crate) fn install_managed_claude(paths: &CiaoPaths) -> Result<()> {
+pub(crate) async fn install_managed_claude(paths: &CiaoPaths) -> Result<()> {
     let prefix = &paths.managed_sdk_prefix;
     ensure_private_directory(prefix).context("create the managed SDK prefix")?;
     write_worker_entrypoint(&paths.managed_worker_entrypoint)?;
@@ -76,23 +82,13 @@ pub(crate) fn install_managed_claude(paths: &CiaoPaths) -> Result<()> {
         serde_json::json!({ "name": "ciao-managed-claude", "private": true }).to_string(),
     )
     .context("prepare the managed SDK prefix")?;
-    clear_sdk_tree(prefix)?;
-    let status = Command::new("npm")
-        .args([
-            "install",
-            &format!("@anthropic-ai/claude-agent-sdk@{PINNED_CLAUDE_SDK_VERSION}"),
-            "--no-audit",
-            "--no-fund",
-        ])
-        .current_dir(prefix)
-        .status()
-        .context("run npm to install the pinned Claude Agent SDK")?;
-    if !status.success() {
-        bail!("npm could not install the pinned Claude Agent SDK.");
-    }
-    // The install is only complete when the pinned pair verifies by digest.
-    ManagedRuntime::resolve(prefix, &paths.managed_worker_entrypoint)
-        .map_err(|reason| anyhow::anyhow!("the installed Claude runtime is unusable: {reason}"))?;
+    println!("Verifying the installed Claude runtime…");
+    ensure_managed_sdk(
+        prefix,
+        &paths.managed_worker_entrypoint,
+        Command::new("npm"),
+    )
+    .await?;
     // A deliberate reinstall supersedes any self-restore news; stale news is noise.
     let _ = std::fs::remove_file(prefix.join(HEAL_MARKER_FILE));
     Ok(())
@@ -112,7 +108,10 @@ pub(crate) fn install_managed_claude(paths: &CiaoPaths) -> Result<()> {
 ///
 /// ponytail: one attempt per daemon run, not per cause. A second corruption in one lifetime is
 /// a disk or an attacker, not drift, and thrashing npm at it helps neither; a restart re-arms.
-pub(crate) fn try_restore_managed_claude_once(sdk_prefix: &Path, worker_entrypoint: &Path) -> bool {
+pub(crate) async fn try_restore_managed_claude_once(
+    sdk_prefix: &Path,
+    worker_entrypoint: &Path,
+) -> bool {
     use std::sync::atomic::{AtomicBool, Ordering};
     static ATTEMPTED_THIS_RUN: AtomicBool = AtomicBool::new(false);
     // Eligibility before the once-guard: a refusal on a never-installed prefix must not spend
@@ -123,7 +122,7 @@ pub(crate) fn try_restore_managed_claude_once(sdk_prefix: &Path, worker_entrypoi
     if ATTEMPTED_THIS_RUN.swap(true, Ordering::SeqCst) {
         return false;
     }
-    match restore_at(sdk_prefix, worker_entrypoint, &tool_path) {
+    match restore_at(sdk_prefix, worker_entrypoint, &tool_path).await {
         Ok(()) => {
             write_heal_marker(sdk_prefix, "restored", "");
             tracing::info!(
@@ -139,7 +138,7 @@ pub(crate) fn try_restore_managed_claude_once(sdk_prefix: &Path, worker_entrypoi
     }
 }
 
-fn restore_at(sdk_prefix: &Path, worker_entrypoint: &Path, tool_path: &str) -> Result<()> {
+async fn restore_at(sdk_prefix: &Path, worker_entrypoint: &Path, tool_path: &str) -> Result<()> {
     ensure_private_directory(sdk_prefix).context("create the managed SDK prefix")?;
     write_worker_entrypoint(worker_entrypoint)?;
     std::fs::write(
@@ -147,28 +146,81 @@ fn restore_at(sdk_prefix: &Path, worker_entrypoint: &Path, tool_path: &str) -> R
         serde_json::json!({ "name": "ciao-managed-claude", "private": true }).to_string(),
     )
     .context("restore the managed SDK prefix")?;
-    clear_sdk_tree(sdk_prefix)?;
     let npm = npm_from_recorded_path(tool_path)
         .ok_or_else(|| anyhow::anyhow!("npm was not found on the recorded PATH"))?;
-    let status = Command::new(npm)
-        .args([
-            "install",
-            &format!("@anthropic-ai/claude-agent-sdk@{PINNED_CLAUDE_SDK_VERSION}"),
-            "--no-audit",
-            "--no-fund",
-        ])
-        // The recorded PATH, exactly as the worker spawn uses it: what worked at install time,
-        // not what launchd happens to offer.
-        .env("PATH", tool_path)
-        .current_dir(sdk_prefix)
-        .status()
-        .context("run npm to restore the pinned Claude Agent SDK")?;
-    if !status.success() {
-        bail!("npm could not restore the pinned Claude Agent SDK");
+    let mut command = Command::new(npm);
+    // Preserve the install-time environment, never the daemon's minimal PATH.
+    command.env("PATH", tool_path);
+    ensure_managed_sdk(sdk_prefix, worker_entrypoint, command).await
+}
+
+const SDK_INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Reuse only an install that passes the same version/digest gate as a worker launch. Setup
+/// used to delete even a healthy 137 MB Linux runtime and download it on every repair.
+async fn ensure_managed_sdk(prefix: &Path, worker: &Path, mut npm: Command) -> Result<()> {
+    if ManagedRuntime::resolve(prefix, worker).is_ok() {
+        println!("Claude runtime verified; no download needed.");
+        return Ok(());
     }
-    ManagedRuntime::resolve(sdk_prefix, worker_entrypoint)
-        .map_err(|reason| anyhow::anyhow!("the restored runtime is still unusable: {reason}"))?;
+    clear_sdk_tree(prefix)?;
+    println!(
+        "Installing the pinned Claude runtime from npm (up to {} minutes; Ctrl-C cancels)…",
+        SDK_INSTALL_TIMEOUT.as_secs() / 60
+    );
+    npm.args([
+        "install",
+        &format!("@anthropic-ai/claude-agent-sdk@{PINNED_CLAUDE_SDK_VERSION}"),
+        "--no-audit",
+        "--no-fund",
+        "--progress=false",
+    ])
+    .current_dir(prefix);
+    run_npm(npm, SDK_INSTALL_TIMEOUT).await?;
+    ManagedRuntime::resolve(prefix, worker)
+        .map_err(|reason| anyhow::anyhow!("the installed Claude runtime is unusable: {reason}"))?;
     Ok(())
+}
+
+/// One process group for npm and its install scripts. Dropping the future (CLI cancellation
+/// or daemon shutdown) kills the owned group; Tokio's child handle arranges direct-child reaping.
+struct NpmProcess {
+    child: tokio::process::Child,
+    group: Pid,
+}
+
+impl Drop for NpmProcess {
+    fn drop(&mut self) {
+        let _ = killpg(self.group, Signal::SIGKILL);
+    }
+}
+
+async fn run_npm(mut command: Command, budget: Duration) -> Result<()> {
+    command
+        .stdin(std::process::Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
+        .context("run npm for the pinned Claude Agent SDK")?;
+    let group = Pid::from_raw(child.id().context("npm process has no PID")? as i32);
+    let mut process = NpmProcess { child, group };
+    match tokio::time::timeout(budget, process.child.wait()).await {
+        Ok(status) => {
+            if !status.context("wait for npm")?.success() {
+                bail!("npm could not install the pinned Claude Agent SDK.");
+            }
+            Ok(())
+        }
+        Err(_) => {
+            let _ = killpg(process.group, Signal::SIGKILL);
+            let _ = process.child.wait().await;
+            bail!(
+                "Claude runtime installation timed out after {} seconds. Check npm registry connectivity, then run `ciao agent install claude` again.",
+                budget.as_secs()
+            );
+        }
+    }
 }
 
 /// npm's install of an already-listed exact version no-ops on the package tree without looking
@@ -449,6 +501,142 @@ mod tests {
         assert!(!uninstall_managed_claude(&paths).unwrap());
     }
 
+    #[tokio::test]
+    async fn verified_runtime_is_preserved_without_spawning_npm() {
+        use crate::claude_managed_adapter::PINNED_MANAGED_CLI_VERSION;
+        let home = tempdir().unwrap();
+        let paths = CiaoPaths::for_home(home.path());
+        let prefix = &paths.managed_sdk_prefix;
+        let modules = prefix.join("node_modules/@anthropic-ai");
+        let wrapper = modules.join("claude-agent-sdk");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        write_worker_entrypoint(&paths.managed_worker_entrypoint).unwrap();
+        let bytes = b"synthetic pinned program, never executed";
+        let digest = hex_digest(bytes);
+        let mut platforms = serde_json::Map::new();
+        for platform in ["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"] {
+            let directory = modules.join(format!("claude-agent-sdk-{platform}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("claude"), bytes).unwrap();
+            platforms.insert(platform.into(), serde_json::json!({"checksum":digest}));
+        }
+        std::fs::write(
+            wrapper.join("package.json"),
+            serde_json::json!({"version":PINNED_CLAUDE_SDK_VERSION}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            wrapper.join("manifest.json"),
+            serde_json::json!({"version":PINNED_MANAGED_CLI_VERSION,"platforms":platforms})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::managed_worker::runtime_record_file(prefix),
+            serde_json::json!({"node":"/bin/sh","path":"/usr/bin:/bin"}).to_string(),
+        )
+        .unwrap();
+        ensure_managed_sdk(
+            prefix,
+            &paths.managed_worker_entrypoint,
+            Command::new("/nonexistent-ciao-npm"),
+        )
+        .await
+        .unwrap();
+        assert!(wrapper.join("manifest.json").is_file());
+        // An exact version alone is not reusable: a changed digest still forces repair.
+        let runtime = ManagedRuntime::resolve(prefix, &paths.managed_worker_entrypoint).unwrap();
+        std::fs::write(runtime.cli_path, b"corrupted and different size").unwrap();
+        assert!(
+            ensure_managed_sdk(
+                prefix,
+                &paths.managed_worker_entrypoint,
+                Command::new("/nonexistent-ciao-npm")
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !modules.exists(),
+            "invalid bytes are removed before repair, as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_npm_exit_still_requires_the_pinned_digest_gate() {
+        let home = tempdir().unwrap();
+        let paths = CiaoPaths::for_home(home.path());
+        std::fs::create_dir_all(&paths.managed_sdk_prefix).unwrap();
+        write_worker_entrypoint(&paths.managed_worker_entrypoint).unwrap();
+        let error = ensure_managed_sdk(
+            &paths.managed_sdk_prefix,
+            &paths.managed_worker_entrypoint,
+            Command::new("/usr/bin/true"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime is unusable"));
+    }
+
+    #[tokio::test]
+    async fn npm_deadline_refuses_a_hung_install_and_success_is_not_assumed() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let started = std::time::Instant::now();
+        let error = run_npm(command, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let mut failed = Command::new("/bin/sh");
+        failed.args(["-c", "exit 17"]);
+        assert!(
+            run_npm(failed, Duration::from_secs(3))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("npm could not install")
+        );
+        let mut success = Command::new("/bin/sh");
+        success.args(["-c", "exit 0"]);
+        run_npm(success, Duration::from_secs(3)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_npm_kills_its_owned_process_group() {
+        let home = tempdir().unwrap();
+        let ready = home.path().join("ready");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "trap '' INT TERM; echo $$ > \"$1\"; exec sleep 60",
+            "fixture",
+        ]);
+        command.arg(&ready);
+        let task = tokio::spawn(run_npm(command, Duration::from_secs(60)));
+        let pid = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(bytes) = std::fs::read_to_string(&ready)
+                    && let Ok(pid) = bytes.trim().parse::<i32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelled npm must not survive");
+    }
+
     #[test]
     fn npm_resolves_from_the_recorded_path_only() {
         let temp = tempdir().unwrap();
@@ -492,15 +680,15 @@ mod tests {
     /// Spec 017 §6, the whole decision surface of the one-shot restore. One test on purpose:
     /// the once-guard is process-wide, so exactly one test may spend the attempt — and the
     /// ineligible case is asserted first precisely because eligibility must not spend it.
-    #[test]
-    fn the_restore_runs_once_needs_a_record_and_writes_its_outcome() {
+    #[tokio::test]
+    async fn the_restore_runs_once_needs_a_record_and_writes_its_outcome() {
         let temp = tempdir().unwrap();
         let prefix = temp.path().join("sdk");
         std::fs::create_dir_all(&prefix).unwrap();
         let entrypoint = temp.path().join("managed/worker.mjs");
 
         // No runtime record: not eligible, no attempt spent, no marker invented.
-        assert!(!try_restore_managed_claude_once(&prefix, &entrypoint));
+        assert!(!try_restore_managed_claude_once(&prefix, &entrypoint).await);
         assert_eq!(heal_marker_note(&prefix), None);
 
         // A record whose PATH holds no npm: the attempt runs, fails at npm resolution, and
@@ -516,7 +704,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        assert!(!try_restore_managed_claude_once(&prefix, &entrypoint));
+        assert!(!try_restore_managed_claude_once(&prefix, &entrypoint).await);
         assert_eq!(
             heal_marker_note(&prefix),
             Some("; a self-restore was attempted and failed, run `ciao setup`")
@@ -528,7 +716,7 @@ mod tests {
 
         // The one attempt is spent: eligible or not, nothing further runs this process.
         std::fs::remove_file(prefix.join(HEAL_MARKER_FILE)).unwrap();
-        assert!(!try_restore_managed_claude_once(&prefix, &entrypoint));
+        assert!(!try_restore_managed_claude_once(&prefix, &entrypoint).await);
         assert_eq!(
             heal_marker_note(&prefix),
             None,

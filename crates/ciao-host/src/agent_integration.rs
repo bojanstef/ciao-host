@@ -4,7 +4,7 @@
 //! multiple Ciao-owned surfaces for that provider, but each installer keeps its own ownership
 //! boundary and never turns into an implicit universal integration.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 
 use crate::{
@@ -121,12 +121,20 @@ impl AgentIntegration {
                 install_pi_extension(paths)?;
                 Ok("Ciao's Pi Agent Session extension is installed. Start Pi normally, or use /reload in an existing Pi TUI.".into())
             }
-            Self::Claude => install_claude_components(
-                || install_claude_plugin(paths).map(|_| ()),
-                || install_managed_claude(paths),
-            ),
+            Self::Claude => {
+                let managed = install_managed_claude(paths).await;
+                let paths = paths.clone();
+                tokio::task::spawn_blocking(move || {
+                    install_claude_components(
+                        || install_claude_plugin(&paths).map(|_| ()),
+                        || managed,
+                    )
+                })
+                .await
+                .context("install attached Claude hooks")?
+            }
             Self::ClaudeManaged => {
-                install_managed_claude(paths)?;
+                install_managed_claude(paths).await?;
                 Ok("Ciao's managed Claude runtime is installed. The `claude-managed` spelling is retained for compatibility; use `ciao agent install claude` for normal setup.".into())
             }
             // A pin miss is a skip, not a failure. Codex auto-updates the way Claude does, so

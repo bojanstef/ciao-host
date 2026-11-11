@@ -126,20 +126,15 @@ impl WorkerLauncher {
         // Spec 017 §6: when the gate refuses a runtime a completed install once verified, the
         // daemon gets one bounded attempt to restore the pinned artifact — never to accept the
         // drifted one — before the refusal surfaces exactly as it always did. The person who
-        // tapped Start waits a few seconds for a working session instead of reading an error.
+        // tapped Start gets a time-bounded repair attempt instead of an immediate refusal.
         let runtime = match ManagedRuntime::resolve(&self.sdk_prefix, &self.worker_entrypoint) {
             Ok(runtime) => runtime,
             Err(reason) => {
-                let sdk_prefix = self.sdk_prefix.clone();
-                let worker_entrypoint = self.worker_entrypoint.clone();
-                let restored = tokio::task::spawn_blocking(move || {
-                    crate::claude_managed_integration::try_restore_managed_claude_once(
-                        &sdk_prefix,
-                        &worker_entrypoint,
-                    )
-                })
-                .await
-                .unwrap_or(false);
+                let restored = crate::claude_managed_integration::try_restore_managed_claude_once(
+                    &self.sdk_prefix,
+                    &self.worker_entrypoint,
+                )
+                .await;
                 if !restored {
                     return Err(reason);
                 }

@@ -199,7 +199,9 @@ pub async fn run() -> Result<()> {
     let paths = CiaoPaths::discover()?;
     match cli.command {
         Some(Command::Peers { action }) => crate::peer_cli::run(action, &paths.socket_file).await,
-        Some(Command::Setup { yes }) => setup_command(&paths, yes).await,
+        Some(Command::Setup { yes }) => {
+            interruptible_install(async move { setup_command(&paths, yes).await }).await
+        }
         Some(Command::Pair) => pair_command(&paths).await,
         Some(Command::Status { json }) => status_command(&paths, json, true).await,
         Some(Command::Unpair { device }) => unpair_command(&paths, device).await,
@@ -225,6 +227,9 @@ pub async fn run() -> Result<()> {
             .await
         }
         Some(Command::Update { release_base }) => update_command(&paths, release_base).await,
+        Some(Command::Agent {
+            action: action @ AgentCommand::Install { .. },
+        }) => interruptible_install(async move { agent_command(&paths, action).await }).await,
         Some(Command::Agent { action }) => agent_command(&paths, action).await,
         Some(Command::Drift { json }) => drift_command(&paths, json),
         Some(Command::Reset { yes }) => reset_command(&paths, yes).await,
@@ -242,8 +247,42 @@ pub async fn run() -> Result<()> {
             let _ = crate::codex_hook::run(&paths).await;
             Ok(())
         }
-        None => default_command(&paths).await,
+        None => interruptible_install(async move { default_command(&paths).await }).await,
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Installation cancelled. Host identity and pairing records were preserved.")]
+struct InstallInterrupted(nix::sys::signal::Signal);
+
+/// The executable uses conventional shell exit codes for an explicit interruption.
+pub fn error_exit_code(error: &anyhow::Error) -> i32 {
+    error
+        .downcast_ref::<InstallInterrupted>()
+        .map_or(1, |error| 128 + error.0 as i32)
+}
+
+/// Own signals for the complete CLI operation, not one npm wait. Tokio's handler remains
+/// installed after a receiver is dropped, so a per-child listener would swallow Ctrl-C in
+/// the following integration or pairing step. The daemon keeps its separate shutdown policy.
+async fn interruptible_install(
+    work: impl std::future::Future<Output = Result<()>> + Send + 'static,
+) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt()).context("listen for Ctrl-C")?;
+    let mut terminate = signal(SignalKind::terminate()).context("listen for termination")?;
+    // Blocking prompts/probes run on the blocking pool, including on a one-worker host.
+    // Async npm owns a process-group guard which abort drops before we return.
+    let mut task = tokio::spawn(work);
+    let received = tokio::select! {
+        biased;
+        _ = interrupt.recv() => nix::sys::signal::Signal::SIGINT,
+        _ = terminate.recv() => nix::sys::signal::Signal::SIGTERM,
+        result = &mut task => return result.context("installation task failed")?,
+    };
+    task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    Err(InstallInterrupted(received).into())
 }
 
 /// Prints the drift ledger the daemon keeps (Spec 017 §4.2). Reads the persisted file rather
@@ -417,7 +456,7 @@ async fn default_command(paths: &CiaoPaths) -> Result<()> {
                     "Ciao is not set up and this invocation is non-interactive. Run `ciao setup --yes`."
                 );
             }
-            if prompt_for_setup()? {
+            if prompt_for_setup().await? {
                 setup_command(paths, true).await
             } else {
                 Ok(())
@@ -427,7 +466,13 @@ async fn default_command(paths: &CiaoPaths) -> Result<()> {
     }
 }
 
-fn prompt_for_setup() -> Result<bool> {
+async fn prompt_for_setup() -> Result<bool> {
+    tokio::task::spawn_blocking(read_setup_prompt)
+        .await
+        .context("read setup confirmation")?
+}
+
+fn read_setup_prompt() -> Result<bool> {
     loop {
         print!("\nCiao is not set up. Set it up now? [Y/n] ");
         io::stdout().flush()?;
@@ -480,7 +525,10 @@ fn integration_list(integrations: &[AgentIntegration]) -> String {
 /// never aborts setup — pairing must still happen on a host whose npm is briefly unhappy.
 async fn install_agent_integrations(paths: &CiaoPaths, yes: bool) -> Result<()> {
     println!();
-    let detected = detect_agents(paths);
+    let detection_paths = paths.clone();
+    let detected = tokio::task::spawn_blocking(move || detect_agents(&detection_paths))
+        .await
+        .context("detect installed agents")?;
     if detected.is_empty() {
         println!("No agent CLIs detected on this host (looked for claude, codex, and pi).");
         println!("The Agents tab needs one. Install an agent, then run `ciao setup` again.");
@@ -504,7 +552,9 @@ async fn install_agent_integrations(paths: &CiaoPaths, yes: bool) -> Result<()> 
         );
     }
     let selected = if !yes && io::stdin().is_terminal() && io::stdout().is_terminal() {
-        prompt_for_agent_selection(&detected)?
+        tokio::task::spawn_blocking(move || prompt_for_agent_selection(&detected))
+            .await
+            .context("read integration selection")??
     } else {
         println!("Installing integrations for the detected agents.");
         detected
@@ -610,7 +660,7 @@ async fn setup_ready(paths: &CiaoPaths, yes: bool) -> Result<bool> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             bail!("Setup needs confirmation. Run `ciao setup --yes` non-interactively.");
         }
-        if !prompt_for_setup()? {
+        if !prompt_for_setup().await? {
             return Ok(false);
         }
     }
@@ -631,7 +681,12 @@ async fn setup_ready(paths: &CiaoPaths, yes: bool) -> Result<bool> {
     let executable = current_executable()?;
     // A host with no supervisor is not a host Ciao cannot run on. Failing here used to abort
     // setup, which told the operator they were blocked when only persistence was unavailable.
-    let supervisor = match install_service(paths, &executable) {
+    let service_paths = paths.clone();
+    let installation =
+        tokio::task::spawn_blocking(move || install_service(&service_paths, &executable))
+            .await
+            .context("install supervised service")?;
+    let supervisor = match installation {
         Ok(supervisor) => supervisor,
         Err(error) => {
             println!("skipped");
