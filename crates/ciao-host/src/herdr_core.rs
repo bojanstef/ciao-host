@@ -299,6 +299,7 @@ pub(crate) async fn create_terminal(
         }
         let selected =
             plain_call(&mut stream, 2, "terminal.get", json!({"terminal":address})).await?;
+        let space = DesktopSpace::of(&selected);
         let selected = parse_terminal(&selected, &identity, &version).ok_or(CoreError::Invalid)?;
         if selected.tab != binding {
             return Err(CoreError::Invalid);
@@ -308,9 +309,7 @@ pub(crate) async fn create_terminal(
             &mut stream,
             3,
             "terminal.run",
-            json!({
-                "cwd":cwd, "no_parent":true, "no_notify":true
-            }),
+            run_params(&cwd, space.as_ref()),
         )
         .await?;
         // RunResult flattens Terminal and adds these two optional fields.
@@ -327,6 +326,47 @@ pub(crate) async fn create_terminal(
     })
     .await
     .map_err(|_| CoreError::Invalid)?
+}
+
+/// The desktop app shows a Core terminal only when it carries these labels; terminals
+/// without them stay off its screens.
+const DESKTOP_SPACE_LABEL: &str = "herdr.space";
+const DESKTOP_TAB_LABEL: &str = "herdr.tab";
+
+/// The desktop space of the selected terminal, read on the same verified socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesktopSpace(String);
+
+impl DesktopSpace {
+    fn of(row: &Value) -> Option<Self> {
+        let Some(labels) = row.get("labels")?.as_object() else {
+            note("labels", "invalid", "shape", None);
+            return None;
+        };
+        let space = labels.get(DESKTOP_SPACE_LABEL)?.as_str().filter(|space| {
+            (1..=64).contains(&space.len())
+                && space
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        });
+        if space.is_none() {
+            note("labels", "invalid", DESKTOP_SPACE_LABEL, None);
+        }
+        space.map(|space| Self(space.to_owned()))
+    }
+}
+
+/// A selected terminal in a desktop space gets its new shell as a new desktop tab there:
+/// an unknown tab id becomes a tab, and `keep` matches the desktop's own terminals. A
+/// terminal outside the desktop gets an unplaced sibling, as before.
+fn run_params(cwd: &str, space: Option<&DesktopSpace>) -> Value {
+    let mut params = json!({"cwd":cwd, "no_parent":true, "no_notify":true});
+    if let Some(DesktopSpace(space)) = space {
+        let tab = format!("tb{:032x}", rand::random::<u128>());
+        params["labels"] = json!({DESKTOP_SPACE_LABEL: space, DESKTOP_TAB_LABEL: tab});
+        params["keep"] = json!(true);
+    }
+    params
 }
 
 fn parse_hello(value: &Value) -> Result<(String, String), CoreError> {
@@ -1142,6 +1182,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_tab_from_a_desktop_terminal_becomes_a_new_desktop_tab_in_its_space() {
+        let space = format!("sp{}", "a".repeat(32));
+        let source_tab = format!("tb{}", "b".repeat(32));
+        let (_temp, config, listener) = fixture();
+        let (expected_space, expected_source) = (space.clone(), source_tab.clone());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            request(&mut stream).await;
+            reply(stream.get_mut(), 1, hello(false)).await;
+            request(&mut stream).await;
+            let mut selected = row("t1");
+            selected["labels"] = json!({
+                "herdr.space": expected_space, "herdr.tab": expected_source,
+                "herdr.seen": "2", "where": "repo / 1"
+            });
+            reply(stream.get_mut(), 2, selected).await;
+            let run = request(&mut stream).await;
+            assert_eq!(run["method"], "terminal.run");
+            let mut params = run["params"].clone();
+            let labels = params
+                .as_object_mut()
+                .unwrap()
+                .remove("labels")
+                .expect("desktop labels");
+            assert_eq!(
+                params,
+                json!({"cwd":"/tmp/current","no_parent":true,"no_notify":true,"keep":true})
+            );
+            let labels = labels.as_object().unwrap();
+            assert_eq!(labels.len(), 2, "only placement labels are written");
+            assert_eq!(labels["herdr.space"], expected_space);
+            let tab = labels["herdr.tab"].as_str().unwrap();
+            assert_ne!(tab, expected_source, "a new tab, not a pane in the old one");
+            assert_eq!(tab.len(), 34);
+            assert!(tab.starts_with("tb"));
+            assert!(
+                tab[2..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            );
+            reply(stream.get_mut(), 3, row("t2")).await;
+        });
+        assert_eq!(
+            create_terminal(&config, "default", &format!("{ID}:t1"))
+                .await
+                .unwrap(),
+            format!("{ID}:t2")
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn new_tab_leaves_terminals_outside_the_desktop_unplaced() {
+        let unplaced = json!({"cwd":"/tmp","no_parent":true,"no_notify":true});
+        for labels in [
+            None,
+            Some(json!({})),
+            Some(json!({"herdr.tab": "tb1"})),
+            Some(json!({"herdr.space": ""})),
+            Some(json!({"herdr.space": 7})),
+            Some(json!({"herdr.space": "../sp"})),
+            Some(json!({"herdr.space": "sp\n1"})),
+            Some(json!({"herdr.space": "s".repeat(65)})),
+            Some(json!("herdr.space=sp1")),
+        ] {
+            let mut selected = row("t1");
+            if let Some(labels) = labels {
+                selected["labels"] = labels;
+            }
+            let space = DesktopSpace::of(&selected);
+            assert_eq!(space, None);
+            assert_eq!(run_params("/tmp", space.as_ref()), unplaced);
+        }
+        let first = run_params("/tmp", Some(&DesktopSpace("sp1".into())));
+        let second = run_params("/tmp", Some(&DesktopSpace("sp1".into())));
+        assert_ne!(first["labels"]["herdr.tab"], second["labels"]["herdr.tab"]);
+    }
+
+    #[tokio::test]
     async fn new_tab_refuses_stale_identity_or_missing_terminal_without_running() {
         for stale_identity in [true, false] {
             let (_temp, config, listener) = fixture();
@@ -1614,7 +1734,8 @@ mod tests {
                 "-c",
                 "printf 'READY\\n'; while IFS= read -r line; do printf 'ACK:%s\\n' \"$line\"; done",
             ];
-            let created = live_call(&test_config, "terminal.run", json!({"argv":program,"cwd":first_cwd,"name":"ciao-first","no_parent":true,"no_notify":true})).await;
+            let desktop = json!({"herdr.space":format!("sp{}", "c".repeat(32)),"herdr.tab":format!("tb{}", "d".repeat(32))});
+            let created = live_call(&test_config, "terminal.run", json!({"argv":program,"cwd":first_cwd,"name":"ciao-first","no_parent":true,"no_notify":true,"labels":desktop})).await;
             let address = created["address"].as_str().unwrap().to_owned();
             let pid = created["pid"].as_u64().unwrap() as u32;
             live_call(&test_config, "terminal.run", json!({"argv":program,"cwd":second_cwd,"name":"ciao-second","no_parent":true,"no_notify":true})).await;
@@ -1633,6 +1754,17 @@ mod tests {
             let new_terminal = terminal(&test_config, "default", &new_tab).await.unwrap();
             assert_eq!(new_terminal.facts.cwd.as_deref(), first_cwd.to_str());
             assert_ne!(new_terminal.pid, Some(pid));
+            let (_, new_address) = new_tab.split_once(':').unwrap();
+            let placed = live_call(
+                &test_config,
+                "terminal.get",
+                json!({"terminal":new_address}),
+            )
+            .await;
+            assert_eq!(placed["keep"], true);
+            assert_eq!(placed["labels"]["herdr.space"], desktop["herdr.space"]);
+            let placed_tab = placed["labels"]["herdr.tab"].as_str().unwrap();
+            assert!(placed_tab.starts_with("tb") && placed_tab != desktop["herdr.tab"]);
             let mut new_viewer = CoreSession::attach(
                 test_config.clone(),
                 "default".into(),
