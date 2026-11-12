@@ -18,5 +18,36 @@
     {"v": 1, "grant_id": "g", "action": {"op": "start", "request_id": "r", "workspace_id": "alpha", "path": "/tmp"}},
     {"v": 1, "grant_id": "g", "action": {"op": "grant", "peer": "another"}},
     {"v": 1, "grant_id": "g", "action": {"op": "start", "request_id": "bad/id", "workspace_id": "alpha"}}
-  ]
+  ],
+  "admin_revision": 2,
+  "revision_2": {
+    "requests": {
+      "grant_all": {"v": 1, "action": {"op": "grant", "peer": {"endpoint_id": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c", "name": "Laptop"}, "workspace_ids": ["all"]}},
+      "grant_selected": {"v": 1, "action": {"op": "grant", "peer": {"endpoint_id": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c", "name": "Laptop"}, "workspace_ids": ["workspace-alpha"]}},
+      "update_all": {"v": 1, "action": {"op": "update", "endpoint_id": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c", "workspace_ids": ["all"]}},
+      "update_selected": {"v": 1, "action": {"op": "update", "endpoint_id": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c", "workspace_ids": ["workspace-alpha"]}},
+      "revoke": {"v": 1, "action": {"op": "revoke", "endpoint_id": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"}},
+      "forget": {"v": 1, "action": {"op": "forget", "endpoint_id": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"}}
+    },
+    "response": {
+      "v": 1,
+      "result": {
+        "peer": {"endpoint_id": "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6", "name": "Build Computer"},
+        "incoming": [
+          {"peer": {"endpoint_id": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c", "name": "Laptop"}, "grant_id": "grant-selected", "issuer": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca", "workspace_ids": ["workspace-alpha"]},
+          {"peer": {"endpoint_id": "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca", "name": "Desktop"}, "grant_id": "grant-all", "issuer": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c", "workspace_ids": ["all"]}
+        ],
+        "outgoing": [{"peer": {"endpoint_id": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c", "name": "Laptop"}, "grant_id": "grant-from-laptop"}],
+        "workspaces": [{"workspace_id": "workspace-alpha", "display_label": "Alpha"}],
+        "scan_incomplete": false,
+        "admin_revision": 2
+      },
+      "error": null
+    },
+    "states": {
+      "update": {"v": 1, "result": {"state": "updated"}, "error": null},
+      "forget": {"v": 1, "result": {"state": "forgotten"}, "error": null}
+    },
+    "invalid_scopes": [[], ["all", "workspace-alpha"], ["workspace-alpha", "workspace-alpha"]]
+  }
 }

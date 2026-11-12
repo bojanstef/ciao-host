@@ -10,29 +10,60 @@ use std::{
 use crate::{
     agent_protocol::MAX_PROMPT_BYTES,
     ipc,
-    peers::{Action, Admin, Descriptor, Outgoing},
+    peers::{Action, Admin, Descriptor, GrantScope, Outgoing},
 };
+
+/// `--workspace` (repeatable) or `--all`, exactly one.
+#[derive(Debug, clap::Args)]
+#[group(required = true, multiple = false)]
+pub(crate) struct ScopeArgs {
+    /// A destination workspace ID from `peers list`; repeat for several
+    #[arg(long)]
+    workspace: Vec<String>,
+    /// Every project on this host, including ones added later
+    #[arg(long)]
+    all: bool,
+}
+
+impl From<ScopeArgs> for GrantScope {
+    fn from(args: ScopeArgs) -> Self {
+        if args.all {
+            Self::All
+        } else {
+            Self::Selected(args.workspace)
+        }
+    }
+}
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Show this host's identity, incoming grants, outgoing links and selectable workspaces
     List,
-    /// Allow one source host to launch agents in explicitly selected workspaces on this host
+    /// Allow one source host to launch agents in selected workspaces, or all of them, on this host
     Grant {
         #[arg(long)]
         endpoint: String,
         #[arg(long)]
         name: String,
-        #[arg(long, required = true)]
-        workspace: Vec<String>,
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
+    /// Change which workspaces an existing incoming grant covers; its link stays valid
+    Update {
+        #[arg(long)]
+        endpoint: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
     },
     /// Remember the destination link JSON returned by `peers grant` (or introduced by the phone)
     Remember {
         #[arg(long)]
         file: PathBuf,
     },
-    /// Remove local incoming/outgoing access for an exact endpoint ID; running workers continue
+    /// Remove an exact endpoint ID's incoming grant on this host; running workers continue
     Revoke { endpoint: String },
+    /// Drop this host's outgoing link to an exact endpoint ID; the destination keeps its grant
+    Forget { endpoint: String },
     /// Ask a linked destination which of your granted workspaces are currently available
     Workspaces {
         #[arg(long)]
@@ -95,9 +126,12 @@ pub(crate) async fn run(command: Command, socket: &Path) -> Result<()> {
         Command::Grant {
             endpoint,
             name,
-            workspace,
+            scope,
         } => {
-            json!({"op":"admin", "action":Admin::Grant { peer:Descriptor {endpoint_id:endpoint, name}, workspace_ids:workspace }})
+            json!({"op":"admin", "action":Admin::Grant { peer:Descriptor {endpoint_id:endpoint, name}, scope:scope.into() }})
+        }
+        Command::Update { endpoint, scope } => {
+            json!({"op":"admin", "action":Admin::Update { endpoint_id:endpoint, scope:scope.into() }})
         }
         Command::Remember { file } => {
             let link: Outgoing = serde_json::from_slice(&read_bounded(&file, 4096)?)?;
@@ -105,6 +139,9 @@ pub(crate) async fn run(command: Command, socket: &Path) -> Result<()> {
         }
         Command::Revoke { endpoint } => {
             json!({"op":"admin", "action":Admin::Revoke {endpoint_id:endpoint}})
+        }
+        Command::Forget { endpoint } => {
+            json!({"op":"admin", "action":Admin::Forget {endpoint_id:endpoint}})
         }
         Command::Workspaces { host } => {
             json!({"op":"call", "host":host, "action":Action::Workspaces {}})

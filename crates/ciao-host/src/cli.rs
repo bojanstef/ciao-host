@@ -1686,7 +1686,7 @@ mod tests {
                         peer: peer.clone(),
                         grant_id: "old-grant".into(),
                         issuer: iroh::SecretKey::generate().public().to_string(),
-                        workspace_ids: vec!["workspace".into()],
+                        scope: crate::peers::GrantScope::Selected(vec!["workspace".into()]),
                     });
                     store.outgoing.push(Outgoing {
                         peer,

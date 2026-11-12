@@ -4,17 +4,23 @@ Ciao can explicitly introduce two computers so an agent on one can start a Ciao-
 Claude session on the other. It uses the daemons' existing Iroh identities and encrypted
 transport. There is no account, public roster, SSH setup or shared private key.
 
-On the phone, hold the destination's host card and choose **Linked Computers**. Choose the
-source computer and destination projects, then confirm **Allow Access**. Both computers must
-already be paired with that phone and reachable during setup. After setup, the phone can be
-offline. Older hosts refuse the new administration stream and need an update.
+On the phone, hold any host card and choose **Linked Computers**. Every other computer has a
+row in each direction: who can start agents on this host, and where this host can start
+agents. Tap a row and choose **Selected projects** or **All projects**, then **Allow**. All
+projects includes projects added to the destination later. Both computers must be paired with
+that phone and reachable while linking. Afterwards the phone can be offline, and changing the
+projects only needs the destination.
 
-The destination's Linked Computers screen lists incoming grants and can revoke them. Revoking
-blocks new requests and closes peer connections; existing agents continue under your control.
-Unpairing the phone on the destination also revokes incoming grants that phone introduced.
-The source may retain a stale introduction, which the destination will refuse. A full `ciao reset`
-removes incoming grants, outgoing links and start claims before discarding the host identity;
-if that removal fails, the identity is retained and the reset reports an error.
+Open the same row later to change projects in place or to **Remove Access**. Removing blocks
+new requests and closes peer connections; existing agents continue under your control.
+Narrowing the projects does the same for sessions in projects you removed. Each direction is
+separate: removing one never removes the other. Unpairing the phone on the destination also
+revokes incoming grants that phone introduced.
+
+Hosts on 0.1.61 or earlier can add selected projects and remove access, but cannot edit a grant,
+allow all projects or replace a stale link; the app says when an update is needed. A full
+`ciao reset` removes incoming grants, outgoing links and start claims before discarding the
+host identity; if that removal fails, the identity is retained and the reset reports an error.
 
 ## Use from an agent or terminal
 
@@ -47,11 +53,14 @@ destination from your phone first. Prompt/interrupt receipts retain the existing
 
 For a phone-free explicit introduction, use `ciao peers list` on both computers, then run
 `ciao peers grant --endpoint <source-id> --name <source-name> --workspace <destination-workspace-id>`
-on the destination. Save the returned public link JSON to a file and run
-`ciao peers remember --file link.json` on the source. The link is bound to the source endpoint's
-authenticated key; it is not a bearer credential. Local revocation is
-`ciao peers revoke <exact-source-endpoint-id>` on the destination. Removing only the source's
-local introduction does not revoke the destination's grant.
+(repeat `--workspace`, or pass `--all`) on the destination. Save the returned public link JSON
+to a file and run `ciao peers remember --file link.json` on the source; it replaces any older
+link to that destination. Change the projects later with
+`ciao peers update --endpoint <source-id> --workspace <id>` (or `--all`) on the destination.
+The link is bound to the source endpoint's authenticated key; it is not a bearer credential.
+Revocation is `ciao peers revoke <exact-source-endpoint-id>` on the destination.
+`ciao peers forget <exact-destination-endpoint-id>` on the source drops only its local link and
+does not revoke the destination's grant.
 
 ## Authority and limits
 
@@ -74,8 +83,13 @@ Grants are directional. New hosts, reverse links and further destinations requir
 grants. No credentials or authority propagate through introductions. An agent's tool access
 can still exercise other access its OS user already holds.
 
-Limits: 16 incoming and 16 outgoing peers, 32 selected projects per grant, two live workers per
-grant, and 256 total durable start records. Full stores refuse new work without dropping replay
+An all-projects grant covers every project the destination itself can resolve: Ciao-managed
+session directories plus Git checkouts it discovers under home, including later ones. The
+source can see all of their names. The source still names a project by its opaque ID, never by
+a path.
+
+Limits: 16 incoming and 16 outgoing peers, 32 selected projects per grant (or all), two live
+workers per grant, and 256 total durable start records. Full stores refuse new work without dropping replay
 protection. Revoking a grant removes its start metadata; a new grant has a fresh ID and no access
 to the old grant's sessions. Project files are not synchronized. The source receives the selected session’s canonical
 snapshots, including its conversation content; Ciao adds no transcript persistence on either

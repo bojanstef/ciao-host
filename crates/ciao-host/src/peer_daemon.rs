@@ -2,7 +2,9 @@
 use super::*;
 use crate::{
     agent_protocol::{self, AgentCommand, AgentCommandKind},
-    peers::{self, Action, Admin, Descriptor, Incoming, Outgoing, Request, StartRecord},
+    peers::{
+        self, Action, Admin, Descriptor, GrantScope, Incoming, Outgoing, Request, StartRecord,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -92,7 +94,10 @@ async fn admin(
         return Err("authorization_denied");
     }
     // Discovery does filesystem work. It must not hold the gate a revoke is waiting for.
-    let projects = if matches!(action, Admin::Describe {} | Admin::Grant { .. }) {
+    let projects = if matches!(
+        action,
+        Admin::Describe {} | Admin::Grant { .. } | Admin::Update { .. }
+    ) {
         Some(state.managed_sessions.workspaces().await)
     } else {
         None
@@ -108,18 +113,15 @@ async fn admin(
             let store = state.peers.snapshot();
             description_result(state, store, projects.ok_or("internal_error")?)
         }
-        Admin::Grant {
-            peer,
-            workspace_ids,
-        } => {
+        Admin::Grant { peer, scope } => {
             peer.validate().map_err(|_| "invalid_peer")?;
             if peer.endpoint_id == state.host_endpoint_id.to_string() {
                 return Err("self_link");
             }
+            scope.validate().map_err(|_| "unknown_workspace")?;
             let known = projects.ok_or("internal_error")?;
-            if workspace_ids.is_empty()
-                || workspace_ids.len() > peers::MAX_WORKSPACES
-                || workspace_ids
+            if let GrantScope::Selected(ids) = &scope
+                && ids
                     .iter()
                     .any(|id| !known.workspaces.iter().any(|w| w.workspace_id == *id))
             {
@@ -129,7 +131,7 @@ async fn admin(
                 peer: peer.clone(),
                 grant_id: format!("{:032x}", rand::random::<u128>()),
                 issuer: issuer.unwrap_or(state.host_endpoint_id).to_string(),
-                workspace_ids,
+                scope,
             };
             state.peers.change(|s| {
                 if s.incoming
@@ -148,6 +150,34 @@ async fn admin(
                 json!({"peer": Descriptor { endpoint_id: state.host_endpoint_id.to_string(), name: state.host_info.display_name.clone() }, "grant_id": grant.grant_id}),
             )
         }
+        Admin::Update { endpoint_id, scope } => {
+            endpoint_id
+                .parse::<EndpointId>()
+                .map_err(|_| "invalid_peer")?;
+            scope.validate().map_err(|_| "unknown_workspace")?;
+            let known = projects.ok_or("internal_error")?;
+            state.peers.change(|s| {
+                let grant = s
+                    .incoming
+                    .iter_mut()
+                    .find(|g| g.peer.endpoint_id == endpoint_id)
+                    .ok_or("not_linked")?;
+                // An ID the grant already holds stays acceptable even when discovery no longer
+                // lists it (a moved checkout, a list cut at its cap). Otherwise re-saving an
+                // unchanged selection would be refused, the bug this operation exists to fix.
+                let held = |id: &String| matches!(&grant.scope, GrantScope::Selected(old) if old.contains(id));
+                if let GrantScope::Selected(ids) = &scope
+                    && ids.iter().any(|id| {
+                        !held(id) && !known.workspaces.iter().any(|w| w.workspace_id == *id)
+                    })
+                {
+                    return Err("unknown_workspace");
+                }
+                grant.scope = scope;
+                Ok(())
+            })?;
+            Ok(json!({"state":"updated"}))
+        }
         Admin::Remember { link } => {
             link.peer.validate().map_err(|_| "invalid_peer")?;
             if !peers::valid_id(&link.grant_id)
@@ -156,12 +186,11 @@ async fn admin(
                 return Err("invalid_link");
             }
             state.peers.change(|s| {
-                if s.outgoing
-                    .iter()
-                    .any(|g| g.peer.endpoint_id == link.peer.endpoint_id)
-                {
-                    return Err("already_linked");
-                }
+                // Replace, not refuse: the phone has just obtained this grant from the
+                // destination, so an older link here is stale (revoked, or from a grant that
+                // was replaced) and refusing it left the pair impossible to link again.
+                s.outgoing
+                    .retain(|g| g.peer.endpoint_id != link.peer.endpoint_id);
                 if s.outgoing.len() >= peers::MAX_PEERS {
                     return Err("peer_limit");
                 }
@@ -177,6 +206,13 @@ async fn admin(
             state.peers.revoke(&endpoint_id)?;
             Ok(json!({"state":"revoked"}))
         }
+        Admin::Forget { endpoint_id } => {
+            endpoint_id
+                .parse::<EndpointId>()
+                .map_err(|_| "invalid_peer")?;
+            state.peers.forget(&endpoint_id)?;
+            Ok(json!({"state":"forgotten"}))
+        }
     }
 }
 
@@ -188,16 +224,22 @@ fn description_result(
     let mut incomplete = projects.scan_incomplete
         || projects.omitted_workspaces > 0
         || projects.workspaces.len() > peers::MAX_WORKSPACES;
-    let mut workspaces: Vec<_> = projects
-        .workspaces
-        .into_iter()
-        .take(peers::MAX_WORKSPACES)
-        .collect();
+    // Projects a grant names lead, so the cap and the size fitting below cut unselected
+    // projects first and the phone can label what it is about to edit. Stable otherwise.
+    let mut workspaces = projects.workspaces;
+    workspaces.sort_by_key(|w| {
+        !store.incoming.iter().any(|g| match &g.scope {
+            GrantScope::Selected(ids) => ids.contains(&w.workspace_id),
+            GrantScope::All => false,
+        })
+    });
+    workspaces.truncate(peers::MAX_WORKSPACES);
     loop {
         let result = json!({
             "peer": Descriptor { endpoint_id: state.host_endpoint_id.to_string(), name: state.host_info.display_name.clone() },
             "incoming": &store.incoming, "outgoing": &store.outgoing,
             "workspaces": &workspaces, "scan_incomplete": incomplete,
+            "admin_revision": peers::ADMIN_REVISION,
         });
         if agent_protocol::encoded_frame_len(&crate::ipc::success_response(
             &"x".repeat(crate::ipc::MAX_IPC_REQUEST_ID_BYTES),
@@ -313,7 +355,7 @@ async fn execute(
             let selected: Vec<_> = projects
                 .workspaces
                 .into_iter()
-                .filter(|w| grant.workspace_ids.contains(&w.workspace_id))
+                .filter(|w| grant.scope.covers(&w.workspace_id))
                 .collect();
             Ok(
                 json!({"workspaces":selected, "scan_incomplete":projects.scan_incomplete, "agent":"claude"}),
@@ -323,7 +365,7 @@ async fn execute(
             request_id,
             workspace_id,
         } => {
-            if !grant.workspace_ids.contains(&workspace_id) {
+            if !grant.scope.covers(&workspace_id) {
                 return Err("authorization_denied");
             }
             let store = state.peers.snapshot();
@@ -345,9 +387,7 @@ async fn execute(
                 .managed_sessions
                 .summaries()
                 .into_iter()
-                .filter(|s| {
-                    s.presence == "live" && state.peers.owns(&grant.grant_id, &s.session_id)
-                })
+                .filter(|s| s.presence == "live" && state.peers.launched(&grant, &s.session_id))
                 .count()
                 + store
                     .starts
@@ -386,7 +426,7 @@ async fn execute(
             Ok(json!(outcome))
         }
         Action::Snapshot { session_id } => {
-            if !state.peers.owns(&grant.grant_id, &session_id) {
+            if !state.peers.owns(&grant, &session_id) {
                 return Err("authorization_denied");
             }
             let snapshot = state
@@ -407,7 +447,7 @@ async fn execute(
             Ok(json!(snapshot))
         }
         Action::Command { mut command } => {
-            if !state.peers.owns(&grant.grant_id, &command.session_id) {
+            if !state.peers.owns(&grant, &command.session_id) {
                 return Err("authorization_denied");
             }
             command.command_id = peers::command_id(&grant.grant_id, &command.command_id);
@@ -421,7 +461,7 @@ async fn execute(
             request_id,
             expected_generation,
         } => {
-            if !state.peers.owns(&grant.grant_id, &session_id) {
+            if !state.peers.owns(&grant, &session_id) {
                 return Err("authorization_denied");
             }
             let outcome = state
@@ -760,7 +800,7 @@ mod tests {
                     endpoint_id: source.to_string(),
                     name: "Source".into(),
                 },
-                workspace_ids: ids.clone(),
+                scope: GrantScope::Selected(ids.clone()),
             },
             None,
             &state,
@@ -987,6 +1027,280 @@ mod tests {
         );
     }
 
+    fn update(source: EndpointId, scope: GrantScope) -> Admin {
+        Admin::Update {
+            endpoint_id: source.to_string(),
+            scope,
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_update_changes_scope_in_place_and_narrowing_fences_removed_projects() {
+        let (_temp, state, source, ids, grant) = fixture().await;
+        let first = start(&state, source, &grant, "in-alpha", &ids[0]).await;
+        assert_eq!(first["state"], "accepted");
+        let sid = first["session_id"].as_str().unwrap().to_owned();
+        let _receiver = register(&state, &sid).await;
+        let snapshot = |sid: String| {
+            let state = state.clone();
+            let request = req(&grant, Action::Snapshot { session_id: sid });
+            async move { execute(source, request, &state).await }
+        };
+        assert!(snapshot(sid.clone()).await.is_ok());
+
+        // Narrow to beta only: the grant and its ID survive, alpha's session is fenced.
+        admin(
+            update(source, GrantScope::Selected(vec![ids[1].clone()])),
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        let kept = state.peers.incoming(source, None).unwrap();
+        assert_eq!(kept.grant_id, grant, "an edit must not mint a new grant");
+        assert_eq!(kept.scope, GrantScope::Selected(vec![ids[1].clone()]));
+        assert_eq!(
+            snapshot(sid.clone()).await.unwrap_err(),
+            "authorization_denied"
+        );
+        assert_eq!(
+            execute(
+                source,
+                req(
+                    &grant,
+                    Action::Start {
+                        request_id: "alpha-again".into(),
+                        workspace_id: ids[0].clone()
+                    }
+                ),
+                &state
+            )
+            .await
+            .unwrap_err(),
+            "authorization_denied"
+        );
+        let listed = execute(source, req(&grant, Action::Workspaces {}), &state)
+            .await
+            .unwrap();
+        assert_eq!(listed["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            state.managed_sessions.live_count(),
+            1,
+            "narrowing never stops a running worker"
+        );
+
+        // Widen again: the same grant regains its own session.
+        admin(
+            update(source, GrantScope::Selected(ids.clone())),
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(snapshot(sid).await.is_ok());
+
+        // An ID that is neither granted nor discoverable is refused; a stale granted ID is not.
+        assert_eq!(
+            admin(
+                update(source, GrantScope::Selected(vec!["0".repeat(32)])),
+                None,
+                &state
+            )
+            .await
+            .unwrap_err(),
+            "unknown_workspace"
+        );
+        state
+            .peers
+            .change(|s| {
+                s.incoming[0].scope = GrantScope::Selected(vec![ids[0].clone(), "f".repeat(32)]);
+                Ok(())
+            })
+            .unwrap();
+        admin(
+            update(
+                source,
+                GrantScope::Selected(vec![ids[1].clone(), "f".repeat(32)]),
+            ),
+            None,
+            &state,
+        )
+        .await
+        .expect("re-saving a granted ID discovery no longer lists must succeed");
+        // Leaving All for a selection names only IDs the host can resolve now.
+        admin(update(source, GrantScope::All), None, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            admin(
+                update(source, GrantScope::Selected(vec!["f".repeat(32)])),
+                None,
+                &state
+            )
+            .await
+            .unwrap_err(),
+            "unknown_workspace"
+        );
+        let stranger = iroh::SecretKey::generate().public();
+        assert_eq!(
+            admin(update(stranger, GrantScope::All), None, &state)
+                .await
+                .unwrap_err(),
+            "not_linked"
+        );
+        for scope in [
+            GrantScope::Selected(vec![]),
+            GrantScope::Selected(vec![peers::ALL_WORKSPACES.into(), ids[0].clone()]),
+        ] {
+            assert_eq!(
+                admin(update(source, scope), None, &state)
+                    .await
+                    .unwrap_err(),
+                "unknown_workspace"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_all_projects_covers_every_resolvable_workspace_including_later_ones() {
+        let (temp, state, source, ids, grant) = fixture().await;
+        admin(update(source, GrantScope::All), None, &state)
+            .await
+            .unwrap();
+        // A checkout created after the grant is covered without another edit.
+        fs::create_dir_all(temp.path().join("gamma").join(".git")).unwrap();
+        let listed = execute(source, req(&grant, Action::Workspaces {}), &state)
+            .await
+            .unwrap();
+        let listed: Vec<_> = listed["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["workspace_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(listed.len(), 3);
+        let gamma = listed.iter().find(|id| !ids.contains(id)).unwrap().clone();
+        let started = start(&state, source, &grant, "in-gamma", &gamma).await;
+        assert_eq!(started["state"], "accepted");
+        // Anything the host cannot resolve is refused by the launcher, never treated as a path.
+        let unknown = start(&state, source, &grant, "nowhere", &"0".repeat(32)).await;
+        assert_eq!(unknown["reason_code"], "unknown_workspace");
+
+        // Persisted and described inside the existing list, so 0.1.61 and older apps still parse
+        // it: one reserved ID that their checks accept and that matches no real workspace.
+        let stored: Value =
+            serde_json::from_slice(&fs::read(temp.path().join("peers.json")).unwrap()).unwrap();
+        assert_eq!(stored["incoming"][0]["workspace_ids"], json!(["all"]));
+        assert!(peers::valid_id(peers::ALL_WORKSPACES));
+        assert!(!ids.iter().any(|id| id == peers::ALL_WORKSPACES));
+        let description = admin(Admin::Describe {}, None, &state).await.unwrap();
+        assert_eq!(description["incoming"][0]["workspace_ids"], json!(["all"]));
+        assert_eq!(description["admin_revision"], 2);
+
+        // A new grant can be all-projects from the start.
+        let other = iroh::SecretKey::generate().public();
+        admin(
+            Admin::Grant {
+                peer: Descriptor {
+                    endpoint_id: other.to_string(),
+                    name: "Other".into(),
+                },
+                scope: GrantScope::All,
+            },
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.peers.incoming(other, None).unwrap().scope,
+            GrantScope::All
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_revoke_and_forget_each_remove_one_direction_and_remember_replaces() {
+        let (_temp, state, source, _ids, grant) = fixture().await;
+        let remember = |grant_id: &str| Admin::Remember {
+            link: Outgoing {
+                peer: Descriptor {
+                    endpoint_id: source.to_string(),
+                    name: "Source".into(),
+                },
+                grant_id: grant_id.into(),
+            },
+        };
+        // This host also sends work to the source: the reverse direction.
+        admin(remember("reverse-one"), None, &state).await.unwrap();
+        // A second introduction replaces the stale link instead of refusing as `already_linked`.
+        admin(remember("reverse-two"), None, &state).await.unwrap();
+        let store = state.peers.snapshot();
+        assert_eq!(store.outgoing.len(), 1);
+        assert_eq!(store.outgoing[0].grant_id, "reverse-two");
+
+        admin(
+            Admin::Revoke {
+                endpoint_id: source.to_string(),
+            },
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        let store = state.peers.snapshot();
+        assert!(store.incoming.is_empty());
+        assert_eq!(
+            store.outgoing.len(),
+            1,
+            "revoking the source's access must keep this host's own link to it"
+        );
+        assert_eq!(
+            execute(source, req(&grant, Action::Workspaces {}), &state)
+                .await
+                .unwrap_err(),
+            "authorization_denied"
+        );
+
+        admin(
+            Admin::Forget {
+                endpoint_id: source.to_string(),
+            },
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(state.peers.snapshot().outgoing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_description_lists_granted_projects_before_the_cap() {
+        let (_temp, state, source, _ids, _grant) = fixture().await;
+        let workspaces: Vec<_> = (0..peers::MAX_WORKSPACES + 8)
+            .map(|i| agent_protocol::WorkspaceDescriptor {
+                workspace_id: format!("{i:032x}"),
+                display_label: format!("Project {i}"),
+            })
+            .collect();
+        let granted = vec![format!("{:032x}", peers::MAX_WORKSPACES + 5)];
+        let mut store = state.peers.snapshot();
+        store.incoming[0].scope = GrantScope::Selected(granted.clone());
+        assert_eq!(store.incoming[0].peer.endpoint_id, source.to_string());
+        let projects = agent_protocol::AgentWorkspaceList {
+            v: 1,
+            message_type: "agent_workspace_list".into(),
+            workspaces,
+            omitted_workspaces: 0,
+            scan_incomplete: false,
+        };
+        let result = description_result(&state, store, projects).unwrap();
+        let listed = result["workspaces"].as_array().unwrap();
+        assert_eq!(listed.len(), peers::MAX_WORKSPACES);
+        assert_eq!(listed[0]["workspace_id"], granted[0]);
+        assert_eq!(listed[1]["workspace_id"], format!("{:032x}", 0));
+        assert_eq!(result["scan_incomplete"], true);
+    }
+
     #[tokio::test]
     async fn peer_revocation_and_regrant_never_restore_old_session_access() {
         let (_temp, state, source, ids, grant) = fixture().await;
@@ -1018,7 +1332,7 @@ mod tests {
                     endpoint_id: source.to_string(),
                     name: "Source".into(),
                 },
-                workspace_ids: ids,
+                scope: GrantScope::Selected(ids),
             },
             None,
             &state,
@@ -1114,7 +1428,7 @@ mod tests {
                         endpoint_id: source.to_string(),
                         name: "Source".into()
                     },
-                    workspace_ids: ids
+                    scope: GrantScope::Selected(ids)
                 },
                 Some(phone),
                 &state
@@ -1165,7 +1479,7 @@ mod tests {
                         },
                         grant_id: "fixture-grant".into(),
                         issuer: host.id().to_string(),
-                        workspace_ids: vec!["workspace".into()],
+                        scope: GrantScope::Selected(vec!["workspace".into()]),
                     }];
                     Ok(())
                 })
@@ -1431,7 +1745,7 @@ mod tests {
                 peer: peer.clone(),
                 grant_id: format!("grant-{i}"),
                 issuer: state.host_endpoint_id.to_string(),
-                workspace_ids: workspace_ids.clone(),
+                scope: GrantScope::Selected(workspace_ids.clone()),
             });
             store.outgoing.push(Outgoing {
                 peer,
