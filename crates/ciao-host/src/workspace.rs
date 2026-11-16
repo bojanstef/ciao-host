@@ -561,13 +561,7 @@ async fn snapshot_tmux(
         Ok(output) if output.status_success && !output.stdout_truncated => {
             parse_tmux_list(&output.stdout)
         }
-        Ok(output)
-            if !output.stderr_truncated
-                && String::from_utf8_lossy(&output.stderr).contains("no server running") =>
-        {
-            // tmux without a running server is an empty provider, not an error.
-            (Vec::new(), 0)
-        }
+        Ok(output) if tmux_server_is_absent(output) => (Vec::new(), 0),
         failure => {
             tracing::warn!(
                 version = %version,
@@ -601,6 +595,39 @@ async fn snapshot_tmux(
         },
         omitted.saturating_add(capped),
     )
+}
+
+/// tmux reports server absence differently for a never-created socket (ENOENT) and a stale
+/// socket (ECONNREFUSED), and wording varies between builds. These are empty providers, not
+/// unavailable binaries. Classify the observed failure, never the version; future releases
+/// keep the existing open-ended version floor and need no per-version exception here.
+///
+/// Only a complete, single diagnostic from a failed command with no stdout proves absence.
+/// Permission, protocol, timeout and unknown failures must remain visible as provider errors.
+fn tmux_server_is_absent(output: &BoundedOutput) -> bool {
+    if output.status_success
+        || output.stdout_truncated
+        || output.stderr_truncated
+        || !output.stdout.is_empty()
+    {
+        return false;
+    }
+    let Ok(stderr) = std::str::from_utf8(&output.stderr) else {
+        return false;
+    };
+    let diagnostic = stderr.strip_suffix('\n').unwrap_or(stderr);
+    if diagnostic.chars().any(char::is_control) {
+        return false;
+    }
+    let socket = diagnostic
+        .strip_prefix("no server running on ")
+        .or_else(|| {
+            let error = diagnostic.strip_prefix("error connecting to ")?;
+            error
+                .strip_suffix(" (No such file or directory)")
+                .or_else(|| error.strip_suffix(" (Connection refused)"))
+        });
+    socket.is_some_and(|path| path.starts_with('/'))
 }
 
 /// Spec 021 §4.1: one `list-windows -a` for every session's tabs. Any failure leaves the
@@ -2504,6 +2531,109 @@ mod tests {
         let encoded = serde_json::to_string(&snapshot).unwrap();
         assert!(!encoded.contains("permission denied"));
         assert!(!encoded.contains("/some/private/path"));
+    }
+
+    /// A supported binary with no server is usable (including for New Session), not broken.
+    /// Keep diagnostic variants in one fixture, independent of the installed version number.
+    #[tokio::test]
+    async fn tmux_snapshot_classifies_list_failures_from_fixture() {
+        let fixture = fixture();
+        let directory = tempdir().unwrap();
+        let diagnostic = directory.path().join("stderr");
+        write_stub(
+            directory.path(),
+            "tmux",
+            &format!(
+                "if [ \"$1\" = \"-V\" ]; then echo 'tmux next-3.4'; else \
+                 cat '{}' >&2; exit 1; fi",
+                diagnostic.display()
+            ),
+        );
+        let config = WorkspaceConfig::with_binary_dirs(vec![directory.path().to_owned()]);
+        for case in fixture["tmux"]["list_failures"].as_array().unwrap() {
+            fs::write(&diagnostic, case["stderr"].as_str().unwrap()).unwrap();
+            let (provider, omitted) = snapshot_tmux(&config, None).await;
+            let expected = case["state"].as_str().unwrap();
+            assert_eq!(provider.state, expected, "{case}");
+            assert_eq!(provider.version.as_deref(), Some("next-3.4"));
+            assert_eq!(omitted, 0);
+            if expected == PROVIDER_STATE_AVAILABLE {
+                assert_eq!(provider.sessions.as_deref(), Some(&[][..]));
+            } else {
+                assert!(provider.sessions.is_none());
+            }
+            assert!(!serde_json::to_string(&provider).unwrap().contains("/tmp/"));
+        }
+    }
+
+    #[test]
+    fn tmux_server_absence_requires_complete_unambiguous_output() {
+        let fixture = fixture();
+        let stderr = fixture["tmux"]["no_server_stderr"]
+            .as_str()
+            .unwrap()
+            .as_bytes();
+        let output = || BoundedOutput {
+            status_success: false,
+            stdout: Vec::new(),
+            stderr: stderr.to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        assert!(tmux_server_is_absent(&output()));
+        assert!(!tmux_server_is_absent(&BoundedOutput {
+            status_success: true,
+            ..output()
+        }));
+        assert!(!tmux_server_is_absent(&BoundedOutput {
+            stdout_truncated: true,
+            ..output()
+        }));
+        assert!(!tmux_server_is_absent(&BoundedOutput {
+            stderr_truncated: true,
+            ..output()
+        }));
+        assert!(!tmux_server_is_absent(&BoundedOutput {
+            stdout: b"partial listing".to_vec(),
+            ..output()
+        }));
+        let mut invalid_utf8 = output();
+        invalid_utf8.stderr.push(0xff);
+        assert!(!tmux_server_is_absent(&invalid_utf8));
+    }
+
+    /// Exercise the real installed tmux through the production snapshot path. An explicit
+    /// disposable socket keeps both missing and stale-socket probes off the user's server.
+    #[tokio::test]
+    async fn tmux_snapshot_without_a_server_is_available_on_real_binary() {
+        let account = crate::pty::resolve_account().unwrap();
+        let Some(tmux) = WorkspaceConfig::for_home(&account.home).resolve(ProviderKind::Tmux)
+        else {
+            eprintln!("real tmux absence check skipped: tmux not installed");
+            return;
+        };
+        // Unix socket paths are short even when the platform's ordinary temp path is long.
+        let directory = tempfile::Builder::new()
+            .prefix("ciao-tmux-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = directory.path().join("socket");
+        write_stub(
+            directory.path(),
+            "tmux",
+            &format!("exec '{}' -S '{}' \"$@\"", tmux.display(), socket.display()),
+        );
+        let config = WorkspaceConfig::with_binary_dirs(vec![directory.path().to_owned()]);
+        for stale in [false, true] {
+            if stale {
+                drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            }
+            let (provider, omitted) = snapshot_tmux(&config, None).await;
+            assert_eq!(provider.state, PROVIDER_STATE_AVAILABLE, "stale={stale}");
+            assert!(provider.version.is_some());
+            assert_eq!(provider.sessions.as_deref(), Some(&[][..]));
+            assert_eq!(omitted, 0);
+        }
     }
 
     #[tokio::test]

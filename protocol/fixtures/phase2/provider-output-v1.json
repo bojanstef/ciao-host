@@ -23,7 +23,21 @@
       ],
       "omitted": 3
     },
-    "no_server_stderr": "no server running on /private/tmp/tmux-501/default\n"
+    "no_server_stderr": "no server running on /private/tmp/tmux-501/default\n",
+    "list_failures": [
+      {"stderr": "no server running on /tmp/tmux-1000/default\n", "state": "available"},
+      {"stderr": "error connecting to /tmp/tmux-1000/default (No such file or directory)\n", "state": "available"},
+      {"stderr": "error connecting to /tmp/tmux-1000/default (Connection refused)\n", "state": "available"},
+      {"stderr": "error connecting to /tmp/tmux-1000/default (Permission denied)\n", "state": "error"},
+      {"stderr": "error connecting to /tmp/tmux-1000/default (Not a directory)\n", "state": "error"},
+      {"stderr": "protocol version mismatch (client 8, server 7)\n", "state": "error"},
+      {"stderr": "open config failed (No such file or directory)\n", "state": "error"},
+      {"stderr": "warning: no server running on /tmp/tmux-1000/default\n", "state": "error"},
+      {"stderr": "no server running on /tmp/tmux-1000/default\npermission denied\n", "state": "error"},
+      {"stderr": "error connecting to /tmp/tmux-1000/default (No such file or directory) extra\n", "state": "error"},
+      {"stderr": "no server running on \n", "state": "error"},
+      {"stderr": "", "state": "error"}
+    ]
   },
   "herdr": {
     "version_stdout": "herdr 0.7.4\n",
