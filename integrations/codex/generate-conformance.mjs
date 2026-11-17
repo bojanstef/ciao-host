@@ -142,6 +142,8 @@ export function generate({ binary = "codex", expectedVersion = PINNED_CODEX_VERS
 			),
 			// The notification set the adopted session maps into canonical entries (Spec 013 §6).
 			adoptedNotifications: [
+				"thread/started",
+				"thread/status/changed",
 				"turn/started",
 				"turn/completed",
 				"item/started",

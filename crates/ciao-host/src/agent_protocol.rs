@@ -784,6 +784,17 @@ pub enum TurnState {
 }
 
 impl TurnState {
+    pub(crate) fn run_id(&self) -> Option<&String> {
+        match self {
+            Self::Running { run_id, .. } | Self::Stopping { run_id } => Some(run_id),
+            Self::AwaitingInteraction { run_id }
+            | Self::Completed { run_id }
+            | Self::Failed { run_id, .. }
+            | Self::Interrupted { run_id } => run_id.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), AgentProtocolError> {
         match self {
             Self::Running { run_id, activity } => {

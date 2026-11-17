@@ -6,6 +6,7 @@ pub(crate) mod agent_integration;
 pub mod agent_protocol;
 pub(crate) mod agent_route;
 pub(crate) mod agent_session;
+mod child_activity;
 pub(crate) mod claude_adapter;
 pub(crate) mod claude_history;
 pub(crate) mod claude_hook;

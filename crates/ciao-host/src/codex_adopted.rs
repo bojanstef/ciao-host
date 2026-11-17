@@ -1085,7 +1085,7 @@ async fn run_adopted(mut runtime: AdoptedRuntime) {
         tokio::select! {
             event = runtime.events.recv() => match event {
                 Some(AppServerEvent::Notification { method, params }) => {
-                    on_notification(&runtime.supervisor, &session, &mut tracking, &method, &params);
+                    on_notification(&runtime, &mut tracking, &method, &params).await;
                 }
                 Some(AppServerEvent::ServerRequest { id, method, params }) => {
                     on_server_request(&runtime, &session, &mut tracking, id, &method, &params).await;
@@ -1158,14 +1158,120 @@ async fn release(mut runtime: AdoptedRuntime, tracking: TurnTracking, reason: Re
     );
 }
 
-fn on_notification(
-    supervisor: &AgentSessionSupervisor,
-    session: &str,
+fn child_key(thread_id: &str) -> String {
+    keyed_digest(CODEX_ADOPTED_DOMAIN, "child", thread_id)
+}
+
+fn child_thread_status(status: &Value) -> Option<crate::child_activity::ChildState> {
+    use crate::child_activity::ChildState::*;
+    match status["type"].as_str()? {
+        "active"
+            if status["activeFlags"].as_array()?.iter().any(|f| {
+                matches!(f.as_str(), Some("waitingOnApproval" | "waitingOnUserInput"))
+            }) =>
+        {
+            Some(Waiting)
+        }
+        "active" => Some(Started),
+        "idle" | "systemError" => Some(Finished),
+        _ => None,
+    }
+}
+
+fn adopted_child_items<'a>(
+    item: &'a Value,
+    out: &mut Vec<(&'a str, crate::child_activity::ChildState)>,
+) {
+    use crate::child_activity::ChildState::*;
+    match item["type"].as_str() {
+        Some("subAgentActivity") => {
+            if let Some(id) = item["agentThreadId"].as_str() {
+                match item["kind"].as_str() {
+                    Some("started") => out.push((id, Started)),
+                    Some("completed") => out.push((id, Finished)),
+                    // The interrupt tool has requested cancellation; the child still owns its close.
+                    _ => {}
+                }
+            }
+        }
+        Some("collabAgentToolCall") => {
+            if let Some(states) = item["agentsStates"].as_object() {
+                for (id, value) in states {
+                    match value["status"].as_str() {
+                        Some("pendingInit" | "running") => out.push((id, Observed)),
+                        Some("completed" | "interrupted" | "errored" | "shutdown") => {
+                            out.push((id, Finished))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn on_notification(
+    runtime: &AdoptedRuntime,
     tracking: &mut TurnTracking,
     method: &str,
     params: &Value,
 ) {
+    let supervisor = &runtime.supervisor;
+    let session = &runtime.registered.session_id;
     tracing::debug!(%method, "app-server notification");
+    let root = &runtime.thread_id;
+    let mut observations = Vec::new();
+    if method == "thread/started" {
+        let thread = &params["thread"];
+        if let (Some(id), Some(parent)) = (thread["id"].as_str(), thread["parentThreadId"].as_str())
+            && (parent == root || supervisor.knows_child(&runtime.registered, &child_key(parent)))
+        {
+            // A new thread can be idle before its first turn. Membership alone is not activity.
+            observations.push((
+                id,
+                child_thread_status(&thread["status"])
+                    .unwrap_or(crate::child_activity::ChildState::Unobserved),
+            ));
+        }
+    }
+    let thread = params["threadId"].as_str();
+    let own = thread == Some(root.as_str());
+    let child =
+        thread.filter(|id| !own && supervisor.knows_child(&runtime.registered, &child_key(id)));
+    if let Some(id) = child {
+        use crate::child_activity::ChildState;
+        let state = match method {
+            "thread/status/changed" => child_thread_status(&params["status"]),
+            "turn/started" => Some(ChildState::Started),
+            "turn/completed" | "turn/failed" => Some(ChildState::Finished),
+            _ => None,
+        };
+        if let Some(state) = state {
+            observations.push((id, state));
+        }
+    }
+    if (own || child.is_some()) && method == "item/completed" {
+        adopted_child_items(&params["item"], &mut observations);
+    }
+    if !observations.is_empty() {
+        let stamp = crate::child_activity::observation_time();
+        let reports = observations
+            .into_iter()
+            .filter(|(id, _)| *id != root && crate::agent_protocol::valid_opaque_id(id).is_ok())
+            .map(|(id, state)| {
+                crate::child_activity::ChildReport::one(child_key(id), state, stamp)
+            });
+        if let Ok(Some(turn)) = supervisor.note_family_state(&runtime.registered, reports, None)
+            && let Some(kind) = crate::agent_bridge::attention_kind_for_turn(&turn)
+        {
+            crate::agent_bridge::push_attention(supervisor, &runtime.notifier, session, kind).await;
+        }
+    }
+    // Only the root's own notifications may change its transcript or interrupt target.
+    if !own {
+        return;
+    }
     match method {
         "turn/started" => {
             let turn_id = params["turn"]["id"].as_str().unwrap_or_default().to_owned();
@@ -1192,7 +1298,12 @@ fn on_notification(
                 },
                 _ => TurnState::Completed { run_id },
             };
-            let _ = supervisor.note_bridge_turn(session, state);
+            if let Ok(Some(turn)) = supervisor.note_bridge_turn(session, state)
+                && let Some(kind) = crate::agent_bridge::attention_kind_for_turn(&turn)
+            {
+                crate::agent_bridge::push_attention(supervisor, &runtime.notifier, session, kind)
+                    .await;
+            }
         }
         "item/started" | "item/completed" => {
             let item = &params["item"];
@@ -1253,6 +1364,9 @@ fn live_item_entry(
     item: &Value,
     complete: bool,
 ) -> Option<NormalizedTimelineEntry> {
+    if item["type"] == "subAgentActivity" {
+        return None;
+    }
     let item_id = item["id"].as_str()?;
     let source_id = entry_source_id(item_id);
     let revision = tracking.next_revision(&source_id);
@@ -1370,6 +1484,18 @@ async fn on_server_request(
     method: &str,
     params: &Value,
 ) {
+    if let Some(thread) = params["threadId"].as_str()
+        && thread != runtime.thread_id
+        && !runtime
+            .supervisor
+            .knows_child(&runtime.registered, &child_key(thread))
+    {
+        let _ = runtime
+            .connection
+            .refuse(id, "request belongs to a different thread")
+            .await;
+        return;
+    }
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
             let offered: Vec<String> = match params["availableDecisions"].as_array() {
@@ -1448,10 +1574,6 @@ async fn on_server_request(
                 .is_ok()
             {
                 tracking.approvals.insert(interaction_id, (id, offered));
-                let run_id = tracking.vendor_turn_id.as_deref().map(codex_run_id);
-                let _ = runtime
-                    .supervisor
-                    .note_bridge_turn(session, TurnState::AwaitingInteraction { run_id });
                 // ADR 005, same moment as every other integration: the card blocks the turn,
                 // and this is the push that reaches a pocket. Managed and adopted were the two
                 // paths that could raise a card and not say so — this closes the adopted half.
@@ -1724,6 +1846,28 @@ async fn answer_approval(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn child_status_uses_reported_state_and_an_interrupt_request_does_not_close_a_child() {
+        use crate::child_activity::ChildState::*;
+        assert_eq!(
+            child_thread_status(&json!({"type":"active","activeFlags":["waitingOnUserInput"]})),
+            Some(Waiting)
+        );
+        assert_eq!(
+            child_thread_status(&json!({"type":"active","activeFlags":[]})),
+            Some(Started)
+        );
+        assert_eq!(child_thread_status(&json!({"type":"idle"})), Some(Finished));
+        let item = json!({"type":"collabAgentToolCall","agentsStates":{"a":{"status":"completed"},"b":{"status":"running"}}});
+        let mut out = Vec::new();
+        adopted_child_items(&item, &mut out);
+        assert!(out.contains(&("a", Finished)) && out.contains(&("b", Observed)));
+        let interrupt = json!({"type":"subAgentActivity","agentThreadId":"b","kind":"interrupted"});
+        out.clear();
+        adopted_child_items(&interrupt, &mut out);
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn function_output_live_history_parity() {
         let item = json!({"type":"functionCallOutput","id":"scope-live",

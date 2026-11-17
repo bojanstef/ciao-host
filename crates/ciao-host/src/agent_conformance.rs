@@ -61,6 +61,8 @@ enum EventKind {
     CommandReceipt,
     VendorSession,
     Turn,
+    ChildActivity,
+    ParentStop,
     UpsertInteraction,
     ResolveInteraction,
     Shutdown,
@@ -86,6 +88,8 @@ fn kind_of(event: &NormalizedAdapterEvent) -> Option<EventKind> {
         NormalizedAdapterEvent::CommandReceipt { .. } => EventKind::CommandReceipt,
         NormalizedAdapterEvent::VendorSession(_) => EventKind::VendorSession,
         NormalizedAdapterEvent::Turn(_) => EventKind::Turn,
+        NormalizedAdapterEvent::ParentStop { .. } => EventKind::ParentStop,
+        NormalizedAdapterEvent::ChildActivity(_) => EventKind::ChildActivity,
         NormalizedAdapterEvent::UpsertInteraction(_) => EventKind::UpsertInteraction,
         NormalizedAdapterEvent::ResolveInteraction { .. } => EventKind::ResolveInteraction,
         NormalizedAdapterEvent::Shutdown { .. } => EventKind::Shutdown,
@@ -435,6 +439,18 @@ fn claude_registration() -> Vec<u8> {
 fn claude_events() -> Vec<(EventKind, Vec<u8>)> {
     vec![
         (
+            EventKind::ParentStop,
+            frame(
+                json!({"v": 1, "type": "parent_stop", "run_id": "root", "background":{"ids": [], "state":"background_snapshot", "observed_us":1}}),
+            ),
+        ),
+        (
+            EventKind::ChildActivity,
+            frame(
+                json!({"v": 1, "type": "child_activity", "report": {"ids": ["child-1"], "state": "started", "observed_us": 1}}),
+            ),
+        ),
+        (
             EventKind::Heartbeat,
             frame(json!({ "v": 1, "type": "heartbeat" })),
         ),
@@ -485,6 +501,12 @@ fn codex_registration() -> Vec<u8> {
 
 fn codex_events() -> Vec<(EventKind, Vec<u8>)> {
     vec![
+        (
+            EventKind::ChildActivity,
+            frame(
+                json!({"v": 1, "type": "child_activity", "report": {"ids": ["child-1"], "state": "started", "observed_us": 1}}),
+            ),
+        ),
         (
             EventKind::Heartbeat,
             frame(json!({ "v": 1, "type": "heartbeat" })),
@@ -537,6 +559,12 @@ fn claude_managed_registration() -> Vec<u8> {
 
 fn claude_managed_events() -> Vec<(EventKind, Vec<u8>)> {
     vec![
+        (
+            EventKind::ChildActivity,
+            frame(
+                json!({"v": 1, "type": "child_activity", "report": {"ids": ["child-1"], "state": "started", "observed_us": 1}}),
+            ),
+        ),
         (
             EventKind::Heartbeat,
             frame(json!({ "v": 1, "type": "heartbeat" })),
@@ -734,6 +762,8 @@ fn contracts() -> [ParityContract; 4] {
                 EventKind::AppendText,
                 EventKind::Notification,
                 EventKind::Turn,
+                EventKind::ParentStop,
+                EventKind::ChildActivity,
                 EventKind::SessionEnded,
             ],
             whereabouts: WhereaboutsDelivery::HookAcknowledgement,
@@ -796,6 +826,7 @@ fn contracts() -> [ParityContract; 4] {
                 EventKind::CommandReceipt,
                 EventKind::VendorSession,
                 EventKind::Turn,
+                EventKind::ChildActivity,
                 EventKind::UpsertInteraction,
                 EventKind::ResolveInteraction,
                 // The worker pushes when it raises a blocking card — the managed half of the
@@ -844,6 +875,7 @@ fn contracts() -> [ParityContract; 4] {
                 EventKind::UpsertEntry,
                 EventKind::Notification,
                 EventKind::Turn,
+                EventKind::ChildActivity,
                 EventKind::SessionEnded,
             ],
             whereabouts: WhereaboutsDelivery::HookAcknowledgement,

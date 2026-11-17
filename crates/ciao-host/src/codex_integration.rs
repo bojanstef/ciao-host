@@ -48,12 +48,14 @@ const SESSION_END_TIMEOUT_SECONDS: u64 = 3;
 
 /// Only the events the adapter actually maps. Installing a hook whose payload is dropped would
 /// buy nothing and cost the user one more entry to approve.
-const CIAO_EVENTS: [&str; 7] = [
+const CIAO_EVENTS: [&str; 9] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
     "Stop",
+    "SubagentStart",
+    "SubagentStop",
     "PermissionRequest",
     "SessionEnd",
 ];
@@ -652,7 +654,7 @@ mod tests {
         assert_eq!(hooks.len(), CIAO_EVENTS.len());
         // Events the adapter drops are not installed, so nobody is asked to approve a hook
         // whose payload Ciao throws away.
-        for absent in ["PreCompact", "PostCompact", "SubagentStart", "SubagentStop"] {
+        for absent in ["PreCompact", "PostCompact"] {
             assert!(!hooks.contains_key(absent));
         }
     }

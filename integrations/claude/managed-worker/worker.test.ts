@@ -248,6 +248,12 @@ export function query(config) {
 				}
 			}
 			for (const message of SCRIPT) {
+                if (message.hook_event_name) {
+                    for (const matcher of config.options.hooks[message.hook_event_name] ?? []) {
+                        for (const hook of matcher.hooks) await hook(message);
+                    }
+                    continue;
+                }
 				yield message;
 				await new Promise((resolve) => setTimeout(resolve, 10));
 			}
@@ -415,7 +421,7 @@ test("destination configuration loads all settings without replacing fresh-sessi
 	expect(journal().options.permissionMode).toBeNull();
 	expect(journal().options.model).toBeNull();
 	expect(journal().options.launchPolicyLeaked).toBe(false);
-	expect(journal().options.hooks).toEqual(["UserPromptSubmit", "PostToolUse"]);
+	expect(journal().options.hooks.sort()).toEqual(["Notification", "PostToolUse", "PostToolUseFailure", "PreToolUse", "SubagentStart", "SubagentStop", "UserPromptSubmit"]);
 	// Until the vendor reports its resolved mode, a default would be an invented fact.
 	expect(frames.filter((frame) => frame.type === "permission_mode")).toEqual([]);
 });
@@ -855,6 +861,23 @@ test("canonical history matches the shared Claude transcript fixture", async () 
 	);
 	expect(JSON.stringify(entries)).not.toContain("never forwarded");
 	expect(JSON.stringify(entries)).not.toContain("Omitted synthetic reasoning");
+});
+
+test("the worker observes child identities across the parent result without forwarding child content", async () => {
+	const { child, frames } = await startWorker([
+		{ hook_event_name: "SubagentStart", agent_id: "private-child" },
+		{ type: "result", subtype: "success" },
+		{ type: "assistant", parent_tool_use_id: "tool-id", message: { id: "private-child-message", content: [{ type: "text", text: "private-child-reply" }] } },
+		{ hook_event_name: "Notification", agent_id: "private-child", notification_type: "permission_prompt" },
+		{ hook_event_name: "PostToolUse", agent_id: "private-child" },
+		{ hook_event_name: "SubagentStop", agent_id: "private-child", last_assistant_message: "private-child-output" },
+	]);
+	expect(await child.exited).toBe(0);
+	const states = frames.filter(f => f.type === "child_activity" || f.type === "turn");
+	const report = (f: Record<string, unknown>) => f.report as { state: string; ids: string[] } | undefined;
+	expect(states.map(f => report(f)?.state ?? f.state)).toEqual(["started", "completed", "waiting", "progress", "finished"]);
+	expect(report(states[0])?.ids).toEqual(report(states.at(-1)!)?.ids);
+	expect(JSON.stringify(frames)).not.toContain("private-child");
 });
 
 test("a message type outside the SDK's union is reported as drift, once, and skipped", async () => {

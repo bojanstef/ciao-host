@@ -271,6 +271,7 @@ impl ClaudeManagedInteraction {
 pub(crate) enum ClaudeManagedInbound {
     Register(ClaudeManagedRegister),
     Heartbeat,
+    ChildActivity(crate::child_activity::ChildReport),
     /// Spec 017 §4.2: the worker met a shape outside its pinned vocabulary and named it. A new
     /// frame type rather than a field on the heartbeat, deliberately: on a host too old to know
     /// it, an unknown *type* degrades to one unsupported card, where a heartbeat with an extra
@@ -400,6 +401,10 @@ fn decode_managed_frame(body: &[u8]) -> Result<ClaudeManagedInbound, AgentProtoc
 
     Ok(match message_type {
         "register" => ClaudeManagedInbound::Register(strict(value)?),
+        "child_activity" => ClaudeManagedInbound::ChildActivity(crate::child_activity::decode(
+            value,
+            CLAUDE_MANAGED_PROTOCOL_VERSION,
+        )?),
         "heartbeat" => {
             unit(&object)?;
             ClaudeManagedInbound::Heartbeat
@@ -685,6 +690,9 @@ impl AttachedAgentAdapter for ClaudeManagedAdapter {
     fn decode_event(&self, body: &[u8]) -> Result<NormalizedAdapterEvent, AgentProtocolError> {
         Ok(match decode_managed_frame(body)? {
             ClaudeManagedInbound::Register(_) => NormalizedAdapterEvent::Registration,
+            ClaudeManagedInbound::ChildActivity(report) => {
+                NormalizedAdapterEvent::ChildActivity(report)
+            }
             ClaudeManagedInbound::Heartbeat => NormalizedAdapterEvent::Heartbeat,
             ClaudeManagedInbound::DriftNote { surface, name } => {
                 // Tallied here and surfaced as a heartbeat: the note is true whenever the

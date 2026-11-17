@@ -93,6 +93,15 @@ pub(crate) enum ClaudeHookEventFrame {
         v: u8,
         turn: TurnState,
     },
+    ParentStop {
+        v: u8,
+        run_id: Option<String>,
+        background: crate::child_activity::ChildReport,
+    },
+    ChildActivity {
+        v: u8,
+        report: crate::child_activity::ChildReport,
+    },
     SessionEnd {
         v: u8,
     },
@@ -214,6 +223,34 @@ impl AttachedAgentAdapter for ClaudeAttachedAdapter {
                 value,
                 CLAUDE_HOOK_PROTOCOL_VERSION,
             )?),
+            "parent_stop" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Frame {
+                    v: u8,
+                    #[serde(rename = "type")]
+                    kind: String,
+                    run_id: Option<String>,
+                    background: crate::child_activity::ChildReport,
+                }
+                let f: Frame =
+                    serde_json::from_value(value).map_err(|_| AgentProtocolError::MalformedJson)?;
+                validate_frame_header(f.v, CLAUDE_HOOK_PROTOCOL_VERSION, &f.kind, "parent_stop")?;
+                if let Some(id) = &f.run_id {
+                    crate::agent_protocol::valid_opaque_id(id)?;
+                }
+                f.background.validate()?;
+                if f.background.state != crate::child_activity::ChildState::BackgroundSnapshot {
+                    return Err(AgentProtocolError::InvalidValue);
+                }
+                NormalizedAdapterEvent::ParentStop {
+                    run_id: f.run_id,
+                    background: f.background,
+                }
+            }
+            "child_activity" => NormalizedAdapterEvent::ChildActivity(
+                crate::child_activity::decode(value, CLAUDE_HOOK_PROTOCOL_VERSION)?,
+            ),
             "session_end" => {
                 decode_unit_frame(&value, CLAUDE_HOOK_PROTOCOL_VERSION, "session_end")?;
                 NormalizedAdapterEvent::SessionEnded

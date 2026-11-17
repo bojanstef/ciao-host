@@ -97,6 +97,16 @@ pub(crate) fn required_bool(object: &Map<String, Value>, key: &str) -> Result<bo
         .ok_or_else(|| anyhow!("hook boolean field is missing"))
 }
 
+/// A child can run in a separate worktree. Only the parent's hooks name its workspace.
+pub(crate) fn parent_workspace(input: &serde_json::Map<String, Value>) -> Result<&str> {
+    let cwd = required_string(input, "cwd")?;
+    Ok(if input.contains_key("agent_id") {
+        ""
+    } else {
+        cwd
+    })
+}
+
 /// The last path component, control characters removed, bounded — the name a person recognizes
 /// without the directory tree it sits in.
 pub(crate) fn workspace_display(cwd: &str) -> String {

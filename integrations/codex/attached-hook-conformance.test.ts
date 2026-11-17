@@ -125,6 +125,8 @@ test("every hook the installer writes is an event this Codex knows", () => {
 		"UserPromptSubmit",
 		"PreToolUse",
 		"PostToolUse",
+		"SubagentStart",
+		"SubagentStop",
 		"Stop",
 		"PermissionRequest",
 		"SessionEnd",

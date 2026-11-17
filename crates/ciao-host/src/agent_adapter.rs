@@ -142,6 +142,11 @@ pub(crate) enum NormalizedAdapterEvent {
     /// An adapter that can see its own turn boundaries saying one changed. Session-level, and
     /// the only sanctioned source of "working": Ciao never infers it from timing or output.
     Turn(TurnState),
+    ChildActivity(crate::child_activity::ChildReport),
+    ParentStop {
+        run_id: Option<String>,
+        background: crate::child_activity::ChildReport,
+    },
     /// A blocking interaction raised by a managed worker (Spec 006 §9.5).
     UpsertInteraction(Box<PendingInteraction>),
     /// The worker's authoritative single resolution of one interaction.

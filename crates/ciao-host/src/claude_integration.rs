@@ -177,6 +177,8 @@ fn expected_plugin(paths: &CiaoPaths) -> Result<PluginFiles> {
             // and none closed. Its payload repeats the opening `prompt_id`, which is how a close
             // names the run it closes.
             "Stop": [event_hooks(None)],
+            "SubagentStart": [event_hooks(None)],
+            "SubagentStop": [event_hooks(None)],
             // The "needs you" signal: Claude Code raises this for a permission prompt and for
             // an idle prompt, and it is the only hook that reports either (ADR 005).
             "Notification": [event_hooks(None)],
@@ -407,6 +409,8 @@ fn validate_expected(expected: &PluginFiles) -> Result<()> {
         // Quoted: a bare `Stop` is a substring of `StopFailure`, so the loose spelling would
         // pass on a plugin that dropped the turn-close edge.
         "\"Stop\"",
+        "SubagentStart",
+        "SubagentStop",
         "SessionEnd",
         "__claude-hook",
     ] {

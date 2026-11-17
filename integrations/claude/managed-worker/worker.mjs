@@ -1027,10 +1027,25 @@ async function canUseTool(toolName, toolInput, options) {
 		if (options.signal.aborted) abort();
 		if (settled) return;
 		published = true;
+		reportChild(options.agentID, "observed");
 		writeFrame(card);
 		// Publish the blocking card before notifying the phone.
 		writeFrame({ type: "notification", kind: questions ? "question_prompt" : "permission_prompt" });
 	});
+}
+
+// SDK callbacks run in this worker. Use their order even when two arrive in one millisecond.
+let lastChildStamp = 0;
+function reportChild(id, state) {
+	if (typeof id !== "string" || !/^[a-zA-Z0-9_.-]{1,128}$/.test(id)) return;
+	lastChildStamp = Math.max(Date.now() * 1000, lastChildStamp + 1);
+	writeFrame({ type: "child_activity", report: {
+		ids: [crypto.createHash("sha256").update(id).digest("hex")], state, observed_us: lastChildStamp,
+	} });
+}
+
+function observeChild(state) {
+	return [{ hooks: [async (input) => { reportChild(input?.agent_id, state); return {}; }] }];
 }
 
 const query = sdk.query({
@@ -1059,6 +1074,16 @@ const query = sdk.query({
 		// Ciao's transport hooks coexist with the destination's filesystem hooks. No matcher:
 		// the map lookup selects which question's output this callback owns.
 		hooks: {
+			PreToolUse: observeChild("observed"),
+			Notification: [{ hooks: [async (input) => {
+				if (["permission_prompt", "agent_needs_input"].includes(input?.notification_type)) {
+					reportChild(input.agent_id, "waiting");
+				}
+				return {};
+			}] }],
+			SubagentStart: observeChild("started"),
+			SubagentStop: observeChild("finished"),
+			PostToolUseFailure: observeChild("progress"),
 			// Spec 025. The vendor's own channel for context that rides a prompt without becoming
 			// part of what the person said: the daemon's note, handed over as Claude reads the
 			// prompt it came with. Machinery Claude delivers through the prompt path took no slot.
@@ -1083,6 +1108,7 @@ const query = sdk.query({
 				{
 					hooks: [
 						async (hookInput) => {
+							reportChild(hookInput?.agent_id, "progress");
 							// The effort the turn actually ran at, after any silent downgrade for
 							// the chosen model. Absent on models without effort support, which is
 							// why effort stays unreported rather than defaulting to a level.
@@ -1522,6 +1548,8 @@ function turnCompleted() {
 
 try {
 	for await (const message of query) {
+		// Nested SDK messages belong to the child. Its hooks carry the status for Home.
+		if (typeof message.parent_tool_use_id === "string") continue;
 		if (!TYPED.has(message.type)) {
 			reportDrift("sdk_stream", message.type);
 			continue;

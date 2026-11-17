@@ -51,6 +51,7 @@ const MAX_CODEX_ANCESTRY: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HookRuntimeFacts {
+    observed_us: u64,
     process_id: u32,
     process_nonce: String,
     adapter_version: String,
@@ -80,6 +81,7 @@ pub(crate) async fn run(paths: &CiaoPaths) -> Result<()> {
 }
 
 async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
+    let observed_us = crate::child_activity::observation_time();
     let body = read_bounded_stdin(MAX_CODEX_HOOK_INPUT_BYTES)?;
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| anyhow!("invalid Codex hook input"))?;
@@ -107,6 +109,7 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
     )
     .await?;
     let facts = HookRuntimeFacts {
+        observed_us,
         process_id,
         process_nonce: process_nonce(process_id),
         adapter_version,
@@ -288,8 +291,6 @@ pub(crate) fn parse_codex_version_output(output: &std::process::Output) -> Resul
 pub(crate) const IGNORED_HOOK_EVENTS: &[&str] = &[
     "PreCompact",
     "PostCompact",
-    "SubagentStart",
-    "SubagentStop",
     "Interrupt",
     "PreModelRequest",
     "PostModelRequest",
@@ -297,15 +298,12 @@ pub(crate) const IGNORED_HOOK_EVENTS: &[&str] = &[
 
 /// Maps one hook payload to a registration plus one event, or to nothing at all.
 ///
-/// Returning `None` is not a failure. An observer registration overwrites the session's turn
-/// every time it refreshes, so an event that cannot say what the turn is would clobber the one
-/// the last event established. Compaction and subagent events are exactly that, and dropping
-/// them costs only a heartbeat the prompt/tool/stop events already provide.
+/// Child hooks update only the identified child turn. Other unmapped events have no effect.
 fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<HookDispatch>> {
     let object = object(value)?;
     let session_id = required_string(object, "session_id")?;
     valid_opaque_id(session_id).map_err(|_| anyhow!("Codex thread ID is invalid"))?;
-    let cwd = required_string(object, "cwd")?;
+    let cwd = crate::hook_common::parent_workspace(object)?;
     let event_name = required_string(object, "hook_event_name")?;
     let timestamp = unix_now();
     // The shared classifier (Spec 017 §3), plus the prover: a 0.x minor is a breaking change
@@ -326,8 +324,39 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
             },
             None,
         )
+    } else if object.contains_key("agent_id") {
+        // Codex puts the session-tree identity in session_id, and the spawned
+        // thread identity in agent_id. Child turns never reach the parent timeline.
+        use crate::child_activity::ChildState;
+        let child_id = required_string(object, "agent_id")?;
+        valid_opaque_id(child_id)?;
+        if child_id == session_id {
+            return Ok(None);
+        }
+        let turn_id = required_string(object, "turn_id")?;
+        valid_opaque_id(turn_id)?;
+        let state = match event_name {
+            "SubagentStart" | "UserPromptSubmit" => ChildState::Started,
+            "PreToolUse" => ChildState::Observed,
+            "PostToolUse" => ChildState::Progress,
+            "PermissionRequest" => ChildState::Waiting,
+            "SubagentStop" => ChildState::Finished,
+            _ => return Ok(None),
+        };
+        (
+            CodexHookEventFrame::ChildActivity {
+                v: CODEX_HOOK_PROTOCOL_VERSION,
+                report: crate::child_activity::ChildReport::one(
+                    opaque_digest("child", &format!("{child_id}/{turn_id}")),
+                    state,
+                    facts.observed_us,
+                ),
+            },
+            None,
+        )
     } else {
         match event_name {
+            "SubagentStart" | "SubagentStop" => return Ok(None),
             "SessionStart" => (
                 CodexHookEventFrame::Heartbeat {
                     v: CODEX_HOOK_PROTOCOL_VERSION,
@@ -642,6 +671,7 @@ pub(crate) mod tests {
 
     fn facts() -> HookRuntimeFacts {
         HookRuntimeFacts {
+            observed_us: 123,
             process_id: 42,
             process_nonce: "0123456789abcdef0123456789abcdef".into(),
             adapter_version: PINNED_CODEX_VERSION.into(),
@@ -681,6 +711,41 @@ pub(crate) mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn nested_turns_are_scoped_to_the_root_and_only_the_matching_child_turn_closes() {
+        use crate::agent_adapter::{AttachedAgentAdapter, NormalizedAdapterEvent};
+        use crate::child_activity::ChildState::*;
+        let child_report = |event_name: &str, turn_id: &str, expected| {
+            let mut payload = common(event_name);
+            payload["agent_id"] = json!("child-private");
+            payload["turn_id"] = json!(turn_id);
+            payload["last_assistant_message"] = json!("private-output");
+            let dispatch = map_hook_input(&payload, &facts()).unwrap().unwrap();
+            assert!(dispatch.registration.workspace_path.is_empty());
+            assert_eq!(dispatch.turn, None);
+            assert_eq!(
+                dispatch.registration.session_id,
+                payload["session_id"].as_str().unwrap()
+            );
+            let wire = serde_json::to_vec(&dispatch.event).unwrap();
+            let text = std::str::from_utf8(&wire).unwrap();
+            assert!(!text.contains("private"));
+            let NormalizedAdapterEvent::ChildActivity(report) =
+                crate::codex_adapter::CodexAttachedAdapter
+                    .decode_event(&wire)
+                    .unwrap()
+            else {
+                panic!("expected child activity")
+            };
+            assert_eq!(report.state, expected);
+            report.ids
+        };
+        let first = child_report("SubagentStart", "first", Started);
+        assert_eq!(first, child_report("PermissionRequest", "first", Waiting));
+        assert_ne!(first, child_report("UserPromptSubmit", "second", Started));
+        assert_eq!(first, child_report("SubagentStop", "first", Finished));
     }
 
     /// Field-for-field the payloads Codex 0.146.0 wrote to a hook's stdin on 2026-08-01.
@@ -732,6 +797,9 @@ pub(crate) mod tests {
             }
             let mut payload = turn(common(&payload_name));
             payload["prompt"] = json!("Synthetic prompt.");
+            if matches!(payload_name.as_str(), "SubagentStart" | "SubagentStop") {
+                payload["agent_id"] = json!("child");
+            }
             payload["last_assistant_message"] = json!("Done.");
             payload["tool_name"] = json!("Bash");
             payload["tool_use_id"] = json!("synthetic-tool");

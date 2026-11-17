@@ -294,6 +294,10 @@ pub(crate) enum CodexHookEventFrame {
         v: u8,
         turn: TurnState,
     },
+    ChildActivity {
+        v: u8,
+        report: crate::child_activity::ChildReport,
+    },
     SessionEnd {
         v: u8,
     },
@@ -412,6 +416,9 @@ impl AttachedAgentAdapter for CodexAttachedAdapter {
             "turn" => {
                 NormalizedAdapterEvent::Turn(decode_turn_frame(value, CODEX_HOOK_PROTOCOL_VERSION)?)
             }
+            "child_activity" => NormalizedAdapterEvent::ChildActivity(
+                crate::child_activity::decode(value, CODEX_HOOK_PROTOCOL_VERSION)?,
+            ),
             "session_end" => {
                 decode_unit_frame(&value, CODEX_HOOK_PROTOCOL_VERSION, "session_end")?;
                 NormalizedAdapterEvent::SessionEnded

@@ -74,6 +74,7 @@ struct VersionCache {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HookRuntimeFacts {
+    observed_us: u64,
     process_id: u32,
     process_nonce: String,
     adapter_version: String,
@@ -104,6 +105,7 @@ pub(crate) async fn run(paths: &CiaoPaths) -> Result<()> {
 }
 
 async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
+    let observed_us = crate::child_activity::observation_time();
     let body = read_bounded_stdin(MAX_CLAUDE_HOOK_INPUT_BYTES)?;
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| anyhow!("invalid Claude hook input"))?;
@@ -116,7 +118,7 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
     {
         bail!("Claude hook environment did not authenticate the session");
     }
-    if object(&value)?.contains_key("agent_id") {
+    if object(&value)?.contains_key("agent_id") && child_hook_state(object(&value)?).is_none() {
         return Ok(());
     }
     let process_id = env::var("CLAUDE_PID")?.parse::<u32>()?;
@@ -135,6 +137,7 @@ async fn observe(paths: &CiaoPaths, event: &mut String) -> Result<()> {
     .await?;
     let process_nonce = process_nonce(process_id);
     let facts = HookRuntimeFacts {
+        observed_us,
         process_id,
         process_nonce,
         adapter_version,
@@ -366,6 +369,57 @@ pub(crate) fn is_synthetic_prompt(prompt: &str) -> bool {
         .any(|envelope| trimmed.starts_with(envelope))
 }
 
+fn background_report(tasks: &Value, observed_us: u64) -> crate::child_activity::ChildReport {
+    use crate::child_activity::{ChildReport, ChildState, MAX_CHILDREN};
+    let mut report = ChildReport {
+        ids: Vec::new(),
+        state: ChildState::BackgroundSnapshot,
+        observed_us,
+        overflow: false,
+    };
+    let Some(tasks) = tasks.as_array() else {
+        report.overflow = true;
+        return report;
+    };
+    for task in tasks {
+        match task["type"].as_str() {
+            Some("subagent") => {
+                let Some(id) = task["id"].as_str().filter(|id| valid_opaque_id(id).is_ok()) else {
+                    report.overflow = true;
+                    continue;
+                };
+                if report.ids.len() == MAX_CHILDREN {
+                    report.overflow = true;
+                    break;
+                }
+                report.ids.push(opaque_digest("child", id));
+            }
+            Some(_) => {}
+            None => report.overflow = true,
+        }
+    }
+    report
+}
+
+fn child_hook_state(object: &Map<String, Value>) -> Option<crate::child_activity::ChildState> {
+    use crate::child_activity::ChildState::*;
+    match object.get("hook_event_name")?.as_str()? {
+        "SubagentStart" => Some(Started),
+        "SubagentStop" => Some(Finished),
+        "PreToolUse" => Some(Observed),
+        "PostToolUse" | "PostToolUseFailure" => Some(Progress),
+        "Notification"
+            if matches!(
+                object.get("notification_type")?.as_str()?,
+                "permission_prompt" | "agent_needs_input"
+            ) =>
+        {
+            Some(Waiting)
+        }
+        _ => None,
+    }
+}
+
 fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<HookDispatch>> {
     let object = object(value)?;
     let session_id = required_string(object, "session_id")?;
@@ -373,12 +427,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
     if session_id != facts.environment_session_id {
         bail!("Claude hook session identity mismatched its environment");
     }
-    // Subagent events share the parent session/process but are not the attached main-thread TUI.
-    // Ignoring them is safer than interleaving timelines or claiming unsupported topology.
-    if object.contains_key("agent_id") {
-        return Ok(None);
-    }
-    let cwd = required_string(object, "cwd")?;
+    let cwd = crate::hook_common::parent_workspace(object)?;
     let workspace_display = workspace_display(cwd);
     let event_name = required_string(object, "hook_event_name")?;
     let timestamp = unix_now();
@@ -394,6 +443,20 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 // A gated version is refused, not novel; the gate already reports itself.
                 unrecognized_event: None,
                 context_reset: false,
+            }
+        } else if object.contains_key("agent_id") {
+            let Some(state) = child_hook_state(object) else {
+                return Ok(None);
+            };
+            let id = required_string(object, "agent_id")?;
+            valid_opaque_id(id)?;
+            ClaudeHookEventFrame::ChildActivity {
+                v: CLAUDE_HOOK_PROTOCOL_VERSION,
+                report: crate::child_activity::ChildReport::one(
+                    opaque_digest("child", id),
+                    state,
+                    facts.observed_us,
+                ),
             }
         } else {
             match event_name {
@@ -420,17 +483,26 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 // against a real 2.1.222 payload — so the close names the exact run it closes
                 // rather than an anonymous one.
                 "Stop" => {
-                    turn = Some(TurnState::Completed {
-                        run_id: object
-                            .get("prompt_id")
-                            .and_then(Value::as_str)
-                            .map(run_id)
-                            .filter(|run_id| valid_opaque_id(run_id).is_ok()),
-                    });
-                    ClaudeHookEventFrame::Heartbeat {
-                        v: CLAUDE_HOOK_PROTOCOL_VERSION,
-                        unrecognized_event: None,
-                        context_reset: false,
+                    let run_id = object
+                        .get("prompt_id")
+                        .and_then(Value::as_str)
+                        .map(run_id)
+                        .filter(|run_id| valid_opaque_id(run_id).is_ok());
+                    // Recent Claude versions include in-flight background tasks on Stop.
+                    // This recovers a start missed during startup or hook delivery.
+                    if let Some(tasks) = object.get("background_tasks") {
+                        ClaudeHookEventFrame::ParentStop {
+                            v: CLAUDE_HOOK_PROTOCOL_VERSION,
+                            run_id,
+                            background: background_report(tasks, facts.observed_us),
+                        }
+                    } else {
+                        turn = Some(TurnState::Completed { run_id });
+                        ClaudeHookEventFrame::Heartbeat {
+                            v: CLAUDE_HOOK_PROTOCOL_VERSION,
+                            unrecognized_event: None,
+                            context_reset: false,
+                        }
                     }
                 }
                 "UserPromptSubmit" => {
@@ -660,6 +732,7 @@ mod tests {
 
     fn facts() -> HookRuntimeFacts {
         HookRuntimeFacts {
+            observed_us: 123,
             process_id: 42,
             process_nonce: "0123456789abcdef0123456789abcdef".into(),
             adapter_version: PINNED_CLAUDE_VERSION.into(),
@@ -1150,6 +1223,37 @@ mod tests {
                 NormalizedAdapterEvent::Turn(turn),
                 "{name}'s turn frame must survive its own serialization"
             );
+        }
+    }
+
+    #[test]
+    fn stop_carries_only_the_background_subagents_in_the_same_frame_as_the_parent_result() {
+        use crate::{
+            agent_adapter::{AttachedAgentAdapter, NormalizedAdapterEvent},
+            claude_adapter::ClaudeAttachedAdapter,
+        };
+        let mut stop = common("Stop");
+        stop["prompt_id"] = json!("root");
+        stop["background_tasks"] = json!([{"type":"shell","id":"shell-task"},{"type":"subagent","id":"private-agent","description":"private-content"}]);
+        let dispatch = map_hook_input(&stop, &facts()).unwrap().unwrap();
+        assert!(dispatch.turn.is_none());
+        let wire = serde_json::to_vec(&dispatch.event).unwrap();
+        assert!(!std::str::from_utf8(&wire).unwrap().contains("private"));
+        let NormalizedAdapterEvent::ParentStop {
+            run_id: parent,
+            background,
+        } = ClaudeAttachedAdapter.decode_event(&wire).unwrap()
+        else {
+            panic!("expected parent stop")
+        };
+        assert_eq!(parent, Some(run_id("root")));
+        assert_eq!(
+            background.ids,
+            vec![opaque_digest("child", "private-agent")]
+        );
+        assert!(!background.overflow);
+        for malformed in [json!(null), json!([{}]), json!([{"type":"subagent"}])] {
+            assert!(background_report(&malformed, 1).overflow);
         }
     }
 

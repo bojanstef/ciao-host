@@ -59,6 +59,8 @@ test("the approval requests and their decision sets are pinned", () => {
 
 test("the notifications the adopted session maps are pinned", () => {
 	expect(pins.adoptedNotifications).toEqual([
+		"thread/started",
+		"thread/status/changed",
 		"turn/started",
 		"turn/completed",
 		"item/started",

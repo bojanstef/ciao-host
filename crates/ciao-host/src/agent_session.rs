@@ -295,6 +295,7 @@ struct LiveSession {
     /// override borrows the turn instead of ending it. Cleared by any other reported turn, by
     /// session end, and by every downgrade.
     open_run: Option<TurnState>,
+    children: crate::child_activity::ChildActivity,
     /// Only a hook-derived wait can be cleared by transcript progress. A native UI wait is
     /// owned by the adapter until it explicitly reports that the dialog ended.
     hook_attention: bool,
@@ -310,6 +311,15 @@ struct LiveSession {
 }
 
 impl LiveSession {
+    fn visible_turn(&self) -> TurnState {
+        if self.adapter_active && !self.snapshot.pending_interactions.is_empty() {
+            return TurnState::AwaitingInteraction {
+                run_id: self.snapshot.turn.run_id().cloned(),
+            };
+        }
+        self.children.turn(&self.snapshot.turn)
+    }
+
     fn blocks_adoption(&self) -> bool {
         self.terminal_binding.is_some()
     }
@@ -394,9 +404,30 @@ impl AgentSessionSupervisor {
     /// Repeated events for the same live process retain canonical history and subscribers.
     pub(crate) async fn register_observer(
         &self,
-        registration: NormalizedRegistration,
+        mut registration: NormalizedRegistration,
     ) -> Result<RegisteredAgentSession> {
         let _registration_guard = self.registration_gate.lock().await;
+        // A child hook omits its workspace. Carry the known parent facts through refresh and
+        // recovery metadata, including when the child works in its own isolated checkout.
+        if registration.workspace_path.is_none() {
+            let mapped = self
+                .metadata
+                .lock()
+                .mapping_for_process(&registration.upstream_identity, &registration.process_nonce);
+            if let Some((id, generation, epoch)) = mapped
+                && let Some(session) = self.inner.lock().sessions.get(&id)
+                && session.snapshot.process_generation == generation
+                && session.snapshot.snapshot_epoch == epoch
+                && session.workspace_path.is_some()
+            {
+                registration
+                    .workspace_display
+                    .clone_from(&session.workspace_display);
+                registration
+                    .workspace_path
+                    .clone_from(&session.workspace_path);
+            }
+        }
         registration
             .validate()
             .map_err(|_| anyhow!("normalized observer registration is invalid"))?;
@@ -521,7 +552,14 @@ impl AgentSessionSupervisor {
             session.offered_commands = CommandCapabilities::none();
             session.adapter_active = true;
             session.updated_at = now;
-            session.workspace_display = registration.workspace_display.clone();
+            session
+                .workspace_display
+                .clone_from(&registration.workspace_display);
+            if session.workspace_path.is_none() {
+                session
+                    .workspace_path
+                    .clone_from(&registration.workspace_path);
+            }
             if facts_changed {
                 session.snapshot.adapter = adapter;
                 session.snapshot.control_owner = registration.control_owner.clone();
@@ -759,6 +797,7 @@ impl AgentSessionSupervisor {
                 bridge_sender: sender,
                 adapter_active: true,
                 open_run: None,
+                children: Default::default(),
                 hook_attention: false,
                 source_entries,
                 history,
@@ -1355,9 +1394,18 @@ impl AgentSessionSupervisor {
                 .pending_interactions
                 .push(interaction.clone());
         }
+        if session.children.turn(&session.snapshot.turn) == session.snapshot.turn
+            && !matches!(
+                session.snapshot.turn,
+                TurnState::Running { .. } | TurnState::AwaitingInteraction { .. }
+            )
+        {
+            session.snapshot.turn = TurnState::AwaitingInteraction {
+                run_id: session.snapshot.turn.run_id().cloned(),
+            };
+        }
         let base_revision = session.snapshot.revision;
         bump_revision(session);
-        session.snapshot.turn = TurnState::AwaitingInteraction { run_id: None };
         let delta = AgentSessionDelta {
             v: AGENT_PROTOCOL_VERSION,
             session_id: session.snapshot.session_id.clone(),
@@ -1368,7 +1416,7 @@ impl AgentSessionSupervisor {
             changes: vec![
                 AgentDeltaChange::UpsertInteraction { interaction },
                 AgentDeltaChange::Turn {
-                    turn: session.snapshot.turn.clone(),
+                    turn: session.visible_turn(),
                 },
             ],
         };
@@ -1414,13 +1462,16 @@ impl AgentSessionSupervisor {
         // card it raised mid-way. Dropping to `Unknown` here made every answered permission show
         // "Watching" until the worker's next delta. Another still-pending card keeps the latch;
         // with nothing pending and no open run, unknown remains the honest answer.
-        session.snapshot.turn = if !session.snapshot.pending_interactions.is_empty() {
-            TurnState::AwaitingInteraction { run_id: None }
-        } else {
-            session.open_run.clone().unwrap_or(TurnState::Unknown {
+        if session.snapshot.pending_interactions.is_empty()
+            && matches!(
+                session.snapshot.turn,
+                TurnState::AwaitingInteraction { .. } | TurnState::Unknown { .. }
+            )
+        {
+            session.snapshot.turn = session.open_run.clone().unwrap_or(TurnState::Unknown {
                 reason_code: "awaiting_worker_state".into(),
-            })
-        };
+            });
+        }
         session.hook_attention = false;
         let delta = AgentSessionDelta {
             v: AGENT_PROTOCOL_VERSION,
@@ -1435,7 +1486,7 @@ impl AgentSessionSupervisor {
                     resolution: resolution.to_owned(),
                 },
                 AgentDeltaChange::Turn {
-                    turn: session.snapshot.turn.clone(),
+                    turn: session.visible_turn(),
                 },
             ],
         };
@@ -1739,38 +1790,81 @@ impl AgentSessionSupervisor {
     /// Answers whether the turn actually moved. A notification is owed to a turn *edge*, and an
     /// adapter re-reporting the state it is already in must not buzz a phone for it — the rate
     /// gate would usually swallow the repeat, but "usually" is not a fence.
-    pub(crate) fn note_bridge_turn(&self, session_id: &str, turn: TurnState) -> Result<bool> {
+    pub(crate) fn note_bridge_turn(
+        &self,
+        session_id: &str,
+        turn: TurnState,
+    ) -> Result<Option<TurnState>> {
         let mut inner = self.inner.lock();
         let session = inner
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| anyhow!("registered session is unavailable"))?;
-        // Recorded before the equality check: an adapter re-reporting the run it already reported
-        // is a no-op for the wire and still the freshest proof that the run is open.
+        let before = session.visible_turn();
         session.open_run = matches!(turn, TurnState::Running { .. }).then(|| turn.clone());
         session.hook_attention = false;
-        if session.snapshot.turn == turn {
-            return Ok(false);
-        }
-        let base_revision = session.snapshot.revision;
-        bump_revision(session);
         session.snapshot.turn = turn;
-        let delta = AgentSessionDelta {
-            v: AGENT_PROTOCOL_VERSION,
-            session_id: session.snapshot.session_id.clone(),
-            snapshot_epoch: session.snapshot.snapshot_epoch,
-            process_generation: session.snapshot.process_generation,
-            base_revision,
-            revision: session.snapshot.revision,
-            changes: vec![AgentDeltaChange::Turn {
-                turn: session.snapshot.turn.clone(),
-            }],
-        };
-        let _ = session.updates.send(AgentServerFrame::SessionDelta {
-            v: AGENT_PROTOCOL_VERSION,
-            delta,
-        });
-        Ok(true)
+        Ok(publish_turn_if_changed(session, before))
+    }
+
+    pub(crate) fn knows_child(&self, registered: &RegisteredAgentSession, id: &str) -> bool {
+        self.inner
+            .lock()
+            .sessions
+            .get(&registered.session_id)
+            .is_some_and(|s| {
+                s.snapshot.snapshot_epoch == registered.snapshot_epoch
+                    && s.snapshot.process_generation == registered.process_generation
+                    && s.children.contains(id)
+            })
+    }
+
+    pub(crate) fn note_child_activity(
+        &self,
+        registered: &RegisteredAgentSession,
+        report: crate::child_activity::ChildReport,
+    ) -> Result<Option<TurnState>> {
+        self.note_family_state(registered, [report], None)
+    }
+
+    pub(crate) fn note_family_state(
+        &self,
+        registered: &RegisteredAgentSession,
+        reports: impl IntoIterator<Item = crate::child_activity::ChildReport>,
+        parent: Option<TurnState>,
+    ) -> Result<Option<TurnState>> {
+        let mut inner = self.inner.lock();
+        let session = inner
+            .sessions
+            .get_mut(&registered.session_id)
+            .ok_or_else(|| anyhow!("registered session is unavailable"))?;
+        if !session.compatible
+            || !session.adapter_active
+            || session.snapshot.process_generation != registered.process_generation
+            || session.snapshot.snapshot_epoch != registered.snapshot_epoch
+        {
+            return Ok(None);
+        }
+        let before = session.visible_turn();
+        let now = unix_now();
+        let mut applied = false;
+        for report in reports {
+            applied |= session.children.apply(report, now);
+        }
+        if let Some(turn) = parent
+            && applied
+            && session
+                .open_run
+                .as_ref()
+                .and_then(TurnState::run_id)
+                .zip(turn.run_id())
+                .is_none_or(|(open, stopped)| open == stopped)
+        {
+            session.open_run = None;
+            session.hook_attention = false;
+            session.snapshot.turn = turn;
+        }
+        Ok(publish_turn_if_changed(session, before))
     }
 
     /// What a vendor notification kind means for the turn (Spec 019, amended 2026-08-19).
@@ -1803,7 +1897,9 @@ impl AgentSessionSupervisor {
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| anyhow!("registered session is unavailable"))?;
-        if matches!(session.snapshot.turn, TurnState::AwaitingInteraction { .. }) {
+        if !session.snapshot.pending_interactions.is_empty()
+            || matches!(session.snapshot.turn, TurnState::AwaitingInteraction { .. })
+        {
             return Ok(());
         }
         let base_revision = session.snapshot.revision;
@@ -1818,7 +1914,7 @@ impl AgentSessionSupervisor {
             base_revision,
             revision: session.snapshot.revision,
             changes: vec![AgentDeltaChange::Turn {
-                turn: session.snapshot.turn.clone(),
+                turn: session.visible_turn(),
             }],
         };
         let _ = session.updates.send(AgentServerFrame::SessionDelta {
@@ -1864,7 +1960,7 @@ impl AgentSessionSupervisor {
             base_revision,
             revision: session.snapshot.revision,
             changes: vec![AgentDeltaChange::Turn {
-                turn: session.snapshot.turn.clone(),
+                turn: session.visible_turn(),
             }],
         };
         let _ = session.updates.send(AgentServerFrame::SessionDelta {
@@ -2395,37 +2491,21 @@ impl AgentSessionSupervisor {
         let now = unix_now();
         let mut inner = self.inner.lock();
         for session in inner.sessions.values_mut() {
-            if session.bridge_sender.is_some()
-                || !matches!(session.snapshot.turn, TurnState::Running { .. })
-                || now.saturating_sub(session.updated_at) < TURN_CLAIM_EXPIRY_SECONDS
-            {
+            if session.bridge_sender.is_some() {
                 continue;
             }
-            session.open_run = None;
-            let base_revision = session.snapshot.revision;
-            bump_revision(session);
-            session.snapshot.turn = TurnState::Unknown {
-                reason_code: "turn_claim_expired".into(),
-            };
-            tracing::info!(
-                session = %session.snapshot.session_id,
-                "agent turn claim expired"
-            );
-            let delta = AgentSessionDelta {
-                v: AGENT_PROTOCOL_VERSION,
-                session_id: session.snapshot.session_id.clone(),
-                snapshot_epoch: session.snapshot.snapshot_epoch,
-                process_generation: session.snapshot.process_generation,
-                base_revision,
-                revision: session.snapshot.revision,
-                changes: vec![AgentDeltaChange::Turn {
-                    turn: session.snapshot.turn.clone(),
-                }],
-            };
-            let _ = session.updates.send(AgentServerFrame::SessionDelta {
-                v: AGENT_PROTOCOL_VERSION,
-                delta,
-            });
+            let before = session.visible_turn();
+            session.children.expire(now, TURN_CLAIM_EXPIRY_SECONDS);
+            if matches!(session.snapshot.turn, TurnState::Running { .. })
+                && now.saturating_sub(session.updated_at) >= TURN_CLAIM_EXPIRY_SECONDS
+            {
+                session.open_run = None;
+                session.snapshot.turn = TurnState::Unknown {
+                    reason_code: "turn_claim_expired".into(),
+                };
+                tracing::info!(session = %session.snapshot.session_id, "agent turn claim expired");
+            }
+            publish_turn_if_changed(session, before);
         }
     }
 
@@ -3454,7 +3534,9 @@ fn still_sized_for(wire: &TimelineEntry, entry: &TimelineEntry) -> bool {
 }
 
 fn snapshot_for_wire(session: &LiveSession) -> AgentSessionSnapshot {
-    fit_snapshot_to_frame(session.snapshot.clone())
+    let mut snapshot = session.snapshot.clone();
+    snapshot.turn = session.visible_turn();
+    fit_snapshot_to_frame(snapshot)
 }
 
 /// The live delta that publishes one entry, its wire copy sized against this very frame —
@@ -3550,7 +3632,7 @@ fn descriptor_for(session: &LiveSession) -> AgentSessionDescriptor {
         stored_reason: session.snapshot.stored_reason.clone(),
         process_generation: session.snapshot.process_generation,
         observation: session.snapshot.observation.clone(),
-        turn: session.snapshot.turn.clone(),
+        turn: session.visible_turn(),
         capabilities: session.snapshot.capabilities.clone(),
         workspace_display: session.workspace_display.clone(),
         terminal_fallback: session.snapshot.terminal_fallback.clone(),
@@ -3609,7 +3691,7 @@ fn clear_hook_attention(session: &mut LiveSession) -> Option<AgentDeltaChange> {
         reason_code: "awaiting_agent_state".into(),
     });
     Some(AgentDeltaChange::Turn {
-        turn: session.snapshot.turn.clone(),
+        turn: session.visible_turn(),
     })
 }
 
@@ -3696,6 +3778,29 @@ pub(crate) fn truncate_on_char_boundary(text: &str, limit: usize) -> String {
     text[..end].trim_end().to_string()
 }
 
+fn publish_turn_if_changed(session: &mut LiveSession, before: TurnState) -> Option<TurnState> {
+    let turn = session.visible_turn();
+    if turn == before {
+        return None;
+    }
+    let base_revision = session.snapshot.revision;
+    bump_revision(session);
+    let delta = AgentSessionDelta {
+        v: AGENT_PROTOCOL_VERSION,
+        session_id: session.snapshot.session_id.clone(),
+        snapshot_epoch: session.snapshot.snapshot_epoch,
+        process_generation: session.snapshot.process_generation,
+        base_revision,
+        revision: session.snapshot.revision,
+        changes: vec![AgentDeltaChange::Turn { turn: turn.clone() }],
+    };
+    let _ = session.updates.send(AgentServerFrame::SessionDelta {
+        v: AGENT_PROTOCOL_VERSION,
+        delta,
+    });
+    Some(turn)
+}
+
 fn bump_revision(session: &mut LiveSession) {
     session.snapshot.revision = session.snapshot.revision.saturating_add(1).max(1);
     session.updated_at = unix_now();
@@ -3708,6 +3813,7 @@ fn downgrade_session(session: &mut LiveSession, reason: &str) {
     // back afterwards.
     session.open_run = None;
     session.hook_attention = false;
+    session.children = Default::default();
     session.snapshot.observation = Observation {
         coverage: "stale".into(),
         reason_code: reason.into(),
@@ -3743,7 +3849,7 @@ fn downgrade_session(session: &mut LiveSession, reason: &str) {
                 capabilities: session.snapshot.capabilities.clone(),
             },
             AgentDeltaChange::Turn {
-                turn: session.snapshot.turn.clone(),
+                turn: session.visible_turn(),
             },
         ],
     };
@@ -4553,6 +4659,148 @@ mod tests {
                 original_bytes: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn a_child_registration_cannot_replace_the_parent_workspace_in_either_arrival_order() {
+        let temp = tempdir().unwrap();
+        let s = supervisor(&temp.path().join("metadata"));
+        let mut root = observer_registration("scope");
+        root.workspace_path = Some("/work/parent".into());
+        root.workspace_display = "parent".into();
+        let mut child = root.clone();
+        child.workspace_path = None;
+        child.workspace_display = "Workspace".into();
+        let reg = s.register_observer(child.clone()).await.unwrap();
+        assert!(s.workspace_path(&reg.session_id).is_none());
+        s.register_observer(root).await.unwrap();
+        s.register_observer(child).await.unwrap();
+        assert_eq!(
+            s.workspace_path(&reg.session_id).as_deref(),
+            Some("/work/parent")
+        );
+        assert_eq!(s.list().sessions[0].workspace_display, "parent");
+    }
+
+    #[tokio::test]
+    async fn a_parent_reply_waits_for_every_child_on_the_directory_snapshot_delta_and_alert_paths()
+    {
+        use crate::child_activity::{ChildReport, ChildState::*};
+        let tmp = tempdir().unwrap();
+        let supervisor = supervisor(&tmp.path().join("agent-metadata.json"));
+        let reg = supervisor
+            .register_observer(observer_registration("family"))
+            .await
+            .unwrap();
+        let id = &reg.session_id;
+        let done = TurnState::Completed {
+            run_id: Some("root".into()),
+        };
+        let work = TurnState::Running {
+            run_id: "root".into(),
+            activity: "subagents".into(),
+        };
+        let wait = TurnState::AwaitingInteraction {
+            run_id: Some("root".into()),
+        };
+        supervisor
+            .note_bridge_turn(
+                id,
+                TurnState::Running {
+                    run_id: "root".into(),
+                    activity: "responding".into(),
+                },
+            )
+            .unwrap();
+        supervisor
+            .upsert_bridge_entry(id, entry("parent-reply", 2, "The parent answered."))
+            .unwrap();
+        let (_, mut updates) = supervisor.subscribe_from_snapshot(id).unwrap();
+        let visible = |expected: &TurnState| {
+            assert_eq!(&supervisor.snapshot(id).unwrap().turn, expected);
+            assert_eq!(&supervisor.list().sessions[0].turn, expected);
+        };
+        let child = |who: &str, state, stamp| {
+            supervisor
+                .note_child_activity(&reg, ChildReport::one(who.into(), state, stamp))
+                .unwrap()
+        };
+        let background = ChildReport {
+            ids: vec!["a".into(), "b".into()],
+            state: BackgroundSnapshot,
+            observed_us: 2,
+            overflow: false,
+        };
+        let edge = supervisor
+            .note_family_state(&reg, [background], Some(done.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(crate::agent_bridge::attention_kind_for_turn(&edge), None);
+        visible(&work);
+        assert_eq!(child("b", Waiting, 3), Some(wait.clone()));
+        assert_eq!(child("a", Finished, 4), None);
+        visible(&wait);
+        let mut stale = reg.clone();
+        stale.process_generation += 1;
+        assert_eq!(
+            supervisor
+                .note_child_activity(&stale, ChildReport::one("b".into(), Finished, 5))
+                .unwrap(),
+            None
+        );
+        visible(&wait);
+        assert_eq!(child("b", Progress, 6), Some(work.clone()));
+        let edge = child("b", Finished, 7).unwrap();
+        assert_eq!(
+            crate::agent_bridge::attention_kind_for_turn(&edge),
+            Some("idle_prompt")
+        );
+        assert_eq!(child("b", Finished, 7), None);
+        visible(&done);
+        let mut turns = Vec::new();
+        while let Ok(frame) = updates.try_recv() {
+            if let AgentServerFrame::SessionDelta { delta, .. } = frame {
+                for change in delta.changes {
+                    if let AgentDeltaChange::Turn { turn } = change {
+                        turns.push(turn);
+                    }
+                }
+            }
+        }
+        assert_eq!(turns, vec![work.clone(), wait, work, done]);
+        assert_eq!(
+            supervisor
+                .snapshot(id)
+                .unwrap()
+                .timeline_window
+                .entries
+                .len(),
+            1
+        );
+        let next = TurnState::Running {
+            run_id: "new-root".into(),
+            activity: "working".into(),
+        };
+        supervisor.note_bridge_turn(id, next.clone()).unwrap();
+        let late = ChildReport {
+            ids: vec![],
+            state: BackgroundSnapshot,
+            observed_us: 8,
+            overflow: false,
+        };
+        assert_eq!(
+            supervisor
+                .note_family_state(
+                    &reg,
+                    [late],
+                    Some(TurnState::Completed {
+                        run_id: Some("root".into())
+                    })
+                )
+                .unwrap(),
+            None
+        );
+        visible(&next);
     }
 
     fn entry(source: &str, revision: u64, text: &str) -> NormalizedTimelineEntry {

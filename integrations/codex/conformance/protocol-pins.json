@@ -34,6 +34,8 @@
 		"decline"
 	],
 	"adoptedNotifications": [
+		"thread/started",
+		"thread/status/changed",
 		"turn/started",
 		"turn/completed",
 		"item/started",

@@ -348,6 +348,8 @@ pub(crate) fn distill_schema_dir(directory: &Path) -> Result<PinExtract> {
         ),
         adopted_notifications: keep_listed(
             &[
+                "thread/started",
+                "thread/status/changed",
                 "turn/started",
                 "turn/completed",
                 "item/started",

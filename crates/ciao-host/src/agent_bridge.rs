@@ -178,7 +178,7 @@ pub(crate) async fn push_attention(
 ///
 /// `Completed { run_id: None }` is deliberately silent: that is the state a session registers
 /// *into*, not a turn that ran, and treating it as one buzzes a phone for every reconnect.
-fn attention_kind_for_turn(turn: &TurnState) -> Option<&'static str> {
+pub(crate) fn attention_kind_for_turn(turn: &TurnState) -> Option<&'static str> {
     match turn {
         TurnState::Completed { run_id: Some(_) } => Some("idle_prompt"),
         // Waiting says nothing about permission semantics. Actual permission notifications
@@ -202,6 +202,73 @@ fn attention_kind_for_turn(turn: &TurnState) -> Option<&'static str> {
 enum EventOutcome {
     Continue,
     End { process_exited: bool },
+}
+
+async fn apply_turn(
+    ctx: &AdapterEventContext<'_>,
+    turn: TurnState,
+    background: Option<crate::child_activity::ChildReport>,
+) -> Result<()> {
+    let session_id = &ctx.registered.session_id;
+    // Categorical and adapter-neutral: the session, and the turn edge it
+    // reported. No prompt, output, or vendor identifier. This is the only
+    // place that answers "is this integration reporting turns at all",
+    // which is otherwise indistinguishable from a quiet agent.
+    tracing::info!(
+        session = %session_id,
+        turn = ?turn,
+        "agent turn changed"
+    );
+    // Spec 012 §6. Codex's `sessionStart` does not fire until a session's first prompt,
+    // so hooks alone show a resumed conversation as empty. The read is triggered here
+    // rather than at registration because a turn is what names the part of the thread
+    // the live tail already owns — without it, history and the live tail both deliver
+    // the message the person just typed.
+    if ctx.codec.id() == "codex"
+        && let Some(agent) = ctx.agent
+        && let Some(run_id) = named_run(&turn)
+    {
+        crate::codex_history::spawn_history_read(
+            ctx.sessions.clone(),
+            ctx.adoptions.clone(),
+            session_id.clone(),
+            agent.thread_id.clone(),
+            run_id.clone(),
+            crate::codex_history::HistorySource {
+                process_id: agent.process_id,
+                codex_home: agent.codex_home.clone(),
+            },
+            ctx.registered.process_generation,
+        );
+    }
+    // A finished Claude turn is on disk in full, so the record repairs whatever of it
+    // the best-effort hooks lost. Only a hook connection names the conversation.
+    if ctx.codec.id() == "claude"
+        && let (Some(agent), TurnState::Completed { run_id }) = (ctx.agent, &turn)
+    {
+        crate::claude_history::spawn_turn_reconcile(
+            ctx.sessions.clone(),
+            session_id.clone(),
+            agent.thread_id.clone(),
+            ctx.registered.process_generation,
+            run_id.clone(),
+            ctx.sessions.turn_mark(session_id),
+        );
+    }
+    // The turn edge is the alert, for every adapter alike. Only on an actual edge: an
+    // adapter re-reporting the state it is already in has not done anything.
+    let edge = match background {
+        Some(report) => ctx
+            .sessions
+            .note_family_state(ctx.registered, [report], Some(turn))?,
+        None => ctx.sessions.note_bridge_turn(session_id, turn)?,
+    };
+    if let Some(effective) = edge
+        && let Some(kind) = attention_kind_for_turn(&effective)
+    {
+        push_attention(ctx.sessions, ctx.notifier, session_id, kind).await;
+    }
+    Ok(())
 }
 
 async fn apply_adapter_event(
@@ -281,57 +348,13 @@ async fn apply_adapter_event(
         }
         // Capability, turn, and receipt events are session-level and may interleave
         // with a paged snapshot burst; they are not ordered timeline content.
-        NormalizedAdapterEvent::Turn(turn) => {
-            // Categorical and adapter-neutral: the session, and the turn edge it
-            // reported. No prompt, output, or vendor identifier. This is the only
-            // place that answers "is this integration reporting turns at all",
-            // which is otherwise indistinguishable from a quiet agent.
-            tracing::info!(
-                session = %session_id,
-                turn = ?turn,
-                "agent turn changed"
-            );
-            // Spec 012 §6. Codex's `sessionStart` does not fire until a session's first prompt,
-            // so hooks alone show a resumed conversation as empty. The read is triggered here
-            // rather than at registration because a turn is what names the part of the thread
-            // the live tail already owns — without it, history and the live tail both deliver
-            // the message the person just typed.
-            if ctx.codec.id() == "codex"
-                && let Some(agent) = ctx.agent
-                && let Some(run_id) = named_run(&turn)
-            {
-                crate::codex_history::spawn_history_read(
-                    ctx.sessions.clone(),
-                    ctx.adoptions.clone(),
-                    session_id.clone(),
-                    agent.thread_id.clone(),
-                    run_id.clone(),
-                    crate::codex_history::HistorySource {
-                        process_id: agent.process_id,
-                        codex_home: agent.codex_home.clone(),
-                    },
-                    ctx.registered.process_generation,
-                );
-            }
-            // A finished Claude turn is on disk in full, so the record repairs whatever of it
-            // the best-effort hooks lost. Only a hook connection names the conversation.
-            if ctx.codec.id() == "claude"
-                && let (Some(agent), TurnState::Completed { run_id }) = (ctx.agent, &turn)
-            {
-                crate::claude_history::spawn_turn_reconcile(
-                    ctx.sessions.clone(),
-                    session_id.clone(),
-                    agent.thread_id.clone(),
-                    ctx.registered.process_generation,
-                    run_id.clone(),
-                    ctx.sessions.turn_mark(session_id),
-                );
-            }
-            // The turn edge is the alert, for every adapter alike. Only on an actual edge: an
-            // adapter re-reporting the state it is already in has not done anything.
-            let kind = attention_kind_for_turn(&turn);
-            if ctx.sessions.note_bridge_turn(session_id, turn)?
-                && let Some(kind) = kind
+        NormalizedAdapterEvent::Turn(turn) => apply_turn(ctx, turn, None).await?,
+        NormalizedAdapterEvent::ParentStop { run_id, background } => {
+            apply_turn(ctx, TurnState::Completed { run_id }, Some(background)).await?;
+        }
+        NormalizedAdapterEvent::ChildActivity(report) => {
+            if let Some(effective) = ctx.sessions.note_child_activity(ctx.registered, report)?
+                && let Some(kind) = attention_kind_for_turn(&effective)
             {
                 push_attention(ctx.sessions, ctx.notifier, session_id, kind).await;
             }
