@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+import { types } from "node:util";
 
 const PROTOCOL_VERSION = 1;
 // Every daemon reads a frame this size, and a daemon from before the bridge grant reads nothing
@@ -877,51 +878,102 @@ function receipt(commandID, state, evidence, reasonCode) {
 	});
 }
 
+// A permission must describe the actual token and a JSON record, not a sanitized name or
+// invented {}. Serialize only plain data, without invoking getters/toJSON, within the existing
+// input-preview byte budget. Cycles, exotic values and excessive nesting stay explicitly
+// unsupported rather than throwing out of the SDK callback or offering an ungrounded Allow.
+// Bytes and depth are bounded, not total inspection cost: own-key enumeration below still
+// takes work/allocation proportional to the input object's keys before the byte limit applies.
+function permissionInput(toolName, input) {
+	try {
+		if (typeof toolName !== "string" || toolName !== safeToolName(toolName) ||
+			!input || typeof input !== "object" || types.isProxy(input) || Array.isArray(input)) return null;
+		let bytes = 0;
+		const chunks = [];
+		const active = new Set();
+		const emit = (text) => {
+			bytes += Buffer.byteLength(text, "utf8");
+			if (bytes > MAX_TOOL_INPUT_PREVIEW_BYTES) throw new Error("input_bound");
+			chunks.push(text);
+		};
+		const string = (value) => {
+			if (value.length > MAX_TOOL_INPUT_PREVIEW_BYTES) throw new Error("input_bound");
+			emit(JSON.stringify(value));
+		};
+		const visit = (value, depth) => {
+			if (depth > 64) throw new Error("input_depth");
+			if (value === null) return emit("null");
+			if (typeof value === "string") return string(value);
+			if (typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return emit(String(value));
+			// isProxy does not invoke traps, including for revoked proxies. Check it before
+			// Array.isArray or any reflection, at every nesting level.
+			if (typeof value !== "object" || types.isProxy(value) || active.has(value)) throw new Error("input_shape");
+			const array = Array.isArray(value);
+			const prototype = Object.getPrototypeOf(value);
+			if (prototype !== (array ? Array.prototype : Object.prototype) && !(prototype === null && !array)) throw new Error("input_shape");
+			if (Object.getOwnPropertySymbols(value).length) throw new Error("input_shape");
+			active.add(value);
+			emit(array ? "[" : "{");
+			const keys = Object.keys(value);
+			if (array && keys.length !== value.length) throw new Error("input_shape");
+			for (const [index, key] of keys.entries()) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, key);
+				if (!descriptor || !("value" in descriptor) || (array && key !== String(index))) throw new Error("input_shape");
+				if (index) emit(",");
+				if (!array) { string(key); emit(":"); }
+				visit(descriptor.value, depth + 1);
+			}
+			emit(array ? "]" : "}");
+			active.delete(value);
+		};
+		visit(input, 0);
+		const json = chunks.join("");
+		return { input: JSON.parse(json), json };
+	} catch {
+		return null;
+	}
+}
+
 async function canUseTool(toolName, toolInput, options) {
 	const interactionID = crypto.randomBytes(16).toString("hex");
-	const name = safeToolName(toolName);
-	const questions = name === ASK_USER_QUESTION ? canonicalQuestions(toolInput) : null;
-	const bounded = boundedText(
-		typeof toolInput?.command === "string" ? toolInput.command : JSON.stringify(toolInput ?? {}),
+	const represented = permissionInput(toolName, toolInput);
+	const unsupported = represented === null;
+	const questions = !unsupported && toolName === ASK_USER_QUESTION ? canonicalQuestions(represented.input) : null;
+	const bounded = unsupported ? null : boundedText(
+		typeof represented.input.command === "string" ? represented.input.command : represented.json,
 		1024,
 	);
-	// Grounded at this pin: `title` is absent, so the card is built from the
-	// tool name plus a bounded input preview rather than vendor prose. A question carries its
-	// own prose in the schema, so its body stays empty rather than repeating it as JSON.
-	writeFrame({
+	// Use the validated tool name and bounded input rather than optional vendor prose.
+	// A question carries its own prose in the schema, not a duplicate JSON body.
+	const card = {
 		type: "upsert_interaction",
 		interaction: {
 			interaction_id: interactionID,
 			interaction_revision: 1,
-			kind: questions ? "question" : "permission",
+			kind: unsupported ? "unsupported" : questions ? "question" : "permission",
 			created_at: nowSeconds(),
-			title: questions
+			title: unsupported ? "Unsupported permission request" : questions
 				? questions.length === 1
 					? "Claude has a question"
 					: `Claude has ${questions.length} questions`
-				: `Run ${name}`,
-			body: questions ? "" : bounded.text,
+				: `Run ${toolName}`,
+			body: unsupported ? "This request cannot be represented safely. Deny it or stop the turn." : questions ? "" : bounded.text,
 			response_schema: questions
 				? { type: "questions", questions }
 				: {
 						type: "choices",
 						minimum: 1,
 						maximum: 1,
-						choices: [
+						choices: unsupported ? [
+							{ choice_id: "deny", label: "Deny", scope: "request" },
+							{ choice_id: "stop", label: "Stop", scope: "request" },
+						] : [
 							{ choice_id: "allow-once", label: "Allow once", scope: "once" },
 							{ choice_id: "deny", label: "Deny", scope: "request" },
 						],
 					},
 		},
-	});
-	// The card blocks the turn; the notification is what reaches a pocket. Sent after the
-	// interaction frame so the row already shows the card when the phone opens from the push.
-	// The only two integrations that could raise a blocking card were the two that could not
-	// push about it — this closes the managed half.
-	writeFrame({
-		type: "notification",
-		kind: questions ? "question_prompt" : "permission_prompt",
-	});
+	};
 
 	// What an inbound response means, decided by the request that raised it. Returns null when
 	// the frame cannot answer this request at all, which is refused rather than guessed at.
@@ -930,7 +982,7 @@ async function canUseTool(toolName, toolInput, options) {
 				if (!Array.isArray(frame.answers) || frame.answers.length === 0) return null;
 				// Answered, so the tool is allowed to run — and its "did not answer" output is
 				// replaced by the PostToolUse hook keyed on this same tool call.
-				answeredQuestions.set(options.toolUseID, askUserQuestionOutput(toolInput, frame.answers));
+				answeredQuestions.set(options.toolUseID, askUserQuestionOutput(represented.input, frame.answers));
 				return { result: { behavior: "allow" }, evidence: "questions_answered" };
 			}
 		: (frame) => {
@@ -938,6 +990,15 @@ async function canUseTool(toolName, toolInput, options) {
 				// still denies, which is the fail-closed rule, but a *missing* one would make a
 				// denial out of a malformed frame rather than out of a decision.
 				if (typeof frame.choice_id !== "string") return null;
+				// Unsupported requests stay blocked even under a crafted Allow/unknown choice.
+				// Stop uses the SDK's documented deny+interrupt result, never a broader grant.
+				if (unsupported) {
+					if (frame.choice_id !== "deny" && frame.choice_id !== "stop") return null;
+					return {
+						result: { behavior: "deny", message: "Denied from Ciao.", ...(frame.choice_id === "stop" ? { interrupt: true } : {}) },
+						evidence: "permission_resolved",
+					};
+				}
 				return {
 					result:
 						frame.choice_id === "allow-once"
@@ -949,18 +1010,26 @@ async function canUseTool(toolName, toolInput, options) {
 
 	return await new Promise((resolve) => {
 		let settled = false;
+		let published = false;
 		const settle = (result, resolution) => {
 			if (settled) return;
 			settled = true;
+			options.signal.removeEventListener("abort", abort);
 			pendingInteractions.delete(interactionID);
-			writeFrame({ type: "resolve_interaction", interaction_id: interactionID, resolution });
+			if (published) writeFrame({ type: "resolve_interaction", interaction_id: interactionID, resolution });
 			resolve(result);
 		};
+		// Attach then check: AbortSignal does not replay a prior abort. A cancelled callback
+		// with no published interaction needs no synthetic pending card or terminal receipt.
+		const abort = () => settle({ behavior: "deny", message: "Interrupted before a decision." }, "expired");
 		pendingInteractions.set(interactionID, { settle, decide });
-		// An interrupt aborts the request; it is never recorded as a user denial.
-		options.signal.addEventListener("abort", () => {
-			settle({ behavior: "deny", message: "Interrupted before a decision." }, "expired");
-		});
+		options.signal.addEventListener("abort", abort);
+		if (options.signal.aborted) abort();
+		if (settled) return;
+		published = true;
+		writeFrame(card);
+		// Publish the blocking card before notifying the phone.
+		writeFrame({ type: "notification", kind: questions ? "question_prompt" : "permission_prompt" });
 	});
 }
 

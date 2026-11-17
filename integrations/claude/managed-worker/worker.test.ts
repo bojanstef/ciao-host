@@ -63,10 +63,22 @@ type HistoryFixture = {
 	messages: unknown[];
 };
 
+type PermissionFixture = {
+	tool: unknown;
+	input: unknown;
+	suggestions?: unknown;
+	toolUseID?: string;
+	preabort?: boolean;
+	abortDuringAttach?: boolean;
+	abortAfterAnswer?: boolean;
+	inputKind?: "cycle" | "bigint" | "getter" | "toJSON" | "deep" | "oversized" | "proxy" | "nestedProxy" | "arrayProxy" | "revoked" | "nestedRevoked";
+};
+type PermissionScenario = PermissionFixture | { requests: PermissionFixture[]; concurrent: boolean };
+
 function plantFakeSdk(
 	root: string,
 	script: unknown[],
-	permission?: { tool: string; input: unknown },
+	permission?: PermissionScenario,
 	history?: HistoryFixture,
 	models?: unknown[],
 	hold?: boolean,
@@ -86,9 +98,14 @@ const TOOL_USE_ID = "toolu_synthetic";
 // The fake records what the worker asked of the SDK, because several of these behaviours are
 // only observable as a call that did or did not happen with a particular argument.
 const JOURNAL = path.join(import.meta.dirname, "journal.json");
-const journal = { options: null, setModel: [], flagSettings: [], promptContexts: [] };
+const journal = { options: null, setModel: [], flagSettings: [], promptContexts: [], permissionRequests: [], permissionDecisions: [], proxyTraps: [] };
+const permissionControllers = new Set();
 function record() {
-	try { fs.writeFileSync(JOURNAL, JSON.stringify(journal)); } catch {}
+	// Publish atomically so the parent never reads the truncation window of a rewrite.
+	try {
+		fs.writeFileSync(JOURNAL + ".tmp", JSON.stringify(journal));
+		fs.renameSync(JOURNAL + ".tmp", JOURNAL);
+	} catch {}
 }
 export async function getSessionInfo(sessionID) {
 	if (!HISTORY || sessionID !== HISTORY.sessionID) return undefined;
@@ -139,48 +156,96 @@ export function query(config) {
 			// Let registration settle first, so the frame order under test is the real one.
 			await new Promise((resolve) => setTimeout(resolve, 150));
 			if (PERMISSION) {
-				// Exactly how the real SDK raises one: the tool name and its arguments, handed to
-				// the callback the worker supplied.
-				const decision = await config.options.canUseTool(PERMISSION.tool, PERMISSION.input, {
-					signal: new AbortController().signal,
-					suggestions: [],
-					toolUseID: TOOL_USE_ID,
-				});
-				let output = "The user did not answer the questions.";
-				if (decision && decision.behavior === "allow") {
-					for (const matcher of (config.options.hooks && config.options.hooks.PostToolUse) || []) {
-						for (const hook of matcher.hooks) {
-							const result = await hook({
-								hook_event_name: "PostToolUse",
-								tool_name: PERMISSION.tool,
-								tool_input: PERMISSION.input,
-								tool_response: output,
-								tool_use_id: TOOL_USE_ID,
-							});
-							const replacement =
-								result && result.hookSpecificOutput && result.hookSpecificOutput.updatedToolOutput;
-							if (replacement !== undefined) output = replacement;
-						}
+				const invoke = async (request) => {
+					const toolUseID = request.toolUseID ?? TOOL_USE_ID;
+					const controller = new AbortController();
+					permissionControllers.add(controller);
+					if (request.preabort) controller.abort();
+					const listeners = new Set();
+					const add = controller.signal.addEventListener.bind(controller.signal);
+					const remove = controller.signal.removeEventListener.bind(controller.signal);
+					controller.signal.addEventListener = (...args) => {
+						listeners.add(args[1]);
+						add(...args);
+						if (request.abortDuringAttach) controller.abort();
+					};
+					controller.signal.removeEventListener = (...args) => { listeners.delete(args[1]); remove(...args); };
+					let input = request.input;
+					if (request.inputKind === "cycle") { input = {}; input.self = input; }
+					if (request.inputKind === "bigint") input = { value: 1n };
+					if (request.inputKind === "getter") input = { get value() { throw Error("synthetic getter"); } };
+					if (request.inputKind === "toJSON") input = { toJSON() { return {}; } };
+					if (request.inputKind === "deep") { input = {}; for (let i = 0; i < 1000; i++) input = { nested: input }; }
+					if (request.inputKind === "oversized") input = { value: "x".repeat(16 * 1024) };
+					if (["proxy", "nestedProxy", "arrayProxy", "revoked", "nestedRevoked"].includes(request.inputKind)) {
+						const handler = Object.fromEntries(["get", "getPrototypeOf", "ownKeys", "getOwnPropertyDescriptor"].map(name => [name, (...args) => {
+							journal.proxyTraps.push(name); record();
+							return Reflect[name](...args);
+						}]));
+						const pair = Proxy.revocable(request.inputKind === "arrayProxy" ? [] : { command: "synthetic" }, handler);
+						if (["revoked", "nestedRevoked"].includes(request.inputKind)) pair.revoke();
+						input = request.inputKind === "nestedProxy" || request.inputKind === "nestedRevoked" || request.inputKind === "arrayProxy"
+							? { nested: [pair.proxy] } : pair.proxy;
 					}
-				} else {
-					output = "Denied.";
-				}
-				// The tool result the model is handed, which is the only thing that decides whether
-				// the answers actually reached it.
-				yield {
-					type: "user",
-					message: {
-						content: [
-							{
-								type: "tool_result",
-								tool_use_id: TOOL_USE_ID,
-								content: [
-									{ type: "text", text: typeof output === "string" ? output : JSON.stringify(output) },
-								],
-							},
-						],
-					},
+					journal.permissionRequests.push({ tool: request.tool, input: request.input, toolUseID });
+					record();
+					const decision = await config.options.canUseTool(request.tool, input, {
+						signal: controller.signal,
+						...(Object.hasOwn(request, "suggestions") ? { suggestions: request.suggestions } : {}),
+						toolUseID,
+						requestId: "request-" + toolUseID,
+					});
+					permissionControllers.delete(controller);
+					if (request.abortAfterAnswer) {
+						controller.abort();
+						controller.signal.dispatchEvent(new Event("abort"));
+					}
+					journal.permissionListeners ??= [];
+					journal.permissionListeners.push(listeners.size);
+					journal.permissionDecisions.push({ toolUseID, decision });
+					record();
+					let output = "The user did not answer the questions.";
+					if (decision && decision.behavior === "allow") {
+						for (const matcher of (config.options.hooks && config.options.hooks.PostToolUse) || []) {
+							for (const hook of matcher.hooks) {
+								const result = await hook({
+									hook_event_name: "PostToolUse",
+									tool_name: request.tool,
+									tool_input: request.input,
+									tool_response: output,
+									tool_use_id: toolUseID,
+								});
+								const replacement =
+									result && result.hookSpecificOutput && result.hookSpecificOutput.updatedToolOutput;
+								if (replacement !== undefined) output = replacement;
+							}
+						}
+					} else {
+						output = "Denied.";
+					}
+					// The tool result the model is handed, which is the only thing that decides whether
+					// the answers actually reached it.
+					return {
+						type: "user",
+						message: {
+							content: [
+								{
+									type: "tool_result",
+									tool_use_id: toolUseID,
+									content: [
+										{ type: "text", text: typeof output === "string" ? output : JSON.stringify(output) },
+									],
+								},
+							],
+						},
+					};
 				};
+				const requests = PERMISSION.requests ?? [PERMISSION];
+				if (PERMISSION.concurrent) {
+					for (const result of await Promise.all(requests.map(invoke))) yield result;
+				} else {
+					for (const request of requests) yield await invoke(request);
+				}
 			}
 			for (const message of SCRIPT) {
 				yield message;
@@ -190,7 +255,12 @@ export function query(config) {
 			// stops talking. Command tests need that window; the harness kills the child after.
 			if (HOLD) await new Promise(() => {});
 		},
-		interrupt() {},
+		async interrupt() {
+			for (const controller of permissionControllers) {
+				controller.abort();
+				controller.signal.dispatchEvent(new Event("abort"));
+			}
+		},
 		setPermissionMode() {},
 		// Async on purpose: the real surfaces return promises and the worker chains a receipt
 		// off each one, so a synchronous fake would pass a test the real SDK would fail.
@@ -228,6 +298,10 @@ type Harness = {
 		setModel: unknown[];
 		flagSettings: unknown[];
 		promptContexts: Array<{ prompt: string; context: string | null }>;
+		permissionRequests: Array<{ tool: string; input: unknown; toolUseID: string }>;
+		permissionDecisions: Array<{ toolUseID: string; decision: Record<string, unknown> }>;
+		permissionListeners: number[];
+		proxyTraps: string[];
 	};
 };
 
@@ -235,7 +309,7 @@ type Harness = {
 /// what the worker raises.
 async function startWorker(
 	script: unknown[],
-	permission?: { tool: string; input: unknown },
+	permission?: PermissionScenario,
 	history?: HistoryFixture,
 	models?: unknown[],
 	extraEnv?: Record<string, string>,
@@ -291,8 +365,8 @@ async function startWorker(
 			CIAO_MANAGED_SESSION_ID: SESSION_ID,
 			CIAO_MANAGED_SPAWN_TOKEN: "fedcba9876543210fedcba9876543210",
 			CIAO_MANAGED_WORKSPACE_LABEL: "workspace",
-			CIAO_MANAGED_CLI_VERSION: "2.1.314",
-			CIAO_MANAGED_SDK_VERSION: "0.3.314",
+			CIAO_MANAGED_CLI_VERSION: "2.1.325",
+			CIAO_MANAGED_SDK_VERSION: "0.3.325",
 			[CONFIGURATION.environment_key]: CONFIGURATION.adapters["claude-managed"],
 			// Tests never consult the developer's settings or browser preference.
 			CLAUDE_CONFIG_DIR: path.join(root, "config"),
@@ -327,7 +401,7 @@ async function startWorker(
 			try {
 				return JSON.parse(fs.readFileSync(journalPath, "utf8"));
 			} catch {
-				return { options: null, setModel: [], flagSettings: [], promptContexts: [] };
+				return { options: null, setModel: [], flagSettings: [], promptContexts: [], permissionRequests: [], permissionDecisions: [], permissionListeners: [] };
 			}
 		},
 	};
@@ -1011,6 +1085,266 @@ test("an ordinary tool is still a permission card with two host-issued choices",
 	const applied = frames.filter((frame) => frame.type === "command_receipt").at(-1) as Record<string, any>;
 	expect(applied.state).toBe("applied");
 	expect(applied.evidence).toBe("permission_resolved");
+});
+
+// Suggestions are vendor proposals, not permission grants. In particular, the candidate SDK's
+// changed Always-allow offering must not change Ciao's request-scoped Allow once / Deny contract.
+const broadPermissionSuggestions = [
+	{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "*" }], behavior: "allow", destination: "localSettings" },
+	{ type: "addDirectories", directories: ["/synthetic"], destination: "session" },
+	{ type: "setMode", mode: "acceptEdits", destination: "session" },
+];
+
+for (const [label, options] of [
+	["absent", {}],
+	["empty", { suggestions: [] }],
+	["nonempty", { suggestions: broadPermissionSuggestions }],
+] satisfies Array<[string, Pick<PermissionFixture, "suggestions">]>) {
+	test(`permission suggestions ${label}: allow once, repeat deny and abort remain request scoped`, async () => {
+		const input = { command: "printf synthetic" };
+		const requests = ["first", "repeat", "aborted"].map((id) => ({
+			tool: "Bash", input, toolUseID: `toolu_${id}`, ...options,
+		}));
+		const { frames, send, journal } = await startWorker(
+			[], { requests, concurrent: false }, undefined, undefined, undefined, true, { runtime: "node" },
+		);
+		const cards = () => frames.filter((frame: any) => frame.type === "upsert_interaction") as any[];
+		const answer = (commandID: string, interactionID: string, choiceID: string) => send({
+			v: 1, type: "command", kind: "interaction_response", command_id: commandID,
+			interaction_id: interactionID, choice_id: choiceID,
+		});
+		const receipt = (id: string) => frames.find((frame: any) => frame.type === "command_receipt" && frame.command_id === id) as any;
+		const checkCard = (index: number) => {
+			const card = cards()[index].interaction;
+			expect(card.kind).toBe("permission");
+			expect(card.title).toBe("Run Bash");
+			expect(card.body).toBe(input.command);
+			expect(card.response_schema.choices).toEqual([
+				{ choice_id: "allow-once", label: "Allow once", scope: "once" },
+				{ choice_id: "deny", label: "Deny", scope: "request" },
+			]);
+			return card.interaction_id;
+		};
+		await eventually(() => cards().length === 1);
+		const firstID = checkCard(0);
+		answer("allow-first", firstID, "allow-once");
+		await eventually(() => cards().length === 2 && journal().permissionDecisions.length === 1);
+		expect(receipt("allow-first")).toMatchObject({ state: "applied", evidence: "permission_resolved" });
+		expect(journal().permissionDecisions).toEqual([{ toolUseID: "toolu_first", decision: { behavior: "allow" } }]);
+
+		// Same tool and input asks again. A stale answer cannot resolve this new callback, and
+		// the SDK receives neither rewritten input nor updatedPermissions to persist a rule.
+		const repeatID = checkCard(1);
+		expect(repeatID).not.toBe(firstID);
+		answer("duplicate-first", firstID, "allow-once");
+		await eventually(() => Boolean(receipt("duplicate-first")));
+		expect(receipt("duplicate-first")).toMatchObject({ state: "rejected", reason_code: "already_resolved" });
+		expect(journal().permissionDecisions).toHaveLength(1);
+		answer("deny-repeat", repeatID, "deny");
+		await eventually(() => cards().length === 3 && journal().permissionDecisions.length === 2);
+		expect(receipt("deny-repeat")).toMatchObject({ state: "applied", evidence: "permission_resolved" });
+		expect(journal().permissionDecisions[1]).toEqual({ toolUseID: "toolu_repeat", decision: { behavior: "deny", message: "Denied from Ciao." } });
+
+		const abortedID = checkCard(2);
+		send({ v: 1, type: "command", kind: "interrupt", command_id: "interrupt-pending" });
+		await eventually(() => journal().permissionDecisions.length === 3 && Boolean(receipt("interrupt-pending")));
+		expect(receipt("interrupt-pending")).toMatchObject({ state: "applied", evidence: "interrupt_receipt" });
+		expect(journal().permissionDecisions[2]).toEqual({ toolUseID: "toolu_aborted", decision: { behavior: "deny", message: "Interrupted before a decision." } });
+		answer("late-after-abort", abortedID, "allow-once");
+		await eventually(() => Boolean(receipt("late-after-abort")));
+		expect(receipt("late-after-abort")).toMatchObject({ state: "rejected", reason_code: "already_resolved" });
+		expect(frames.filter((frame) => frame.type === "resolve_interaction").map((frame) => [frame.interaction_id, frame.resolution])).toEqual([
+			[firstID, "applied"], [repeatID, "applied"], [abortedID, "expired"],
+		]);
+		expect(journal().permissionRequests).toEqual(requests.map(({ tool, input, toolUseID }) => ({ tool, input, toolUseID })));
+		expect(journal().permissionDecisions).toHaveLength(3);
+	});
+}
+
+for (const runtime of [process.execPath, "node"]) {
+	for (const timing of ["preabort", "abortDuringAttach", "abortThenAnswer", "answerThenAbort"] as const) {
+		test(`permission cancellation ${timing} settles once and detaches on ${path.basename(runtime)}`, async () => {
+			const h = await startWorker([], {
+				tool: "Bash", input: { command: "synthetic" }, toolUseID: "toolu_cancel",
+				preabort: timing === "preabort", abortDuringAttach: timing === "abortDuringAttach",
+				abortAfterAnswer: timing === "answerThenAbort",
+			}, undefined, undefined, undefined, true, { runtime });
+			const cards = () => h.frames.filter((f: any) => f.type === "upsert_interaction").map((f: any) => f.interaction);
+			const receipt = (id: string) => h.frames.find((f: any) => f.type === "command_receipt" && f.command_id === id);
+			if (timing === "preabort" || timing === "abortDuringAttach") {
+				await eventually(() => h.journal().permissionDecisions?.length === 1);
+				expect(cards()).toEqual([]);
+				expect(h.frames.filter((f) => f.type === "resolve_interaction")).toEqual([]);
+			} else {
+				await eventually(() => cards().length === 1);
+				const id = cards()[0].interaction_id;
+				if (timing === "abortThenAnswer") {
+					h.send({ type: "command", command_id: "cancel", kind: "interrupt" });
+					await eventually(() => Boolean(receipt("cancel")));
+					expect(receipt("cancel")).toMatchObject({ state: "applied", evidence: "interrupt_receipt" });
+				}
+				h.send({ type: "command", command_id: "answer", kind: "interaction_response", interaction_id: id, choice_id: "allow-once" });
+				await eventually(() => Boolean(receipt("answer")) && h.journal().permissionDecisions.length === 1);
+				expect(receipt("answer")).toMatchObject(timing === "abortThenAnswer"
+					? { state: "rejected", reason_code: "already_resolved" }
+					: { state: "applied", evidence: "permission_resolved" });
+				h.send({ type: "command", command_id: "again", kind: "interrupt" });
+				await eventually(() => Boolean(receipt("again")));
+				expect(h.frames.filter((f) => f.type === "resolve_interaction")).toEqual([
+					expect.objectContaining({ interaction_id: id, resolution: timing === "abortThenAnswer" ? "expired" : "applied" }),
+				]);
+			}
+			expect(h.journal().permissionDecisions).toEqual([{ toolUseID: "toolu_cancel", decision: timing === "answerThenAbort"
+				? { behavior: "allow" } : { behavior: "deny", message: "Interrupted before a decision." } }]);
+			expect(h.journal().permissionListeners).toEqual([0]);
+		});
+	}
+}
+
+const unsupportedPermissions: PermissionFixture[] = [
+	...[null, 1, "scalar", true, [], ["item"]].map((input) => ({ tool: "Bash", input })),
+	...[null, 42, {}, [], "", "bad name", "a/b", "x".repeat(65), "Bash\\n"].map((tool) => ({ tool, input: {} })),
+	...(["cycle", "bigint", "getter", "toJSON", "deep", "oversized"] as const).map((inputKind) => ({ tool: "Bash", input: {}, inputKind })),
+];
+for (const [index, request] of unsupportedPermissions.entries()) {
+	test(`unrepresentable permission ${index} blocks with only explicit safe decisions`, async () => {
+		const h = await startWorker([], { ...request, toolUseID: "toolu_unsupported" }, undefined, undefined, undefined, true);
+		await eventually(() => h.frames.some((f) => f.type === "upsert_interaction"));
+		const card = (h.frames.find((f) => f.type === "upsert_interaction") as any).interaction;
+		expect(card.kind).toBe("unsupported");
+		expect(card.response_schema.choices.map((c: any) => c.choice_id)).toEqual(["deny", "stop"]);
+		expect(h.journal().permissionDecisions).toEqual([]);
+		const answer = (command_id: string, choice_id: string) => h.send({ type: "command", kind: "interaction_response", command_id, interaction_id: card.interaction_id, choice_id });
+		const receipt = (id: string) => h.frames.find((f: any) => f.type === "command_receipt" && f.command_id === id);
+		answer("crafted", "allow-once");
+		await eventually(() => Boolean(receipt("crafted")));
+		expect(receipt("crafted")).toMatchObject({ state: "rejected", reason_code: "answer_shape_mismatch" });
+		expect(h.journal().permissionDecisions).toEqual([]);
+		const action = index % 3;
+		if (action === 2) h.send({ type: "command", kind: "interrupt", command_id: "safe" });
+		else answer("safe", action === 0 ? "deny" : "stop");
+		await eventually(() => Boolean(receipt("safe")) && h.journal().permissionDecisions.length === 1);
+		expect(receipt("safe")).toMatchObject({ state: "applied", evidence: action === 2 ? "interrupt_receipt" : "permission_resolved" });
+		expect(h.journal().permissionDecisions).toEqual([{ toolUseID: "toolu_unsupported", decision: action === 2
+			? { behavior: "deny", message: "Interrupted before a decision." }
+			: { behavior: "deny", message: "Denied from Ciao.", ...(action === 1 ? { interrupt: true } : {}) } }]);
+		expect(h.journal().permissionListeners).toEqual([0]);
+		answer("late", "allow-once");
+		await eventually(() => Boolean(receipt("late")));
+		expect(receipt("late")).toMatchObject({ state: "rejected", reason_code: "already_resolved" });
+		expect(h.frames.filter((f) => f.type === "resolve_interaction")).toEqual([
+			expect.objectContaining({ interaction_id: card.interaction_id, resolution: action === 2 ? "expired" : "applied" }),
+		]);
+	});
+}
+
+for (const runtime of [process.execPath, "node"]) {
+	for (const inputKind of ["proxy", "nestedProxy", "arrayProxy", "revoked", "nestedRevoked"] as const) {
+		test(`proxy permission ${inputKind} never invokes traps on ${path.basename(runtime)}`, async () => {
+			const h = await startWorker([], {
+				requests: ["deny", "stop", "cancel"].map(toolUseID => ({ tool: "Bash", input: {}, inputKind, toolUseID })), concurrent: false,
+			}, undefined, undefined, undefined, true, { runtime });
+			const cards = () => h.frames.filter(f => f.type === "upsert_interaction").map((f: any) => f.interaction);
+			const receipt = (id: string) => h.frames.find(f => f.type === "command_receipt" && f.command_id === id);
+			for (const [index, action] of ["deny", "stop", "cancel"].entries()) {
+				await eventually(() => cards().length === index + 1);
+				const card = cards()[index];
+				expect(card.kind).toBe("unsupported");
+				expect(card.response_schema.choices).toEqual([
+					{ choice_id: "deny", label: "Deny", scope: "request" },
+					{ choice_id: "stop", label: "Stop", scope: "request" },
+				]);
+				const answer = (command_id: string, choice_id: string) => h.send({ type: "command", kind: "interaction_response", command_id, interaction_id: card.interaction_id, choice_id });
+				answer(`forged-${action}`, "allow-once");
+				await eventually(() => Boolean(receipt(`forged-${action}`)));
+				expect(receipt(`forged-${action}`)).toMatchObject({ state: "rejected", reason_code: "answer_shape_mismatch" });
+				expect(h.journal().permissionDecisions).toHaveLength(index);
+				if (action === "cancel") h.send({ type: "command", kind: "interrupt", command_id: action });
+				else answer(action, action);
+				await eventually(() => Boolean(receipt(action)) && h.journal().permissionDecisions.length === index + 1);
+				expect(receipt(action)).toMatchObject({ state: "applied", evidence: action === "cancel" ? "interrupt_receipt" : "permission_resolved" });
+				expect(h.journal().permissionDecisions[index]).toEqual({ toolUseID: action, decision: action === "cancel"
+					? { behavior: "deny", message: "Interrupted before a decision." }
+					: { behavior: "deny", message: "Denied from Ciao.", ...(action === "stop" ? { interrupt: true } : {}) } });
+				answer(`late-${action}`, "allow-once");
+				await eventually(() => Boolean(receipt(`late-${action}`)));
+				expect(receipt(`late-${action}`)).toMatchObject({ state: "rejected", reason_code: "already_resolved" });
+				expect(h.frames.filter(f => f.type === "resolve_interaction" && f.interaction_id === card.interaction_id)).toEqual([
+					expect.objectContaining({ resolution: action === "cancel" ? "expired" : "applied" }),
+				]);
+			}
+			expect(h.journal().proxyTraps).toEqual([]);
+			expect(h.journal().permissionListeners).toEqual([0, 0, 0]);
+			expect(h.child.exitCode).toBeNull();
+		});
+	}
+}
+
+test("permission representation honors exact byte, token and nesting bounds", async () => {
+	const byteLimit = 16 * 1024;
+	const overhead = Buffer.byteLength(JSON.stringify({ value: "" }));
+	const nested = (depth: number): unknown => {
+		let value: unknown = null;
+		for (let i = 0; i < depth; i++) value = { nested: value };
+		return value;
+	};
+	for (const [request, kind] of [
+		[{ tool: "x".repeat(64), input: { value: "x".repeat(byteLimit - overhead) } }, "permission"],
+		[{ tool: "Bash", input: { value: "x".repeat(byteLimit - overhead + 1) } }, "unsupported"],
+		[{ tool: "Bash", input: { value: "é".repeat((byteLimit - overhead) / 2) } }, "permission"],
+		[{ tool: "Bash", input: { value: "é".repeat((byteLimit - overhead) / 2) + "x" } }, "unsupported"],
+		[{ tool: "Bash", input: nested(64) }, "permission"],
+		[{ tool: "Bash", input: nested(65) }, "unsupported"],
+	] as const) {
+		const h = await startWorker([], request);
+		await eventually(() => h.frames.some((f) => f.type === "upsert_interaction"));
+		const card = (h.frames.find((f) => f.type === "upsert_interaction") as any).interaction;
+		expect(card.kind).toBe(kind);
+		h.send({ type: "command", kind: "interaction_response", command_id: "deny-bound", interaction_id: card.interaction_id, choice_id: "deny" });
+		await eventually(() => h.journal().permissionDecisions.length === 1);
+		expect(h.journal().permissionDecisions[0].decision.behavior).toBe("deny");
+	}
+});
+
+test("unknown but representable tool tokens are not a vendor allowlist", async () => {
+	const h = await startWorker([], { tool: "mcp__future_server__new_tool", input: { nested: [null, true, 1, { value: "synthetic" }] }, suggestions: { malformed: true } });
+	await eventually(() => h.frames.some((f) => f.type === "upsert_interaction"));
+	const card = (h.frames.find((f) => f.type === "upsert_interaction") as any).interaction;
+	expect(card.kind).toBe("permission");
+	h.send({ type: "command", kind: "interaction_response", command_id: "allow", interaction_id: card.interaction_id, choice_id: "allow-once" });
+	await eventually(() => h.journal().permissionDecisions.length === 1);
+	expect(h.journal().permissionDecisions[0].decision).toEqual({ behavior: "allow" });
+});
+
+test("concurrent permissions resolve only their exact callback, out of order", async () => {
+	const { frames, send, journal } = await startWorker([], {
+		concurrent: true,
+		requests: [
+			{ tool: "Bash", input: { command: "printf first" }, toolUseID: "toolu_bash", suggestions: broadPermissionSuggestions },
+			{ tool: "Write", input: { file_path: "/synthetic/second", content: "second" }, toolUseID: "toolu_write", suggestions: broadPermissionSuggestions },
+		],
+	}, undefined, undefined, undefined, true, { runtime: "node" });
+	await eventually(() => frames.filter((frame) => frame.type === "upsert_interaction").length === 2);
+	const cards = frames.filter((frame) => frame.type === "upsert_interaction") as any[];
+	const bash = cards.find((frame) => frame.interaction.title === "Run Bash").interaction;
+	const write = cards.find((frame) => frame.interaction.title === "Run Write").interaction;
+	expect(bash.interaction_id).not.toBe(write.interaction_id);
+	const answer = (id: string, choice: string, commandID: string) => send({
+		v: 1, type: "command", kind: "interaction_response", command_id: commandID,
+		interaction_id: id, choice_id: choice,
+	});
+	answer("unknown-interaction", "allow-once", "unknown");
+	await eventually(() => frames.some((frame) => frame.type === "command_receipt" && frame.command_id === "unknown"));
+	expect(frames.find((frame) => frame.type === "command_receipt" && frame.command_id === "unknown")).toMatchObject({ state: "rejected", reason_code: "already_resolved" });
+	expect(journal().permissionDecisions).toEqual([]);
+	answer(write.interaction_id, "allow-once", "allow-write");
+	await eventually(() => journal().permissionDecisions.length === 1);
+	expect(journal().permissionDecisions).toEqual([{ toolUseID: "toolu_write", decision: { behavior: "allow" } }]);
+	// Even a fabricated persistent choice fails closed; vendor suggestions never mint one.
+	answer(bash.interaction_id, "always-allow", "refuse-broad-choice");
+	await eventually(() => journal().permissionDecisions.length === 2);
+	expect(journal().permissionDecisions[1]).toEqual({ toolUseID: "toolu_bash", decision: { behavior: "deny", message: "Denied from Ciao." } });
+	expect(frames.filter((frame) => frame.type === "resolve_interaction").map((frame) => frame.interaction_id)).toEqual([write.interaction_id, bash.interaction_id]);
 });
 
 test("an AskUserQuestion is answered from the phone, and the answers become the tool's output", async () => {
