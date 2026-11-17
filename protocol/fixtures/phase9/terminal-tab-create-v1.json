@@ -3,6 +3,9 @@
   "core_request": {"v":1,"type":"request","request_id":"AAECAwQFBgcICQoLDA0ODw","method":"terminal.tab.create.v1","params":{"target":"herdr_core.attach","session":"default","tab":"0123456789abcdef0123456789abcdef:t1"}},
   "tui_response": {"v":1,"type":"response","request_id":"AAECAwQFBgcICQoLDA0ODw","result":{"tab":"w1:t2"}},
   "core_response": {"v":1,"type":"response","request_id":"AAECAwQFBgcICQoLDA0ODw","result":{"tab":"0123456789abcdef0123456789abcdef:t2"}},
+  "core_v2_request": {"v":1,"type":"request","request_id":"AAECAwQFBgcICQoLDA0ODw","method":"terminal.tab.create.v2","params":{"target":"herdr_core.attach","session":"default","tab":"0123456789abcdef0123456789abcdef:t1"}},
+  "core_v2_response": {"v":1,"type":"response","request_id":"AAECAwQFBgcICQoLDA0ODw","result":{"tab":"0123456789abcdef0123456789abcdef:t2"}},
+  "core_space_unavailable": {"v":1,"type":"error","request_id":"AAECAwQFBgcICQoLDA0ODw","error":{"code":"core_space_unavailable","message":"Choose a terminal in a Herdr desktop space to create a tab."}},
   "invalid_params": [
     {"target":"shell","session":"default"},
     {"target":"tmux.attach","session":"default"},

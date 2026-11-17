@@ -759,6 +759,13 @@ impl TerminalCommandsRequest {
 }
 
 pub const METHOD_TERMINAL_TAB_CREATE: &str = "terminal.tab.create.v1";
+pub const METHOD_DESKTOP_TAB_CREATE: &str = "terminal.tab.create.v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreTabPlacement {
+    Legacy,
+    Desktop,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -781,12 +788,20 @@ pub struct TerminalTabCreateRequest {
 }
 
 impl TerminalTabCreateRequest {
+    pub fn placement(&self) -> Result<CoreTabPlacement, HostProtocolError> {
+        match self.method.as_str() {
+            METHOD_TERMINAL_TAB_CREATE => Ok(CoreTabPlacement::Legacy),
+            METHOD_DESKTOP_TAB_CREATE if self.params.target == "herdr_core.attach" => {
+                Ok(CoreTabPlacement::Desktop)
+            }
+            _ => Err(HostProtocolError::InvalidControlValue),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), HostProtocolError> {
         validate_request_id(&self.request_id)?;
-        if self.v != HOST_PROTOCOL_VERSION
-            || self.message_type != "request"
-            || self.method != METHOD_TERMINAL_TAB_CREATE
-        {
+        self.placement()?;
+        if self.v != HOST_PROTOCOL_VERSION || self.message_type != "request" {
             return Err(HostProtocolError::InvalidControlValue);
         }
         self.params.validate()
@@ -2020,7 +2035,7 @@ pub fn decode_rpc_request(body: &[u8]) -> Result<RpcRequest, HostProtocolError> 
             request.validate()?;
             Ok(RpcRequest::LiveActivityRegister(request))
         }
-        METHOD_TERMINAL_TAB_CREATE => {
+        METHOD_TERMINAL_TAB_CREATE | METHOD_DESKTOP_TAB_CREATE => {
             let request: TerminalTabCreateRequest =
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             request.validate()?;

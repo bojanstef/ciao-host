@@ -2372,25 +2372,26 @@ async fn ready_phase_rpc(
                 .await;
                 return Ok(());
             };
-            if let Some(result) =
-                crate::terminal_tabs::create(&state.workspace, &request.params).await
-            {
-                let response = crate::host_protocol::TerminalTabCreateResponse {
-                    v: 1,
-                    message_type: "response",
-                    request_id: request.request_id,
-                    result,
-                };
-                let _ = write_rpc(send, &response).await;
-                finish_rpc_send(send).await;
-            } else {
-                send_rpc_error_code(
-                    send,
-                    Some(request.request_id),
-                    "creation_unconfirmed",
-                    "Could not confirm the new tab. Check the host board before trying again.",
-                )
-                .await;
+            match crate::terminal_tabs::create(&state.workspace, &request).await {
+                Ok(result) => {
+                    let response = crate::host_protocol::TerminalTabCreateResponse {
+                        v: 1,
+                        message_type: "response",
+                        request_id: request.request_id,
+                        result,
+                    };
+                    let _ = write_rpc(send, &response).await;
+                    finish_rpc_send(send).await;
+                }
+                Err(failure) => {
+                    send_rpc_error_code(
+                        send,
+                        Some(request.request_id),
+                        failure.code(),
+                        failure.message(),
+                    )
+                    .await;
+                }
             }
         }
         Ok(RpcRequest::TerminalCommands(request)) => {

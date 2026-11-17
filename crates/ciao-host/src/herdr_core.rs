@@ -28,11 +28,12 @@ use tokio::{
 use crate::{
     drift,
     host_protocol::{
-        Dimensions, HOST_PENDING_INPUT_BYTES, HOST_PENDING_OUTPUT_BYTES, MAX_DATA_PAYLOAD,
-        MAX_SESSIONS_PER_PROVIDER, MAX_TABS_PER_SESSION, valid_herdr_core_tab_id,
+        CoreTabPlacement, Dimensions, HOST_PENDING_INPUT_BYTES, HOST_PENDING_OUTPUT_BYTES,
+        MAX_DATA_PAYLOAD, MAX_SESSIONS_PER_PROVIDER, MAX_TABS_PER_SESSION, valid_herdr_core_tab_id,
         valid_session_name,
     },
     pty::{CleanupReason, PtyError, PtyExit, QueueHighWaterMarks},
+    terminal_tabs::CreationFailure,
     workspace::{PaneFacts, sanitize_tab_label},
 };
 
@@ -53,6 +54,7 @@ const RESIZE: u8 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoreError {
     Unavailable,
+    TerminalMissing,
     Invalid,
     Unsupported,
 }
@@ -228,7 +230,7 @@ pub(crate) async fn discover(config: &CoreConfig) -> CoreDiscovery {
                 // are already accounted individually in the drift ledger.
                 result.sessions.push(session);
             }
-            Err(CoreError::Unavailable) => {} // A saved, stopped session is not a live Core.
+            Err(CoreError::Unavailable | CoreError::TerminalMissing) => {} // No live session.
             Err(CoreError::Unsupported) => {
                 result.unsupported = true;
                 result.omitted = result.omitted.saturating_add(1);
@@ -285,9 +287,10 @@ pub(crate) async fn create_terminal(
     config: &CoreConfig,
     session: &str,
     binding: &str,
-) -> Result<String, CoreError> {
+    placement: CoreTabPlacement,
+) -> Result<String, CreationFailure> {
     if !valid_herdr_core_tab_id(binding) {
-        return Err(CoreError::Invalid);
+        return Err(CreationFailure::Unconfirmed);
     }
     timeout(Duration::from_secs(5), async {
         let mut stream = BufReader::new(config.connect(session).await?);
@@ -295,23 +298,31 @@ pub(crate) async fn create_terminal(
         let (identity, version) = parse_hello(&hello)?;
         let (expected, address) = binding.split_once(':').ok_or(CoreError::Invalid)?;
         if identity != expected {
-            return Err(CoreError::Invalid);
+            return Err(CreationFailure::Unconfirmed);
         }
         let selected =
             plain_call(&mut stream, 2, "terminal.get", json!({"terminal":address})).await?;
-        let space = DesktopSpace::of(&selected);
-        let selected = parse_terminal(&selected, &identity, &version).ok_or(CoreError::Invalid)?;
-        if selected.tab != binding {
-            return Err(CoreError::Invalid);
+        let source = parse_terminal(&selected, &identity, &version).ok_or(CoreError::Invalid)?;
+        if source.tab != binding {
+            return Err(CreationFailure::Unconfirmed);
         }
-        let cwd = selected.facts.cwd.ok_or(CoreError::Invalid)?;
-        let created = plain_call(
-            &mut stream,
-            3,
-            "terminal.run",
-            run_params(&cwd, space.as_ref()),
-        )
-        .await?;
+        let cwd = source.facts.cwd.ok_or(CoreError::Invalid)?;
+        let space = match placement {
+            CoreTabPlacement::Legacy => DesktopSpace::of(&selected),
+            CoreTabPlacement::Desktop => {
+                Some(DesktopSpace::resolve(&mut stream, &identity, selected).await?)
+            }
+        };
+        let params = run_params(&cwd, space.as_ref());
+        let created = plain_call(&mut stream, 3, "terminal.run", params.clone()).await?;
+        if placement == CoreTabPlacement::Desktop
+            && (created["labels"][DESKTOP_SPACE_LABEL] != params["labels"][DESKTOP_SPACE_LABEL]
+                || created["labels"][DESKTOP_TAB_LABEL] != params["labels"][DESKTOP_TAB_LABEL]
+                || !created["parent"].is_null()
+                || created["keep"] != true)
+        {
+            return Err(CreationFailure::Unconfirmed);
+        }
         // RunResult flattens Terminal and adds these two optional fields.
         let mut terminal = created;
         if let Some(object) = terminal.as_object_mut() {
@@ -320,12 +331,12 @@ pub(crate) async fn create_terminal(
         }
         let created = parse_terminal(&terminal, &identity, &version).ok_or(CoreError::Invalid)?;
         if created.tab == binding {
-            return Err(CoreError::Invalid);
+            return Err(CreationFailure::Unconfirmed);
         }
         Ok(created.tab)
     })
     .await
-    .map_err(|_| CoreError::Invalid)?
+    .map_err(|_| CreationFailure::Unconfirmed)?
 }
 
 /// The desktop app shows a Core terminal only when it carries these labels; terminals
@@ -338,22 +349,75 @@ const DESKTOP_TAB_LABEL: &str = "herdr.tab";
 struct DesktopSpace(String);
 
 impl DesktopSpace {
+    /// An agent started by a desktop terminal can belong to its tab through its parent
+    /// without carrying labels itself. Follow only live addresses on this proven Core.
+    async fn resolve(
+        stream: &mut BufReader<UnixStream>,
+        identity: &str,
+        mut row: Value,
+    ) -> Result<Self, CreationFailure> {
+        let mut visited = std::collections::HashSet::new();
+        for depth in 0..MAX_TABS_PER_SESSION {
+            if let Some(space) = Self::of(&row)
+                && row["labels"][DESKTOP_TAB_LABEL]
+                    .as_str()
+                    .is_some_and(valid_desktop_label)
+            {
+                return Ok(space);
+            }
+            let parent = row["parent"]
+                .as_str()
+                .ok_or(CreationFailure::NoDesktopSpace)?
+                .to_owned();
+            if !valid_herdr_core_tab_id(&format!("{identity}:{parent}"))
+                || !visited.insert(parent.clone())
+            {
+                return Err(CreationFailure::NoDesktopSpace);
+            }
+            row = plain_call(
+                stream,
+                4 + depth as u32,
+                "terminal.get",
+                json!({"terminal":parent}),
+            )
+            .await
+            .map_err(|error| match error {
+                CoreError::TerminalMissing => CreationFailure::NoDesktopSpace,
+                _ => CreationFailure::Unconfirmed,
+            })?;
+            if row["address"] != parent {
+                return Err(CreationFailure::Unconfirmed);
+            }
+            match row["state"].as_str() {
+                Some("live") => {}
+                Some("finished") => return Err(CreationFailure::NoDesktopSpace),
+                _ => return Err(CreationFailure::Unconfirmed),
+            }
+        }
+        Err(CreationFailure::NoDesktopSpace)
+    }
+
     fn of(row: &Value) -> Option<Self> {
         let Some(labels) = row.get("labels")?.as_object() else {
             note("labels", "invalid", "shape", None);
             return None;
         };
-        let space = labels.get(DESKTOP_SPACE_LABEL)?.as_str().filter(|space| {
-            (1..=64).contains(&space.len())
-                && space
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        });
+        let space = labels
+            .get(DESKTOP_SPACE_LABEL)?
+            .as_str()
+            .filter(|space| valid_desktop_label(space));
         if space.is_none() {
             note("labels", "invalid", DESKTOP_SPACE_LABEL, None);
         }
         space.map(|space| Self(space.to_owned()))
     }
+}
+
+fn valid_desktop_label(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// A selected terminal in a desktop space gets its new shell as a new desktop tab there:
@@ -650,7 +714,8 @@ fn rpc_result(bytes: &[u8], id: u32) -> Result<Value, CoreError> {
             .and_then(Value::as_str);
         return match kind {
             Some("unsupported_generation") => Err(CoreError::Unsupported),
-            Some("not_found" | "unavailable" | "finished") => Err(CoreError::Unavailable),
+            Some("not_found" | "finished") => Err(CoreError::TerminalMissing),
+            Some("unavailable") => Err(CoreError::Unavailable),
             Some("invalid_params" | "internal" | "method_not_found") => Err(CoreError::Invalid),
             _ => {
                 note("rpc_error", "unknown_enum", "error_kind", None);
@@ -1173,9 +1238,14 @@ mod tests {
             reply(stream.get_mut(), 3, row("t2")).await;
         });
         assert_eq!(
-            create_terminal(&config, "default", &format!("{ID}:t1"))
-                .await
-                .unwrap(),
+            create_terminal(
+                &config,
+                "default",
+                &format!("{ID}:t1"),
+                CoreTabPlacement::Legacy
+            )
+            .await
+            .unwrap(),
             format!("{ID}:t2")
         );
         server.await.unwrap();
@@ -1226,9 +1296,14 @@ mod tests {
             reply(stream.get_mut(), 3, row("t2")).await;
         });
         assert_eq!(
-            create_terminal(&config, "default", &format!("{ID}:t1"))
-                .await
-                .unwrap(),
+            create_terminal(
+                &config,
+                "default",
+                &format!("{ID}:t1"),
+                CoreTabPlacement::Legacy
+            )
+            .await
+            .unwrap(),
             format!("{ID}:t2")
         );
         server.await.unwrap();
@@ -1262,6 +1337,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn desktop_tab_refuses_unplaced_and_foreign_sources_before_mutation() {
+        for (labels, parent) in [
+            (json!({}), Value::Null),
+            (json!({"herdr.space":"sp1"}), Value::Null),
+            (
+                json!({"herdr.space":"sp1","herdr.tab":"bad/tab"}),
+                Value::Null,
+            ),
+            (json!({}), json!("other/t1")),
+        ] {
+            let (_temp, config, listener) = fixture();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                request(&mut stream).await;
+                reply(stream.get_mut(), 1, hello(false)).await;
+                let get = request(&mut stream).await;
+                assert_eq!(get["params"]["terminal"], "t1");
+                let mut source = row("t1");
+                source["labels"] = labels;
+                source["parent"] = parent;
+                reply(stream.get_mut(), 2, source).await;
+                assert_eq!(stream.read_line(&mut String::new()).await.unwrap(), 0);
+            });
+            let result = create_terminal(
+                &config,
+                "default",
+                &format!("{ID}:t1"),
+                CoreTabPlacement::Desktop,
+            )
+            .await;
+            assert_eq!(result, Err(CreationFailure::NoDesktopSpace));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_tab_distinguishes_missing_parent_from_an_unreadable_reply() {
+        for (kind, expected) in [
+            ("not_found", CreationFailure::NoDesktopSpace),
+            ("unavailable", CreationFailure::Unconfirmed),
+            ("internal", CreationFailure::Unconfirmed),
+        ] {
+            let (_temp, config, listener) = fixture();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                request(&mut stream).await;
+                reply(stream.get_mut(), 1, hello(false)).await;
+                request(&mut stream).await;
+                let mut child = row("t2");
+                child["parent"] = json!("t1");
+                reply(stream.get_mut(), 2, child).await;
+                let get_parent = request(&mut stream).await;
+                assert_eq!(get_parent["method"], "terminal.get");
+                assert_eq!(get_parent["params"]["terminal"], "t1");
+                let error = json!({"jsonrpc":"2.0","id":get_parent["id"],"error":{"code":-32000,"message":kind,"data":{"kind":kind}}});
+                stream
+                    .get_mut()
+                    .write_all(format!("{error}\n").as_bytes())
+                    .await
+                    .unwrap();
+                assert_eq!(stream.read_line(&mut String::new()).await.unwrap(), 0);
+            });
+            let result = create_terminal(
+                &config,
+                "default",
+                &format!("{ID}:t2"),
+                CoreTabPlacement::Desktop,
+            )
+            .await;
+            assert_eq!(result, Err(expected));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn new_tab_refuses_stale_identity_or_missing_terminal_without_running() {
         for stale_identity in [true, false] {
             let (_temp, config, listener) = fixture();
@@ -1286,7 +1438,11 @@ mod tests {
             } else {
                 format!("{ID}:t1")
             };
-            assert!(create_terminal(&config, "default", &binding).await.is_err());
+            assert!(
+                create_terminal(&config, "default", &binding, CoreTabPlacement::Desktop)
+                    .await
+                    .is_err()
+            );
             server.await.unwrap();
         }
     }
@@ -1738,7 +1894,9 @@ mod tests {
             let created = live_call(&test_config, "terminal.run", json!({"argv":program,"cwd":first_cwd,"name":"ciao-first","no_parent":true,"no_notify":true,"labels":desktop})).await;
             let address = created["address"].as_str().unwrap().to_owned();
             let pid = created["pid"].as_u64().unwrap() as u32;
-            live_call(&test_config, "terminal.run", json!({"argv":program,"cwd":second_cwd,"name":"ciao-second","no_parent":true,"no_notify":true})).await;
+            let child = live_call(&test_config, "terminal.run", json!({"argv":program,"cwd":second_cwd,"name":"ciao-second","parent":address,"no_notify":true})).await;
+            assert_eq!(child["parent"], address);
+            assert!(child["labels"]["herdr.space"].is_null());
             let found = discover(&test_config).await;
             assert_eq!(found.sessions.len(), 1);
             assert_eq!(found.sessions[0].terminals.len(), 2);
@@ -1748,11 +1906,23 @@ mod tests {
                 .find(|terminal| terminal.pid == Some(pid))
                 .unwrap();
             let tab = first.tab.clone();
-            let new_tab = create_terminal(&test_config, "default", &tab)
-                .await
-                .unwrap();
+            let child_binding = found.sessions[0]
+                .terminals
+                .iter()
+                .find(|terminal| terminal.pid == child["pid"].as_u64().map(|pid| pid as u32))
+                .unwrap()
+                .tab
+                .clone();
+            let new_tab = create_terminal(
+                &test_config,
+                "default",
+                &child_binding,
+                CoreTabPlacement::Desktop,
+            )
+            .await
+            .unwrap();
             let new_terminal = terminal(&test_config, "default", &new_tab).await.unwrap();
-            assert_eq!(new_terminal.facts.cwd.as_deref(), first_cwd.to_str());
+            assert_eq!(new_terminal.facts.cwd.as_deref(), second_cwd.to_str());
             assert_ne!(new_terminal.pid, Some(pid));
             let (_, new_address) = new_tab.split_once(':').unwrap();
             let placed = live_call(
@@ -1761,6 +1931,7 @@ mod tests {
                 json!({"terminal":new_address}),
             )
             .await;
+            assert!(placed["parent"].is_null());
             assert_eq!(placed["keep"], true);
             assert_eq!(placed["labels"]["herdr.space"], desktop["herdr.space"]);
             let placed_tab = placed["labels"]["herdr.tab"].as_str().unwrap();

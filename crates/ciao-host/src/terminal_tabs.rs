@@ -3,20 +3,59 @@ use serde_json::Value;
 
 use crate::{
     host_protocol::{
-        CreatedTerminalTab as CreatedTab, ProviderKind, TerminalTabCreateParams as CreateParams,
-        valid_tab_id,
+        CreatedTerminalTab as CreatedTab, ProviderKind, TerminalTabCreateRequest, valid_tab_id,
     },
     workspace::{WorkspaceConfig, run_bounded},
 };
 
-pub(crate) async fn create(config: &WorkspaceConfig, params: &CreateParams) -> Option<CreatedTab> {
-    params.validate().ok()?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CreationFailure {
+    Unconfirmed,
+    NoDesktopSpace,
+}
+
+impl CreationFailure {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Unconfirmed => "creation_unconfirmed",
+            Self::NoDesktopSpace => "core_space_unavailable",
+        }
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Unconfirmed => {
+                "Could not confirm the new tab. Check the host board before trying again."
+            }
+            Self::NoDesktopSpace => "Choose a terminal in a Herdr desktop space to create a tab.",
+        }
+    }
+}
+
+impl From<crate::herdr_core::CoreError> for CreationFailure {
+    fn from(_: crate::herdr_core::CoreError) -> Self {
+        Self::Unconfirmed
+    }
+}
+
+pub(crate) async fn create(
+    config: &WorkspaceConfig,
+    request: &TerminalTabCreateRequest,
+) -> Result<CreatedTab, CreationFailure> {
+    let params = &request.params;
+    request
+        .validate()
+        .map_err(|_| CreationFailure::Unconfirmed)?;
     let tab = if let Some(binding) = &params.tab {
-        crate::herdr_core::create_terminal(&config.core, &params.session, binding)
-            .await
-            .ok()?
+        let placement = request
+            .placement()
+            .map_err(|_| CreationFailure::Unconfirmed)?;
+        crate::herdr_core::create_terminal(&config.core, &params.session, binding, placement)
+            .await?
     } else {
-        let binary = config.resolve(ProviderKind::Herdr)?;
+        let binary = config
+            .resolve(ProviderKind::Herdr)
+            .ok_or(CreationFailure::Unconfirmed)?;
         // API commands connect to an existing server; unlike `herdr --session NAME` alone,
         // they never launch one. Focus/cwd/shell policy belongs to Herdr, not Ciao.
         let output = run_bounded(
@@ -24,13 +63,13 @@ pub(crate) async fn create(config: &WorkspaceConfig, params: &CreateParams) -> O
             &["--session", &params.session, "tab", "create", "--focus"],
         )
         .await
-        .ok()?;
+        .map_err(|_| CreationFailure::Unconfirmed)?;
         if !output.status_success {
-            return None;
+            return Err(CreationFailure::Unconfirmed);
         }
-        parse_created_tab(&output.stdout)?
+        parse_created_tab(&output.stdout).ok_or(CreationFailure::Unconfirmed)?
     };
-    Some(CreatedTab { tab })
+    Ok(CreatedTab { tab })
 }
 
 fn parse_created_tab(bytes: &[u8]) -> Option<String> {
@@ -83,7 +122,9 @@ fn parse_created_tab(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_protocol::TerminalTabCreateRequest as CreateRequest;
+    use crate::host_protocol::{
+        TerminalTabCreateParams as CreateParams, TerminalTabCreateRequest as CreateRequest,
+    };
     use serde_json::json;
 
     #[test]
@@ -92,7 +133,7 @@ mod tests {
             "../../../protocol/fixtures/phase9/terminal-tab-create-v1.json"
         ))
         .unwrap();
-        for provider in ["tui", "core"] {
+        for provider in ["tui", "core", "core_v2"] {
             let request: CreateRequest =
                 serde_json::from_value(fixture[format!("{provider}_request")].clone()).unwrap();
             request.validate().unwrap();
@@ -112,6 +153,24 @@ mod tests {
             };
             assert_eq!(serde_json::to_value(response).unwrap(), *expected);
         }
+        let mut tui_v2 = fixture["tui_request"].clone();
+        tui_v2["method"] = fixture["core_v2_request"]["method"].clone();
+        assert!(
+            crate::host_protocol::decode_rpc_request(&serde_json::to_vec(&tui_v2).unwrap())
+                .is_err()
+        );
+        let failure = CreationFailure::NoDesktopSpace;
+        let response = crate::host_protocol::RpcErrorResponse::new(
+            fixture["core_v2_request"]["request_id"]
+                .as_str()
+                .map(str::to_owned),
+            failure.code(),
+            failure.message(),
+        );
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            fixture["core_space_unavailable"]
+        );
         for params in fixture["invalid_params"].as_array().unwrap() {
             if let Ok(params) = serde_json::from_value::<CreateParams>(params.clone()) {
                 assert!(params.validate().is_err());
