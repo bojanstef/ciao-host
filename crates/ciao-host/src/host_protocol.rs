@@ -1317,6 +1317,9 @@ pub fn valid_live_activity_session_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+#[path = "herdr_management.rs"]
+pub mod herdr_management;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcRequest {
     Hello(HostHelloRequest),
@@ -1326,6 +1329,7 @@ pub enum RpcRequest {
     LiveActivityRegister(LiveActivityRegisterRequest),
     TerminalCommands(TerminalCommandsRequest),
     TerminalTabCreate(TerminalTabCreateRequest),
+    HerdrManagement(herdr_management::Request),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2034,6 +2038,14 @@ pub fn decode_rpc_request(body: &[u8]) -> Result<RpcRequest, HostProtocolError> 
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             request.validate()?;
             Ok(RpcRequest::LiveActivityRegister(request))
+        }
+        herdr_management::SPACES
+        | herdr_management::CREATE
+        | herdr_management::SPACE_ACTION
+        | herdr_management::DESKTOP_TAB_ACTION
+        | herdr_management::TUI_INSPECT
+        | herdr_management::TAB_ACTION => {
+            herdr_management::decode(body).map(RpcRequest::HerdrManagement)
         }
         METHOD_TERMINAL_TAB_CREATE | METHOD_DESKTOP_TAB_CREATE => {
             let request: TerminalTabCreateRequest =

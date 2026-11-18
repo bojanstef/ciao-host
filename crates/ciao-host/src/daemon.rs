@@ -2156,6 +2156,17 @@ async fn hello_phase_rpc(
             let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
             Ok(HelloPhaseOutcome::KeepWaiting)
         }
+        Ok(RpcRequest::HerdrManagement(request)) => {
+            send_rpc_error_code(
+                send,
+                Some(request.id),
+                "not_ready",
+                "The Ciao host connection is not ready for this request.",
+            )
+            .await;
+            let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
+            Ok(HelloPhaseOutcome::KeepWaiting)
+        }
         Ok(RpcRequest::TerminalTabCreate(request)) => {
             send_rpc_error_code(
                 send,
@@ -2300,7 +2311,7 @@ async fn ready_phase_rpc(
                     )
                     .await;
                 }
-                Ok(_guard) => {
+                Ok(guard) => {
                     let capture_began = Instant::now();
                     let v3 = request.method == METHOD_WORKSPACE_SNAPSHOT_V3;
                     let mut result = capture_snapshot_version(
@@ -2313,6 +2324,7 @@ async fn ready_phase_rpc(
                         v3 || request.method == "workspace.snapshot.v2",
                     )
                     .await;
+                    drop(guard);
                     // Spec 029: v3 alone carries the integrations, read from the cache so a
                     // sweep never waits on an agent CLI. Absent until the first probe lands.
                     if v3 {
@@ -2343,6 +2355,59 @@ async fn ready_phase_rpc(
                 }
             }
         }
+        Ok(RpcRequest::HerdrManagement(request)) => {
+            if require_finished_request(send, recv, Some(request.id.clone()))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            if !state.paired_devices.lock().contains(remote_id) {
+                send_rpc_error_code(
+                    send,
+                    Some(request.id),
+                    "authorization_denied",
+                    "This installation is no longer authorized.",
+                )
+                .await;
+                return Ok(());
+            }
+            // A catalog reads local Core documents. Give it one bounded read slot so
+            // a canceled Home sweep cannot make the first view after a mutation empty.
+            static CATALOG_READ: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let gate = if matches!(
+                request.operation,
+                crate::host_protocol::herdr_management::Operation::Catalog
+            ) {
+                &CATALOG_READ
+            } else {
+                snapshot_busy.as_ref()
+            };
+            let Ok(guard) = gate.try_lock() else {
+                send_rpc_error_code(
+                    send,
+                    Some(request.id),
+                    "busy",
+                    "A workspace operation is already in progress.",
+                )
+                .await;
+                return Ok(());
+            };
+            let result =
+                crate::herdr_core::desktop::execute(&state.workspace, request.operation).await;
+            drop(guard);
+            match result {
+                Ok(result) => {
+                    let response = serde_json::json!({"v":1,"type":"response","request_id":request.id,"result":result});
+                    write_rpc(send, &response).await?;
+                    finish_rpc_send(send).await;
+                }
+                Err(failure) => {
+                    send_rpc_error_code(send, Some(request.id), failure.code(), failure.message())
+                        .await
+                }
+            }
+        }
         Ok(RpcRequest::TerminalTabCreate(request)) => {
             if require_finished_request(send, recv, Some(request.request_id.clone()))
                 .await
@@ -2362,7 +2427,7 @@ async fn ready_phase_rpc(
             }
             // Share the connection's workspace-operation guard; never queue mutations behind
             // another request. No retry on a failed/ambiguous provider response.
-            let Ok(_guard) = snapshot_busy.try_lock() else {
+            let Ok(guard) = snapshot_busy.try_lock() else {
                 send_rpc_error_code(
                     send,
                     Some(request.request_id),
@@ -2372,7 +2437,9 @@ async fn ready_phase_rpc(
                 .await;
                 return Ok(());
             };
-            match crate::terminal_tabs::create(&state.workspace, &request).await {
+            let result = crate::terminal_tabs::create(&state.workspace, &request).await;
+            drop(guard);
+            match result {
                 Ok(result) => {
                     let response = crate::host_protocol::TerminalTabCreateResponse {
                         v: 1,

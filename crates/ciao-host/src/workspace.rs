@@ -88,6 +88,7 @@ const MAX_HERDR_TAB_QUERIES: usize = 8;
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceConfig {
     binary_dirs: Vec<PathBuf>,
+    pub(crate) herdr_config: PathBuf,
     pub(crate) core: crate::herdr_core::CoreConfig,
 }
 
@@ -104,6 +105,7 @@ impl WorkspaceConfig {
         );
         Self {
             binary_dirs,
+            herdr_config: home.join(".config/herdr"),
             core: crate::herdr_core::CoreConfig::for_home(home),
         }
     }
@@ -115,6 +117,7 @@ impl WorkspaceConfig {
             .unwrap_or_else(|| PathBuf::from("/nonexistent-ciao-test"));
         Self {
             binary_dirs,
+            herdr_config: home.join(".config/herdr"),
             core: crate::herdr_core::CoreConfig::at(home.join(".local/state/herdr-core")),
         }
     }

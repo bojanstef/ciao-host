@@ -1,6 +1,8 @@
 //! Existing, same-user Herdr Core sessions. The API is the provider boundary: discovery and
 //! attachment never launch `hc`, whose CLI would start a missing core as a side effect.
 
+pub(crate) mod desktop;
+
 use std::{
     collections::BTreeMap,
     os::unix::fs::{FileTypeExt, MetadataExt},
@@ -27,6 +29,7 @@ use tokio::{
 
 use crate::{
     drift,
+    host_protocol::herdr_management::valid_space_id,
     host_protocol::{
         CoreTabPlacement, Dimensions, HOST_PENDING_INPUT_BYTES, HOST_PENDING_OUTPUT_BYTES,
         MAX_DATA_PAYLOAD, MAX_SESSIONS_PER_PROVIDER, MAX_TABS_PER_SESSION, valid_herdr_core_tab_id,
@@ -38,6 +41,7 @@ use crate::{
 };
 
 const VENDOR: &str = "herdr_core";
+const CORE_DOCUMENT_BYTES: usize = 1024 * 1024;
 const RPC_BYTES: usize = 64 * 1024;
 const JSON_DEPTH: usize = 12;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -55,6 +59,7 @@ const RESIZE: u8 = 3;
 pub(crate) enum CoreError {
     Unavailable,
     TerminalMissing,
+    Conflict,
     Invalid,
     Unsupported,
 }
@@ -235,7 +240,7 @@ pub(crate) async fn discover(config: &CoreConfig) -> CoreDiscovery {
                 result.unsupported = true;
                 result.omitted = result.omitted.saturating_add(1);
             }
-            Err(CoreError::Invalid) => {
+            Err(CoreError::Invalid | CoreError::Conflict) => {
                 result.failed = true;
                 result.omitted = result.omitted.saturating_add(1);
                 note("discovery", "invalid", "response", None);
@@ -361,7 +366,7 @@ impl DesktopSpace {
             if let Some(space) = Self::of(&row)
                 && row["labels"][DESKTOP_TAB_LABEL]
                     .as_str()
-                    .is_some_and(valid_desktop_label)
+                    .is_some_and(valid_space_id)
             {
                 return Ok(space);
             }
@@ -405,19 +410,12 @@ impl DesktopSpace {
         let space = labels
             .get(DESKTOP_SPACE_LABEL)?
             .as_str()
-            .filter(|space| valid_desktop_label(space));
+            .filter(|space| valid_space_id(space));
         if space.is_none() {
             note("labels", "invalid", DESKTOP_SPACE_LABEL, None);
         }
         space.map(|space| Self(space.to_owned()))
     }
-}
-
-fn valid_desktop_label(value: &str) -> bool {
-    (1..=64).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// A selected terminal in a desktop space gets its new shell as a new desktop tab there:
@@ -648,9 +646,18 @@ async fn plain_call(
     method: &str,
     params: Value,
 ) -> Result<Value, CoreError> {
+    let (limit, depth) = if method == "doc.get" || method == "doc.set" {
+        // Core's opaque documents permit 1 MiB plus the JSON-RPC envelope.
+        (CORE_DOCUMENT_BYTES + 4096, 64)
+    } else {
+        (RPC_BYTES, JSON_DEPTH)
+    };
     let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
     let mut bytes = serde_json::to_vec(&request).map_err(|_| CoreError::Invalid)?;
     bytes.push(b'\n');
+    if bytes.len() > limit {
+        return Err(CoreError::Invalid);
+    }
     stream
         .get_mut()
         .write_all(&bytes)
@@ -666,7 +673,7 @@ async fn plain_call(
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |index| index + 1);
-        if line.len().saturating_add(count) > RPC_BYTES {
+        if line.len().saturating_add(count) > limit {
             note("rpc", "invalid", "size_bound", None);
             return Err(CoreError::Invalid);
         }
@@ -677,11 +684,20 @@ async fn plain_call(
             break;
         }
     }
-    rpc_result(&line, id)
+    rpc_result_bounded(&line, id, limit, depth)
 }
 
 fn rpc_result(bytes: &[u8], id: u32) -> Result<Value, CoreError> {
-    if bytes.len() > RPC_BYTES {
+    rpc_result_bounded(bytes, id, RPC_BYTES, JSON_DEPTH)
+}
+
+fn rpc_result_bounded(
+    bytes: &[u8],
+    id: u32,
+    limit: usize,
+    levels: usize,
+) -> Result<Value, CoreError> {
+    if bytes.len() > limit {
         return Err(CoreError::Invalid);
     }
     let value: Value = serde_json::from_slice(bytes).map_err(|_| {
@@ -698,7 +714,7 @@ fn rpc_result(bytes: &[u8], id: u32) -> Result<Value, CoreError> {
             _ => true,
         }
     }
-    if !depth(&value, JSON_DEPTH)
+    if !depth(&value, levels)
         || value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || value.get("id").and_then(Value::as_u64) != Some(u64::from(id))
     {
@@ -713,6 +729,7 @@ fn rpc_result(bytes: &[u8], id: u32) -> Result<Value, CoreError> {
             .and_then(|data| data.get("kind"))
             .and_then(Value::as_str);
         return match kind {
+            Some("conflict") => Err(CoreError::Conflict),
             Some("unsupported_generation") => Err(CoreError::Unsupported),
             Some("not_found" | "finished") => Err(CoreError::TerminalMissing),
             Some("unavailable") => Err(CoreError::Unavailable),
@@ -1881,6 +1898,7 @@ mod tests {
             })
             .await
             .expect("isolated Core did not become ready");
+            desktop::tests::live(&test_config).await;
             let first_cwd = root.join("first");
             let second_cwd = root.join("second");
             std::fs::create_dir(&first_cwd).unwrap();

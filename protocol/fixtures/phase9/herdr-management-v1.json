@@ -1,0 +1,280 @@
+{
+  "cases": {
+    "catalog": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.core.spaces.v1",
+        "params": {}
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {
+          "servers": [
+            {
+              "session": "default",
+              "core": "0123456789abcdef0123456789abcdef",
+              "version": 4,
+              "spaces": [
+                {
+                  "id": "sp1",
+                  "name": "Work",
+                  "tabs": 2,
+                  "tab_items": [
+                    {
+                      "id": "tb1",
+                      "name": "Design",
+                      "terminals": ["t1", "t3"]
+                    },
+                    {
+                      "id": "tb2",
+                      "name": "2"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "omitted": 0
+        }
+      }
+    },
+    "new_space": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.core.create.v1",
+        "params": {
+          "session": "default",
+          "core": "0123456789abcdef0123456789abcdef",
+          "destination": {
+            "kind": "new_space",
+            "name": "Release QA"
+          }
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {
+          "tab": "0123456789abcdef0123456789abcdef:t2"
+        }
+      }
+    },
+    "existing_space": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.core.create.v1",
+        "params": {
+          "session": "default",
+          "core": "0123456789abcdef0123456789abcdef",
+          "destination": {
+            "kind": "existing_space",
+            "space": "sp1"
+          }
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {
+          "tab": "0123456789abcdef0123456789abcdef:t2"
+        }
+      }
+    },
+    "close_terminal": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.tab.action.v1",
+        "params": {
+          "target": "herdr_core.attach",
+          "session": "default",
+          "tab": "0123456789abcdef0123456789abcdef:t1",
+          "action": {
+            "kind": "close"
+          }
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {}
+      }
+    },
+    "close_tui": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.tab.action.v1",
+        "params": {
+          "target": "herdr.attach",
+          "session": "default",
+          "tab": "w1:t2",
+          "action": {
+            "kind": "close"
+          },
+          "instance": "abcde0123456789fabcde0123456789f"
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {}
+      }
+    },
+    "rename_tui": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.tab.action.v1",
+        "params": {
+          "target": "herdr.attach",
+          "session": "default",
+          "tab": "w1:t2",
+          "action": {
+            "kind": "rename",
+            "name": "Build log"
+          },
+          "instance": "abcde0123456789fabcde0123456789f"
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {}
+      }
+    },
+    "rename_space": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.core.space.action.v1",
+        "params": {
+          "session": "default",
+          "core": "0123456789abcdef0123456789abcdef",
+          "space": "sp1",
+          "version": 4,
+          "action": {
+            "kind": "rename",
+            "name": "Release QA"
+          }
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {}
+      }
+    },
+    "close_space": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.core.space.action.v1",
+        "params": {
+          "session": "default",
+          "core": "0123456789abcdef0123456789abcdef",
+          "space": "sp1",
+          "version": 4,
+          "action": {
+            "kind": "close"
+          }
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {}
+      }
+    },
+    "inspect_tui": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.tui.tab.inspect.v1",
+        "params": {
+          "session": "default",
+          "tab": "w1:t2"
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {
+          "instance": "abcde0123456789fabcde0123456789f",
+          "name": "Build log"
+        }
+      }
+    },
+    "close_core_tab": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.core.tab.action.v1",
+        "params": {
+          "session": "default",
+          "core": "0123456789abcdef0123456789abcdef",
+          "space": "sp1",
+          "version": 4,
+          "action": {
+            "kind": "close"
+          },
+          "tab": "tb1"
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {}
+      }
+    },
+    "rename_core_tab": {
+      "request": {
+        "v": 1,
+        "type": "request",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "method": "herdr.core.tab.action.v1",
+        "params": {
+          "session": "default",
+          "core": "0123456789abcdef0123456789abcdef",
+          "space": "sp1",
+          "version": 4,
+          "action": {
+            "kind": "rename",
+            "name": "Release QA"
+          },
+          "tab": "tb1"
+        }
+      },
+      "response": {
+        "v": 1,
+        "type": "response",
+        "request_id": "AAECAwQFBgcICQoLDA0ODw",
+        "result": {}
+      }
+    }
+  }
+}
