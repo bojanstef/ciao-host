@@ -3621,7 +3621,11 @@ fn drift_note_for(registration: &NormalizedRegistration) -> Option<DriftNote> {
     })
 }
 
+mod directory_preview;
+
 fn descriptor_for(session: &LiveSession) -> AgentSessionDescriptor {
+    let turn = session.visible_turn();
+    let context_preview = directory_preview::for_session(session, &turn);
     AgentSessionDescriptor {
         v: AGENT_PROTOCOL_VERSION,
         session_id: session.snapshot.session_id.clone(),
@@ -3632,7 +3636,8 @@ fn descriptor_for(session: &LiveSession) -> AgentSessionDescriptor {
         stored_reason: session.snapshot.stored_reason.clone(),
         process_generation: session.snapshot.process_generation,
         observation: session.snapshot.observation.clone(),
-        turn: session.visible_turn(),
+        turn,
+        context_preview,
         capabilities: session.snapshot.capabilities.clone(),
         workspace_display: session.workspace_display.clone(),
         terminal_fallback: session.snapshot.terminal_fallback.clone(),
@@ -3758,12 +3763,7 @@ fn recent_reply_for(session: &LiveSession) -> Option<String> {
             _ => None,
         }
     })?;
-    // The host keeps up to a megabyte of a reply and the alert needs its first sentence, so
-    // collapse a bounded prefix rather than every word of the body.
-    let head = &text[..text.floor_char_boundary(8 * 1024)];
-    let collapsed = head.split_whitespace().collect::<Vec<_>>().join(" ");
-    let bounded = truncate_on_char_boundary(&collapsed, MAX_RECENT_PROMPT_BYTES);
-    (!bounded.is_empty()).then_some(bounded)
+    directory_preview::summary(text)
 }
 
 /// Byte bounds cannot split a UTF-8 scalar, and prompts are arbitrary user text.
@@ -4740,6 +4740,13 @@ mod tests {
         assert_eq!(child("b", Waiting, 3), Some(wait.clone()));
         assert_eq!(child("a", Finished, 4), None);
         visible(&wait);
+        assert_eq!(
+            supervisor.list().sessions[0]
+                .context_preview
+                .as_ref()
+                .map(|p| p.kind),
+            Some(crate::agent_protocol::DirectoryPreviewKind::SubagentInput)
+        );
         let mut stale = reg.clone();
         stale.process_generation += 1;
         assert_eq!(
@@ -4757,6 +4764,15 @@ mod tests {
         );
         assert_eq!(child("b", Finished, 7), None);
         visible(&done);
+        let reply = supervisor.list().sessions[0]
+            .context_preview
+            .clone()
+            .unwrap();
+        assert_eq!(
+            reply.kind,
+            crate::agent_protocol::DirectoryPreviewKind::Reply
+        );
+        assert_eq!(reply.text.as_deref(), Some("The parent answered."));
         let mut turns = Vec::new();
         while let Ok(frame) = updates.try_recv() {
             if let AgentServerFrame::SessionDelta { delta, .. } = frame {
@@ -5199,6 +5215,18 @@ mod tests {
             supervisor.snapshot(&registered.session_id).unwrap().turn,
             TurnState::AwaitingInteraction { .. }
         ));
+        let preview = supervisor.list().sessions[0]
+            .context_preview
+            .clone()
+            .unwrap();
+        assert_eq!(
+            preview.kind,
+            crate::agent_protocol::DirectoryPreviewKind::Permission
+        );
+        assert_eq!(
+            preview.text, None,
+            "a missing title never exposes the raw tool arguments"
+        );
     }
 
     /// Spec 019 amendment (2026-08-19): only a kind that names a person being needed may latch

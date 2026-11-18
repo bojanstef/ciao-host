@@ -533,6 +533,7 @@ pub(crate) fn unheld_descriptor(
             // themselves.
             resume_command: codex_resume_command(&row.thread_id),
         },
+        context_preview: None,
         recent_prompt: row.preview.clone().filter(|preview| !preview.is_empty()),
         managed_session_id: None,
         // The whole point of the row: nobody holds this thread, so the daemon can.

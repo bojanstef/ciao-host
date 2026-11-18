@@ -1,0 +1,34 @@
+{
+  "cards": [
+    { "interaction_case": 0, "preview": { "kind": "permission", "text": "Synthetic permission request" } },
+    { "interaction_case": 1, "preview": { "kind": "question", "text": "Choose one synthetic option." } },
+    { "interaction_case": 4, "preview": { "kind": "decision" } }
+  ],
+  "messages": [
+    {
+      "family": "Codex",
+      "message": "Message Type: MESSAGE\nTask name: /root\nSender: /root/reviewer\nPayload:\nThe review is ready.",
+      "preview": { "kind": "agent_message", "text": "The review is ready." }
+    },
+    {
+      "family": "Codex",
+      "message": "Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\nReview the checkout flow.",
+      "preview": { "kind": "agent_task", "text": "Review the checkout flow." }
+    },
+    {
+      "family": "Codex",
+      "message": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/reviewer\nPayload:\nBoth checks passed.",
+      "preview": { "kind": "agent_result", "text": "Both checks passed." }
+    },
+    {
+      "family": "Claude",
+      "message": "Another Claude session sent a message:\n\nThe notes are ready.",
+      "preview": { "kind": "agent_message", "text": "The notes are ready." }
+    },
+    {
+      "family": "Codex",
+      "message": "<subagent_notification>\n{\"agent_path\":\"/root/test\",\"status\":\"running\"}\n</subagent_notification>",
+      "preview": { "kind": "subagent_update" }
+    }
+  ]
+}

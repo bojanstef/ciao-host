@@ -1275,6 +1275,7 @@ fn stored_descriptor(
         // reads Claude's own conversation store instead of reconstructing one. A stored record
         // is otherwise permanently unnamed, since its worker is gone and no hook will ever
         // report for it again. Absent stays truthful for a record whose transcript is missing.
+        context_preview: None,
         recent_prompt: record.vendor_session_id.as_deref().and_then(|vendor| {
             crate::claude_transcript::recent_prompt(vendor, MAX_RECENT_PROMPT_BYTES)
         }),

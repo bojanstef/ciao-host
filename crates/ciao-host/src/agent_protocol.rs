@@ -603,6 +603,31 @@ pub fn valid_resume_command(value: &str) -> Result<(), AgentProtocolError> {
     Ok(())
 }
 
+/// Display-only context for the paired-device directory. Never grants an interaction or command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryPreviewKind {
+    Permission,
+    Question,
+    Decision,
+    SubagentInput,
+    AgentMessage,
+    AgentTask,
+    AgentResult,
+    SubagentUpdate,
+    Reply,
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryPreview {
+    pub kind: DirectoryPreviewKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionDescriptor {
@@ -626,6 +651,8 @@ pub struct AgentSessionDescriptor {
     /// Absent when the session has no user message yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_preview: Option<DirectoryPreview>,
     /// The managed session already running this attached session's conversation, when there is
     /// one. Ciao's own session ID, never the vendor's — the phone uses it to open the
     /// conversation where it actually lives instead of offering a takeover that has already
@@ -667,6 +694,14 @@ impl AgentSessionDescriptor {
         }
         if let Some(prompt) = &self.recent_prompt
             && (prompt.is_empty() || prompt.len() > MAX_RECENT_PROMPT_BYTES)
+        {
+            return Err(AgentProtocolError::InvalidValue);
+        }
+        if let Some(text) = self
+            .context_preview
+            .as_ref()
+            .and_then(|preview| preview.text.as_ref())
+            && (text.is_empty() || text.len() > MAX_RECENT_PROMPT_BYTES)
         {
             return Err(AgentProtocolError::InvalidValue);
         }
