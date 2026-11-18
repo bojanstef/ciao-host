@@ -4,6 +4,14 @@
     { "interaction_case": 1, "preview": { "kind": "question", "text": "Choose one synthetic option." } },
     { "interaction_case": 4, "preview": { "kind": "decision" } }
   ],
+  "text_cases": [
+    { "text": "Ready 👩‍💻", "valid": true, "summary": "Ready 👩‍💻" },
+    { "text": "first\r\nsecond", "valid": false, "summary": "first second" },
+    { "text": "a\u0000\u0007\u001bb", "valid": false, "summary": "a b" },
+    { "text": "one\u2028two\u2029three", "valid": false, "summary": "one two three" },
+    { "text": "\u0007", "valid": false, "summary": null },
+    { "text": "", "valid": false, "summary": null }
+  ],
   "messages": [
     {
       "family": "Codex",

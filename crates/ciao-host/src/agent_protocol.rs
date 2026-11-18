@@ -628,6 +628,12 @@ pub struct DirectoryPreview {
     pub text: Option<String>,
 }
 
+impl DirectoryPreview {
+    pub(crate) fn invalid_text_character(c: char) -> bool {
+        c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionDescriptor {
@@ -701,7 +707,9 @@ impl AgentSessionDescriptor {
             .context_preview
             .as_ref()
             .and_then(|preview| preview.text.as_ref())
-            && (text.is_empty() || text.len() > MAX_RECENT_PROMPT_BYTES)
+            && (text.is_empty()
+                || text.len() > MAX_RECENT_PROMPT_BYTES
+                || text.chars().any(DirectoryPreview::invalid_text_character))
         {
             return Err(AgentProtocolError::InvalidValue);
         }

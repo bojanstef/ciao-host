@@ -295,6 +295,7 @@ struct LiveSession {
     /// override borrows the turn instead of ending it. Cleared by any other reported turn, by
     /// session end, and by every downgrade.
     open_run: Option<TurnState>,
+    directory_reply: Option<directory_preview::ObservedReply>,
     children: crate::child_activity::ChildActivity,
     /// Only a hook-derived wait can be cleared by transcript progress. A native UI wait is
     /// owned by the adapter until it explicitly reports that the dialog ended.
@@ -797,6 +798,7 @@ impl AgentSessionSupervisor {
                 bridge_sender: sender,
                 adapter_active: true,
                 open_run: None,
+                directory_reply: None,
                 children: Default::default(),
                 hook_attention: false,
                 source_entries,
@@ -1345,6 +1347,7 @@ impl AgentSessionSupervisor {
             }
             *existing = canonical.clone();
         } else {
+            directory_preview::observe_new_entry(session, &canonical);
             session.history.push(canonical.clone());
             session.history.sort_by_key(|candidate| candidate.sequence);
         }
@@ -1605,6 +1608,7 @@ impl AgentSessionSupervisor {
             .iter()
             .any(|entry| entry.entry_id == canonical.entry_id)
         {
+            directory_preview::observe_new_entry(session, &canonical);
             session.history.push(canonical.clone());
             session.history.sort_by_key(|entry| entry.sequence);
         }
@@ -1759,7 +1763,7 @@ impl AgentSessionSupervisor {
             let facts = NotificationFacts {
                 workspace: session.workspace_display.clone(),
                 tab: None,
-                subject: recent_prompt_for(session),
+                subject: recent_prompt_for(session, |_| true),
                 reply: recent_reply_for(session),
             };
             let proof = inner
@@ -1801,6 +1805,11 @@ impl AgentSessionSupervisor {
             .get_mut(session_id)
             .ok_or_else(|| anyhow!("registered session is unavailable"))?;
         let before = session.visible_turn();
+        if let TurnState::Running { run_id, .. } = &turn
+            && session.open_run.as_ref().and_then(TurnState::run_id) != Some(run_id)
+        {
+            session.directory_reply = None;
+        }
         session.open_run = matches!(turn, TurnState::Running { .. }).then(|| turn.clone());
         session.hook_attention = false;
         session.snapshot.turn = turn;
@@ -3641,7 +3650,9 @@ fn descriptor_for(session: &LiveSession) -> AgentSessionDescriptor {
         capabilities: session.snapshot.capabilities.clone(),
         workspace_display: session.workspace_display.clone(),
         terminal_fallback: session.snapshot.terminal_fallback.clone(),
-        recent_prompt: recent_prompt_for(session),
+        recent_prompt: recent_prompt_for(session, |text| {
+            directory_preview::incoming(&session.snapshot.adapter.family, text).is_none()
+        }),
         // Filled in by the caller, which is the only place that can see both directories.
         managed_session_id: None,
         takeover: session
@@ -3714,8 +3725,8 @@ fn has_resumable_conversation(
     observed_a_prompt || transcript_prompt().is_some()
 }
 
-fn recent_prompt_for(session: &LiveSession) -> Option<String> {
-    let text = session.history.iter().rev().find_map(|entry| {
+fn recent_prompt_for(session: &LiveSession, prefer: impl Fn(&str) -> bool) -> Option<String> {
+    let mut prompts = session.history.iter().rev().filter_map(|entry| {
         if entry.kind != "user_message" {
             return None;
         }
@@ -3725,7 +3736,12 @@ fn recent_prompt_for(session: &LiveSession) -> Option<String> {
         }
     });
 
-    let Some(text) = text else {
+    let latest = prompts.next();
+    let Some(text) = latest
+        .filter(|text| prefer(text))
+        .or_else(|| prompts.find(|text| prefer(text)))
+        .or(latest)
+    else {
         // Hooks report only what was submitted while Ciao was watching, so a registration that
         // outlived its last prompt — a daemon restart, a `--resume` — leaves the conversation
         // unnamed here while Claude still holds it on disk. Claude only: another adapter's
@@ -4817,6 +4833,105 @@ mod tests {
             None
         );
         visible(&next);
+    }
+
+    #[tokio::test]
+    async fn home_reply_requires_a_new_live_message_in_the_completed_run() {
+        use crate::agent_protocol::DirectoryPreviewKind;
+
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let mut registration = observer_registration("preview");
+        registration.adapter_family = "Claude".into();
+        let session = supervisor.register_observer(registration).await.unwrap();
+        let id = &session.session_id;
+        let start = |run: &str| {
+            supervisor
+                .note_bridge_turn(
+                    id,
+                    TurnState::Running {
+                        run_id: run.into(),
+                        activity: "responding".into(),
+                    },
+                )
+                .unwrap();
+        };
+        let stop = |run: &str| {
+            supervisor
+                .note_bridge_turn(
+                    id,
+                    TurnState::Completed {
+                        run_id: Some(run.into()),
+                    },
+                )
+                .unwrap();
+        };
+        let preview = || supervisor.list().sessions[0].context_preview.clone();
+        let quoted = "Another Claude session sent a message: this is an example.";
+        start("first");
+        supervisor
+            .upsert_bridge_entry(id, prompt_entry("user", 1, quoted))
+            .unwrap();
+        assert_eq!(preview().unwrap().kind, DirectoryPreviewKind::AgentMessage);
+        supervisor
+            .upsert_bridge_entry(id, entry("answer", 2, "The build passed"))
+            .unwrap();
+        stop("first");
+        let reply = preview().unwrap();
+        assert_eq!(reply.kind, DirectoryPreviewKind::Reply);
+        assert_eq!(reply.text.as_deref(), Some("The build passed"));
+
+        start("empty");
+        stop("empty");
+        assert!(preview().is_none());
+
+        start("late-update");
+        supervisor
+            .upsert_bridge_entry(id, entry("answer", 3, "Earlier reply revised"))
+            .unwrap();
+        stop("late-update");
+        assert!(preview().is_none());
+
+        start("quote");
+        supervisor
+            .upsert_bridge_entry(id, entry("quotation", 2, quoted))
+            .unwrap();
+        stop("quote");
+        let reply = preview().unwrap();
+        assert_eq!(reply.kind, DirectoryPreviewKind::Reply);
+        assert_eq!(reply.text.as_deref(), Some(quoted));
+    }
+
+    #[tokio::test]
+    async fn home_keeps_the_human_task_when_an_agent_message_arrives() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let mut registration = observer_registration("peer-message");
+        registration.adapter_family = "Codex".into();
+        let session = supervisor.register_observer(registration).await.unwrap();
+        let id = &session.session_id;
+        supervisor
+            .upsert_bridge_entry(id, prompt_entry("human", 1, "Fix refunds"))
+            .unwrap();
+        let message = "Message Type: MESSAGE\nTask name: /root\nSender: /root/review\nPayload:\nThe tests passed.";
+        supervisor
+            .upsert_bridge_entry(id, prompt_entry("peer", 1, message))
+            .unwrap();
+        let row = supervisor.list().sessions.remove(0);
+        assert_eq!(row.recent_prompt.as_deref(), Some("Fix refunds"));
+        assert_eq!(
+            row.context_preview.unwrap().text.as_deref(),
+            Some("The tests passed.")
+        );
+        assert_eq!(
+            supervisor
+                .notification_facts(id)
+                .await
+                .unwrap()
+                .subject
+                .as_deref(),
+            Some("Message Type: MESSAGE")
+        );
     }
 
     fn entry(source: &str, revision: u64, text: &str) -> NormalizedTimelineEntry {
