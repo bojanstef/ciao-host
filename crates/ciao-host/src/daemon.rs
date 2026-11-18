@@ -1021,15 +1021,37 @@ async fn monitor_agent_routes(state: Arc<RuntimeState>) {
     // Route recovery runs on a multiple of this loop rather than every pass: a session with no
     // pane to find would otherwise shell out to a provider every second forever.
     let mut ticks: u32 = 0;
+    let mut shared_recovery = tokio::task::JoinSet::new();
+    let mut provider_recovery = tokio::task::JoinSet::new();
+    let mut cadence = tokio::time::interval(AGENT_ROUTE_REVALIDATION_INTERVAL);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(AGENT_ROUTE_REVALIDATION_INTERVAL) => {
+            _ = shared_recovery.join_next(), if !shared_recovery.is_empty() => {}
+            _ = provider_recovery.join_next(), if !provider_recovery.is_empty() => {}
+            _ = cadence.tick() => {
+                // Single-flight jobs, never a queue. Native helper work must not block
+                // managed supervision; cancellation retains native child cleanup ownership.
+                if shared_recovery.is_empty() {
+                    let state = state.clone();
+                    shared_recovery.spawn(async move {
+                        if let Ok(paths) = CiaoPaths::discover() {
+                            let _ = tokio::time::timeout(Duration::from_secs(90),
+                                crate::agent_bridge::recover_shared_status(&state.agent_sessions,
+                                    &state.codex_adoptions, &paths)).await;
+                        }
+                    });
+                }
                 state.agent_sessions.sweep_dead_sessions();
                 state.agent_sessions.expire_stale_turn_claims();
                 state.agent_sessions.revalidate_live_routes().await;
                 ticks = ticks.wrapping_add(1);
-                if ticks.is_multiple_of(AGENT_ROUTE_RECOVERY_TICKS) {
-                    state.agent_sessions.recover_missing_routes().await;
+                if ticks.is_multiple_of(AGENT_ROUTE_RECOVERY_TICKS) && provider_recovery.is_empty() {
+                    let sessions = state.agent_sessions.clone();
+                    provider_recovery.spawn(async move {
+                        let _ = tokio::time::timeout(Duration::from_secs(90),
+                            sessions.recover_missing_routes()).await;
+                    });
                 }
                 // A worker that exited on its own becomes a truthful stored
                 // session; a nonzero exit is reported as a crash.
@@ -1058,6 +1080,10 @@ async fn monitor_agent_routes(state: Arc<RuntimeState>) {
             }
         }
     }
+    shared_recovery.abort_all();
+    provider_recovery.abort_all();
+    while shared_recovery.join_next().await.is_some() {}
+    while provider_recovery.join_next().await.is_some() {}
 }
 
 /// Snapshots both session owners and projects Spec 018's bounded facts, so notification delivery
@@ -3867,7 +3893,7 @@ async fn handle_terminal_stream(
         finish_terminal_error(send, recv, STREAM_TERMINAL_LIMIT).await;
         return Ok(());
     }
-    let agent_plan = match resolve_agent_terminal_plan(&open, &state).await {
+    let pending_agent = match resolve_agent_terminal_plan(&open, &state).await {
         Ok(plan) => plan,
         Err((code, message)) => {
             send_terminal_error(send, None, code, message).await;
@@ -3875,6 +3901,7 @@ async fn handle_terminal_stream(
             return Ok(());
         }
     };
+    let agent_plan = pending_agent.as_ref().map(|pending| &pending.plan);
     let resumable = target_is_resumable(open.validated_target().ok(), agent_plan.is_some());
     // Opened and finished are logged as a pair with the device that holds it, because the only
     // record of a terminal used to be a number in `ciao status`. An owner blocked by that number
@@ -3940,8 +3967,8 @@ async fn handle_terminal_stream(
         tracing::debug!("detached tmux pre-create did not report success; attaching anyway");
     }
 
-    let tmux_detach_binary = tmux_detach_binary(&open, &state, agent_plan.as_ref());
-    let mut spawn_task = match spawn_terminal_child(&open, &state, agent_plan.as_ref()) {
+    let tmux_detach_binary = tmux_detach_binary(&open, &state, agent_plan);
+    let mut spawn_task = match spawn_terminal_child(&open, &state, agent_plan) {
         Ok(task) => task,
         Err((code, message)) => {
             send_terminal_error(send, None, code, message).await;
@@ -3987,17 +4014,31 @@ async fn handle_terminal_stream(
         }
         Ok(Ok(Ok(session))) => session,
     };
-    if herdr_viewer_child(&open, agent_plan.as_ref()) {
+    if herdr_viewer_child(&open, agent_plan) {
         session.mark_viewer_cleanup();
     }
 
     let terminal_id = session.terminal_id().to_owned();
-    let opened = TerminalFrame::Opened(TerminalOpened {
-        v: HOST_PROTOCOL_VERSION,
-        terminal_id: terminal_id.clone(),
-        dimensions: open.dimensions,
-        term: "xterm-256color".into(),
-    });
+    let opened = match terminal_opened_after_spawn(
+        &mut session,
+        open.dimensions,
+        tmux_detach_binary.as_deref(),
+        async {
+            match pending_agent.as_ref() {
+                Some(pending) => state.agent_sessions.revalidate_terminal_open(pending).await,
+                None => true,
+            }
+        },
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err((code, message)) => {
+            send_terminal_error(send, None, code, message).await;
+            finish_terminal_error(send, recv, STREAM_PTY_FAILURE).await;
+            return Ok(());
+        }
+    };
     if let Err(error) = write_terminal_frame(send, &opened).await {
         cleanup_terminal(
             &mut session,
@@ -4033,6 +4074,28 @@ async fn handle_terminal_stream(
         "PTY terminal finished"
     );
     result
+}
+
+pub(crate) async fn terminal_opened_after_spawn(
+    session: &mut crate::terminal_session::TerminalSession,
+    dimensions: crate::host_protocol::Dimensions,
+    tmux_detach_binary: Option<&std::path::Path>,
+    closing: impl std::future::Future<Output = bool>,
+) -> Result<TerminalFrame, (&'static str, &'static str)> {
+    if !closing.await {
+        // Only the just-created viewer/attachment is ours. Never signal the TUI/backend.
+        cleanup_terminal(session, tmux_detach_binary, CleanupReason::BridgeFailure).await;
+        return Err((
+            "stale_agent_route",
+            "The Agent Session terminal route is no longer available.",
+        ));
+    }
+    Ok(TerminalFrame::Opened(TerminalOpened {
+        v: HOST_PROTOCOL_VERSION,
+        terminal_id: session.terminal_id().to_owned(),
+        dimensions,
+        term: "xterm-256color".into(),
+    }))
 }
 
 #[allow(clippy::too_many_arguments)] // one call site; a params struct would be ceremony
@@ -4498,7 +4561,7 @@ fn spawn_terminal_child(
 async fn resolve_agent_terminal_plan(
     open: &TerminalOpen,
     state: &Arc<RuntimeState>,
-) -> Result<Option<crate::agent_route::AgentTerminalPlan>, (&'static str, &'static str)> {
+) -> Result<Option<crate::agent_session::PendingAgentTerminal>, (&'static str, &'static str)> {
     let target = open
         .validated_target()
         .map_err(|_| invalid_target_error())?;
@@ -4903,6 +4966,58 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn idle_spawn_completion_must_refuse_stale_before_opened_and_reap_only_viewer() {
+        use super::*;
+        use crate::host_protocol::Dimensions;
+        for current in [false, true] {
+            let dimensions = Dimensions {
+                cols: 80,
+                rows: 24,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            let (release, withheld) = tokio::sync::oneshot::channel();
+            let spawn = tokio::spawn(async move {
+                let session = crate::terminal_session::TerminalSession::spawn_fixed_argv(
+                    dimensions,
+                    "/bin/sleep".into(),
+                    vec!["60".into()],
+                )
+                .await
+                .unwrap();
+                withheld.await.unwrap();
+                session
+            });
+            // A status/registration/provider verdict changes while spawn completion is held.
+            release.send(()).unwrap();
+            let mut session = spawn.await.unwrap();
+            let mut watcher = session.exit_watcher();
+            let result = terminal_opened_after_spawn(
+                &mut session,
+                dimensions,
+                None,
+                std::future::ready(current),
+            )
+            .await;
+            // Cleanup even the original defective path before the red assertion.
+            session.cleanup(CleanupReason::ExplicitClose).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), watcher.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(crate::process::exists(std::process::id()));
+            if current {
+                assert!(matches!(result, Ok(TerminalFrame::Opened(_))));
+            } else {
+                assert!(
+                    matches!(result, Err(("stale_agent_route", _))),
+                    "stale spawn sent Opened"
+                );
+            }
+        }
+    }
+
     /// The failure this replaced: a phone that backgrounded without closing its stream kept the
     /// endpoint's only slot, and every later open was refused with `subscription_limit` until
     /// the QUIC idle timeout expired. Superseding answers the live request and still never lets

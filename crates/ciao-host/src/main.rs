@@ -1,8 +1,25 @@
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{filter::Targets, prelude::*};
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // The native image helper is deliberately single-threaded, before runtime/logging setup.
+    // It owns blocking Security/filesystem work and arms its own pre-exec lifetime timer.
+    #[cfg(target_os = "macos")]
+    if let Some(code) = ciao_native_process::image::helper_entry() {
+        std::process::exit(code);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(code) = ciao_host::native_codex_image::helper_entry() {
+        std::process::exit(code);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create Ciao runtime")
+        .block_on(run());
+}
+
+async fn run() {
     // Upstream transport logs can contain addressing diagnostics. Phase 0 writes only
     // Ciao-owned, redacted events by default.
     //

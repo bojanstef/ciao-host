@@ -39,6 +39,7 @@ pub mod ipc;
 pub(crate) mod live_activity;
 pub(crate) mod managed_session;
 pub(crate) mod managed_worker;
+pub mod native_codex_image;
 #[cfg(test)]
 mod netlab;
 pub(crate) mod notify;

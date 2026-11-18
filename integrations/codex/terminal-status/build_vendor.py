@@ -3,7 +3,7 @@
 
 The checkout must be clean at the exact public upstream revision. The patch preserves all
 third-party dependency pins and the upstream version; artifact provenance distinguishes it.
-Use a separate Cargo home so the large vendor fetch does not block Ciao development builds.
+Use a new private Cargo home; reused dependency sources are not provenance-bound inputs.
 The candidate retains the upstream LICENSE and NOTICE alongside its provenance.
 """
 
@@ -20,10 +20,11 @@ import subprocess
 import sys
 import tempfile
 
-BASE_COMMIT = "6ff1e1ca3b30fc8b914720681fcf5fe62e95f856"
-BASE_VERSION = "0.166.0"
+BASE_COMMIT = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
+BASE_VERSION = "0.169.0"
 FEATURE_VERSION = 1
-PATCH = Path(__file__).with_name("codex-0.166.0.patch")
+CARGO_HOME_POLICY = "new-private-home-no-reused-dependency-sources"
+PATCH = Path(__file__).with_name("codex-0.169.0.patch")
 
 
 class Refused(Exception):
@@ -167,6 +168,48 @@ def patch_paths(checkout):
     return paths
 
 
+def validate_build_inputs(checkout, allowed, cargo_home=None):
+    # Porcelain deliberately omits ignored files. Cargo does not: a legacy config can
+    # override config.toml, and build scripts can read arbitrary ignored source inputs.
+    for flags in (("--exclude-standard",), ("--ignored", "--exclude-standard")):
+        extras = checked(["git", "ls-files", "--others", "-z", *flags], cwd=checkout)
+        if any(path not in allowed for path in extras.split("\0") if path):
+            raise Refused("vendor source contains unbound untracked or ignored inputs")
+    for path in allowed:
+        file = checkout / path
+        if file.is_symlink():
+            try:
+                target = file.resolve(strict=True).relative_to(checkout).as_posix()
+            except (ValueError, OSError, RuntimeError) as error:
+                raise Refused("vendor source contains an external symlink input") from error
+            if target not in allowed or not (checkout / target).is_file():
+                raise Refused("vendor symlink target is not a bound source file")
+    # Cargo walks from cwd to the filesystem root, regardless of the Git boundary.
+    for ancestor in checkout.parents:
+        for name in ("config", "config.toml"):
+            config = ancestor / ".cargo" / name
+            if config.exists() or config.is_symlink():
+                raise Refused("unbound ancestor Cargo configuration")
+    if cargo_home is not None:
+        for name in ("config", "config.toml", "credentials", "credentials.toml"):
+            config = cargo_home / name
+            if config.exists() or config.is_symlink():
+                raise Refused("vendor Cargo home must not contain configuration or credentials")
+
+
+def compiler_binding(checkout, cargo_home, sources, env):
+    validate_build_inputs(checkout, sources, cargo_home)
+    return {
+        "rustc": checked(["rustc", "--version", "--verbose"], cwd=checkout / "codex-rs", env=env),
+        "cargo": checked(["cargo", "--version", "--verbose"], cwd=checkout / "codex-rs", env=env),
+        "cargo_configs": {path: record for path, record in sources.items()
+                          if path in (".cargo/config", ".cargo/config.toml",
+                                      "codex-rs/.cargo/config", "codex-rs/.cargo/config.toml")},
+        "environment": env,
+        "cargo_home_policy": CARGO_HOME_POLICY,
+    }
+
+
 def validate_source(checkout):
     if Path(checked(["git", "rev-parse", "--show-toplevel"], cwd=checkout)).resolve() != checkout:
         raise Refused("checkout must name the public repository root")
@@ -178,6 +221,7 @@ def validate_source(checkout):
             raise Refused("vendor source differs from the grounded public tree")
     if checked(["git", "status", "--porcelain", "--untracked-files=all"], cwd=checkout):
         raise Refused("checkout must be clean before applying the vendor patch")
+    validate_build_inputs(checkout, base_tree(checkout))
     if not PATCH.is_file():
         raise Refused("the reviewed vendor patch is missing")
     checked(["git", "apply", "--check", str(PATCH)], cwd=checkout)
@@ -191,6 +235,7 @@ def source_binding(checkout):
     )
     if any(entry[3:] not in paths for entry in changed.split("\0") if entry):
         raise Refused("vendor source contains changes outside the reviewed patch")
+    validate_build_inputs(checkout, set(base) | paths)
     records = {}
     for path in sorted(set(base) | paths):
         actual = file_record(checkout, path)
@@ -224,6 +269,11 @@ def build(args):
     if any((cargo_home / name).exists() or (cargo_home / name).is_symlink()
            for name in ("config", "config.toml", "credentials", "credentials.toml")):
         raise Refused("vendor Cargo home must not contain configuration or credentials")
+    # --locked pins resolution, not mutable extracted Git/registry cache bytes. Even an
+    # empty existing directory is not ours to trust. Check the original path as well so
+    # resolve() cannot hide a dangling home symlink. --check never reserves this path.
+    if args.cargo_home.exists() or args.cargo_home.is_symlink() or cargo_home.exists():
+        raise Refused("vendor Cargo home already exists; choose a new private Cargo home")
     if args.jobs < 1 or args.jobs > 4:
         raise Refused("candidate builds require between one and four jobs")
     validate_source(checkout)
@@ -236,8 +286,10 @@ def build(args):
         raise Refused("candidate output already exists; choose a new output directory")
     # Reserve a new private directory before source mutation. Existing bin directories and
     # dangling output symlinks cannot turn this artifact build into an installation.
+    # Exclusive reservation also refuses a home created after the preflight check.
+    # Failed builds consume this path too: retries must fetch into another new home.
+    cargo_home.mkdir(mode=0o700, parents=True, exist_ok=False)
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
-    cargo_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     checked(["git", "apply", str(PATCH)], cwd=checkout)
     sources = source_binding(checkout)
     rust = checkout / "codex-rs"
@@ -254,14 +306,16 @@ def build(args):
     # target directory, never the checkout's pre-existing target/cache contents.
     with tempfile.TemporaryDirectory(prefix=".build-", dir=output) as target:
         build_env["CARGO_TARGET_DIR"] = target
-        toolchain = checked(["rustc", "--version"], cwd=rust, env=build_env)
+        compiler = compiler_binding(checkout, cargo_home, sources, build_env)
+        toolchain = compiler["rustc"]
         checked(
             ["cargo", "build", "--locked", "--profile", args.profile,
              "-p", "codex-cli", "--bin", "codex", "-j", str(args.jobs)],
             cwd=rust, env=build_env, timeout=7200, capture=False,
         )
         if (checked(["git", "rev-parse", "HEAD"], cwd=checkout) != BASE_COMMIT
-                or digest(PATCH) != patch_digest or source_binding(checkout) != sources):
+                or digest(PATCH) != patch_digest or source_binding(checkout) != sources
+                or compiler_binding(checkout, cargo_home, sources, build_env) != compiler):
             raise Refused("candidate source binding changed during the build")
         # Original CLI version stays numeric so existing vendor admission remains unchanged.
         source = Path(target) / args.profile / "codex"
@@ -294,6 +348,11 @@ def build(args):
         "platform": platform.system().lower(),
         "architecture": platform.machine(),
         "toolchain": toolchain,
+        "compiler_inputs_sha256": hashlib.sha256(json.dumps(compiler, sort_keys=True).encode()).hexdigest(),
+        "cargo_version": compiler["cargo"],
+        "cargo_config_sha256": {path: record["sha256"] for path, record in compiler["cargo_configs"].items()},
+        "ancestor_and_cargo_home_config": "absent-checked-before-and-after",
+        "cargo_home_policy": compiler["cargo_home_policy"],
         "profile": args.profile,
         "official_binary": False,
         "installed": False,
@@ -306,9 +365,9 @@ def build(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkout", type=Path, required=True, help="clean public rust-v0.166.0 checkout")
+    parser.add_argument("--checkout", type=Path, required=True, help="clean public rust-v0.169.0 checkout")
     parser.add_argument("--out", type=Path, required=True, help="new candidate artifact directory")
-    parser.add_argument("--cargo-home", type=Path, required=True, help="dedicated vendor Cargo cache")
+    parser.add_argument("--cargo-home", type=Path, required=True, help="new private vendor Cargo home (must not exist, even empty)")
     parser.add_argument("--profile", choices=("dev-small", "release"), default="dev-small")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--check", action="store_true", help="verify revision and patch applicability only")

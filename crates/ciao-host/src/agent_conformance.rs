@@ -773,8 +773,8 @@ fn contracts() -> [ParityContract; 4] {
         ParityContract {
             id: "claude-managed",
             configuration_source: ConfigurationSource::Destination,
-            // SDK 0.3.314 / CLI 2.1.314 preserve this declaration read-set and the correlated
-            // replay acknowledgement; broader permission/resume probes stay manual.
+            // Candidate SDK 0.3.325 / CLI 2.1.325 preserve the consumed declaration read-set.
+            // Exact-pair runtime acknowledgement/permission/resume grounding stays manual.
             family: "Claude",
             topology: "managed",
             connection: AdapterConnectionKind::PersistentBridge,

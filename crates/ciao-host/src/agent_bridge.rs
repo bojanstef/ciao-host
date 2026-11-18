@@ -505,6 +505,11 @@ pub(crate) async fn handle_agent_bridge(
     // Authentication always concerns the actual event producer. A separately proven terminal
     // may own the route, but the hook is not its descendant in shared-server mode.
     let producer_process_id = selected.registration.process_id;
+    let peer_identity = if selected.codec.id() == "codex" {
+        crate::process::terminal_identity(peer_pid).await
+    } else {
+        None
+    };
     let producer_identity = if selected.codec.id() == "codex" {
         Some(
             crate::process::terminal_identity(producer_process_id)
@@ -554,6 +559,8 @@ pub(crate) async fn handle_agent_bridge(
         if producer_identity.as_ref() != Some(&binding.server_identity)
             || crate::process::terminal_identity(producer_process_id).await != producer_identity
             || !process_descends_from(peer_pid, producer_process_id).await
+            || peer_identity.is_none()
+            || crate::process::terminal_identity(peer_pid).await != peer_identity
         {
             bail!("Codex event producer changed during terminal authentication");
         }
@@ -610,7 +617,26 @@ pub(crate) async fn handle_agent_bridge(
         } else {
             None
         };
-        let registered = sessions.register_observer(selected.registration).await?;
+        let shared_hook = match &terminal_binding {
+            Some(binding) => Some(crate::codex_terminal_status::HookAssociation {
+                binding: binding.clone(),
+                peer_pid,
+                peer_identity: peer_identity
+                    .ok_or_else(|| anyhow!("Codex hook peer incarnation is unavailable"))?,
+            }),
+            None => None,
+        };
+        let (registered, pending_hook_guard) = if shared_hook.is_some() {
+            let (registered, guard) = sessions
+                .register_shared_observer(selected.registration)
+                .await?;
+            (registered, Some(guard))
+        } else {
+            (
+                sessions.register_observer(selected.registration).await?,
+                None,
+            )
+        };
         if let Some(binding) = terminal_binding
             && crate::codex_terminal_status::remember_verified_directory(&binding).is_err()
         {
@@ -642,10 +668,12 @@ pub(crate) async fn handle_agent_bridge(
             shutdown,
             selected.codec,
             registered,
+            pending_hook_guard,
             AgentProcessIdentity {
                 thread_id,
                 process_id: agent_process_id,
                 codex_home,
+                shared_hook,
             },
         )
         .await;
@@ -865,35 +893,7 @@ pub(crate) async fn readopt_attached(
             }
             VendorRecord::CodexOpenRollout => crate::codex_history::live_rollout_sightings().await,
         };
-        let mut shared_bindings = std::collections::HashMap::new();
-        if adapter.id() == "codex"
-            && let Ok(directories) = crate::codex_terminal_status::known_status_directories()
-        {
-            for directory in directories {
-                match crate::codex_terminal_status::live_bindings(&directory).await {
-                    Ok(bindings) => {
-                        for binding in bindings {
-                            let Some(cwd) = crate::process::cwd(binding.tui_pid).await else {
-                                continue;
-                            };
-                            let Some(cwd) = cwd.to_str() else {
-                                continue;
-                            };
-                            sightings.insert(
-                                0,
-                                AgentSighting {
-                                    vendor_session_id: binding.thread_id.clone(),
-                                    process_id: binding.tui_pid,
-                                    cwd: cwd.to_owned(),
-                                },
-                            );
-                            shared_bindings.insert(binding.tui_pid, binding);
-                        }
-                    }
-                    Err(_) => tracing::debug!("Codex terminal recovery inspection unavailable"),
-                }
-            }
-        }
+        // Shared observations recover independently on the one-second status cadence.
         sightings.extend(sessions.herdr_agent_sightings(adapter.id()).await);
         let mut seen = std::collections::HashSet::new();
         for sighting in sightings {
@@ -913,7 +913,7 @@ pub(crate) async fn readopt_attached(
                 adapter,
                 &sighting,
                 &process_start,
-                shared_bindings.remove(&sighting.process_id),
+                None,
             )
             .await
             {
@@ -926,6 +926,168 @@ pub(crate) async fn readopt_attached(
         "re-adopted attached agent sessions after startup"
     );
     readopted
+}
+
+/// Bounded source-specific poll; all receipts precede status/native awaits. Native facts
+/// cannot discover unknown conversations or manufacture prior hook ancestry.
+pub(crate) async fn recover_shared_status(
+    sessions: &AgentSessionSupervisor,
+    adoptions: &std::sync::Arc<crate::codex_adopted::AdoptionRegistry>,
+    paths: &crate::storage::CiaoPaths,
+) {
+    let receipts = sessions.shared_recovery_receipts();
+    if receipts.is_empty() {
+        return;
+    }
+    let mut directories =
+        crate::codex_terminal_status::known_status_directories().unwrap_or_default();
+    for receipt in &receipts {
+        if let Some(directory) = receipt.directory()
+            && !directories.iter().any(|known| known == directory)
+        {
+            directories.push(directory.to_owned());
+        }
+    }
+    for directory in directories {
+        let Ok(bindings) = crate::codex_terminal_status::live_bindings(&directory).await else {
+            continue;
+        };
+        for binding in bindings {
+            let Some(receipt) = receipts
+                .iter()
+                .find(|receipt| sessions.recovery_matches_thread(receipt, &binding))
+            else {
+                continue;
+            };
+            if receipt.unchanged(&binding) {
+                continue;
+            }
+            let Some(cwd) = crate::process::cwd(binding.tui_pid).await else {
+                continue;
+            };
+            let Some(cwd) = cwd.to_str() else { continue };
+            let sighting = AgentSighting {
+                vendor_session_id: binding.thread_id.clone(),
+                process_id: binding.tui_pid,
+                cwd: cwd.into(),
+            };
+            let Some(mut registration) = shared_recovery_registration(
+                &sighting,
+                &binding,
+                &receipt.lineage().adapter_version,
+            ) else {
+                continue;
+            };
+            let derived = if sessions.recovery_needs_native(receipt, &registration) {
+                let proof = match receipt
+                    .derived()
+                    .filter(|proof| proof.covers(receipt.lineage(), &binding))
+                {
+                    Some(proof) => Some(proof.clone()),
+                    None => {
+                        crate::codex_terminal_status::DerivedAdmission::observe(
+                            paths,
+                            receipt.lineage(),
+                            &binding,
+                        )
+                        .await
+                    }
+                };
+                let Some(proof) = proof else { continue };
+                let Some(measured) = shared_recovery_registration(
+                    &sighting,
+                    &binding,
+                    crate::codex_adapter::PINNED_CODEX_VERSION,
+                ) else {
+                    continue;
+                };
+                registration = measured;
+                Some(proof)
+            } else {
+                None
+            };
+            if !crate::codex_terminal_status::revalidate(&binding).await {
+                continue;
+            }
+            if let Some(proof) = &derived
+                && !proof.revalidate(paths, &binding).await
+            {
+                continue;
+            }
+            if derived.is_some() && !crate::codex_terminal_status::revalidate(&binding).await {
+                continue;
+            }
+            let measured = derived.as_ref().map(|proof| {
+                let (backend, tui) = proof.versions();
+                (backend.to_owned(), tui.to_owned())
+            });
+            let read_history = registration.compatible;
+            let Some(row) = sessions.commit_shared_recovery(receipt, registration, derived) else {
+                continue;
+            };
+            if let Some((backend_version, tui_version)) = measured {
+                tracing::info!(session = %row.registered.session_id, backend_pid = binding.server_pid,
+                    tui_pid = binding.tui_pid, generation = row.registered.process_generation,
+                    backend_version, tui_version, "Codex native image derived admission");
+            }
+            tracing::info!(session = %row.registered.session_id, generation = row.registered.process_generation,
+                shared_recovered = 1, "Codex shared observation recovered");
+            // History first, then resolve against its exact successor receipt. Never race a
+            // history epoch advance against provider minting, nor borrow a newer hook's fence.
+            let row = if read_history {
+                backfill_recovered_shared(sessions, adoptions, row).await
+            } else {
+                row
+            };
+            sessions.resolve_recovered_route(&row).await;
+        }
+    }
+}
+
+fn shared_recovery_registration(
+    sighting: &AgentSighting,
+    binding: &crate::codex_terminal_status::TerminalBinding,
+    version: &str,
+) -> Option<crate::agent_session::NormalizedRegistration> {
+    let hook_nonce = CODEX_ADAPTER.hook_process_nonce(binding.tui_pid)?;
+    let mut registration = CODEX_ADAPTER
+        .readopted_registration(sighting, hook_nonce.clone(), version.into())?
+        .ok()?;
+    registration.process_nonce =
+        authenticated_process_nonce(&hook_nonce, binding.tui_pid, &binding.tui_identity);
+    registration.terminal_binding = Some(binding.clone());
+    Some(registration)
+}
+
+async fn backfill_recovered_shared(
+    sessions: &AgentSessionSupervisor,
+    adoptions: &std::sync::Arc<crate::codex_adopted::AdoptionRegistry>,
+    row: crate::agent_session::RecoveredSharedRow,
+) -> crate::agent_session::RecoveredSharedRow {
+    let Some(home) = row.binding.status_directory.parent() else {
+        return row;
+    };
+    let Some((binary, history)) = crate::codex_history::read_observed_history(
+        row.binding.server_pid,
+        home,
+        &row.binding.thread_id,
+        crate::codex_history::NO_LIVE_RUN,
+    )
+    .await
+    else {
+        return row;
+    };
+    let count = history.entries.len();
+    let complete = history.complete;
+    match sessions.backfill_recovered_shared(&row, history) {
+        Ok(current) => {
+            adoptions.record_binary_evidence(binary);
+            tracing::info!(session = %row.registered.session_id, count, complete, "Codex history reconciled");
+            current
+        }
+        // A failed/superseded read retains the old fence. Route resolution will refuse it.
+        Err(_) => row,
+    }
 }
 
 /// One sighting, with the process start already read — the part a test can drive without a
@@ -955,6 +1117,12 @@ async fn readopt_one(
     if registration.adapter_family != family {
         return None;
     }
+    if let Some(binding) = &terminal_binding {
+        let lineage = sessions.registered_backend_lineage(&sighting.vendor_session_id, &nonce)?;
+        if !lineage.matches(binding, &registration.adapter_version) {
+            return None;
+        }
+    }
     registration.process_nonce = nonce;
     let history_process_id = terminal_binding
         .as_ref()
@@ -977,7 +1145,7 @@ async fn readopt_one(
     // The hook path's own rule: an unestablished build's record is no better established than
     // its hooks, so only a compatible one is read.
     let read_history = registration.compatible;
-    let registered = sessions.register_observer(registration).await.ok()?;
+    let registered = sessions.rediscover_observer(registration).await.ok()?;
     if read_history {
         match adapter.id() {
             "claude" => crate::claude_history::spawn_backfill(
@@ -1013,6 +1181,7 @@ struct AgentProcessIdentity {
     thread_id: String,
     process_id: u32,
     codex_home: Option<std::path::PathBuf>,
+    shared_hook: Option<crate::codex_terminal_status::HookAssociation>,
 }
 
 #[allow(clippy::too_many_arguments)] // one call site; a params struct would be ceremony
@@ -1025,6 +1194,7 @@ async fn handle_transient_agent_event(
     mut shutdown: watch::Receiver<bool>,
     codec: &dyn AttachedAgentAdapter,
     registered: RegisteredAgentSession,
+    pending_hook_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     agent: AgentProcessIdentity,
 ) -> Result<()> {
     let body = tokio::select! {
@@ -1043,12 +1213,23 @@ async fn handle_transient_agent_event(
     let event = codec
         .decode_event(&body)
         .map_err(|_| anyhow!("agent event was invalid"))?;
-    if !sessions
-        .revalidate_terminal_binding(&registered.session_id)
-        .await
-    {
-        bail!("agent terminal binding changed before event delivery");
-    }
+    // Fresh read-only association is explicitly distinct from route continuity. Never
+    // replay this event against another thread/TUI or borrow a later hook's registration.
+    let _shared_hook_guard = pending_hook_guard;
+    let registered = if let Some(association) = &agent.shared_hook {
+        sessions
+            .associate_readonly_hook(&registered, association)
+            .await
+            .ok_or_else(|| anyhow!("agent terminal binding changed before event delivery"))?
+    } else {
+        if !sessions
+            .revalidate_terminal_binding(&registered.session_id)
+            .await
+        {
+            bail!("agent terminal binding changed before event delivery");
+        }
+        registered
+    };
     let mut context = AdapterEventContext {
         sessions: &sessions,
         adoptions: &adoptions,
@@ -1149,6 +1330,81 @@ mod tests {
     };
 
     use super::*;
+
+    // Ported independent review reproductions: discovery is not a hook and a backend
+    // incarnation cannot borrow the preceding producer's version.
+    #[tokio::test]
+    async fn recovery_preserves_hook_token_and_requires_backend_lineage() {
+        for change in 0..5 {
+            let tmp = tempdir().unwrap();
+            let sessions = AgentSessionSupervisor::load(
+                &tmp.path().join("metadata.json"),
+                WorkspaceConfig::with_binary_dirs(Vec::new()),
+            )
+            .unwrap();
+            let adoptions = std::sync::Arc::new(crate::codex_adopted::AdoptionRegistry::default());
+            let mut sighting = AgentSighting {
+                vendor_session_id: "22222222-2222-4222-8222-222222222222".into(),
+                process_id: 2147483600,
+                cwd: "/tmp".into(),
+            };
+            let mut binding = crate::codex_terminal_status::TerminalBinding {
+                tui_pid: sighting.process_id,
+                tui_identity: "known-tui".into(),
+                server_pid: 2147483601,
+                server_identity: "known-backend".into(),
+                generation: 1,
+                thread_id: sighting.vendor_session_id.clone(),
+                status_directory: tmp.path().join("missing"),
+            };
+            let nonce = CODEX_ADAPTER
+                .hook_process_nonce(sighting.process_id)
+                .unwrap();
+            let mut registration = CODEX_ADAPTER
+                .readopted_registration(
+                    &sighting,
+                    nonce.clone(),
+                    crate::codex_adapter::PINNED_CODEX_VERSION.into(),
+                )
+                .unwrap()
+                .unwrap();
+            registration.process_nonce =
+                authenticated_process_nonce(&nonce, sighting.process_id, &binding.tui_identity);
+            registration.terminal_binding = Some(binding.clone());
+            let original = sessions.register_observer(registration).await.unwrap();
+            match change {
+                1 => binding.server_pid += 1,
+                2 => binding.server_identity.push_str("-replacement"),
+                3 => binding.tui_identity.push_str("-replacement"),
+                4 => {
+                    sighting.vendor_session_id = "33333333-3333-4333-8333-333333333333".into();
+                    binding.thread_id.clone_from(&sighting.vendor_session_id);
+                }
+                _ => {}
+            }
+            let recovered = readopt_one(
+                &sessions,
+                &adoptions,
+                &CODEX_ADAPTER,
+                &sighting,
+                "unused",
+                Some(binding),
+            )
+            .await;
+            if change != 0 {
+                assert!(
+                    recovered.is_none(),
+                    "changed backend/TUI or unknown thread borrowed old lineage: {change}"
+                );
+            } else {
+                assert_eq!(
+                    recovered.unwrap(),
+                    original,
+                    "discovery changed the hook receipt"
+                );
+            }
+        }
+    }
 
     fn pi_registration(adapter: Option<&str>) -> Vec<u8> {
         let mut value = serde_json::json!({

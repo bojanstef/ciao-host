@@ -68,6 +68,8 @@ class BuildVendorTests(unittest.TestCase):
         def checked(argv, **kwargs):
             if argv[:2] == ["rustc", "--version"]:
                 return "rustc fixture"
+            if argv[:2] == ["cargo", "--version"]:
+                return "cargo fixture"
             if argv[:2] == ["cargo", "build"]:
                 target = Path(kwargs["env"]["CARGO_TARGET_DIR"])
                 self.assertNotEqual(target, self.checkout / "codex-rs/target")
@@ -83,13 +85,13 @@ class BuildVendorTests(unittest.TestCase):
                 binary.write_bytes(b"fresh public compiler fixture\n")
                 return ""
             if argv[-1:] == ["--version"]:
-                return "codex-cli 0.166.0"
+                return f"codex-cli {self.builder.BASE_VERSION}"
             return real_checked(argv, **kwargs)
 
         return checked, calls
 
     def test_clean_tree_and_reviewed_patch_create_bound_unofficial_artifacts(self):
-        stale = self.checkout / "codex-rs/target/dev-small/codex"
+        stale = self.root / "test-only-old-target/dev-small/codex"
         stale.parent.mkdir(parents=True)
         stale.write_bytes(b"unbound old binary")
         self.assertEqual(self.git("status", "--porcelain").strip(), "")
@@ -101,9 +103,11 @@ class BuildVendorTests(unittest.TestCase):
         self.assertEqual(stale.read_bytes(), b"unbound old binary")
         self.assertEqual(set(path.name for path in output.iterdir()), {"codex", "provenance.json", "LICENSE", "NOTICE"})
         self.assertEqual(len(calls), 1)
+        self.assertEqual(self.args().cargo_home.stat().st_mode & 0o777, 0o700)
         self.assertFalse(calls[0].exists())
         self.assertFalse(manifest["official_binary"])
         self.assertFalse(manifest["installed"])
+        self.assertEqual(manifest["cargo_home_policy"], "new-private-home-no-reused-dependency-sources")
         self.assertEqual(manifest["source_commit"], self.base)
         self.assertEqual(manifest["binary_sha256"], hashlib.sha256((output / "codex").read_bytes()).hexdigest())
         self.assertEqual(json.loads((output / "provenance.json").read_text()), manifest)
@@ -117,6 +121,154 @@ class BuildVendorTests(unittest.TestCase):
         self.assertIn("codex-rs/other.rs", binding)
         self.assertIn("codex-rs/new.rs", binding)
         self.assertEqual(binding["codex-rs/link.rs"]["mode"], "120000")
+
+    def assert_reused_home_refused(self, contents=None):
+        home = self.root / "reused-home"
+        home.mkdir(mode=0o700)
+        if contents:
+            file = home / contents
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text("tampered cached input\n")
+        compiler, calls = self.fake_compiler()
+        with mock.patch.object(self.builder, "checked", compiler):
+            with self.assertRaises(self.builder.Refused):
+                self.builder.build(self.args(cargo_home=home))
+        self.assertEqual(calls, [])
+        self.assertFalse((self.root / "candidate").exists())
+        self.assertEqual((self.checkout / "codex-rs/source.rs").read_text(), "baseline\n")
+
+    def test_reused_empty_cargo_home_is_refused(self):
+        self.assert_reused_home_refused()
+
+    def test_reused_tampered_git_dependency_home_is_refused(self):
+        self.assert_reused_home_refused("git/checkouts/dep/rev/src/lib.rs")
+
+    def test_reused_tampered_registry_dependency_home_is_refused(self):
+        self.assert_reused_home_refused("registry/src/index/dep/src/lib.rs")
+
+    def test_reused_legacy_config_home_is_refused(self):
+        self.assert_reused_home_refused("config")
+
+    def assert_home_symlink_refused(self, exists):
+        target = self.root / "home-target"
+        if exists:
+            target.mkdir()
+        link = self.root / "home-link"
+        link.symlink_to(target, target_is_directory=True)
+        compiler, calls = self.fake_compiler()
+        with mock.patch.object(self.builder, "checked", compiler):
+            with self.assertRaises(self.builder.Refused):
+                self.builder.build(self.args(cargo_home=link))
+        self.assertEqual(calls, [])
+        self.assertEqual(target.exists(), exists)
+        self.assertFalse((self.root / "candidate").exists())
+
+    def test_existing_cargo_home_symlink_is_refused(self):
+        self.assert_home_symlink_refused(True)
+
+    def test_dangling_cargo_home_symlink_is_refused(self):
+        self.assert_home_symlink_refused(False)
+
+    def test_check_does_not_create_cargo_home_output_or_patch_sources(self):
+        args = self.args(check=True)
+        result = self.builder.build(args)
+        self.assertTrue(result["applicable"])
+        self.assertFalse(args.cargo_home.exists())
+        self.assertFalse(args.out.exists())
+        self.assertEqual((self.checkout / "codex-rs/source.rs").read_text(), "baseline\n")
+
+    def test_cargo_home_reservation_refuses_a_racing_directory(self):
+        args = self.args()
+        validate = self.builder.validate_source
+        def raced(checkout):
+            validate(checkout)
+            args.cargo_home.mkdir()
+            (args.cargo_home / "untrusted").write_text("racing cache\n")
+        compiler, calls = self.fake_compiler()
+        with mock.patch.object(self.builder, "validate_source", raced), mock.patch.object(self.builder, "checked", compiler):
+            with self.assertRaises((self.builder.Refused, FileExistsError)):
+                self.builder.build(args)
+        self.assertEqual(calls, [])
+        self.assertEqual((self.checkout / "codex-rs/source.rs").read_text(), "baseline\n")
+        self.assertFalse((args.out / "provenance.json").exists())
+
+    def test_ignored_legacy_config_is_refused_before_and_after_patch(self):
+        config = self.checkout / "codex-rs/.cargo/config"
+        config.parent.mkdir()
+        (self.checkout / ".git/info/exclude").write_text("codex-rs/.cargo/config\n")
+        config.write_text('[build]\nrustflags = ["--cfg", "unbound"]\n')
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        with self.assertRaisesRegex(self.builder.Refused, "ignored inputs"):
+            self.builder.validate_source(self.checkout)
+        self.git("apply", str(self.patch))
+        with self.assertRaisesRegex(self.builder.Refused, "ignored inputs"):
+            self.builder.source_binding(self.checkout)
+
+    def test_ancestor_configs_including_legacy_are_refused(self):
+        directory = self.root / ".cargo"
+        directory.mkdir()
+        for name in ("config", "config.toml"):
+            with self.subTest(name=name):
+                config = directory / name
+                config.write_text('[build]\nrustflags = []\n')
+                with self.assertRaisesRegex(self.builder.Refused, "ancestor Cargo"):
+                    self.builder.validate_source(self.checkout)
+                config.unlink()
+        self.builder.validate_source(self.checkout)
+
+    def test_external_symlink_input_is_refused_even_when_tracked(self):
+        external = self.root / "external.rs"
+        external.write_text("external input\n")
+        link = self.checkout / "codex-rs/link.rs"
+        link.unlink()
+        link.symlink_to(external)
+        self.git("add", "codex-rs/link.rs")
+        self.git("commit", "-m", "external symlink fixture")
+        self.builder.BASE_COMMIT = self.git("rev-parse", "HEAD").strip()
+        with self.assertRaisesRegex(self.builder.Refused, "external symlink"):
+            self.builder.validate_source(self.checkout)
+
+    def test_config_injected_during_compile_refuses_artifacts(self):
+        for index, location in enumerate(("source", "ancestor", "cargo-home")):
+            with self.subTest(location=location):
+                args = self.args(out=self.root / f"config-candidate-{index}",
+                                 cargo_home=self.root / f"config-cargo-{index}")
+                config = {"source": self.checkout / "codex-rs/.cargo/config",
+                          "ancestor": self.root / ".cargo/config.toml",
+                          "cargo-home": args.cargo_home / "config"}[location]
+                def mutate():
+                    config.parent.mkdir(parents=True, exist_ok=True)
+                    config.write_text("[build]\nrustflags = []\n")
+                    (self.checkout / ".git/info/exclude").write_text("codex-rs/.cargo/config\n")
+                compiler, _ = self.fake_compiler(mutate)
+                with mock.patch.object(self.builder, "checked", compiler):
+                    with self.assertRaises(self.builder.Refused):
+                        self.builder.build(args)
+                self.assertFalse((args.out / "codex").exists())
+                self.assertFalse((args.out / "provenance.json").exists())
+                config.unlink()
+                self.git("reset", "--hard", self.base)
+                (self.checkout / "codex-rs/new.rs").unlink()
+
+    def test_wrong_numeric_version_refuses_candidate(self):
+        compiler, _ = self.fake_compiler()
+        def wrong_version(argv, **kwargs):
+            if argv[-1:] == ["--version"] and Path(argv[0]).name == "codex":
+                return "codex-cli 0.166.0"
+            return compiler(argv, **kwargs)
+        with mock.patch.object(self.builder, "checked", wrong_version):
+            with self.assertRaisesRegex(self.builder.Refused, "grounded base version"):
+                self.builder.build(self.args())
+        self.assertFalse((self.root / "candidate/codex").exists())
+        self.assertFalse((self.root / "candidate/provenance.json").exists())
+
+    def test_public_base_is_exact_0169_not_a_moving_tag(self):
+        self.assertEqual(self.builder.BASE_VERSION, "0.169.0")
+        spec = importlib.util.spec_from_file_location("candidate_public_pin", SCRIPT)
+        public = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(public)
+        self.assertEqual(public.BASE_COMMIT, "d32063f96c2dff1dc96af839b3952abb6acfeda4")
+        self.assertEqual(public.PATCH.name, "codex-0.169.0.patch")
 
     def test_hidden_tracked_changes_refuse_assume_unchanged_skip_worktree_and_fsmonitor(self):
         file = self.checkout / "codex-rs/other.rs"
@@ -211,7 +363,7 @@ class BuildVendorTests(unittest.TestCase):
                 output = self.root / f"candidate-{index}"
                 with mock.patch.object(self.builder, "checked", compiler):
                     with self.assertRaises(self.builder.Refused):
-                        self.builder.build(self.args(out=output))
+                        self.builder.build(self.args(out=output, cargo_home=self.root / f"mutation-cargo-{index}"))
                 self.assertFalse((output / "codex").exists())
                 self.assertFalse((output / "provenance.json").exists())
                 self.git("update-index", "--no-assume-unchanged", "codex-rs/other.rs")

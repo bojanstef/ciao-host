@@ -401,6 +401,8 @@ name = "ciao-native-process"
 version = "0.1.0"
 dependencies = [
  "nix 0.31.3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

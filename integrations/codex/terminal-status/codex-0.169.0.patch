@@ -1,5 +1,5 @@
 diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
-index 1d27abb..0455dff 100644
+index d719a52..2071ce8 100644
 --- a/codex-rs/Cargo.lock
 +++ b/codex-rs/Cargo.lock
 @@ -287,7 +287,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
@@ -7,7 +7,7 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "app_test_support"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "base64 0.22.1",
@@ -16,7 +16,7 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-agent-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-core",
@@ -25,7 +25,7 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-agent-graph-store"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
   "codex-state",
@@ -34,7 +34,7 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-agent-identity"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "base64 0.22.1",
@@ -43,7 +43,7 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-agent-message-board-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "chrono",
@@ -52,1143 +52,1162 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-agent-message-board-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
-  "codex-extension-api",
-  "codex-message-board",
-@@ -1972,7 +1972,7 @@ dependencies = [
+  "codex-agent-message-board-client",
+  "codex-config",
+@@ -1977,7 +1977,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-message-board-host"
+-version = "0.0.0"
++version = "0.169.0"
+ dependencies = [
+  "chrono",
+  "codex-agent-message-board-client",
+@@ -1994,7 +1994,7 @@ dependencies = [
  
  [[package]]
  name = "codex-agent-roles"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-config",
   "codex-file-system",
-@@ -1985,7 +1985,7 @@ dependencies = [
+@@ -2007,7 +2007,7 @@ dependencies = [
  
  [[package]]
  name = "codex-analytics"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-app-server-protocol",
-  "codex-git-utils",
-@@ -2008,7 +2008,7 @@ dependencies = [
+  "codex-features",
+@@ -2035,7 +2035,7 @@ dependencies = [
  
  [[package]]
  name = "codex-ansi-escape"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "ansi-to-tui",
   "pretty_assertions",
-@@ -2019,7 +2019,7 @@ dependencies = [
+@@ -2046,7 +2046,7 @@ dependencies = [
  
  [[package]]
  name = "codex-api"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "assert_matches",
-@@ -2057,7 +2057,7 @@ dependencies = [
+@@ -2084,7 +2084,7 @@ dependencies = [
  
  [[package]]
  name = "codex-app-server"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "app_test_support",
-@@ -2174,9 +2174,10 @@ dependencies = [
+@@ -2205,9 +2205,10 @@ dependencies = [
  
  [[package]]
  name = "codex-app-server-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-app-server",
 + "codex-app-server-daemon",
   "codex-app-server-protocol",
   "codex-app-server-transport",
   "codex-arg0",
-@@ -2189,6 +2190,7 @@ dependencies = [
-  "codex-utils-absolute-path",
+@@ -2223,6 +2224,7 @@ dependencies = [
   "codex-utils-rustls-provider",
+  "color-eyre",
   "futures",
 + "libc",
   "pretty_assertions",
   "serde",
   "serde_json",
-@@ -2202,7 +2204,7 @@ dependencies = [
+@@ -2238,7 +2240,7 @@ dependencies = [
  
  [[package]]
  name = "codex-app-server-daemon"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "blake3",
-@@ -2232,7 +2234,7 @@ dependencies = [
+@@ -2268,7 +2270,7 @@ dependencies = [
  
  [[package]]
  name = "codex-app-server-protocol"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-app-server-protocol-noop-macros",
-@@ -2266,11 +2268,11 @@ dependencies = [
+@@ -2303,11 +2305,11 @@ dependencies = [
  
  [[package]]
  name = "codex-app-server-protocol-noop-macros"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  
  [[package]]
  name = "codex-app-server-test-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "clap",
-@@ -2292,7 +2294,7 @@ dependencies = [
+@@ -2330,7 +2332,7 @@ dependencies = [
  
  [[package]]
  name = "codex-app-server-transport"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
+  "anyhow",
   "axum",
-  "base64 0.22.1",
-@@ -2335,7 +2337,7 @@ dependencies = [
+@@ -2378,7 +2380,7 @@ dependencies = [
  
  [[package]]
  name = "codex-apply-patch"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "assert_cmd",
-@@ -2355,7 +2357,7 @@ dependencies = [
+@@ -2398,7 +2400,7 @@ dependencies = [
  
  [[package]]
  name = "codex-arg0"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-apply-patch",
-@@ -2378,7 +2380,7 @@ dependencies = [
+@@ -2421,7 +2423,7 @@ dependencies = [
  
  [[package]]
  name = "codex-async-utils"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
   "rand 0.9.3",
-@@ -2388,7 +2390,7 @@ dependencies = [
+@@ -2431,7 +2433,7 @@ dependencies = [
  
  [[package]]
  name = "codex-attachment-store"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
   "serde",
-@@ -2398,7 +2400,7 @@ dependencies = [
+@@ -2441,7 +2443,7 @@ dependencies = [
  
  [[package]]
  name = "codex-aws-auth"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "aws-config",
   "aws-credential-types",
-@@ -2424,7 +2426,7 @@ dependencies = [
+@@ -2467,7 +2469,7 @@ dependencies = [
  
  [[package]]
  name = "codex-backend-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
-  "codex-api",
-@@ -2444,7 +2446,7 @@ dependencies = [
+  "base64 0.22.1",
+@@ -2494,7 +2496,7 @@ dependencies = [
  
  [[package]]
  name = "codex-backend-openapi-models"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "serde",
   "serde_json",
-@@ -2453,7 +2455,7 @@ dependencies = [
+@@ -2503,7 +2505,7 @@ dependencies = [
  
  [[package]]
  name = "codex-build-info"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-install-context",
   "pretty_assertions",
-@@ -2466,7 +2468,7 @@ dependencies = [
+@@ -2516,7 +2518,7 @@ dependencies = [
  
  [[package]]
  name = "codex-bwrap"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "cc",
   "libc",
-@@ -2475,7 +2477,7 @@ dependencies = [
+@@ -2525,7 +2527,7 @@ dependencies = [
  
  [[package]]
  name = "codex-chatgpt"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
-  "clap",
-@@ -2497,7 +2499,7 @@ dependencies = [
+  "base64 0.22.1",
+@@ -2553,7 +2555,7 @@ dependencies = [
  
  [[package]]
  name = "codex-cli"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "app_test_support",
-@@ -2601,7 +2603,7 @@ dependencies = [
+@@ -2658,7 +2660,7 @@ dependencies = [
  
  [[package]]
  name = "codex-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-http-client",
   "eventsource-stream",
-@@ -2615,7 +2617,7 @@ dependencies = [
+@@ -2672,7 +2674,7 @@ dependencies = [
  
  [[package]]
  name = "codex-cloud-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "async-stream",
-@@ -2639,7 +2641,7 @@ dependencies = [
+@@ -2698,7 +2700,7 @@ dependencies = [
  
  [[package]]
  name = "codex-cloud-config"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "chrono",
-@@ -2667,7 +2669,7 @@ dependencies = [
+@@ -2726,7 +2728,7 @@ dependencies = [
  
  [[package]]
  name = "codex-cloud-tasks"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
-  "chrono",
-@@ -2700,7 +2702,7 @@ dependencies = [
+  "base64 0.22.1",
+@@ -2768,7 +2770,7 @@ dependencies = [
  
  [[package]]
  name = "codex-cloud-tasks-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "chrono",
-@@ -2715,7 +2717,7 @@ dependencies = [
+@@ -2783,7 +2785,7 @@ dependencies = [
  
  [[package]]
  name = "codex-cloud-tasks-mock-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "chrono",
   "codex-cloud-tasks-client",
-@@ -2724,7 +2726,7 @@ dependencies = [
+@@ -2792,7 +2794,7 @@ dependencies = [
  
  [[package]]
  name = "codex-code-mode"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-code-mode-protocol",
   "codex-http-client",
-@@ -2748,7 +2750,7 @@ dependencies = [
+@@ -2816,7 +2818,7 @@ dependencies = [
  
  [[package]]
  name = "codex-code-mode-host"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "axum",
-@@ -2779,7 +2781,7 @@ dependencies = [
+@@ -2847,7 +2849,7 @@ dependencies = [
  
  [[package]]
  name = "codex-code-mode-protocol"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
   "glob",
-@@ -2797,7 +2799,7 @@ dependencies = [
+@@ -2865,7 +2867,7 @@ dependencies = [
  
  [[package]]
  name = "codex-code-mode-runtime"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "codex-code-mode-protocol",
-@@ -2816,11 +2818,11 @@ dependencies = [
+@@ -2887,11 +2889,11 @@ dependencies = [
  
  [[package]]
  name = "codex-collaboration-mode-templates"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  
  [[package]]
  name = "codex-config"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -2874,7 +2876,7 @@ dependencies = [
+@@ -2945,7 +2947,7 @@ dependencies = [
  
  [[package]]
  name = "codex-config-schema"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "clap",
-@@ -2883,7 +2885,7 @@ dependencies = [
+@@ -2954,7 +2956,7 @@ dependencies = [
  
  [[package]]
  name = "codex-connectors"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "arc-swap",
-@@ -2905,7 +2907,7 @@ dependencies = [
+@@ -2976,7 +2978,7 @@ dependencies = [
  
  [[package]]
  name = "codex-connectors-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-connectors",
   "codex-core-plugins",
-@@ -2919,7 +2921,7 @@ dependencies = [
+@@ -2990,7 +2992,7 @@ dependencies = [
  
  [[package]]
  name = "codex-context-fragments"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
   "codex-protocol-test-support",
-@@ -2930,7 +2932,7 @@ dependencies = [
+@@ -3001,7 +3003,7 @@ dependencies = [
  
  [[package]]
  name = "codex-core"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "arc-swap",
-@@ -3080,7 +3082,7 @@ dependencies = [
+@@ -3155,7 +3157,7 @@ dependencies = [
  
  [[package]]
  name = "codex-core-api"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-analytics",
   "codex-app-server-protocol",
-@@ -3103,7 +3105,7 @@ dependencies = [
+@@ -3179,7 +3181,7 @@ dependencies = [
  
  [[package]]
  name = "codex-core-plugin-common"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-utils-absolute-path",
   "semver",
-@@ -3114,7 +3116,7 @@ dependencies = [
+@@ -3190,7 +3192,7 @@ dependencies = [
  
  [[package]]
  name = "codex-core-plugins"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
-  "chrono",
-@@ -3171,7 +3173,7 @@ dependencies = [
+  "base64 0.22.1",
+@@ -3251,7 +3253,7 @@ dependencies = [
  
  [[package]]
  name = "codex-diagnostics"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "libc",
   "pretty_assertions",
-@@ -3179,7 +3181,7 @@ dependencies = [
+@@ -3259,7 +3261,7 @@ dependencies = [
  
  [[package]]
  name = "codex-direct-tool-timing"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-utils-critical-path",
   "pretty_assertions",
-@@ -3190,7 +3192,7 @@ dependencies = [
+@@ -3270,7 +3272,7 @@ dependencies = [
  
  [[package]]
  name = "codex-exec"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "assert_cmd",
-@@ -3243,7 +3245,7 @@ dependencies = [
+@@ -3324,7 +3326,7 @@ dependencies = [
  
  [[package]]
  name = "codex-exec-server"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "arc-swap",
-@@ -3316,7 +3318,7 @@ dependencies = [
+@@ -3396,7 +3398,7 @@ dependencies = [
  
  [[package]]
  name = "codex-exec-server-cli"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "assert_matches",
-@@ -3356,7 +3358,7 @@ dependencies = [
+@@ -3440,7 +3442,7 @@ dependencies = [
  
  [[package]]
  name = "codex-exec-server-protocol"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "codex-file-system",
-@@ -3374,7 +3376,7 @@ dependencies = [
+@@ -3458,7 +3460,7 @@ dependencies = [
  
  [[package]]
  name = "codex-exec-server-test-support"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-exec-server",
-@@ -3389,7 +3391,7 @@ dependencies = [
+@@ -3473,7 +3475,7 @@ dependencies = [
  
  [[package]]
  name = "codex-execpolicy"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
-  "clap",
-@@ -3407,7 +3409,7 @@ dependencies = [
+  "caseless",
+@@ -3493,7 +3495,7 @@ dependencies = [
  
  [[package]]
  name = "codex-experimental-api-macros"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "proc-macro2",
   "quote",
-@@ -3416,7 +3418,7 @@ dependencies = [
+@@ -3502,7 +3504,7 @@ dependencies = [
  
  [[package]]
  name = "codex-extension-api"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-api",
   "codex-config",
-@@ -3439,7 +3441,7 @@ dependencies = [
+@@ -3525,7 +3527,7 @@ dependencies = [
  
  [[package]]
  name = "codex-extension-items"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-utils-absolute-path",
   "pretty_assertions",
-@@ -3451,7 +3453,7 @@ dependencies = [
+@@ -3537,7 +3539,7 @@ dependencies = [
  
  [[package]]
  name = "codex-external-agent-migration"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "chrono",
   "codex-analytics",
-@@ -3482,7 +3484,7 @@ dependencies = [
+@@ -3568,7 +3570,7 @@ dependencies = [
  
  [[package]]
  name = "codex-features"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-network-proxy",
   "codex-protocol",
-@@ -3496,7 +3498,7 @@ dependencies = [
+@@ -3582,7 +3584,7 @@ dependencies = [
  
  [[package]]
  name = "codex-feedback"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "bytes",
-@@ -3524,7 +3526,7 @@ dependencies = [
+@@ -3610,7 +3612,7 @@ dependencies = [
  
  [[package]]
  name = "codex-file-search"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "clap",
-@@ -3540,7 +3542,7 @@ dependencies = [
+@@ -3626,7 +3628,7 @@ dependencies = [
  
  [[package]]
  name = "codex-file-system"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "bytes",
   "codex-protocol",
-@@ -3554,7 +3556,7 @@ dependencies = [
+@@ -3640,7 +3642,7 @@ dependencies = [
  
  [[package]]
  name = "codex-file-watcher"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "notify",
   "pretty_assertions",
-@@ -3565,7 +3567,7 @@ dependencies = [
+@@ -3651,7 +3653,7 @@ dependencies = [
  
  [[package]]
  name = "codex-git-attribution"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-backend-client",
   "codex-extension-api",
-@@ -3578,7 +3580,7 @@ dependencies = [
+@@ -3667,7 +3669,7 @@ dependencies = [
  
  [[package]]
  name = "codex-git-utils"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "chrono",
-@@ -3606,7 +3608,7 @@ dependencies = [
+@@ -3695,7 +3697,7 @@ dependencies = [
  
  [[package]]
  name = "codex-goal-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "chrono",
-@@ -3631,7 +3633,7 @@ dependencies = [
+@@ -3720,7 +3722,7 @@ dependencies = [
  
  [[package]]
  name = "codex-guardian-context"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-context-fragments",
   "codex-history",
-@@ -3645,7 +3647,7 @@ dependencies = [
+@@ -3734,7 +3736,7 @@ dependencies = [
  
  [[package]]
  name = "codex-guardian-reviewer"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-analytics",
-@@ -3681,7 +3683,7 @@ dependencies = [
+@@ -3771,7 +3773,7 @@ dependencies = [
  
  [[package]]
  name = "codex-guardian-v2"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
-  "codex-analytics",
-@@ -3720,7 +3722,7 @@ dependencies = [
+  "base64 0.22.1",
+@@ -3813,7 +3815,7 @@ dependencies = [
  
  [[package]]
  name = "codex-guardian-v3"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
-  "codex-message-board",
-  "codex-protocol",
-@@ -3729,7 +3731,7 @@ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3844,7 +3846,7 @@ dependencies = [
  
  [[package]]
  name = "codex-history"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-protocol",
-@@ -3741,7 +3743,7 @@ dependencies = [
+@@ -3858,7 +3860,7 @@ dependencies = [
  
  [[package]]
  name = "codex-history-notes-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-analytics",
   "codex-client",
-@@ -3767,7 +3769,7 @@ dependencies = [
+@@ -3884,7 +3886,7 @@ dependencies = [
  
  [[package]]
  name = "codex-home"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-extension-api",
   "codex-utils-absolute-path",
-@@ -3779,7 +3781,7 @@ dependencies = [
+@@ -3896,7 +3898,7 @@ dependencies = [
  
  [[package]]
  name = "codex-hooks"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "async-channel",
-@@ -3808,7 +3810,7 @@ dependencies = [
+@@ -3925,7 +3927,7 @@ dependencies = [
  
  [[package]]
  name = "codex-http-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "bytes",
   "codex-utils-cargo-bin",
-@@ -3848,7 +3850,7 @@ dependencies = [
+@@ -3965,7 +3967,7 @@ dependencies = [
  
  [[package]]
  name = "codex-image-generation-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "codex-api",
-@@ -3880,7 +3882,7 @@ dependencies = [
+@@ -3997,7 +3999,7 @@ dependencies = [
  
  [[package]]
  name = "codex-install-context"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-utils-absolute-path",
   "codex-utils-home-dir",
-@@ -3893,7 +3895,7 @@ dependencies = [
+@@ -4010,7 +4012,7 @@ dependencies = [
  
  [[package]]
  name = "codex-keyring-store"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "keyring",
   "pretty_assertions",
-@@ -3904,7 +3906,7 @@ dependencies = [
+@@ -4021,7 +4023,7 @@ dependencies = [
  
  [[package]]
  name = "codex-linux-sandbox"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "clap",
   "codex-core",
-@@ -3933,7 +3935,7 @@ dependencies = [
+@@ -4053,7 +4055,7 @@ dependencies = [
  
  [[package]]
  name = "codex-lmstudio"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-core",
   "codex-http-client",
-@@ -3947,7 +3949,7 @@ dependencies = [
+@@ -4067,7 +4069,7 @@ dependencies = [
  
  [[package]]
  name = "codex-login"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -3993,7 +3995,7 @@ dependencies = [
+@@ -4116,7 +4118,7 @@ dependencies = [
  
  [[package]]
  name = "codex-mcp"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "arc-swap",
-@@ -4037,7 +4039,7 @@ dependencies = [
+@@ -4167,7 +4169,7 @@ dependencies = [
  
  [[package]]
  name = "codex-mcp-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "axum",
-@@ -4070,7 +4072,7 @@ dependencies = [
+@@ -4200,7 +4202,7 @@ dependencies = [
  
  [[package]]
  name = "codex-memories-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-core",
   "codex-extension-api",
-@@ -4092,7 +4094,7 @@ dependencies = [
+@@ -4222,7 +4224,7 @@ dependencies = [
  
  [[package]]
  name = "codex-memories-read"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
   "codex-shell-command",
-@@ -4102,7 +4104,7 @@ dependencies = [
+@@ -4232,7 +4234,7 @@ dependencies = [
  
  [[package]]
  name = "codex-memories-write"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
-  "chrono",
-@@ -4139,7 +4141,7 @@ dependencies = [
+  "base64 0.22.1",
+@@ -4271,7 +4273,7 @@ dependencies = [
  
  [[package]]
  name = "codex-mermaid"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "insta",
   "pretty_assertions",
-@@ -4148,7 +4150,7 @@ dependencies = [
+@@ -4280,7 +4282,7 @@ dependencies = [
  
  [[package]]
  name = "codex-message-board"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "caseless",
-@@ -4171,7 +4173,7 @@ dependencies = [
+@@ -4305,7 +4307,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-message-board-mcp"
+-version = "0.0.0"
++version = "0.169.0"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4333,7 +4335,7 @@ dependencies = [
  
  [[package]]
  name = "codex-message-history"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-config",
   "memchr",
-@@ -4185,7 +4187,7 @@ dependencies = [
+@@ -4347,7 +4349,7 @@ dependencies = [
  
  [[package]]
  name = "codex-model-provider"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
+  "anyhow",
   "base64 0.22.1",
-  "chrono",
-@@ -4224,7 +4226,7 @@ dependencies = [
+@@ -4387,7 +4389,7 @@ dependencies = [
  
  [[package]]
  name = "codex-model-provider-info"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-client",
   "codex-http-client",
-@@ -4242,7 +4244,7 @@ dependencies = [
+@@ -4405,7 +4407,7 @@ dependencies = [
  
  [[package]]
  name = "codex-models-manager"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "chrono",
   "codex-http-client",
-@@ -4261,7 +4263,7 @@ dependencies = [
+@@ -4424,7 +4426,7 @@ dependencies = [
  
  [[package]]
  name = "codex-multi-env-copy-file"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-config",
-@@ -4287,7 +4289,7 @@ dependencies = [
+@@ -4450,7 +4452,7 @@ dependencies = [
  
  [[package]]
  name = "codex-mxc-sandbox"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-network-proxy",
-@@ -4308,7 +4310,7 @@ dependencies = [
+@@ -4471,7 +4473,7 @@ dependencies = [
  
  [[package]]
  name = "codex-network-proxy"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "aws-credential-types",
-@@ -4359,7 +4361,7 @@ dependencies = [
+@@ -4522,7 +4524,7 @@ dependencies = [
  
  [[package]]
  name = "codex-ollama"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "assert_matches",
   "async-stream",
-@@ -4379,7 +4381,7 @@ dependencies = [
+@@ -4542,7 +4544,7 @@ dependencies = [
  
  [[package]]
  name = "codex-otel"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "bytes",
   "chrono",
-@@ -4418,7 +4420,7 @@ dependencies = [
+@@ -4580,7 +4582,7 @@ dependencies = [
  
  [[package]]
  name = "codex-otel-trace-websocket"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "axum",
-@@ -4429,7 +4431,7 @@ dependencies = [
+@@ -4591,7 +4593,7 @@ dependencies = [
  
  [[package]]
  name = "codex-plugin"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-config",
   "codex-core-plugin-common",
-@@ -4444,7 +4446,7 @@ dependencies = [
+@@ -4606,7 +4608,7 @@ dependencies = [
  
  [[package]]
  name = "codex-plugin-host"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-utils-cargo-bin",
   "codex-utils-process",
-@@ -4461,7 +4463,7 @@ dependencies = [
+@@ -4623,7 +4625,7 @@ dependencies = [
  
  [[package]]
  name = "codex-process-hardening"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "libc",
   "pretty_assertions",
-@@ -4469,7 +4471,7 @@ dependencies = [
+@@ -4631,7 +4633,7 @@ dependencies = [
  
  [[package]]
  name = "codex-prompts"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-collaboration-mode-templates",
-@@ -4487,7 +4489,7 @@ dependencies = [
+@@ -4649,7 +4651,7 @@ dependencies = [
  
  [[package]]
  name = "codex-protocol"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "chardetng",
-@@ -4533,14 +4535,14 @@ dependencies = [
+@@ -4695,7 +4697,7 @@ dependencies = [
  
  [[package]]
  name = "codex-protocol-test-support"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
- ]
+  "uuid",
+@@ -4703,7 +4705,7 @@ dependencies = [
  
  [[package]]
  name = "codex-queue-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-core",
-@@ -4561,7 +4563,7 @@ dependencies = [
+@@ -4724,7 +4726,7 @@ dependencies = [
  
  [[package]]
  name = "codex-realtime-webrtc"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-build-info",
-@@ -4580,7 +4582,7 @@ dependencies = [
+@@ -4743,7 +4745,7 @@ dependencies = [
  
  [[package]]
  name = "codex-response-debug-context"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "codex-api",
-@@ -4591,7 +4593,7 @@ dependencies = [
+@@ -4754,7 +4756,7 @@ dependencies = [
  
  [[package]]
  name = "codex-responses-api-proxy"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "bytes",
-@@ -4615,7 +4617,7 @@ dependencies = [
+@@ -4778,7 +4780,7 @@ dependencies = [
  
  [[package]]
  name = "codex-rmcp-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "axum",
-@@ -4666,7 +4668,7 @@ dependencies = [
+@@ -4830,7 +4832,7 @@ dependencies = [
  
  [[package]]
  name = "codex-rollout"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "chrono",
-@@ -4699,7 +4701,7 @@ dependencies = [
+@@ -4863,7 +4865,7 @@ dependencies = [
  
  [[package]]
  name = "codex-rollout-trace"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-code-mode",
-@@ -4716,7 +4718,7 @@ dependencies = [
+@@ -4880,7 +4882,7 @@ dependencies = [
  
  [[package]]
  name = "codex-runtime-agent-instance"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
-  "codex-agent-identity",
-@@ -4742,7 +4744,7 @@ dependencies = [
+  "bytes",
+@@ -4909,7 +4911,7 @@ dependencies = [
  
  [[package]]
  name = "codex-sandboxing"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-mxc-sandbox",
-@@ -4770,7 +4772,7 @@ dependencies = [
+@@ -4937,7 +4939,7 @@ dependencies = [
  
  [[package]]
  name = "codex-secrets"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "age",
   "anyhow",
-@@ -4791,7 +4793,7 @@ dependencies = [
+@@ -4958,7 +4960,7 @@ dependencies = [
  
  [[package]]
  name = "codex-shell-command"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -4814,7 +4816,7 @@ dependencies = [
+@@ -4981,7 +4983,7 @@ dependencies = [
  
  [[package]]
  name = "codex-skills"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
   "codex-shell-command",
-@@ -4831,7 +4833,7 @@ dependencies = [
+@@ -4998,7 +5000,7 @@ dependencies = [
  
  [[package]]
  name = "codex-skills-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "assert_matches",
   "blake3",
-@@ -4871,7 +4873,7 @@ dependencies = [
+@@ -5038,7 +5040,7 @@ dependencies = [
  
  [[package]]
  name = "codex-state"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "chrono",
-@@ -4900,7 +4902,7 @@ dependencies = [
+@@ -5067,7 +5069,7 @@ dependencies = [
  
  [[package]]
  name = "codex-stdio-to-uds"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-uds",
-@@ -4912,7 +4914,7 @@ dependencies = [
+@@ -5079,7 +5081,7 @@ dependencies = [
  
  [[package]]
  name = "codex-tcp-tunnel"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
-  "bytes",
-@@ -4933,7 +4935,7 @@ dependencies = [
+  "base64 0.22.1",
+@@ -5101,7 +5103,7 @@ dependencies = [
  
  [[package]]
  name = "codex-terminal-detection"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
   "tracing",
-@@ -4941,7 +4943,7 @@ dependencies = [
+@@ -5109,7 +5111,7 @@ dependencies = [
  
  [[package]]
  name = "codex-test-binary-support"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-arg0",
   "tempfile",
-@@ -4949,7 +4951,7 @@ dependencies = [
+@@ -5117,7 +5119,7 @@ dependencies = [
  
  [[package]]
  name = "codex-thread-manager-sample"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "clap",
-@@ -4960,7 +4962,7 @@ dependencies = [
+@@ -5128,7 +5130,7 @@ dependencies = [
  
  [[package]]
  name = "codex-thread-store"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
+  "caseless",
   "chrono",
-  "codex-app-server-protocol",
-@@ -4991,7 +4993,7 @@ dependencies = [
+@@ -5161,7 +5163,7 @@ dependencies = [
  
  [[package]]
  name = "codex-tools"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "bitflags 2.13.1",
   "codex-attachment-store",
-@@ -5017,7 +5019,7 @@ dependencies = [
+@@ -5187,7 +5189,7 @@ dependencies = [
  
  [[package]]
  name = "codex-tui"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "app_test_support",
-@@ -5145,7 +5147,7 @@ dependencies = [
+@@ -5319,7 +5321,7 @@ dependencies = [
  
  [[package]]
  name = "codex-uds"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "async-io",
   "libc",
-@@ -5159,7 +5161,7 @@ dependencies = [
+@@ -5333,7 +5335,7 @@ dependencies = [
  
  [[package]]
  name = "codex-user-verification"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "block2",
-@@ -5180,7 +5182,7 @@ dependencies = [
+@@ -5354,7 +5356,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-absolute-path"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "dirs",
   "dunce",
-@@ -5194,14 +5196,14 @@ dependencies = [
+@@ -5368,14 +5370,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-approval-presets"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
  ]
@@ -1196,43 +1215,43 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-utils-audio"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "codex-protocol",
-@@ -5215,7 +5217,7 @@ dependencies = [
+@@ -5389,7 +5391,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-cache"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "lru",
   "sha1 0.10.6",
-@@ -5224,7 +5226,7 @@ dependencies = [
+@@ -5398,7 +5400,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-cargo-bin"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "assert_cmd",
   "runfiles",
-@@ -5233,7 +5235,7 @@ dependencies = [
+@@ -5407,7 +5409,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-cli"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "clap",
   "codex-protocol",
-@@ -5245,22 +5247,22 @@ dependencies = [
+@@ -5419,22 +5421,22 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-critical-path"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
  ]
@@ -1240,26 +1259,26 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-utils-elapsed"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  
  [[package]]
  name = "codex-utils-fuzzy-match"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  
  [[package]]
  name = "codex-utils-git-discovery"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-git-utils",
   "codex-utils-absolute-path",
-@@ -5273,14 +5275,14 @@ dependencies = [
+@@ -5447,14 +5449,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-head-tail-buffer"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
  ]
@@ -1267,115 +1286,124 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-utils-home-dir"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-utils-absolute-path",
   "dirs",
-@@ -5290,7 +5292,7 @@ dependencies = [
+@@ -5464,7 +5466,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-image"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "codex-utils-cache",
-@@ -5304,7 +5306,7 @@ dependencies = [
+@@ -5478,7 +5480,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-json-to-toml"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
   "serde_json",
-@@ -5313,7 +5315,7 @@ dependencies = [
+@@ -5487,7 +5489,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-model-facing-id"
+-version = "0.0.0"
++version = "0.169.0"
+ dependencies = [
+  "blake3",
+  "pretty_assertions",
+@@ -5500,7 +5502,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-oss"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-core",
   "codex-lmstudio",
-@@ -5323,7 +5325,7 @@ dependencies = [
+@@ -5510,7 +5512,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-output-truncation"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
   "codex-utils-string",
-@@ -5333,7 +5335,7 @@ dependencies = [
+@@ -5520,7 +5522,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-path"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-utils-absolute-path",
   "dunce",
-@@ -5344,7 +5346,7 @@ dependencies = [
+@@ -5531,7 +5533,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-path-uri"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "base64 0.22.1",
   "codex-utils-absolute-path",
-@@ -5360,7 +5362,7 @@ dependencies = [
+@@ -5547,7 +5549,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-plugins"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-exec-server",
   "codex-exec-server-protocol",
-@@ -5374,7 +5376,7 @@ dependencies = [
+@@ -5561,7 +5563,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-process"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
   "tokio",
-@@ -5382,7 +5384,7 @@ dependencies = [
+@@ -5569,7 +5571,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-pty"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-utils-cargo-bin",
-@@ -5401,7 +5403,7 @@ dependencies = [
+@@ -5588,7 +5590,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-readiness"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "assert_matches",
   "thiserror 2.0.18",
-@@ -5411,7 +5413,7 @@ dependencies = [
+@@ -5598,7 +5600,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-redacted-string"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "schemars 0.8.22",
   "serde",
-@@ -5419,14 +5421,14 @@ dependencies = [
+@@ -5606,14 +5608,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-rustls-provider"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "rustls",
  ]
@@ -1383,25 +1411,25 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-utils-sandbox-summary"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-protocol",
   "codex-utils-absolute-path",
-@@ -5436,7 +5438,7 @@ dependencies = [
+@@ -5623,7 +5625,7 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-sleep-inhibitor"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "core-foundation 0.9.4",
   "libc",
-@@ -5446,14 +5448,14 @@ dependencies = [
+@@ -5633,14 +5635,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-stream-parser"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
  ]
@@ -1409,16 +1437,16 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-utils-string"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
   "regex-lite",
-@@ -5463,14 +5465,14 @@ dependencies = [
+@@ -5650,14 +5652,14 @@ dependencies = [
  
  [[package]]
  name = "codex-utils-template"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
  ]
@@ -1426,70 +1454,70 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-v8-poc"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "pretty_assertions",
   "v8",
-@@ -5478,7 +5480,7 @@ dependencies = [
+@@ -5665,7 +5667,7 @@ dependencies = [
  
  [[package]]
  name = "codex-voice-host"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-install-context",
-@@ -5505,7 +5507,7 @@ dependencies = [
+@@ -5692,7 +5694,7 @@ dependencies = [
  
  [[package]]
  name = "codex-web-search-extension"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-api",
   "codex-core",
-@@ -5527,7 +5529,7 @@ dependencies = [
+@@ -5716,7 +5718,7 @@ dependencies = [
  
  [[package]]
  name = "codex-websocket-auth"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -5546,7 +5548,7 @@ dependencies = [
+@@ -5735,7 +5737,7 @@ dependencies = [
  
  [[package]]
  name = "codex-websocket-client"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-http-client",
   "codex-utils-rustls-provider",
-@@ -5562,7 +5564,7 @@ dependencies = [
+@@ -5751,7 +5753,7 @@ dependencies = [
  
  [[package]]
  name = "codex-windows-sandbox"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "base64 0.22.1",
-@@ -5592,7 +5594,7 @@ dependencies = [
+@@ -5782,7 +5784,7 @@ dependencies = [
  
  [[package]]
  name = "codex-windows-sandbox-service"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-cloud-config",
-@@ -5610,14 +5612,14 @@ dependencies = [
+@@ -5800,14 +5802,14 @@ dependencies = [
  
  [[package]]
  name = "codex-windows-sandbox-test-support"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "dirs",
  ]
@@ -1497,30 +1525,30 @@ index 1d27abb..0455dff 100644
  [[package]]
  name = "codex-workload-identity"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "codex-http-client",
   "pretty_assertions",
-@@ -5632,7 +5634,7 @@ dependencies = [
+@@ -5822,7 +5824,7 @@ dependencies = [
  
  [[package]]
  name = "codex-worktree"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "codex-git-utils",
-@@ -5885,7 +5887,7 @@ dependencies = [
+@@ -6075,7 +6077,7 @@ dependencies = [
  
  [[package]]
  name = "core_test_support"
 -version = "0.0.0"
-+version = "0.166.0"
++version = "0.169.0"
  dependencies = [
   "anyhow",
   "assert_cmd",
 diff --git a/codex-rs/app-server-client/Cargo.toml b/codex-rs/app-server-client/Cargo.toml
-index 272173b..8c695ab 100644
+index 9568426..2c79898 100644
 --- a/codex-rs/app-server-client/Cargo.toml
 +++ b/codex-rs/app-server-client/Cargo.toml
 @@ -14,6 +14,7 @@ workspace = true
@@ -1531,28 +1559,29 @@ index 272173b..8c695ab 100644
  codex-app-server-protocol = { workspace = true }
  codex-app-server-transport = { workspace = true }
  codex-arg0 = { workspace = true }
-@@ -26,6 +27,7 @@ codex-uds = { workspace = true }
- codex-utils-absolute-path = { workspace = true }
+@@ -29,6 +30,7 @@ codex-utils-absolute-path = { workspace = true }
  codex-utils-rustls-provider = { workspace = true }
+ color-eyre = { workspace = true }
  futures = { workspace = true }
 +libc = { workspace = true }
  serde = { workspace = true }
  serde_json = { workspace = true }
- tokio = { workspace = true, features = ["sync", "time", "rt"] }
+ thiserror = { workspace = true }
 diff --git a/codex-rs/app-server-client/src/lib.rs b/codex-rs/app-server-client/src/lib.rs
-index e7df794..f862209 100644
+index 3d25037..6fbbbe7 100644
 --- a/codex-rs/app-server-client/src/lib.rs
 +++ b/codex-rs/app-server-client/src/lib.rs
-@@ -23,6 +23,8 @@
- mod cloud;
+@@ -25,6 +25,9 @@ pub mod cloud_backend;
+ pub use codex_cloud_client::ProjectEnvironment;
  mod path;
  mod remote;
 +pub use remote::LocalServerIdentity;
 +pub use remote::RemoteAppServerStatus;
++pub use remote::RemoteAttachmentSnapshot;
  mod remote_websocket;
  pub use cloud::CloudClient;
  pub use cloud::CloudCommand;
-@@ -862,6 +864,7 @@ mod tests {
+@@ -895,6 +898,7 @@ mod tests {
      use codex_app_server_protocol::AccountUpdatedNotification;
      use codex_app_server_protocol::ConfigRequirementsReadResponse;
      use codex_app_server_protocol::GetAccountResponse;
@@ -1560,7 +1589,7 @@ index e7df794..f862209 100644
      use codex_app_server_protocol::JSONRPCMessage;
      use codex_app_server_protocol::JSONRPCRequest;
      use codex_app_server_protocol::JSONRPCResponse;
-@@ -1547,6 +1550,20 @@ mod tests {
+@@ -1586,6 +1590,20 @@ mod tests {
          .await
          .expect("remote client should connect");
  
@@ -1581,7 +1610,7 @@ index e7df794..f862209 100644
          let response: GetAccountResponse = client
              .request_typed(ClientRequest::GetAccount {
                  request_id: RequestId::Integer(1),
-@@ -1561,6 +1578,89 @@ mod tests {
+@@ -1600,6 +1618,89 @@ mod tests {
          client.shutdown().await.expect("shutdown should complete");
      }
  
@@ -1672,7 +1701,7 @@ index e7df794..f862209 100644
      async fn remote_typed_request_accepts_large_single_frame_response() {
          let padding = "x".repeat((17 << 20) + 1024);
 diff --git a/codex-rs/app-server-client/src/remote.rs b/codex-rs/app-server-client/src/remote.rs
-index ad8d28b..030637f 100644
+index c6ac801..c945d97 100644
 --- a/codex-rs/app-server-client/src/remote.rs
 +++ b/codex-rs/app-server-client/src/remote.rs
 @@ -11,10 +11,15 @@ higher-level session logic.
@@ -1691,7 +1720,7 @@ index ad8d28b..030637f 100644
  use std::time::Duration;
  
  use crate::AppServerEvent;
-@@ -160,7 +165,100 @@ struct RemoteServerMetadata {
+@@ -163,7 +168,116 @@ struct RemoteServerMetadata {
      platform_os: Option<String>,
  }
  
@@ -1703,31 +1732,39 @@ index ad8d28b..030637f 100644
 +
 +static CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 +
++/// Revision and membership are sampled under the same lock. A detach/re-ack of the
++/// same UUID is a new ownership interval even when nobody samples the empty set.
++#[derive(Clone, Default)]
++pub struct RemoteAttachmentSnapshot {
++    pub revision: u64,
++    pub thread_ids: HashSet<String>,
++}
++
 +#[derive(Clone)]
 +/// Transport facts shared with read-only status queries. UI foreground/live-channel state is
 +/// owned by the TUI and must be checked separately from these acknowledged subscriptions.
 +pub struct RemoteAppServerStatus {
-+    attached_threads: Arc<std::sync::Mutex<HashSet<String>>>,
++    attached_threads: Arc<std::sync::Mutex<RemoteAttachmentSnapshot>>,
 +    local_server: Option<LocalServerIdentity>,
 +    connected: Arc<AtomicBool>,
 +    connection_generation: u64,
 +}
 +
 +impl RemoteAppServerStatus {
-+    pub fn attached_thread_ids(&self) -> HashSet<String> {
-+        if !self.is_connected() {
-+            return HashSet::new();
-+        }
-+        let threads = self
++    pub fn attachment_snapshot(&self) -> RemoteAttachmentSnapshot {
++        let mut snapshot = self
 +            .attached_threads
 +            .lock()
-+            .map(|threads| threads.clone())
++            .map(|snapshot| snapshot.clone())
 +            .unwrap_or_default();
-+        if self.is_connected() {
-+            threads
-+        } else {
-+            HashSet::new()
++        if !self.is_connected() {
++            snapshot.thread_ids.clear();
 +        }
++        snapshot
++    }
++
++    pub fn attached_thread_ids(&self) -> HashSet<String> {
++        self.attachment_snapshot().thread_ids
 +    }
 +
 +    pub fn local_server_identity(&self) -> Option<&LocalServerIdentity> {
@@ -1756,22 +1793,26 @@ index ad8d28b..030637f 100644
 +fn remove_attachment(
 +    thread_id: &str,
 +    pending: &mut HashMap<RequestId, PendingAttachment>,
-+    attached: &std::sync::Mutex<HashSet<String>>,
++    attached: &std::sync::Mutex<RemoteAttachmentSnapshot>,
 +) {
 +    // A late load response must not restore a claim withdrawn by a later detach. New/forked
 +    // IDs are unknown until the response, so invalidate those pending claims conservatively.
 +    pending.retain(|_, request| matches!(request, PendingAttachment::Existing(expected) if expected != thread_id));
-+    if let Ok(mut threads) = attached.lock()
-+        && threads.len() < 65
++    if let Ok(mut snapshot) = attached.lock()
++        && snapshot.thread_ids.len() < 65
++        && snapshot.thread_ids.remove(thread_id)
 +    {
-+        threads.remove(thread_id);
++        snapshot.revision = snapshot
++            .revision
++            .checked_add(1)
++            .expect("attachment revision exhausted");
 +    }
 +}
 +
 +fn acknowledge_attachment(
 +    pending: PendingAttachment,
 +    thread_id: &str,
-+    attached: &std::sync::Mutex<HashSet<String>>,
++    attached: &std::sync::Mutex<RemoteAttachmentSnapshot>,
 +) {
 +    let Some(thread_id) = canonical_thread_id(thread_id) else {
 +        return;
@@ -1779,11 +1820,15 @@ index ad8d28b..030637f 100644
 +    if matches!(pending, PendingAttachment::Existing(expected) if expected != thread_id) {
 +        return;
 +    }
-+    if let Ok(mut threads) = attached.lock()
-+        && threads.len() < 65
++    if let Ok(mut snapshot) = attached.lock()
++        && snapshot.thread_ids.len() < 65
++        && snapshot.thread_ids.insert(thread_id.to_owned())
 +    {
 +        // 65 is a sticky overflow sentinel: status refuses rather than truncating ownership.
-+        threads.insert(thread_id.to_owned());
++        snapshot.revision = snapshot
++            .revision
++            .checked_add(1)
++            .expect("attachment revision exhausted");
 +    }
 +}
 +
@@ -1792,7 +1837,7 @@ index ad8d28b..030637f 100644
      command_tx: mpsc::Sender<RemoteClientCommand>,
      event_rx: mpsc::UnboundedReceiver<AppServerEvent>,
      pending_events: VecDeque<AppServerEvent>,
-@@ -214,14 +312,41 @@ impl RemoteAppServerClient {
+@@ -217,14 +331,41 @@ impl RemoteAppServerClient {
                      .await
              }
              RemoteAppServerEndpoint::UnixSocket { socket_path } => {
@@ -1837,11 +1882,11 @@ index ad8d28b..030637f 100644
      pub fn server_version(&self) -> Option<&str> {
          self.metadata.server_version.as_deref()
      }
-@@ -259,14 +384,27 @@ impl RemoteAppServerClient {
+@@ -262,14 +403,27 @@ impl RemoteAppServerClient {
  
          let (command_tx, mut command_rx) = mpsc::channel::<RemoteClientCommand>(channel_capacity);
          let (event_tx, event_rx) = mpsc::unbounded_channel::<AppServerEvent>();
-+        let attached_threads = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
++        let attached_threads = Arc::new(std::sync::Mutex::new(RemoteAttachmentSnapshot::default()));
 +        let worker_attachments = Arc::clone(&attached_threads);
 +        let connected = Arc::new(AtomicBool::new(true));
 +        let worker_connected = Arc::clone(&connected);
@@ -1865,7 +1910,7 @@ index ad8d28b..030637f 100644
                              let _ = stream.close().await;
                              break;
                          };
-@@ -280,6 +418,16 @@ impl RemoteAppServerClient {
+@@ -283,6 +437,16 @@ impl RemoteAppServerClient {
                                      )));
                                      continue;
                                  }
@@ -1882,7 +1927,7 @@ index ad8d28b..030637f 100644
                                  pending_requests.insert(request_id.clone(), response_tx);
                                  if let Err(err) = write_jsonrpc_message(
                                      &mut stream,
-@@ -288,6 +436,7 @@ impl RemoteAppServerClient {
+@@ -291,6 +455,7 @@ impl RemoteAppServerClient {
                                  )
                                  .await
                                  {
@@ -1890,7 +1935,7 @@ index ad8d28b..030637f 100644
                                      let err_message = err.to_string();
                                      let message = format!(
                                          "remote app server at `{endpoint}` write failed: {err_message}"
-@@ -314,6 +463,7 @@ impl RemoteAppServerClient {
+@@ -317,6 +482,7 @@ impl RemoteAppServerClient {
                                      &endpoint,
                                  )
                                  .await;
@@ -1898,7 +1943,7 @@ index ad8d28b..030637f 100644
                                  let _ = response_tx.send(result);
                              }
                              RemoteClientCommand::ResolveServerRequest {
-@@ -330,6 +480,7 @@ impl RemoteAppServerClient {
+@@ -333,6 +499,7 @@ impl RemoteAppServerClient {
                                      &endpoint,
                                  )
                                  .await;
@@ -1906,7 +1951,7 @@ index ad8d28b..030637f 100644
                                  let _ = response_tx.send(result);
                              }
                              RemoteClientCommand::RejectServerRequest {
-@@ -346,9 +497,11 @@ impl RemoteAppServerClient {
+@@ -349,9 +516,11 @@ impl RemoteAppServerClient {
                                      &endpoint,
                                  )
                                  .await;
@@ -1918,7 +1963,7 @@ index ad8d28b..030637f 100644
                                  let close_result = stream.close().await.or_else(|err| {
                                      if websocket_close_error_is_already_closed(&err) {
                                          Ok(())
-@@ -368,16 +521,25 @@ impl RemoteAppServerClient {
+@@ -371,16 +540,25 @@ impl RemoteAppServerClient {
                              Some(Ok(Message::Text(text))) => {
                                  match serde_json::from_str::<JSONRPCMessage>(&text) {
                                      Ok(JSONRPCMessage::Response(response)) => {
@@ -1944,7 +1989,7 @@ index ad8d28b..030637f 100644
                                          if let Some(event) =
                                              app_server_event_from_notification(notification)
                                              && let Err(err) = deliver_event(
-@@ -385,6 +547,7 @@ impl RemoteAppServerClient {
+@@ -388,6 +566,7 @@ impl RemoteAppServerClient {
                                                  event,
                                              )
                                              {
@@ -1952,7 +1997,7 @@ index ad8d28b..030637f 100644
                                                  warn!(%err, "failed to deliver remote app-server event");
                                                  break;
                                              }
-@@ -399,6 +562,7 @@ impl RemoteAppServerClient {
+@@ -402,6 +581,7 @@ impl RemoteAppServerClient {
                                                      AppServerEvent::ServerRequest(Box::new(request)),
                                                  )
                                                  {
@@ -1960,7 +2005,7 @@ index ad8d28b..030637f 100644
                                                      warn!(%err, "failed to deliver remote app-server server request");
                                                      break;
                                                  }
-@@ -421,6 +585,7 @@ impl RemoteAppServerClient {
+@@ -424,6 +604,7 @@ impl RemoteAppServerClient {
                                                  )
                                                  .await
                                                  {
@@ -1968,7 +2013,7 @@ index ad8d28b..030637f 100644
                                                      let err_message = reject_err.to_string();
                                                      let message = format!(
                                                          "remote app server at `{endpoint}` write failed: {err_message}"
-@@ -439,6 +604,7 @@ impl RemoteAppServerClient {
+@@ -442,6 +623,7 @@ impl RemoteAppServerClient {
                                          }
                                      }
                                      Err(err) => {
@@ -1976,7 +2021,7 @@ index ad8d28b..030637f 100644
                                          let message = format!(
                                              "remote app server at `{endpoint}` sent invalid JSON-RPC: {err}"
                                          );
-@@ -455,6 +621,7 @@ impl RemoteAppServerClient {
+@@ -458,6 +640,7 @@ impl RemoteAppServerClient {
                                  }
                              }
                              Some(Ok(Message::Close(frame))) => {
@@ -1984,7 +2029,7 @@ index ad8d28b..030637f 100644
                                  let reason = frame
                                      .as_ref()
                                      .map(|frame| frame.reason.to_string())
-@@ -480,6 +647,7 @@ impl RemoteAppServerClient {
+@@ -483,6 +666,7 @@ impl RemoteAppServerClient {
                              | Some(Ok(Message::Pong(_)))
                              | Some(Ok(Message::Frame(_))) => {}
                              Some(Err(err)) => {
@@ -1992,7 +2037,7 @@ index ad8d28b..030637f 100644
                                  let message = format!(
                                      "remote app server at `{endpoint}` transport failed: {err}"
                                  );
-@@ -493,6 +661,7 @@ impl RemoteAppServerClient {
+@@ -496,6 +680,7 @@ impl RemoteAppServerClient {
                                  break;
                              }
                              None => {
@@ -2000,7 +2045,7 @@ index ad8d28b..030637f 100644
                                  let message = format!(
                                      "remote app server at `{endpoint}` closed the connection"
                                  );
-@@ -522,6 +691,12 @@ impl RemoteAppServerClient {
+@@ -525,6 +710,12 @@ impl RemoteAppServerClient {
          });
  
          Ok(Self {
@@ -2013,7 +2058,7 @@ index ad8d28b..030637f 100644
              command_tx,
              event_rx,
              pending_events: pending_events.into(),
-@@ -600,6 +775,7 @@ impl RemoteAppServerClient {
+@@ -603,6 +794,7 @@ impl RemoteAppServerClient {
  
      pub async fn shutdown(self) -> IoResult<()> {
          let Self {
@@ -2021,7 +2066,7 @@ index ad8d28b..030637f 100644
              command_tx,
              event_rx,
              pending_events: _pending_events,
-@@ -784,7 +960,11 @@ async fn connect_websocket_endpoint(
+@@ -787,7 +979,11 @@ async fn connect_websocket_endpoint(
  async fn connect_unix_socket_endpoint(
      socket_path: AbsolutePathBuf,
      peer_policy: SocketPeerPolicy,
@@ -2034,7 +2079,7 @@ index ad8d28b..030637f 100644
      let endpoint = format!("unix://{}", socket_path.display());
      let request = websocket_request(UDS_WEBSOCKET_HANDSHAKE_URL).map_err(|err| {
          IoError::new(
-@@ -805,6 +985,30 @@ async fn connect_unix_socket_endpoint(
+@@ -808,6 +1004,30 @@ async fn connect_unix_socket_endpoint(
                  "failed to connect to remote app server at `{endpoint}`: {err}"
              ))
          })?;
@@ -2065,7 +2110,7 @@ index ad8d28b..030637f 100644
      match peer_policy {
          SocketPeerPolicy::ExplicitEndpoint => {}
          #[cfg(windows)]
-@@ -828,7 +1032,7 @@ async fn connect_unix_socket_endpoint(
+@@ -831,7 +1051,7 @@ async fn connect_unix_socket_endpoint(
          ))
      })?;
  
@@ -2074,7 +2119,7 @@ index ad8d28b..030637f 100644
  }
  
  fn websocket_request(url: &str) -> Result<Request, TungsteniteError> {
-@@ -1066,6 +1270,220 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
+@@ -1069,6 +1289,335 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
  #[cfg(test)]
  mod tests {
      use super::*;
@@ -2086,9 +2131,9 @@ index ad8d28b..030637f 100644
 +
 +    #[test]
 +    fn terminal_status_attachment_claims_are_bounded_canonical_and_causal() {
-+        let attached = std::sync::Mutex::new(HashSet::new());
++        let attached = std::sync::Mutex::new(RemoteAttachmentSnapshot::default());
 +        acknowledge_attachment(PendingAttachment::New, THREAD_A, &attached);
-+        assert!(attached.lock().unwrap().contains(THREAD_A));
++        assert!(attached.lock().unwrap().thread_ids.contains(THREAD_A));
 +        for invalid in [
 +            "bad".to_owned(),
 +            "x".repeat(1 << 20),
@@ -2101,7 +2146,7 @@ index ad8d28b..030637f 100644
 +            THREAD_B,
 +            &attached,
 +        );
-+        assert_eq!(attached.lock().unwrap().len(), 1);
++        assert_eq!(attached.lock().unwrap().thread_ids.len(), 1);
 +        let mut pending = HashMap::from([
 +            (
 +                RequestId::Integer(1),
@@ -2117,7 +2162,7 @@ index ad8d28b..030637f 100644
 +        assert!(!pending.contains_key(&RequestId::Integer(1)));
 +        assert!(pending.contains_key(&RequestId::Integer(2)));
 +        assert!(!pending.contains_key(&RequestId::Integer(3)));
-+        assert!(attached.lock().unwrap().is_empty());
++        assert!(attached.lock().unwrap().thread_ids.is_empty());
 +        for index in 0..66 {
 +            acknowledge_attachment(
 +                PendingAttachment::New,
@@ -2125,19 +2170,45 @@ index ad8d28b..030637f 100644
 +                &attached,
 +            );
 +        }
-+        assert_eq!(attached.lock().unwrap().len(), 65);
++        assert_eq!(attached.lock().unwrap().thread_ids.len(), 65);
 +        remove_attachment(THREAD_A, &mut pending, &attached);
 +        assert_eq!(
-+            attached.lock().unwrap().len(),
++            attached.lock().unwrap().thread_ids.len(),
 +            65,
 +            "overflow remains fail-closed"
 +        );
 +    }
 +
 +    #[test]
++    fn terminal_attachment_revision_changes_only_for_ownership_mutations() {
++        let attached = std::sync::Mutex::new(RemoteAttachmentSnapshot::default());
++        let mut pending = HashMap::new();
++        acknowledge_attachment(PendingAttachment::New, THREAD_A, &attached);
++        assert_eq!(attached.lock().unwrap().revision, 1);
++        acknowledge_attachment(PendingAttachment::New, THREAD_A, &attached);
++        remove_attachment(THREAD_B, &mut pending, &attached);
++        assert_eq!(
++            attached.lock().unwrap().revision,
++            1,
++            "unchanged membership is stable"
++        );
++        remove_attachment(THREAD_A, &mut pending, &attached);
++        acknowledge_attachment(PendingAttachment::New, THREAD_A, &attached);
++        let current = attached.lock().unwrap();
++        assert_eq!(current.thread_ids, HashSet::from([THREAD_A.to_owned()]));
++        assert_eq!(
++            current.revision, 3,
++            "ABA cannot reuse the old ownership interval"
++        );
++    }
++
++    #[test]
 +    fn terminal_status_handle_observes_worker_liveness_without_ui_dispatch() {
 +        let status = RemoteAppServerStatus {
-+            attached_threads: Arc::new(std::sync::Mutex::new(HashSet::from([THREAD_A.to_owned()]))),
++            attached_threads: Arc::new(std::sync::Mutex::new(RemoteAttachmentSnapshot {
++                revision: 1,
++                thread_ids: HashSet::from([THREAD_A.to_owned()]),
++            })),
 +            local_server: None,
 +            connected: Arc::new(AtomicBool::new(true)),
 +            connection_generation: 7,
@@ -2150,7 +2221,12 @@ index ad8d28b..030637f 100644
 +        assert!(!observer.is_connected());
 +        assert!(observer.attached_thread_ids().is_empty());
 +        assert!(
-+            status.attached_threads.lock().unwrap().contains(THREAD_A),
++            status
++                .attached_threads
++                .lock()
++                .unwrap()
++                .thread_ids
++                .contains(THREAD_A),
 +            "stale storage must not become a live claim"
 +        );
 +    }
@@ -2227,16 +2303,57 @@ index ad8d28b..030637f 100644
 +                    serde_json::json!({"thread":{"id":THREAD_A}}),
 +                )
 +                .await;
++                // Request handles mutate the same revision even when the UI never drains events.
++                let JSONRPCMessage::Request(unsubscribe) = test_read(&mut websocket).await else {
++                    panic!("second unsubscribe");
++                };
++                assert_eq!(unsubscribe.method, "thread/unsubscribe");
++                test_reply(&mut websocket, unsubscribe.id, serde_json::json!({})).await;
++                let JSONRPCMessage::Request(resume) = test_read(&mut websocket).await else {
++                    panic!("reattach");
++                };
++                test_reply(
++                    &mut websocket,
++                    resume.id,
++                    serde_json::json!({"thread":{"id":THREAD_A}}),
++                )
++                .await;
++                for method in ["thread/closed", "thread/archived", "thread/deleted"] {
++                    let JSONRPCMessage::Request(barrier) = test_read(&mut websocket).await else {
++                        panic!("lifecycle barrier");
++                    };
++                    websocket
++                        .send(Message::Text(
++                            serde_json::json!({
++                                "jsonrpc":"2.0", "method":method, "params":{"threadId":THREAD_A}
++                            })
++                            .to_string()
++                            .into(),
++                        ))
++                        .await
++                        .unwrap();
++                    test_reply(&mut websocket, barrier.id, serde_json::json!({})).await;
++                    let JSONRPCMessage::Request(resume) = test_read(&mut websocket).await else {
++                        panic!("lifecycle reattach");
++                    };
++                    test_reply(
++                        &mut websocket,
++                        resume.id,
++                        serde_json::json!({"thread":{"id":THREAD_A}}),
++                    )
++                    .await;
++                }
 +                close_receiver.await.unwrap();
 +                websocket.close(None).await.unwrap();
 +            });
 +            let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
++                required_human_approval: false,
 +                endpoint: RemoteAppServerEndpoint::WebSocket {
 +                    websocket_url: format!("ws://{address}"),
 +                    auth_token: None,
 +                },
 +                client_name: "terminal-status-test".to_owned(),
-+                client_version: "0.166.0".to_owned(),
++                client_version: "0.169.0".to_owned(),
 +                experimental_api: true,
 +                mcp_server_openai_form_elicitation: false,
 +                opt_out_notification_methods: Vec::new(),
@@ -2256,6 +2373,10 @@ index ad8d28b..030637f 100644
 +            let resume =
 +                tokio::spawn(async move { handle.request_json_rpc(first).await.unwrap().unwrap() });
 +            resume_ready.await.unwrap();
++            assert!(
++                status.attached_thread_ids().is_empty(),
++                "no live claim before resume acknowledgement"
++            );
 +            client
 +                .request_handle()
 +                .request_json_rpc(request(2, "thread/unsubscribe"))
@@ -2281,6 +2402,45 @@ index ad8d28b..030637f 100644
 +                status.attached_thread_ids().contains(THREAD_A),
 +                "a genuinely new resume may reattach"
 +            );
++            let initial_revision = status.attachment_snapshot().revision;
++            client
++                .request_handle()
++                .request_json_rpc(request(4, "thread/unsubscribe"))
++                .await
++                .unwrap()
++                .unwrap();
++            client
++                .request_handle()
++                .request_json_rpc(request(5, "thread/resume"))
++                .await
++                .unwrap()
++                .unwrap();
++            // No status sampling between withdrawal and reack of the identical UUID.
++            let mut previous = status.attachment_snapshot();
++            assert_eq!(previous.thread_ids, HashSet::from([THREAD_A.to_owned()]));
++            assert_eq!(previous.revision, initial_revision + 2);
++            for index in 0..3 {
++                client
++                    .request_handle()
++                    .request_json_rpc(request(6 + index * 2, "thread/list"))
++                    .await
++                    .unwrap()
++                    .unwrap();
++                client
++                    .request_handle()
++                    .request_json_rpc(request(7 + index * 2, "thread/resume"))
++                    .await
++                    .unwrap()
++                    .unwrap();
++                let current = status.attachment_snapshot();
++                assert_eq!(current.thread_ids, previous.thread_ids);
++                assert_eq!(
++                    current.revision,
++                    previous.revision + 2,
++                    "queued lifecycle invalidates before UI event consumption"
++                );
++                previous = current;
++            }
 +            close_sender.send(()).unwrap();
 +            while status.is_connected() {
 +                tokio::task::yield_now().await;
@@ -2295,7 +2455,7 @@ index ad8d28b..030637f 100644
  
      #[tokio::test]
      async fn shutdown_tolerates_worker_exit_after_command_is_queued() {
-@@ -1087,6 +1505,12 @@ mod tests {
+@@ -1090,6 +1639,12 @@ mod tests {
              let _ = delivered_tx.send(result);
          });
          let client = RemoteAppServerClient {
@@ -2404,7 +2564,7 @@ index 0454e52..b6ad3d9 100644
  fn parses_start_ticks_after_comm_with_spaces_and_parentheses() {
      let stat =
 diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
-index 51b9c72..28dd444 100644
+index ce7d58e..be3a87b 100644
 --- a/codex-rs/app-server-daemon/src/lib.rs
 +++ b/codex-rs/app-server-daemon/src/lib.rs
 @@ -1,6 +1,12 @@
@@ -2421,19 +2581,19 @@ index 51b9c72..28dd444 100644
  #[cfg(windows)]
  pub use backend::windows::DetachedLaunchRestricted;
 diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
-index fbc1090..250580c 100644
+index ddddc61..cba21a5 100644
 --- a/codex-rs/tui/src/app.rs
 +++ b/codex-rs/tui/src/app.rs
-@@ -537,6 +537,7 @@ struct InitialHistoryReplayBuffer {
+@@ -551,6 +551,7 @@ struct InitialHistoryReplayBuffer {
  }
  
  pub(crate) struct App {
 +    terminal_status: Option<crate::tui_status::StatusPublisher>,
+     provider_writes: HashMap<crate::backend_id::BackendId, crate::model_catalog::ProviderWrite>,
      feature_write_lock: Arc<tokio::sync::Mutex<()>>,
      config_notification_test_generation: u64,
-     config_notification_test_pending: Option<u64>,
 diff --git a/codex-rs/tui/src/app/agent_picker.rs b/codex-rs/tui/src/app/agent_picker.rs
-index 93c4b53..c5f3afb 100644
+index 681d123..b3aa785 100644
 --- a/codex-rs/tui/src/app/agent_picker.rs
 +++ b/codex-rs/tui/src/app/agent_picker.rs
 @@ -199,6 +199,9 @@ impl App {
@@ -2447,18 +2607,18 @@ index 93c4b53..c5f3afb 100644
              if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
                  channel.mark_replay_only();
 diff --git a/codex-rs/tui/src/app/agents_overview.rs b/codex-rs/tui/src/app/agents_overview.rs
-index 3cb5a42..28408d9 100644
+index 6ef5057..95c022f 100644
 --- a/codex-rs/tui/src/app/agents_overview.rs
 +++ b/codex-rs/tui/src/app/agents_overview.rs
-@@ -90,6 +90,7 @@ impl Drop for AgentsOverviewState {
+@@ -93,6 +93,7 @@ impl Drop for AgentsOverviewState {
  
  impl App {
      pub(super) fn open_agents_overview(&mut self, app_server: &AppServerSession) {
 +        self.invalidate_tui_status();
-         if !self.app_server_target.supports_command_center() {
-             let workload_identity_selected = codex_login::is_workload_identity_selected();
-             self.chat_widget.show_selection_view(SelectionViewParams {
-@@ -446,6 +447,7 @@ impl App {
+         let threads = self
+             .agents_overview
+             .threads
+@@ -462,6 +463,7 @@ impl App {
          started: Option<(Config, crate::app_server_session::AppServerStartedThread)>,
          mut startup_draft: Option<&mut StartupDraftPump>,
      ) -> color_eyre::Result<AppRunControl> {
@@ -2466,11 +2626,23 @@ index 3cb5a42..28408d9 100644
          if self.windows_sandbox_blocks_thread_switch() {
              return Ok(AppRunControl::Continue);
          }
+diff --git a/codex-rs/tui/src/app/backend_selection.rs b/codex-rs/tui/src/app/backend_selection.rs
+index ef345a4..6e10372 100644
+--- a/codex-rs/tui/src/app/backend_selection.rs
++++ b/codex-rs/tui/src/app/backend_selection.rs
+@@ -372,6 +372,7 @@ impl App {
+         cwd: PathBuf,
+         bootstrap: AppServerBootstrap,
+     ) {
++        self.invalidate_tui_status();
+         let outgoing = backends.displayed_owner();
+         self.saved_openings.abandon();
+         self.capture_session_inputs().await;
 diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
-index 550965d..21073b8 100644
+index 881d272..200dfb0 100644
 --- a/codex-rs/tui/src/app/event_dispatch.rs
 +++ b/codex-rs/tui/src/app/event_dispatch.rs
-@@ -452,6 +452,7 @@ impl App {
+@@ -527,6 +527,7 @@ impl App {
                  self.chat_widget.show_copy_result(&label, result);
              }
              AppEvent::ClearUi { name } => {
@@ -2478,15 +2650,7 @@ index 550965d..21073b8 100644
                  if self.reject_pending_permission_root_switch() {
                      return Ok(AppRunControl::Continue);
                  }
-@@ -471,6 +472,7 @@ impl App {
-                 self.apply_raw_output_mode(tui, enabled, /*notify*/ false);
-             }
-             AppEvent::ClearUiAndSubmitUserMessage { text } => {
-+                self.invalidate_tui_status();
-                 if self.reject_pending_permission_root_switch() {
-                     self.chat_widget.restore_user_message_to_composer(text.into());
-                     return Ok(AppRunControl::Continue);
-@@ -1136,6 +1138,7 @@ impl App {
+@@ -1366,6 +1367,7 @@ impl App {
                          .is_some_and(|owner| owner.thread_id() == Some(*thread_id)),
                      _ => false,
                  };
@@ -2495,10 +2659,10 @@ index 550965d..21073b8 100644
                  if parked_voice
                      && let Some(owner) = self.background_voice.as_mut()
 diff --git a/codex-rs/tui/src/app/reconnect.rs b/codex-rs/tui/src/app/reconnect.rs
-index 91dde41..c526694 100644
+index d6e2f6f..220e20e 100644
 --- a/codex-rs/tui/src/app/reconnect.rs
 +++ b/codex-rs/tui/src/app/reconnect.rs
-@@ -215,6 +215,7 @@ impl App {
+@@ -218,6 +218,7 @@ impl App {
      }
  
      fn begin_reconnect_inner(&mut self, preserve_startup_input: bool) -> bool {
@@ -2507,18 +2671,26 @@ index 91dde41..c526694 100644
              return false;
          }
 diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
-index c7dc18d..7c5600d 100644
+index ac4d2b0..6823945 100644
 --- a/codex-rs/tui/src/app/session_lifecycle.rs
 +++ b/codex-rs/tui/src/app/session_lifecycle.rs
-@@ -542,6 +542,7 @@ impl App {
+@@ -604,6 +604,7 @@ impl App {
          app_server: &mut AppServerSession,
          thread_id: ThreadId,
      ) -> Result<()> {
 +        self.invalidate_tui_status();
-         let pending_profile_on_unavailable_thread = self.thread_unavailable(thread_id)
-             && self.pending_server_profiles.contains_key(&thread_id);
-         let cached_session = if self.thread_unavailable(thread_id) {
-@@ -789,6 +790,7 @@ impl App {
+         if self
+             .side_threads
+             .get(&thread_id)
+@@ -718,6 +719,7 @@ impl App {
+         thread_id: ThreadId,
+         selection: Selection,
+     ) -> Result<()> {
++        self.invalidate_tui_status();
+         let Selection {
+             mode,
+             cached_session,
+@@ -980,6 +982,7 @@ impl App {
      }
  
      pub(super) async fn reset_thread_event_state(&mut self) {
@@ -2526,7 +2698,7 @@ index c7dc18d..7c5600d 100644
          let voice_owner = self.voice_owner_thread_id();
          let mut previous_pending = std::mem::take(&mut self.pending_app_server_requests);
          // Move retained tasks' approvals to background routing before clearing request bookkeeping.
-@@ -1000,6 +1002,7 @@ impl App {
+@@ -1213,6 +1216,7 @@ impl App {
          initial_user_message: Option<crate::chatwidget::UserMessage>,
          new_thread_name: Option<String>,
      ) {
@@ -2534,15 +2706,15 @@ index c7dc18d..7c5600d 100644
          if self.reject_pending_permission_root_switch() {
              if let Some(message) = initial_user_message {
                  self.chat_widget.restore_user_message_to_composer(message);
-@@ -1138,6 +1141,7 @@ impl App {
-         presentation: ThreadAttachPresentation,
+@@ -1472,6 +1476,7 @@ impl App {
          initial_user_message: Option<crate::chatwidget::UserMessage>,
+         account: Option<SessionAccount>,
      ) -> Result<()> {
 +        self.invalidate_tui_status();
          // Initial messages are for freshly attached primary threads only. Thread switches and
          // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
          // user turn by accident.
-@@ -1339,6 +1343,7 @@ impl App {
+@@ -1688,6 +1693,7 @@ impl App {
          app_server: &mut AppServerSession,
          target_session: SessionTarget,
      ) -> Result<AppRunControl> {
@@ -2550,30 +2722,150 @@ index c7dc18d..7c5600d 100644
          if let Err(error) = target_session.ensure_backend(app_server.backend_id()) {
              self.add_session_picker_error(error.to_string());
              return Ok(AppRunControl::Continue);
+diff --git a/codex-rs/tui/src/app/side.rs b/codex-rs/tui/src/app/side.rs
+index a97fdea..2a8333c 100644
+--- a/codex-rs/tui/src/app/side.rs
++++ b/codex-rs/tui/src/app/side.rs
+@@ -796,6 +796,7 @@ impl App {
+         let request = uuid::Uuid::new_v4();
+         if workspace {
+             let pane = self.sidebars.entry(Some(parent_thread_id)).or_default();
++            pane.terminal_status = self.terminal_status.clone();
+             pane.creation = Some(sidebar::SideCreation {
+                 owner: app_server.backend_id(),
+                 state: sidebar::CreationState::Waiting {
+diff --git a/codex-rs/tui/src/app/side_focus.rs b/codex-rs/tui/src/app/side_focus.rs
+index cc05efe..a8507cc 100644
+--- a/codex-rs/tui/src/app/side_focus.rs
++++ b/codex-rs/tui/src/app/side_focus.rs
+@@ -53,6 +53,7 @@ impl App {
+         tui: &mut tui::Tui,
+         server: &mut AppServerSession,
+     ) -> Result<()> {
++        self.invalidate_tui_status();
+         if let Some(parent) = self.active_side_parent_thread_id() {
+             self.select_agent_thread(tui, server, parent).await?;
+             if self.current_displayed_thread_id() != Some(parent) {
+diff --git a/codex-rs/tui/src/app/sidebar.rs b/codex-rs/tui/src/app/sidebar.rs
+index 3a124a1..2d4f1db 100644
+--- a/codex-rs/tui/src/app/sidebar.rs
++++ b/codex-rs/tui/src/app/sidebar.rs
+@@ -78,6 +78,7 @@ pub(super) struct SidebarInputState {
+ pub(super) struct SidebarPane {
+     pub(super) creation: Option<SideCreation>,
+     pub(super) close: Option<super::sidebar_close::Confirmation>,
++    pub(super) terminal_status: Option<crate::tui_status::StatusPublisher>,
+     content: SidebarContent,
+     tabs: Vec<ThreadId>,
+     // The chooser keeps the same order when an attached chat becomes a live tab.
+@@ -96,14 +97,28 @@ pub(super) struct SidebarPane {
+ }
+ 
+ impl SidebarPane {
++    // One owner for every presentation mutation, including mouse/keyboard refocus,
++    // ready/close events and error recovery. Invalidate synchronously, before any await.
++    fn set_presentation(&mut self, content: SidebarContent, focus: Option<PaneFocus>) {
++        if (self.content != content || self.focus != focus)
++            && let Some(publisher) = &self.terminal_status
++        {
++            publisher.invalidate();
++        }
++        self.content = content;
++        self.focus = focus;
++    }
++
+     pub(super) fn show(&mut self, content: SidebarContent, focus: PaneFocus) {
++        let reset_choice = self.content != content || self.focus.is_none();
++        self.set_presentation(content, Some(focus));
+         match content {
+             SidebarContent::Chat(id) => {
+                 self.add_tab(id);
+                 self.visits.retain(|visited| *visited != id);
+                 self.visits.push(id);
+             }
+-            SidebarContent::Chooser if self.content != content || self.focus.is_none() => {
++            SidebarContent::Chooser if reset_choice => {
+                 self.reset_choice();
+             }
+             SidebarContent::Chooser => {}
+@@ -111,8 +126,6 @@ impl SidebarPane {
+         if content != SidebarContent::Chooser || focus == PaneFocus::Main {
+             self.opening = None;
+         }
+-        self.content = content;
+-        self.focus = Some(focus);
+     }
+ 
+     pub(super) fn chat_tabs(&self) -> ChatTabs<'_> {
+@@ -222,13 +235,13 @@ impl SidebarPane {
+         if self.content == SidebarContent::Chooser
+             && let Some(selected) = self.selected_chat()
+         {
+-            self.content = SidebarContent::Chat(selected);
++            self.set_presentation(SidebarContent::Chat(selected), self.focus);
+         }
+     }
+ 
+     pub(super) fn hide(&mut self) {
++        self.set_presentation(self.content, None);
+         self.opening = None;
+-        self.focus = None;
+     }
+ 
+     pub(super) fn remove_chat(&mut self, id: ThreadId, storage: SideChatStorage) {
+@@ -243,7 +256,7 @@ impl SidebarPane {
+             self.remove_choice(id);
+         }
+         if self.content == SidebarContent::Chat(id) {
+-            self.content = match self.selected_chat() {
++            let content = match self.selected_chat() {
+                 Some(child) => SidebarContent::Chat(child),
+                 None => {
+                     self.hide();
+@@ -251,6 +264,7 @@ impl SidebarPane {
+                     SidebarContent::Chooser
+                 }
+             };
++            self.set_presentation(content, self.focus);
+         }
+     }
+ 
+@@ -399,7 +413,10 @@ impl App {
+     }
+ 
+     pub(super) fn sidebar_mut(&mut self) -> &mut SidebarPane {
+-        self.sidebars.entry(self.sidebar_parent()).or_default()
++        let publisher = self.terminal_status.clone();
++        let pane = self.sidebars.entry(self.sidebar_parent()).or_default();
++        pane.terminal_status = publisher;
++        pane
+     }
+ 
+     pub(super) fn chooser_focus(&self) -> Option<PaneFocus> {
 diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
-index f1e83e5..146b77f 100644
+index 4ca0360..a9c0dd1 100644
 --- a/codex-rs/tui/src/app/startup.rs
 +++ b/codex-rs/tui/src/app/startup.rs
-@@ -966,6 +966,7 @@ See the Codex keymap documentation for supported actions and examples."
-             agents_overview::AgentsOverviewState::new(local_settings.tui.agents_overview_grouping);
+@@ -987,6 +987,7 @@ See the Codex keymap documentation for supported actions and examples."
          let mut app = Self {
+             provider_writes,
              feature_write_lock: Arc::default(),
 +            terminal_status: None,
              config_notification_test_generation: 0,
              config_notification_test_pending: None,
              model_catalog,
-@@ -1275,6 +1276,10 @@ See the Codex keymap documentation for supported actions and examples."
-         let initial_owner = app_server.backend_id();
-         let mut backends =
-             super::backend_sessions::BackendSessions::from_initial(app_server, other_backends);
+@@ -1324,6 +1325,10 @@ See the Codex keymap documentation for supported actions and examples."
+             }
+         }
+         backends.settings = backend_settings;
 +        let tui_status = crate::tui_status::StatusService::start(&app.config.codex_home);
 +        app.terminal_status = tui_status
 +            .as_ref()
 +            .map(crate::tui_status::StatusService::publisher);
  
+         let mut parked_side_completions = HashMap::<_, Vec<AppEvent>>::new();
          let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
-             Ok(exit_reason)
-@@ -1291,6 +1296,7 @@ See the Codex keymap documentation for supported actions and examples."
+@@ -1353,6 +1358,7 @@ See the Codex keymap documentation for supported actions and examples."
                  {
                      app.begin_reconnect();
                  }
@@ -2581,7 +2873,7 @@ index f1e83e5..146b77f 100644
                  // Reconnect can dismiss an overlay from the server-event path.
                  if app.overlay.is_none() {
                      if !tui.is_owned_screen() && tui.is_alt_screen_active() {
-@@ -1680,6 +1686,7 @@ See the Codex keymap documentation for supported actions and examples."
+@@ -1784,6 +1790,7 @@ See the Codex keymap documentation for supported actions and examples."
              }
          };
          // Let the pending terminal poll unwind while the app server shuts down.
@@ -2590,42 +2882,362 @@ index f1e83e5..146b77f 100644
          app.chat_widget.mention_usage_mut().flush().await;
          if let Err(err) = backends.shutdown().await {
 diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
-index a0efb33..b4c301e 100644
+index a07888d..59aad86 100644
 --- a/codex-rs/tui/src/app/test_support.rs
 +++ b/codex-rs/tui/src/app/test_support.rs
-@@ -22,6 +22,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
- 
+@@ -45,6 +45,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
      Box::new(App {
+         provider_writes: HashMap::new(),
          feature_write_lock: Arc::default(),
 +        terminal_status: None,
          config_notification_test_generation: 0,
          config_notification_test_pending: None,
          model_catalog: chat_widget.model_catalog(),
 diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
-index a2d2191..a10fb9f 100644
+index cf56ac7..32c0f5a 100644
 --- a/codex-rs/tui/src/app/tests.rs
 +++ b/codex-rs/tui/src/app/tests.rs
-@@ -6409,6 +6409,7 @@ async fn make_test_app() -> Box<App> {
+@@ -3327,27 +3327,57 @@ async fn docked_replay_finishes_while_skills_refresh_is_pending() -> Result<()>
+     Ok(())
+ }
+ 
+-#[tokio::test]
+-async fn sidebar_reopens_saved_side_chat_after_restart() -> Result<()> {
+-    boxed_future!(reopen_saved_side_chat(DuringOpen::Navigate)).await
++#[test]
++fn terminal_status_sidebar_reopens_saved_side_chat_after_restart() -> Result<()> {
++    run_saved_side_chat_regression(DuringOpen::Navigate)
+ }
+ 
+-#[tokio::test]
+-async fn closed_saved_chat_keeps_its_live_read_receipt_during_install() -> Result<()> {
+-    boxed_future!(reopen_saved_side_chat(DuringOpen::Close)).await
++#[test]
++fn closed_saved_chat_keeps_its_live_read_receipt_during_install() -> Result<()> {
++    run_saved_side_chat_regression(DuringOpen::Close)
+ }
+ 
+-#[tokio::test]
+-async fn saved_chat_replays_approval_after_a_stale_runtime_close() -> Result<()> {
+-    boxed_future!(reopen_saved_side_chat(DuringOpen::Approval)).await
++#[test]
++fn saved_chat_replays_approval_after_a_stale_runtime_close() -> Result<()> {
++    run_saved_side_chat_regression(DuringOpen::Approval)
+ }
+ 
+-#[tokio::test]
+-async fn fork_releases_a_provisional_saved_chat_on_its_original_connection() -> Result<()> {
+-    boxed_future!(reopen_saved_side_chat(DuringOpen::Fork)).await
++#[test]
++fn fork_releases_a_provisional_saved_chat_on_its_original_connection() -> Result<()> {
++    run_saved_side_chat_regression(DuringOpen::Fork)
+ }
+ 
++#[test]
++fn terminal_status_chooser_invalidates_before_blocked_mouse_selection_and_keyboard_refocus()
++-> Result<()> {
++    run_saved_side_chat_regression(DuringOpen::Focus)
++}
++
++fn run_saved_side_chat_regression(during: DuringOpen) -> Result<()> {
++    // The native app/embedded-server future exceeds the default libtest stack in dev-small.
++    // Keep the larger stack local to these fixtures, as in terminal_status_excludes_displayed_replay.
++    std::thread::Builder::new()
++        .name(format!("saved-chat-{during:?}"))
++        .stack_size(16 * 1024 * 1024)
++        .spawn(move || {
++            let runtime = tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()?;
++            runtime.block_on(async {
++                time::timeout(
++                    Duration::from_secs(120),
++                    boxed_future!(reopen_saved_side_chat(during)),
++                )
++                .await?
++            })
++        })?
++        .join()
++        .expect("saved chat test thread")
++}
++
++#[derive(Debug)]
+ enum DuringOpen {
++    Focus,
+     Navigate,
+     Close,
+     Approval,
+@@ -3530,6 +3560,94 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
+         ])
+     );
+     assert_eq!(app.sidebar().unwrap().choice, 1);
++    if matches!(during, DuringOpen::Focus) {
++        use super::sidebar::{PaneFocus, SidebarContent};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        let home = tempfile::Builder::new()
++            .prefix("status-focus-")
++            .tempdir_in("/tmp")?;
++        let service =
++            crate::tui_status::StatusService::start(home.path()).expect("status endpoint");
++        app.terminal_status = Some(service.publisher());
++        let socket = home
++            .path()
++            .join("tui-status")
++            .join(format!("{}.sock", std::process::id()));
++        let query = async || -> Result<serde_json::Value> {
++            let mut client = tokio::net::UnixStream::connect(&socket).await?;
++            client.write_all(b"{\"v\":1,\"type\":\"status\"}\n").await?;
++            let mut bytes = Vec::new();
++            time::timeout(Duration::from_secs(2), client.read_to_end(&mut bytes)).await??;
++            Ok(serde_json::from_slice(&bytes)?)
++        };
++        app.sidebar_mut()
++            .show(SidebarContent::Chooser, PaneFocus::Main);
++        side_frame(&mut app, &mut tui, size)?;
++        app.publish_tui_status(&server);
++        let before = query().await?;
++        assert_eq!(before["displayed_thread_id"], parent.to_string());
++        let saved = app.sidebar().unwrap().chat_tabs().choice(1).unwrap();
++        app.ensure_thread_channel(saved);
++        app.thread_event_channels
++            .get_mut(&saved)
++            .unwrap()
++            .mark_replay_only();
++        let store = Arc::clone(&app.thread_event_channels[&saved].store);
++        let held = store.lock().await;
++        let area = app.conversation_frame.chooser_area().unwrap();
++        let pane = app.sidebar().unwrap();
++        let row = (area.y..area.bottom())
++            .find(|row| {
++                crate::sidebar_chooser::choice_at(area, pane.chat_tabs(), pane.choice, *row)
++                    == Some(1)
++            })
++            .expect("saved row");
++        let click = mouse(MouseEventKind::Down(MouseButton::Left), area.x + 1, row);
++        {
++            let transition = app.handle_sidebar_input(&mut tui, &mut server, &click);
++            tokio::pin!(transition);
++            assert!(
++                futures::poll!(&mut transition).is_pending(),
++                "selection must await held store"
++            );
++            // The independent socket task runs while the real dispatcher is blocked.
++            let blocked = query().await?;
++            assert!(blocked["displayed_thread_id"].is_null());
++            assert!(
++                blocked["generation"].as_u64().unwrap() > before["generation"].as_u64().unwrap()
++            );
++            assert_eq!(
++                query().await?["generation"],
++                blocked["generation"],
++                "unchanged query is stable"
++            );
++            drop(held);
++            assert!(time::timeout(Duration::from_secs(5), transition).await?);
++        }
++        app.sidebar_mut()
++            .show(SidebarContent::Chooser, PaneFocus::Main);
++        app.publish_tui_status(&server);
++        let before_key = query().await?;
++        assert_eq!(before_key["displayed_thread_id"], parent.to_string());
++        for key in [
++            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
++            KeyCode::Char('s').into(),
++        ] {
++            boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key))).await?;
++        }
++        assert_eq!(app.chooser_focus(), Some(PaneFocus::Sidebar));
++        let refocused = query().await?;
++        assert!(refocused["displayed_thread_id"].is_null());
++        assert!(
++            refocused["generation"].as_u64().unwrap() > before_key["generation"].as_u64().unwrap()
++        );
++        // Failed/cleared opening state cannot restore the previously published parent.
++        app.sidebar_mut().opening = None;
++        app.publish_tui_status(&server);
++        assert!(query().await?["displayed_thread_id"].is_null());
++        server.shutdown().await?;
++        return Ok(());
++    }
+     // The last frame showed New, but the first saved chat is now selected.
+     boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(enter))).await?;
+     assert_eq!(app.current_displayed_thread_id(), Some(parent));
+@@ -3709,8 +3827,20 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
+         .lines()
+         .filter_map(|row| row.split_once('│').map(|(_, pane)| pane.trim()))
+         .find(|row| row.contains("Opening…"));
+-    insta::assert_snapshot!(status.expect("opening row"), @"› ◌ Child-only prompt  Opening…");
++    // Several independent journey tests execute this shared assertion in one libtest process.
++    insta::allow_duplicates! {
++        insta::assert_snapshot!(status.expect("opening row"), @"› ◌ Child-only prompt  Opening…");
++    }
+     assert_eq!(app.current_displayed_thread_id(), Some(parent));
++    let preparing = app.tui_status(&server).1;
++    assert!(
++        preparing.displayed_thread_id.is_none(),
++        "chooser is not a focused conversation"
++    );
++    assert!(
++        !preparing.attached_thread_ids.contains(&child.to_string()),
++        "provisional restore is not live"
++    );
+     // Hold the completed request at the foreground installation boundary. Moving away,
+     // cancelling and reselecting the same child must share that request.
+     let completed = loop {
+@@ -3724,6 +3854,13 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
+         }
+         boxed_future!(app.handle_event(&mut tui, &mut server, event)).await?;
+     };
++    assert!(
++        !app.tui_status(&server)
++            .1
++            .attached_thread_ids
++            .contains(&child.to_string()),
++        "transport completion alone does not install the foreground channel"
++    );
+     let wait_for_close = async |server: &mut AppServerSession| {
+         while let Some(event) = server.next_event().await {
+             if matches!(&event.event, AppServerEvent::ServerNotification(n)
+@@ -3841,6 +3978,14 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
+                 Some("during-open".into())
+             )
+         );
++        drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
++        let status = app.tui_status(&server).1;
++        assert_eq!(status.displayed_thread_id, Some(child.to_string()));
++        assert_eq!(
++            status.attached_thread_ids.contains(&child.to_string()),
++            !closed,
++            "restored replay is never a live attachment"
++        );
+         if !closed {
+             assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("echo hello"));
+         }
+@@ -3899,6 +4044,10 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
+     }
+     boxed_future!(app.handle_event(&mut tui, &mut server, completed)).await?;
+     assert_eq!(app.current_displayed_thread_id(), Some(child));
++    assert!(
++        app.tui_status(&server).1.displayed_thread_id.is_none(),
++        "queued transcript replay must settle before foreground proof"
++    );
+     let held_accept = |kind| KeyEvent::new_with_kind(KeyCode::Char('g'), KeyModifiers::NONE, kind);
+     assert!(
+         app.chat_widget
+@@ -3966,12 +4115,29 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
+     ))
+     .await?;
+     drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
++    let focused_child = app.tui_status(&server).1;
++    assert_eq!(focused_child.displayed_thread_id, Some(child.to_string()));
++    assert!(
++        focused_child
++            .attached_thread_ids
++            .contains(&child.to_string())
++    );
++    assert_ne!(
++        focused_child.displayed_thread_id,
++        Some(parent.to_string()),
++        "the hidden main/parked companion must not supply foreground identity"
++    );
+     // The reopened child participates in keyboard navigation back to its parent.
+     let previous = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+     boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(previous))).await?;
+     assert_eq!(app.current_displayed_thread_id(), Some(parent));
++    assert!(app.tui_status(&server).1.displayed_thread_id.is_none());
+     // The name notification still updates the tab after focus returns to the parent.
+     drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
++    assert_eq!(
++        app.tui_status(&server).1.displayed_thread_id,
++        Some(parent.to_string())
++    );
+     loop {
+         let event = time::timeout(Duration::from_secs(/*secs*/ 5), server.next_event())
+             .await?
+@@ -4002,9 +4168,49 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
+             .and_then(|chat| chat.name.as_deref()),
+         Some("New name")
+     );
+-    app.select_agent_thread(&mut tui, &mut server, child)
+-        .await?;
++    // Reopen a second persisted workspace chat after restart. Both can remain attached,
++    // but only the focused tab can be the displayed proof.
++    app.sidebar_mut().show(
++        sidebar::SidebarContent::Chooser,
++        sidebar::PaneFocus::Sidebar,
++    );
++    let target = sidebar_loading::Target {
++        backend_id: server.backend_id(),
++        parent,
++        child: children[0],
++    };
++    app.open_saved_chat(&mut tui, &mut server, target).await?;
++    assert!(app.tui_status(&server).1.displayed_thread_id.is_none());
++    time::timeout(Duration::from_secs(5), async {
++        while app.current_displayed_thread_id() != Some(children[0]) {
++            let event = app
++                .saved_openings
++                .next_event(&mut events)
++                .await
++                .expect("second restored chat");
++            boxed_future!(app.handle_event(&mut tui, &mut server, event)).await?;
++        }
++        Result::<()>::Ok(())
++    })
++    .await??;
+     drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
++    let second = app.tui_status(&server).1;
++    assert_eq!(second.displayed_thread_id, Some(children[0].to_string()));
++    assert!(
++        second
++            .attached_thread_ids
++            .contains(&children[0].to_string())
++    );
++    assert!(second.attached_thread_ids.contains(&child.to_string()));
++    for selected in [parent, child, children[0], child] {
++        app.select_agent_thread(&mut tui, &mut server, selected)
++            .await?;
++        assert!(app.tui_status(&server).1.displayed_thread_id.is_none());
++        drain_app_events(&mut app, &mut tui, &mut server, &mut events).await?;
++        let focused = app.tui_status(&server).1;
++        assert_eq!(focused.displayed_thread_id, Some(selected.to_string()));
++        assert!(focused.attached_thread_ids.contains(&selected.to_string()));
++    }
+     let archive = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL);
+     boxed_future!(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(archive))).await?;
+     let frame = side_frame(&mut app, &mut tui, size)?;
+@@ -4014,7 +4220,9 @@ async fn reopen_saved_side_chat(during: DuringOpen) -> Result<()> {
+         .map(|(_, pane)| pane.trim())
+         .find(|line| line.contains("remove it"))
+         .unwrap_or_else(|| panic!("expected the archive confirmation in {frame}"));
+-    insta::assert_snapshot!(prompt, @"This will remove it from Side chats. Archive “New name”?");
++    insta::allow_duplicates! {
++        insta::assert_snapshot!(prompt, @"This will remove it from Side chats. Archive “New name”?");
++    }
+     let enter = TuiEvent::Key(KeyCode::Enter.into());
+     boxed_future!(app.handle_tui_event(&mut tui, &mut server, enter)).await?;
+     assert_eq!(app.current_displayed_thread_id(), Some(child));
+@@ -8926,6 +9134,7 @@ async fn make_test_app() -> Box<App> {
+     let session_telemetry = test_session_telemetry(&config, model.as_str());
  
      Box::new(App {
-         feature_write_lock: Arc::default(),
 +        terminal_status: None,
+         provider_writes: HashMap::new(),
+         feature_write_lock: Arc::default(),
          config_notification_test_generation: 0,
-         config_notification_test_pending: None,
-         model_catalog: chat_widget.model_catalog(),
-@@ -6535,6 +6536,7 @@ pub(super) async fn make_test_app_with_channels() -> (
+@@ -9066,6 +9275,7 @@ pub(super) async fn make_test_app_with_channels() -> (
+ 
      (
          Box::new(App {
-             feature_write_lock: Arc::default(),
 +            terminal_status: None,
+             provider_writes: HashMap::new(),
+             feature_write_lock: Arc::default(),
              config_notification_test_generation: 0,
-             config_notification_test_pending: None,
-             model_catalog: chat_widget.model_catalog(),
 diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
-index e4ecae0..ac72f8a 100644
+index 57145d6..579cee0 100644
 --- a/codex-rs/tui/src/app/thread_routing.rs
 +++ b/codex-rs/tui/src/app/thread_routing.rs
-@@ -86,6 +86,7 @@ impl App {
+@@ -105,6 +105,7 @@ impl App {
      }
  
      pub(super) async fn activate_thread_channel(&mut self, thread_id: ThreadId) {
@@ -2633,7 +3245,7 @@ index e4ecae0..ac72f8a 100644
          if self.active_thread_id.is_some() {
              return;
          }
-@@ -101,6 +102,7 @@ impl App {
+@@ -131,6 +132,7 @@ impl App {
      }
  
      pub(super) async fn store_active_thread_receiver(&mut self) {
@@ -2641,7 +3253,7 @@ index e4ecae0..ac72f8a 100644
          let Some(active_id) = self.active_thread_id else {
              return;
          };
-@@ -155,6 +157,7 @@ impl App {
+@@ -188,6 +190,7 @@ impl App {
      }
  
      pub(super) async fn clear_active_thread(&mut self) {
@@ -2649,7 +3261,7 @@ index e4ecae0..ac72f8a 100644
          if let Some(active_id) = self.active_thread_id.take() {
              self.set_thread_active(active_id, /*active*/ false).await;
          }
-@@ -223,6 +226,70 @@ impl App {
+@@ -266,6 +269,79 @@ impl App {
          self.active_thread_id.or(self.chat_widget.thread_id())
      }
  
@@ -2685,6 +3297,10 @@ index e4ecae0..ac72f8a 100644
 +                .iter()
 +                .filter(|(id, channel)| {
 +                    channel.attachment() == ThreadEventAttachment::Live
++                        && channel
++                            .backend_id
++                            .is_none_or(|owner| owner == session.backend_id())
++                        && !self.saved_openings.preparing(**id, Some(channel))
 +                        && attached
 +                            .as_ref()
 +                            .is_none_or(|threads| threads.contains(&id.to_string()))
@@ -2696,7 +3312,12 @@ index e4ecae0..ac72f8a 100644
 +            Vec::new()
 +        };
 +        attached_thread_ids.sort();
++        // The active widget follows focus, including restored workspace side chats; the
++        // primary thread and parked companion are not the foreground conversation. Queued
++        // Park/Reset/Finish events must settle before any new foreground proof is published.
 +        let displayed_thread_id = if may_claim
++            && self.pending_thread_switch_resets == 0
++            && self.chooser_focus() != Some(super::sidebar::PaneFocus::Sidebar)
 +            && !self
 +                .chat_widget
 +                .active_view_is(super::agents_overview::AGENTS_OVERVIEW_VIEW_ID)
@@ -2720,7 +3341,7 @@ index e4ecae0..ac72f8a 100644
      pub(super) fn ignore_same_thread_resume(
          &mut self,
          target_session: &crate::resume_picker::SessionTarget,
-@@ -2122,6 +2189,45 @@ mod tests {
+@@ -2230,6 +2306,63 @@ mod tests {
      use codex_protocol::models::ActivePermissionProfile;
      use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
  
@@ -2748,6 +3369,24 @@ index e4ecae0..ac72f8a 100644
 +                        Some(thread_id.to_string().as_str())
 +                    );
 +                    assert!(live.attached_thread_ids.contains(&thread_id.to_string()));
++                    let view = app.tui_status(&server.request_view()).1;
++                    assert!(
++                        view.displayed_thread_id.is_none(),
++                        "request view is not a live connection owner"
++                    );
++                    assert!(view.attached_thread_ids.is_empty());
++                    app.thread_event_channels
++                        .get_mut(&thread_id)
++                        .unwrap()
++                        .backend_id = Some(crate::backend_id::BackendId::new());
++                    assert!(
++                        app.tui_status(&server).1.attached_thread_ids.is_empty(),
++                        "another backend's channel is not an attachment"
++                    );
++                    app.thread_event_channels
++                        .get_mut(&thread_id)
++                        .unwrap()
++                        .backend_id = Some(server.backend_id());
 +                    app.thread_event_channels
 +                        .get_mut(&thread_id)
 +                        .expect("live channel")
@@ -2767,7 +3406,7 @@ index e4ecae0..ac72f8a 100644
          let temp_dir = tempfile::tempdir().expect("tempdir");
          ConfigBuilder::default()
 diff --git a/codex-rs/tui/src/app/voice_owner.rs b/codex-rs/tui/src/app/voice_owner.rs
-index 67ca610..267d419 100644
+index 3b0af9f..b3b69dc 100644
 --- a/codex-rs/tui/src/app/voice_owner.rs
 +++ b/codex-rs/tui/src/app/voice_owner.rs
 @@ -125,6 +125,7 @@ impl App {
@@ -2775,14 +3414,14 @@ index 67ca610..267d419 100644
          destination: Option<ThreadId>,
      ) {
 +        self.invalidate_tui_status();
-         let thread_ids: Vec<_> = self.thread_event_channels.keys().copied().collect();
-         for thread_id in thread_ids {
-             if self.voice_owner_thread_id() == Some(thread_id)
+         let thread_ids: Vec<_> = self
+             .thread_event_channels
+             .iter()
 diff --git a/codex-rs/tui/src/app/working_directory.rs b/codex-rs/tui/src/app/working_directory.rs
-index b15fb9a..15b8626 100644
+index 7a3a796..82fc407 100644
 --- a/codex-rs/tui/src/app/working_directory.rs
 +++ b/codex-rs/tui/src/app/working_directory.rs
-@@ -154,6 +154,7 @@ impl App {
+@@ -153,6 +153,7 @@ impl App {
          )>,
          destination_config: DestinationConfig,
      ) {
@@ -2799,32 +3438,32 @@ index b15fb9a..15b8626 100644
              started,
              config,
 diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
-index 683e732..37cd5c0 100644
+index 7a026d0..72b750a 100644
 --- a/codex-rs/tui/src/app_server_session.rs
 +++ b/codex-rs/tui/src/app_server_session.rs
-@@ -639,6 +639,65 @@ impl AppServerSession {
-         matches!(&self.client, AppServerClient::InProcess(_))
+@@ -874,6 +874,66 @@ impl AppServerSession {
+             .and_then(|client| client.codex_home(local_codex_home))
      }
  
 +    pub(crate) fn status_probe(&self) -> Option<Arc<dyn crate::tui_status::ConnectionProbe>> {
-+        match &self.client {
-+            AppServerClient::Remote(client) => Some(Arc::new(client.status_handle())),
++        match &self.connection_owner {
++            Some(AppServerClient::Remote(client)) => Some(Arc::new(client.status_handle())),
 +            _ => None,
 +        }
 +    }
 +
 +    pub(crate) fn status_attached_thread_ids(&self) -> Option<HashSet<String>> {
-+        match &self.client {
-+            AppServerClient::InProcess(_) => None,
-+            AppServerClient::Remote(client) => Some(client.attached_thread_ids()),
-+            AppServerClient::Cloud(_) => Some(HashSet::new()),
++        match &self.connection_owner {
++            Some(AppServerClient::InProcess(_)) => None,
++            Some(AppServerClient::Remote(client)) => Some(client.attached_thread_ids()),
++            _ => Some(HashSet::new()),
 +        }
 +    }
 +
 +    pub(crate) fn status_connection(&self) -> (u64, crate::tui_status::Connection) {
 +        use crate::tui_status::{Connection, ServerIdentity};
-+        match &self.client {
-+            AppServerClient::InProcess(_) => (
++        match &self.connection_owner {
++            Some(AppServerClient::InProcess(_)) => (
 +                0,
 +                Connection {
 +                    kind: "embedded",
@@ -2832,7 +3471,7 @@ index 683e732..37cd5c0 100644
 +                    server: None,
 +                },
 +            ),
-+            AppServerClient::Remote(client) => {
++            Some(AppServerClient::Remote(client)) => {
 +                let server = client.local_server_identity().map(|server| ServerIdentity {
 +                    pid: server.pid,
 +                    identity: server.identity.clone(),
@@ -2854,21 +3493,22 @@ index 683e732..37cd5c0 100644
 +                    },
 +                )
 +            }
-+            AppServerClient::Cloud(_) => (
++            // A request-only view is not a connection owner and cannot attest liveness.
++            _ => (
 +                0,
 +                Connection {
 +                    kind: "remote",
-+                    state: "connected",
++                    state: "disconnected",
 +                    server: None,
 +                },
 +            ),
 +        }
 +    }
 +
-     /// Carry capabilities that may exist only in memory when the optional cache is unwritable.
-     pub(crate) fn inherit_task_tool_capabilities(&mut self, previous: &Self) {
-         self.task_tool_threads.extend(&previous.task_tool_threads);
-@@ -4864,3 +4923,12 @@ mod tests {
+     pub(crate) fn server_version(&self) -> Option<&str> {
+         let Some(AppServerClient::Remote(client)) = &self.connection_owner else {
+             return None;
+@@ -5393,3 +5453,12 @@ mod tests {
          ));
      }
  }
@@ -2877,15 +3517,15 @@ index 683e732..37cd5c0 100644
 +    fn connected(&self) -> bool {
 +        self.is_connected()
 +    }
-+    fn attached_thread_ids(&self) -> HashSet<String> {
-+        self.attached_thread_ids()
++    fn attachment_snapshot(&self) -> codex_app_server_client::RemoteAttachmentSnapshot {
++        self.attachment_snapshot()
 +    }
 +}
 diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
-index 1b0b08c..a9d59b2 100644
+index 8b3608c..d449942 100644
 --- a/codex-rs/tui/src/lib.rs
 +++ b/codex-rs/tui/src/lib.rs
-@@ -139,6 +139,7 @@ mod markdown_copy;
+@@ -142,6 +142,7 @@ mod markdown_copy;
  mod permission_discovery;
  mod pets;
  mod security_setup;
@@ -2895,16 +3535,16 @@ index 1b0b08c..a9d59b2 100644
  mod assistant_directives;
 diff --git a/codex-rs/tui/src/tui_status.rs b/codex-rs/tui/src/tui_status.rs
 new file mode 100644
-index 0000000..6c1b5db
+index 0000000..5f12098
 --- /dev/null
 +++ b/codex-rs/tui/src/tui_status.rs
-@@ -0,0 +1,513 @@
+@@ -0,0 +1,573 @@
 +//! Read-only, same-user status published by the TUI's lifecycle owner.
 +//! No transcript, paths, prompts, or terminal control cross this socket.
 +
++use codex_app_server_client::RemoteAttachmentSnapshot;
 +use serde::Deserialize;
 +use serde::Serialize;
-+use std::collections::HashSet;
 +use std::sync::{Arc, Mutex};
 +
 +#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -2938,14 +3578,14 @@ index 0000000..6c1b5db
 +
 +pub(crate) trait ConnectionProbe: Send + Sync {
 +    fn connected(&self) -> bool;
-+    fn attached_thread_ids(&self) -> HashSet<String>;
++    fn attachment_snapshot(&self) -> RemoteAttachmentSnapshot;
 +}
 +
 +struct Published {
 +    snapshot: Snapshot,
 +    connection_generation: u64,
 +    probe: Option<Arc<dyn ConnectionProbe>>,
-+    previous: Option<(u64, Snapshot)>,
++    previous: Option<(u64, u64, Snapshot)>,
 +    generation: u64,
 +}
 +
@@ -2953,11 +3593,14 @@ index 0000000..6c1b5db
 +    fn current(&mut self) -> Snapshot {
 +        let mut snapshot = self.snapshot.clone();
 +        snapshot.generation = 0;
++        let mut attachment_revision = 0;
 +        if let Some(probe) = &self.probe {
 +            if !probe.connected() {
 +                snapshot.connection.state = "disconnected";
 +            }
-+            let attached = probe.attached_thread_ids();
++            let attachments = probe.attachment_snapshot();
++            attachment_revision = attachments.revision;
++            let attached = attachments.thread_ids;
 +            if attached.len() > 64 {
 +                snapshot.attached_thread_ids = attached.into_iter().take(65).collect();
 +            } else {
@@ -2974,11 +3617,24 @@ index 0000000..6c1b5db
 +            snapshot.attached_thread_ids.clear();
 +        }
 +        snapshot.attached_thread_ids.sort();
-+        if self.previous.as_ref().is_none_or(|(generation, previous)| {
-+            *generation != self.connection_generation || previous != &snapshot
-+        }) {
-+            self.generation = self.generation.saturating_add(1);
-+            self.previous = Some((self.connection_generation, snapshot.clone()));
++        if self
++            .previous
++            .as_ref()
++            .is_none_or(|(generation, revision, previous)| {
++                *generation != self.connection_generation
++                    || *revision != attachment_revision
++                    || previous != &snapshot
++            })
++        {
++            self.generation = self
++                .generation
++                .checked_add(1)
++                .expect("status generation exhausted");
++            self.previous = Some((
++                self.connection_generation,
++                attachment_revision,
++                snapshot.clone(),
++            ));
 +        }
 +        snapshot.generation = self.generation;
 +        snapshot
@@ -3181,6 +3837,7 @@ index 0000000..6c1b5db
 +#[cfg(all(test, unix))]
 +mod tests {
 +    use super::*;
++    use std::collections::HashSet;
 +    use std::os::unix::fs::PermissionsExt;
 +    use std::sync::atomic::{AtomicBool, Ordering};
 +    use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3290,14 +3947,14 @@ index 0000000..6c1b5db
 +
 +    struct Probe {
 +        connected: AtomicBool,
-+        ids: Mutex<HashSet<String>>,
++        attachments: Mutex<RemoteAttachmentSnapshot>,
 +    }
 +    impl ConnectionProbe for Probe {
 +        fn connected(&self) -> bool {
 +            self.connected.load(Ordering::Acquire)
 +        }
-+        fn attached_thread_ids(&self) -> HashSet<String> {
-+            self.ids.lock().expect("ids").clone()
++        fn attachment_snapshot(&self) -> RemoteAttachmentSnapshot {
++            self.attachments.lock().expect("attachments").clone()
 +        }
 +    }
 +
@@ -3307,7 +3964,10 @@ index 0000000..6c1b5db
 +        let service = StatusService::start(home.path()).expect("bind");
 +        let probe = Arc::new(Probe {
 +            connected: AtomicBool::new(true),
-+            ids: Mutex::new(HashSet::from(["a".to_owned()])),
++            attachments: Mutex::new(RemoteAttachmentSnapshot {
++                revision: 1,
++                thread_ids: HashSet::from(["a".to_owned()]),
++            }),
 +        });
 +        let mut active = snapshot(Some("a"));
 +        active.connection = Connection {
@@ -3322,10 +3982,20 @@ index 0000000..6c1b5db
 +            .publisher()
 +            .publish(1, active.clone(), Some(probe.clone()));
 +        let generation = current(&service).generation;
-+        probe.ids.lock().expect("ids").clear();
++        probe
++            .attachments
++            .lock()
++            .expect("attachments")
++            .thread_ids
++            .clear();
 +        assert!(current(&service).attached_thread_ids.is_empty());
 +        assert!(current(&service).generation > generation);
-+        probe.ids.lock().expect("ids").insert("a".to_owned());
++        probe
++            .attachments
++            .lock()
++            .expect("attachments")
++            .thread_ids
++            .insert("a".to_owned());
 +        active.attached_thread_ids.clear(); // UI marks the displayed channel as saved-history replay.
 +        service.publisher().publish(1, active, Some(probe.clone()));
 +        assert!(current(&service).attached_thread_ids.is_empty());
@@ -3335,6 +4005,36 @@ index 0000000..6c1b5db
 +        assert_eq!(disconnected.connection.state, "disconnected");
 +        assert!(disconnected.connection.server.is_none());
 +        assert!(disconnected.displayed_thread_id.is_none());
++    }
++
++    #[tokio::test]
++    async fn terminal_attachment_aba_advances_generation_without_intermediate_query() {
++        let home = directory();
++        let service = StatusService::start(home.path()).expect("bind");
++        let probe = Arc::new(Probe {
++            connected: AtomicBool::new(true),
++            attachments: Mutex::new(RemoteAttachmentSnapshot {
++                revision: 1,
++                thread_ids: HashSet::from(["a".to_owned()]),
++            }),
++        });
++        let publisher = service.publisher();
++        publisher.publish(1, snapshot(Some("a")), Some(probe.clone()));
++        let first = current(&service).generation;
++        {
++            let mut attachments = probe.attachments.lock().unwrap();
++            attachments.thread_ids.clear();
++            attachments.revision += 1;
++            attachments.thread_ids.insert("a".to_owned());
++            attachments.revision += 1;
++        }
++        // No publish/query occurred during the empty ownership interval.
++        let after = current(&service);
++        assert_eq!(after.displayed_thread_id.as_deref(), Some("a"));
++        assert_eq!(after.attached_thread_ids, vec!["a"]);
++        assert!(after.generation > first);
++        publisher.publish(1, snapshot(Some("a")), Some(probe));
++        assert_eq!(current(&service).generation, after.generation);
 +    }
 +
 +    #[tokio::test]

@@ -149,6 +149,232 @@ pub(crate) struct TerminalBinding {
     pub(crate) status_directory: PathBuf,
 }
 
+/// Prior ancestry-authenticated hook producer, persisted beside the keyed conversation and
+/// TUI nonce. This is lineage, NOT measurement of the current executable or its version.
+/// A future current-image proof must bind to this record rather than manufacture ancestry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BackendLineage {
+    pub(crate) backend_pid: u32,
+    pub(crate) backend_identity: String,
+    pub(crate) adapter_version: String,
+    pub(crate) tui_pid: u32,
+    pub(crate) tui_identity: String,
+    /// Original hook directory. Legacy records cannot admit a new TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) status_directory: Option<PathBuf>,
+}
+
+impl BackendLineage {
+    pub(crate) fn from_hook(binding: &TerminalBinding, adapter_version: String) -> Self {
+        Self {
+            backend_pid: binding.server_pid,
+            backend_identity: binding.server_identity.clone(),
+            adapter_version,
+            tui_pid: binding.tui_pid,
+            tui_identity: binding.tui_identity.clone(),
+            status_directory: Some(binding.status_directory.clone()),
+        }
+    }
+    pub(crate) fn valid(&self) -> bool {
+        self.backend_pid > 0
+            && self.tui_pid > 0
+            && self.backend_pid != self.tui_pid
+            && [&self.backend_identity, &self.tui_identity]
+                .iter()
+                .all(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control))
+            && crate::agent_protocol::valid_token(&self.adapter_version).is_ok()
+            && self.status_directory.as_ref().is_none_or(|directory| {
+                directory.is_absolute() && directory.as_os_str().len() <= 4096
+            })
+    }
+    pub(crate) fn matches_backend(&self, binding: &TerminalBinding) -> bool {
+        self.valid()
+            && self.backend_pid == binding.server_pid
+            && self.backend_identity == binding.server_identity
+    }
+    pub(crate) fn admits_native_join(&self, binding: &TerminalBinding) -> bool {
+        self.matches_backend(binding)
+            && self.status_directory.as_ref() == Some(&binding.status_directory)
+    }
+    pub(crate) fn matches(&self, binding: &TerminalBinding, version: &str) -> bool {
+        self.valid()
+            && self.backend_pid == binding.server_pid
+            && self.backend_identity == binding.server_identity
+            && self.tui_pid == binding.tui_pid
+            && self.tui_identity == binding.tui_identity
+            && self.adapter_version == version
+            && self
+                .status_directory
+                .as_ref()
+                .is_none_or(|directory| directory == &binding.status_directory)
+    }
+}
+
+/// Memory-only native evidence, kept distinct from actual hook authentication.
+#[derive(Clone, Debug)]
+pub(crate) struct DerivedAdmission {
+    lineage: BackendLineage,
+    incarnation: TerminalBinding,
+    backend: crate::native_codex_image::VerifiedCodexImage,
+    tui: crate::native_codex_image::VerifiedCodexImage,
+}
+
+impl DerivedAdmission {
+    pub(crate) async fn observe(
+        paths: &crate::storage::CiaoPaths,
+        lineage: &BackendLineage,
+        binding: &TerminalBinding,
+    ) -> Option<Self> {
+        if !lineage.admits_native_join(binding) {
+            return None;
+        }
+        // Independent observations share the native API's existing two-operation bound.
+        let (backend, tui) = tokio::join!(
+            crate::native_codex_image::observe(paths, binding.server_pid, &binding.server_identity),
+            crate::native_codex_image::observe(paths, binding.tui_pid, &binding.tui_identity),
+        );
+        Self::from_images(lineage, binding, backend?, tui?)
+    }
+
+    pub(crate) fn from_images(
+        lineage: &BackendLineage,
+        binding: &TerminalBinding,
+        backend: crate::native_codex_image::VerifiedCodexImage,
+        tui: crate::native_codex_image::VerifiedCodexImage,
+    ) -> Option<Self> {
+        if !lineage.admits_native_join(binding)
+            || !grounded_image_pair(backend.version().as_str(), tui.version().as_str())
+        {
+            return None;
+        }
+        Some(Self {
+            lineage: lineage.clone(),
+            incarnation: binding.clone(),
+            backend,
+            tui,
+        })
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    pub(crate) async fn revalidate_fixture(
+        &self,
+        binding: &TerminalBinding,
+        executable: PathBuf,
+    ) -> bool {
+        if !self.covers(&self.lineage, binding) {
+            return false;
+        }
+        let (backend, tui) = tokio::join!(
+            crate::native_codex_image::revalidate_fixture(
+                binding.server_pid,
+                &binding.server_identity,
+                &self.backend,
+                executable.clone()
+            ),
+            crate::native_codex_image::revalidate_fixture(
+                binding.tui_pid,
+                &binding.tui_identity,
+                &self.tui,
+                executable
+            ),
+        );
+        backend && tui
+    }
+
+    pub(crate) fn versions(&self) -> (&str, &str) {
+        (self.backend.version().as_str(), self.tui.version().as_str())
+    }
+    pub(crate) fn covers(&self, lineage: &BackendLineage, binding: &TerminalBinding) -> bool {
+        self.lineage == *lineage && self.incarnation.same_incarnations(binding)
+    }
+    pub(crate) async fn revalidate(
+        &self,
+        paths: &crate::storage::CiaoPaths,
+        binding: &TerminalBinding,
+    ) -> bool {
+        if !self.covers(&self.lineage, binding) {
+            return false;
+        }
+        let (backend, tui) = tokio::join!(
+            crate::native_codex_image::revalidate(
+                paths,
+                binding.server_pid,
+                &binding.server_identity,
+                &self.backend
+            ),
+            crate::native_codex_image::revalidate(
+                paths,
+                binding.tui_pid,
+                &binding.tui_identity,
+                &self.tui
+            ),
+        );
+        backend && tui
+    }
+}
+
+fn grounded_image_pair(backend: &str, tui: &str) -> bool {
+    backend == crate::codex_adapter::PINNED_CODEX_VERSION
+        && tui == crate::codex_adapter::PINNED_CODEX_VERSION
+}
+
+/// Correlates one read-only hook connection with its original authenticated association.
+/// This is not a route lease and cannot authorize terminal use.
+#[derive(Clone, Debug)]
+pub(crate) struct HookAssociation {
+    pub(crate) binding: TerminalBinding,
+    pub(crate) peer_pid: u32,
+    pub(crate) peer_identity: String,
+}
+
+impl TerminalBinding {
+    pub(crate) fn same_incarnations(&self, other: &Self) -> bool {
+        self.tui_pid == other.tui_pid
+            && self.tui_identity == other.tui_identity
+            && self.server_pid == other.server_pid
+            && self.server_identity == other.server_identity
+            && self.thread_id == other.thread_id
+            && self.status_directory == other.status_directory
+    }
+}
+
+impl HookAssociation {
+    async fn peer_is_current(&self) -> bool {
+        crate::process::terminal_identity(self.peer_pid)
+            .await
+            .as_ref()
+            == Some(&self.peer_identity)
+            && crate::process::terminal_identity(self.binding.server_pid)
+                .await
+                .as_ref()
+                == Some(&self.binding.server_identity)
+            && crate::process::descends_from(self.peer_pid, self.binding.server_pid).await
+    }
+
+    /// Fresh proof, not continuous ownership: an unsampled ABA is permitted for this new
+    /// read-only association only. Strict route generation checks remain in `revalidate`.
+    pub(crate) async fn resolve(&self) -> Option<TerminalBinding> {
+        if !self.peer_is_current().await {
+            return None;
+        }
+        let current = resolve_shared(
+            &self.binding.status_directory,
+            self.binding.server_pid,
+            &self.binding.thread_id,
+        )
+        .await
+        .ok()??;
+        if !self.binding.same_incarnations(&current)
+            || current.generation < self.binding.generation
+            || !self.peer_is_current().await
+        {
+            return None;
+        }
+        Some(current)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Snapshot {
     v: u8,
@@ -484,6 +710,11 @@ fn unambiguous(bindings: Vec<TerminalBinding>) -> Vec<TerminalBinding> {
 /// TUIs displaying the same backend/thread are ambiguous to the current single-route model.
 pub(crate) async fn live_bindings(directory: &Path) -> Result<Vec<TerminalBinding>> {
     timeout(DISCOVERY_TIMEOUT, async {
+        if private_directory(directory)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let directory = std::fs::canonicalize(directory).map_err(|_| invalid_status())?;
+        let directory = directory.as_path();
         let candidates = candidate_pids(directory)?;
         let mut tasks = JoinSet::new();
         let mut candidates = candidates.into_iter();
@@ -545,6 +776,23 @@ mod tests {
     use serde_json::json;
 
     const THREAD: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn idle_native_lane_requires_both_exact_grounded_versions() {
+        let pin = crate::codex_adapter::PINNED_CODEX_VERSION;
+        assert_eq!(
+            pin, "0.169.0",
+            "candidate lane requires explicit requalification"
+        );
+        for other in [
+            "", "unknown", "0.166.0", "0.168.9", "0.169.1", "0.170.0", "1.0.0",
+        ] {
+            assert!(!grounded_image_pair(pin, other));
+            assert!(grounded_image_pair(pin, pin));
+            assert!(!grounded_image_pair(other, pin));
+            assert!(grounded_image_pair(pin, pin));
+        }
+    }
 
     fn shared() -> Value {
         serde_json::from_str::<Value>(include_str!(
@@ -668,6 +916,46 @@ mod tests {
                 .unwrap()
                 .contains("terminal-status-sensitive-value")
         );
+    }
+
+    #[tokio::test]
+    async fn readonly_hook_peer_fences_reject_changed_peer_and_producer_incarnations() {
+        let pid = std::process::id();
+        let identity = crate::process::terminal_identity(pid).await.unwrap();
+        let mut association = HookAssociation {
+            binding: binding(pid, "00000000-0000-0000-0000-000000000001"),
+            peer_pid: pid,
+            peer_identity: identity.clone(),
+        };
+        association.binding.server_pid = pid;
+        association.binding.server_identity = identity;
+        assert!(association.peer_is_current().await);
+        association.peer_identity.push_str("-reused");
+        assert!(!association.peer_is_current().await);
+        association.peer_identity = association.binding.server_identity.clone();
+        association.binding.server_identity.push_str("-reused");
+        assert!(!association.peer_is_current().await);
+        association.binding.server_identity = association.peer_identity.clone();
+        association.binding.server_pid = u32::MAX;
+        assert!(!association.peer_is_current().await);
+    }
+
+    #[test]
+    fn readonly_hook_identity_requires_exact_thread_backend_tui_and_directory() {
+        let old = binding(42, "00000000-0000-0000-0000-000000000001");
+        for change in 0..7 {
+            let mut fresh = old.clone();
+            match change {
+                0 => fresh.generation += 2, // ABA can produce fresh proof, never continuity.
+                1 => fresh.tui_pid += 1,
+                2 => fresh.tui_identity.push_str("-reused"),
+                3 => fresh.server_pid += 1,
+                4 => fresh.server_identity.push_str("-reused"),
+                5 => fresh.thread_id = "00000000-0000-0000-0000-000000000002".into(),
+                _ => fresh.status_directory = "/other-status".into(),
+            }
+            assert_eq!(old.same_incarnations(&fresh), change == 0);
+        }
     }
 
     #[test]

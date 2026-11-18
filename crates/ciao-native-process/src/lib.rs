@@ -5,6 +5,18 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(target_os = "macos")]
+pub mod image;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod probe_runtime;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use probe_runtime::{can_reap_probe_children, prepare_probe_helper, reset_probe_alarm};
+
+/// Shared bounds for the two platform-specific native image proof helpers.
+pub const MAX_PROBE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_PROBE_TRANSACTIONS: usize = 4;
+pub const PROBE_ALARM_SECONDS: u32 = 20;
+
 #[cfg(any(target_os = "macos", test))]
 const MAX_KERNEL_ARGUMENT_BYTES: usize = 256 * 1024;
 #[cfg(any(target_os = "macos", test))]

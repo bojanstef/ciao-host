@@ -573,7 +573,7 @@ where
     Ok((version, reused))
 }
 
-fn native_image_identity(path: &std::path::Path) -> Result<(fs::File, String)> {
+pub(crate) fn native_image_identity(path: &std::path::Path) -> Result<(fs::File, String)> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut file = fs::OpenOptions::new()
         .read(true)

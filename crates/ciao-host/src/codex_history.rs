@@ -180,25 +180,12 @@ pub(crate) fn spawn_history_read(
         return false;
     }
     tokio::spawn(async move {
-        let Some(binary) = codex_binary_of(source.process_id).await else {
-            tracing::debug!(
-                session = %session_id,
-                "the Codex binary running this session could not be resolved; keeping the live tail"
-            );
+        let Some((binary, history)) =
+            read_observed_history(source.process_id, &codex_home, &thread_id, &live_run_id).await
+        else {
             return;
         };
-        // The resolved binary is the registration evidence discovery runs on (Spec 013 §8):
-        // proven from a live process, persisted so an unheld thread is reachable after every
-        // terminal has closed.
-        adoptions.record_binary_evidence(binary.clone());
-        let history =
-            match read_thread_in_home(&binary, &thread_id, &live_run_id, Some(&codex_home)).await {
-                Ok(history) => history,
-                Err(error) => {
-                    tracing::debug!(error = %error, "reading Codex thread history failed");
-                    return;
-                }
-            };
+        adoptions.record_binary_evidence(binary);
         let count = history.entries.len();
         let complete = complete_with_live_tail(&history, |source| {
             sessions.holds_source(&session_id, source)
@@ -219,6 +206,24 @@ pub(crate) fn spawn_history_read(
         }
     });
     true
+}
+
+/// Shared read-only orchestration. A process-derived path is history input, never native
+/// admission authority. The caller owns its registration/history commit fence and read claim.
+pub(crate) async fn read_observed_history(
+    process_id: u32,
+    codex_home: &std::path::Path,
+    thread_id: &str,
+    live_run_id: &str,
+) -> Option<(PathBuf, ThreadHistory)> {
+    let binary = codex_binary_of(process_id).await?;
+    match read_thread_in_home(&binary, thread_id, live_run_id, Some(codex_home)).await {
+        Ok(history) => Some((binary, history)),
+        Err(error) => {
+            tracing::debug!(error = %error, "reading Codex thread history failed");
+            None
+        }
+    }
 }
 
 /// The exact binary the observed session is running, taken from the process itself.

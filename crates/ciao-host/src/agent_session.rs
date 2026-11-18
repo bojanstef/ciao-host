@@ -267,6 +267,97 @@ struct SupervisorInner {
     /// daemon had stood there and seen the process die. Any registration for the ID revokes the
     /// verdict — a resumed session is alive, whatever was observed before.
     ended: HashMap<String, u64>,
+    /// Bounded, no-authority evidence survives selection invalidation/session erasure.
+    shared_recovery: HashMap<String, SharedRecoveryCandidate>,
+}
+
+#[derive(Debug, Clone)]
+struct SharedRecoveryCandidate {
+    ticket: String,
+    registration: NormalizedRegistration,
+    derived: Option<crate::codex_terminal_status::DerivedAdmission>,
+}
+
+/// Immutable pre-I/O receipt, including absence. Only a final locked CAS may replace it.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedRecoveryReceipt {
+    mapping: IdentityMapping,
+    candidate: Option<SharedRecoveryCandidate>,
+    live: Option<SessionFence>,
+    derived: Option<crate::codex_terminal_status::DerivedAdmission>,
+}
+
+impl SharedRecoveryReceipt {
+    pub(crate) fn lineage(&self) -> &crate::codex_terminal_status::BackendLineage {
+        self.mapping.backend_lineage.as_ref().unwrap()
+    }
+    pub(crate) fn directory(&self) -> Option<&Path> {
+        self.lineage().status_directory.as_deref().or_else(|| {
+            self.candidate
+                .as_ref()?
+                .registration
+                .terminal_binding
+                .as_ref()
+                .map(|binding| binding.status_directory.as_path())
+        })
+    }
+    pub(crate) fn unchanged(
+        &self,
+        binding: &crate::codex_terminal_status::TerminalBinding,
+    ) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.binding.as_ref() == Some(binding))
+    }
+    pub(crate) fn derived(&self) -> Option<&crate::codex_terminal_status::DerivedAdmission> {
+        self.derived.as_ref()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RecoveredSharedRow {
+    pub(crate) registered: RegisteredAgentSession,
+    pub(crate) binding: crate::codex_terminal_status::TerminalBinding,
+    fence: SessionFence,
+}
+
+/// Plan plus ORIGINAL opaque-route receipt. Carried across independently scheduled PTY/Core
+/// allocation; never refreshed from a later hook or history epoch before Opened.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingAgentTerminal {
+    pub(crate) plan: AgentTerminalPlan,
+    route_id: String,
+    record: RouteRecord,
+    fence: SessionFence,
+}
+
+/// Captured before I/O, checked at commit. Binding equality alone misses same-binding
+/// reconnects; a route ID alone misses renewed authentication of an unchanged route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionFence {
+    registered: RegisteredAgentSession,
+    process_id: u32,
+    proof_revision: u64,
+    binding: Option<crate::codex_terminal_status::TerminalBinding>,
+}
+
+impl SessionFence {
+    fn capture(session: &LiveSession) -> Self {
+        Self {
+            registered: RegisteredAgentSession {
+                session_id: session.snapshot.session_id.clone(),
+                process_generation: session.snapshot.process_generation,
+                snapshot_epoch: session.snapshot.snapshot_epoch,
+                disconnect_token: session.bridge_disconnect_token.clone(),
+            },
+            process_id: session.process_id,
+            proof_revision: session.proof_revision,
+            binding: session.terminal_binding.clone(),
+        }
+    }
+    fn matches(&self, session: &LiveSession) -> bool {
+        *self == Self::capture(session)
+    }
 }
 
 #[derive(Debug)]
@@ -281,8 +372,14 @@ struct LiveSession {
     /// the SDK resumes Claude's session by Claude's ID, not by Ciao's.
     upstream_identity: String,
     bridge_disconnect_token: String,
+    /// Incremented by fresh hook proof even when its binding is unchanged, fencing
+    /// negative scans started during this very connection's pending event.
+    proof_revision: u64,
     process_id: u32,
     terminal_binding: Option<crate::codex_terminal_status::TerminalBinding>,
+    /// Required at-use evidence belongs to live authority, never solely to an evictable
+    /// recovery candidate. Only an actual hook may replace it with hook authority.
+    derived_admission: Option<crate::codex_terminal_status::DerivedAdmission>,
     compatible: bool,
     offered_commands: CommandCapabilities,
     bridge_sender: Option<mpsc::Sender<BridgeCommandEnvelope>>,
@@ -352,10 +449,11 @@ struct SourceEntryMapping {
     settled: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteRecord {
     session_id: String,
     process_generation: u64,
+    terminal_binding: Option<crate::codex_terminal_status::TerminalBinding>,
     proof: AgentRouteProof,
 }
 
@@ -369,6 +467,7 @@ impl AgentSessionSupervisor {
                 server_epoch: nonzero_random_u64(),
                 carried_history: HashMap::new(),
                 ended: HashMap::new(),
+                shared_recovery: HashMap::new(),
             })),
             metadata: Arc::new(Mutex::new(metadata)),
             registration_gate: Arc::new(AsyncMutex::new(())),
@@ -405,9 +504,26 @@ impl AgentSessionSupervisor {
     /// Repeated events for the same live process retain canonical history and subscribers.
     pub(crate) async fn register_observer(
         &self,
-        mut registration: NormalizedRegistration,
+        registration: NormalizedRegistration,
     ) -> Result<RegisteredAgentSession> {
         let _registration_guard = self.registration_gate.lock().await;
+        self.register_observer_locked(registration)
+    }
+
+    /// Keep registration and its one event in the same scheduling critical section.
+    /// The bounded socket read owns this guard; polling can never strand a pending Stop.
+    pub(crate) async fn register_shared_observer(
+        &self,
+        registration: NormalizedRegistration,
+    ) -> Result<(RegisteredAgentSession, tokio::sync::OwnedMutexGuard<()>)> {
+        let guard = self.shared_hook_guard().await;
+        Ok((self.register_observer_locked(registration)?, guard))
+    }
+
+    fn register_observer_locked(
+        &self,
+        mut registration: NormalizedRegistration,
+    ) -> Result<RegisteredAgentSession> {
         // A child hook omits its workspace. Carry the known parent facts through refresh and
         // recovery metadata, including when the child works in its own isolated checkout.
         if registration.workspace_path.is_none() {
@@ -435,16 +551,338 @@ impl AgentSessionSupervisor {
         if registration.capabilities.commands != CommandCapabilities::none() {
             bail!("a transient observer cannot advertise native commands");
         }
-        if let Some(registered) = self.refresh_observer_registration(&registration)? {
-            return Ok(registered);
+        let registered = match self.refresh_observer_registration(&registration)? {
+            Some(registered) => registered,
+            None => self.register_new(registration.clone(), None)?,
+        };
+        self.metadata.lock().record_hook_lineage(&registration)?;
+        self.remember_shared_recovery(&registered.session_id, registration);
+        if self
+            .inner
+            .lock()
+            .sessions
+            .get(&registered.session_id)
+            .is_some_and(|session| session.route_id.is_none())
+        {
+            let supervisor = self.clone();
+            let session_id = registered.session_id.clone();
+            tokio::spawn(async move {
+                supervisor.refresh_route(&session_id).await;
+            });
         }
-        let registered = self.register_new(registration, None)?;
-        let supervisor = self.clone();
-        let session_id = registered.session_id.clone();
-        tokio::spawn(async move {
-            supervisor.refresh_route(&session_id).await;
-        });
         Ok(registered)
+    }
+
+    fn remember_shared_recovery(&self, session_id: &str, registration: NormalizedRegistration) {
+        let mut inner = self.inner.lock();
+        if registration.terminal_binding.is_none() {
+            inner.shared_recovery.remove(session_id);
+            return;
+        }
+        if inner.shared_recovery.len() >= MAX_IDENTITY_MAPPINGS
+            && !inner.shared_recovery.contains_key(session_id)
+        {
+            // Eviction withdraws recovery, never grants authority.
+            if let Some(id) = inner.shared_recovery.keys().next().cloned() {
+                inner.shared_recovery.remove(&id);
+            }
+        }
+        inner.shared_recovery.insert(
+            session_id.into(),
+            SharedRecoveryCandidate {
+                ticket: random_id(),
+                registration,
+                derived: None,
+            },
+        );
+    }
+
+    /// Rediscovery is not a connection. Validate prior hook lineage under the same gate
+    /// as registration; never replace an active token, epoch, turn or history.
+    pub(crate) async fn rediscover_observer(
+        &self,
+        registration: NormalizedRegistration,
+    ) -> Result<RegisteredAgentSession> {
+        let _guard = self.shared_hook_guard().await;
+        self.rediscover_observer_locked(registration)
+    }
+
+    fn rediscover_observer_locked(
+        &self,
+        registration: NormalizedRegistration,
+    ) -> Result<RegisteredAgentSession> {
+        registration
+            .validate()
+            .map_err(|_| anyhow!("invalid rediscovery"))?;
+        let metadata = self.metadata.lock();
+        let (id, _, _) = metadata
+            .mapping_for_process(&registration.upstream_identity, &registration.process_nonce)
+            .ok_or_else(|| anyhow!("rediscovery lacks prior hook identity"))?;
+        let mapping = metadata
+            .mapping_for(&registration.upstream_identity)
+            .unwrap();
+        if mapping.adapter_family != registration.adapter_family
+            || mapping.adapter_version != registration.adapter_version
+            || (mapping.backend_lineage.is_some() && registration.terminal_binding.is_none())
+            || registration
+                .terminal_binding
+                .as_ref()
+                .is_some_and(|binding| {
+                    !mapping.backend_lineage.as_ref().is_some_and(|lineage| {
+                        lineage.matches(binding, &registration.adapter_version)
+                    })
+                })
+        {
+            bail!("rediscovery lacks prior hook backend lineage");
+        }
+        drop(metadata);
+        let mut inner = self.inner.lock();
+        if let Some(candidate) = inner.shared_recovery.get(&id)
+            && let (Some(known), Some(discovered)) = (
+                candidate.registration.terminal_binding.as_ref(),
+                registration.terminal_binding.as_ref(),
+            )
+            && (!known.same_incarnations(discovered) || discovered.generation < known.generation)
+        {
+            bail!("rediscovery predates retained hook evidence");
+        }
+        if let Some(session) = inner.sessions.get_mut(&id) {
+            if session.process_id != registration.process_id
+                || session.terminal_binding != registration.terminal_binding
+            {
+                // Active discovery must not silently replace a connection's association.
+                // The periodic recovery path first revokes its old binding with a full fence.
+                bail!("rediscovery superseded by active registration");
+            }
+            return Ok(SessionFence::capture(session).registered);
+        }
+        drop(inner);
+        let registered = self.register_new(registration.clone(), None)?;
+        self.remember_shared_recovery(&registered.session_id, registration);
+        Ok(registered)
+    }
+
+    /// Hook-authenticated lineage only; not independently measured executable provenance.
+    pub(crate) fn registered_backend_lineage(
+        &self,
+        upstream: &str,
+        nonce: &str,
+    ) -> Option<crate::codex_terminal_status::BackendLineage> {
+        let metadata = self.metadata.lock();
+        metadata.mapping_for_process(upstream, nonce)?;
+        metadata.mapping_for(upstream)?.backend_lineage.clone()
+    }
+
+    pub(crate) fn shared_recovery_receipts(&self) -> Vec<SharedRecoveryReceipt> {
+        // Same lock order as history: inner, then metadata.
+        let inner = self.inner.lock();
+        self.metadata
+            .lock()
+            .mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.adapter_family == "Codex" && mapping.backend_lineage.is_some()
+            })
+            .map(|mapping| SharedRecoveryReceipt {
+                candidate: inner.shared_recovery.get(&mapping.session_id).cloned(),
+                live: inner
+                    .sessions
+                    .get(&mapping.session_id)
+                    .map(SessionFence::capture),
+                derived: inner
+                    .sessions
+                    .get(&mapping.session_id)
+                    .and_then(|session| session.derived_admission.clone())
+                    .or_else(|| {
+                        inner
+                            .shared_recovery
+                            .get(&mapping.session_id)
+                            .and_then(|candidate| candidate.derived.clone())
+                    }),
+                mapping: mapping.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn recovery_matches_thread(
+        &self,
+        receipt: &SharedRecoveryReceipt,
+        binding: &crate::codex_terminal_status::TerminalBinding,
+    ) -> bool {
+        receipt.mapping.upstream_digest == self.metadata.lock().digest(&binding.thread_id)
+            && receipt.lineage().matches_backend(binding)
+            && receipt
+                .directory()
+                .is_none_or(|directory| directory == binding.status_directory)
+    }
+
+    pub(crate) fn recovery_needs_native(
+        &self,
+        receipt: &SharedRecoveryReceipt,
+        registration: &NormalizedRegistration,
+    ) -> bool {
+        receipt.derived().is_some()
+            || receipt.mapping.adapter_version != receipt.lineage().adapter_version
+            || receipt.mapping.process_nonce_digest
+                != self.metadata.lock().digest(&registration.process_nonce)
+            || !registration
+                .terminal_binding
+                .as_ref()
+                .is_some_and(|binding| {
+                    receipt
+                        .lineage()
+                        .matches(binding, &registration.adapter_version)
+                })
+    }
+
+    pub(crate) fn commit_shared_recovery(
+        &self,
+        receipt: &SharedRecoveryReceipt,
+        registration: NormalizedRegistration,
+        derived: Option<crate::codex_terminal_status::DerivedAdmission>,
+    ) -> Option<RecoveredSharedRow> {
+        // Never wait behind a pending hook, nor hold this gate over native I/O.
+        let _guard = self.registration_gate.try_lock().ok()?;
+        self.commit_shared_recovery_locked(&mut self.inner.lock(), receipt, registration, derived)
+    }
+
+    fn commit_shared_recovery_locked(
+        &self,
+        inner: &mut SupervisorInner,
+        receipt: &SharedRecoveryReceipt,
+        mut registration: NormalizedRegistration,
+        derived: Option<crate::codex_terminal_status::DerivedAdmission>,
+    ) -> Option<RecoveredSharedRow> {
+        let binding = registration.terminal_binding.as_ref()?.clone();
+        // FINAL CAS and replacement share this one inner critical section. History, proof
+        // refresh, eviction and candidate replacement cannot interleave after this check.
+        if self
+            .metadata
+            .lock()
+            .mappings
+            .iter()
+            .find(|mapping| mapping.session_id == receipt.mapping.session_id)
+            != Some(&receipt.mapping)
+            || inner
+                .sessions
+                .get(&receipt.mapping.session_id)
+                .map(SessionFence::capture)
+                != receipt.live
+            || inner
+                .shared_recovery
+                .get(&receipt.mapping.session_id)
+                .map(|candidate| &candidate.ticket)
+                != receipt
+                    .candidate
+                    .as_ref()
+                    .map(|candidate| &candidate.ticket)
+            || !self.recovery_matches_thread(receipt, &binding)
+            || receipt.unchanged(&binding)
+            || registration.process_id != binding.tui_pid
+            || registration.upstream_identity != binding.thread_id
+            || registration.adapter_family != "Codex"
+            || registration.topology != "attached"
+            || registration.capabilities.commands != CommandCapabilities::none()
+        {
+            return None;
+        }
+        if self.recovery_needs_native(receipt, &registration)
+            && (registration.adapter_version != crate::codex_adapter::PINNED_CODEX_VERSION
+                || !registration.compatible
+                || !derived
+                    .as_ref()
+                    .is_some_and(|proof| proof.covers(receipt.lineage(), &binding)))
+        {
+            return None;
+        }
+        if let Some(old) = receipt
+            .candidate
+            .as_ref()
+            .and_then(|candidate| candidate.registration.terminal_binding.as_ref())
+            && old.same_incarnations(&binding)
+            && binding.generation < old.generation
+        {
+            return None;
+        }
+        registration.validate().ok()?;
+        if let Some(old) = inner.sessions.remove(&receipt.mapping.session_id)
+            && let Some(route) = old.route_id
+        {
+            inner.routes.remove(&route);
+        }
+        registration.turn = TurnState::Unknown {
+            reason_code: "observer_recovered".into(),
+        };
+        let registered = self
+            .register_new_locked(
+                inner,
+                registration.clone(),
+                None,
+                Some(receipt.lineage().clone()),
+            )
+            .ok()?;
+        if inner.shared_recovery.len() >= MAX_IDENTITY_MAPPINGS
+            && !inner.shared_recovery.contains_key(&registered.session_id)
+            && let Some(id) = inner.shared_recovery.keys().next().cloned()
+        {
+            inner.shared_recovery.remove(&id);
+        }
+        inner
+            .sessions
+            .get_mut(&registered.session_id)?
+            .derived_admission = derived.clone();
+        inner.shared_recovery.insert(
+            registered.session_id.clone(),
+            SharedRecoveryCandidate {
+                ticket: random_id(),
+                registration,
+                derived,
+            },
+        );
+        let fence = SessionFence::capture(inner.sessions.get(&registered.session_id)?);
+        Some(RecoveredSharedRow {
+            registered,
+            binding,
+            fence,
+        })
+    }
+
+    pub(crate) async fn resolve_recovered_route(&self, row: &RecoveredSharedRow) {
+        self.refresh_route_for(&row.registered.session_id, Some(&row.fence))
+            .await;
+    }
+
+    /// Reconcile and issue the successor receipt in the SAME critical section. Only this
+    /// history transaction may advance the epoch; hooks/proof changes still refuse it.
+    pub(crate) fn backfill_recovered_shared(
+        &self,
+        row: &RecoveredSharedRow,
+        history: crate::codex_history::ThreadHistory,
+    ) -> Result<RecoveredSharedRow> {
+        let mut inner = self.inner.lock();
+        self.reconcile_bridge_history_locked(
+            &mut inner,
+            &row.registered.session_id,
+            Some(row.registered.process_generation),
+            history.entries,
+            ReconcileMode::Backfill {
+                complete: history.complete,
+            },
+            None,
+            TurnScope::default(),
+            Some(&row.fence),
+        )?;
+        let fence = SessionFence::capture(
+            inner
+                .sessions
+                .get(&row.registered.session_id)
+                .ok_or_else(|| anyhow!("recovered row unavailable"))?,
+        );
+        Ok(RecoveredSharedRow {
+            registered: fence.registered.clone(),
+            binding: row.binding.clone(),
+            fence,
+        })
     }
 
     /// Agents herdr says are running, for a startup re-adoption to check against the metadata.
@@ -498,6 +936,17 @@ impl AgentSessionSupervisor {
                 return Ok(None);
             }
 
+            // A fresh observation may replace its association, but never lends that new
+            // authority to a previously issued route (including an unsampled focus ABA).
+            let revoked_route = if session.terminal_binding != registration.terminal_binding {
+                let route = session.route_id.take();
+                downgrade_route(session, "terminal_binding_changed");
+                revision_to_persist = Some(session.snapshot.revision);
+                route
+            } else {
+                None
+            };
+
             let adapter = AgentAdapterMetadata {
                 family: registration.adapter_family.clone(),
                 version: registration.adapter_version.clone(),
@@ -547,7 +996,13 @@ impl AgentSessionSupervisor {
                 || drift_identity_changed;
 
             session.process_id = registration.process_id;
+            // Each shared hook is its own correlation. A later registration must not lend
+            // its association to an event still waiting on an older connection.
+            if registration.terminal_binding.is_some() {
+                session.bridge_disconnect_token = random_id();
+            }
             session.terminal_binding = registration.terminal_binding.clone();
+            session.derived_admission = None;
             session.snapshot.drift = drift;
             session.compatible = registration.compatible;
             session.offered_commands = CommandCapabilities::none();
@@ -574,12 +1029,16 @@ impl AgentSessionSupervisor {
                     reason_code: "adapter_facts_changed".into(),
                 });
             }
-            RegisteredAgentSession {
+            let registered = RegisteredAgentSession {
                 session_id: session_id.clone(),
                 process_generation,
                 snapshot_epoch,
                 disconnect_token: session.bridge_disconnect_token.clone(),
+            };
+            if let Some(route) = revoked_route {
+                inner.routes.remove(&route);
             }
+            registered
         };
         if let Some(revision) = revision_to_persist {
             self.metadata
@@ -593,6 +1052,16 @@ impl AgentSessionSupervisor {
         &self,
         registration: NormalizedRegistration,
         sender: Option<mpsc::Sender<BridgeCommandEnvelope>>,
+    ) -> Result<RegisteredAgentSession> {
+        self.register_new_locked(&mut self.inner.lock(), registration, sender, None)
+    }
+
+    fn register_new_locked(
+        &self,
+        inner: &mut SupervisorInner,
+        registration: NormalizedRegistration,
+        sender: Option<mpsc::Sender<BridgeCommandEnvelope>>,
+        lineage: Option<crate::codex_terminal_status::BackendLineage>,
     ) -> Result<RegisteredAgentSession> {
         registration
             .validate()
@@ -611,7 +1080,6 @@ impl AgentSessionSupervisor {
         // in-flight command before replacing its sender, and carry the highest in-memory
         // revision into metadata so a same-process reconnect cannot move backward in one epoch.
         let live_revision = if let Some(session_id) = mapped_session_id.as_ref() {
-            let mut inner = self.inner.lock();
             if let Some(session) = inner.sessions.get_mut(session_id) {
                 let in_flight: Vec<_> = session.in_flight_commands.iter().cloned().collect();
                 for command_id in in_flight {
@@ -642,7 +1110,7 @@ impl AgentSessionSupervisor {
         let preferred_session_id = matches!(registration.topology.as_str(), "managed" | "adopted")
             .then_some(registration.upstream_identity.as_str());
         let (session_id, process_generation, snapshot_epoch, revision) =
-            self.metadata.lock().register(
+            self.metadata.lock().register_with_lineage(
                 &registration.upstream_identity,
                 preferred_session_id,
                 &process_nonce_digest,
@@ -650,6 +1118,7 @@ impl AgentSessionSupervisor {
                 &registration.adapter_version,
                 live_revision,
                 now,
+                lineage,
             )?;
         let bridge_disconnect_token = random_id();
 
@@ -730,7 +1199,6 @@ impl AgentSessionSupervisor {
         };
         let (updates, _) = broadcast::channel(SUBSCRIPTION_FRAME_CAPACITY);
         {
-            let mut inner = self.inner.lock();
             // A re-registering process supersedes any other bridge-less session it left
             // behind: an identity change across reconnects would otherwise orphan the old
             // session forever, since its process never reports a clean exit for it.
@@ -791,8 +1259,10 @@ impl AgentSessionSupervisor {
                 workspace_path: registration.workspace_path,
                 upstream_identity: registration.upstream_identity.clone(),
                 bridge_disconnect_token: bridge_disconnect_token.clone(),
+                proof_revision: 0,
                 process_id: registration.process_id,
                 terminal_binding: registration.terminal_binding,
+                derived_admission: None,
                 compatible: registration.compatible,
                 offered_commands: registration.capabilities.commands,
                 bridge_sender: sender,
@@ -1242,6 +1712,30 @@ impl AgentSessionSupervisor {
         live_only_prefix: Option<&str>,
         scope: TurnScope,
     ) -> Result<()> {
+        self.reconcile_bridge_history_locked(
+            &mut self.inner.lock(),
+            session_id,
+            process_generation,
+            authority,
+            mode,
+            live_only_prefix,
+            scope,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_bridge_history_locked(
+        &self,
+        inner: &mut SupervisorInner,
+        session_id: &str,
+        process_generation: Option<u64>,
+        authority: Vec<NormalizedTimelineEntry>,
+        mode: ReconcileMode,
+        live_only_prefix: Option<&str>,
+        scope: TurnScope,
+        recovery_fence: Option<&SessionFence>,
+    ) -> Result<()> {
         if authority.len() > MAX_HOST_TIMELINE_ENTRIES {
             bail!("bridge history entry count exceeds the host memory bound");
         }
@@ -1250,11 +1744,13 @@ impl AgentSessionSupervisor {
                 .validate()
                 .map_err(|_| anyhow!("normalized bridge history entry is invalid"))?;
         }
-        let mut inner = self.inner.lock();
         let session = inner
             .sessions
             .get_mut(session_id)
             .ok_or_else(|| anyhow!("registered session is unavailable"))?;
+        if recovery_fence.is_some_and(|fence| !fence.matches(session)) {
+            bail!("recovered history receipt was superseded");
+        }
         // A read that finished after its process was replaced describes a conversation this
         // incarnation may not be showing; the new process's own read will land instead.
         if process_generation
@@ -2383,68 +2879,256 @@ impl AgentSessionSupervisor {
         route_id: &str,
         expected_session: &str,
         expected_generation: u64,
-    ) -> Option<AgentTerminalPlan> {
+    ) -> Option<PendingAgentTerminal> {
         if valid_opaque_id(route_id).is_err() {
             return None;
         }
-        let record = self.inner.lock().routes.get(route_id).cloned()?;
-        if record.session_id != expected_session || record.process_generation != expected_generation
+        let (record, fence) = {
+            let inner = self.inner.lock();
+            let record = inner.routes.get(route_id)?.clone();
+            let fence = SessionFence::capture(inner.sessions.get(&record.session_id)?);
+            (record, fence)
+        };
+        if record.session_id != expected_session
+            || record.process_generation != expected_generation
+            || !self.route_record_is_current(route_id, &record)
         {
             return None;
         }
         if !self.revalidate_terminal_binding(&record.session_id).await {
             return None;
         }
+        if !self.route_record_is_current(route_id, &record) {
+            return None;
+        }
         let plan = self.routes.terminal_plan(&record.proof).await;
-        if !self.revalidate_terminal_binding(&record.session_id).await {
+        if !self.revalidate_terminal_binding(&record.session_id).await
+            || !self.route_record_is_current(route_id, &record)
+            || !self
+                .inner
+                .lock()
+                .sessions
+                .get(&record.session_id)
+                .is_some_and(|s| fence.matches(s))
+        {
             return None;
         }
         if plan.is_none() {
-            self.downgrade_if_current(
-                route_id,
-                &record.session_id,
-                record.process_generation,
-                "route_invalidated",
-            );
+            self.downgrade_if_current(route_id, &fence, "route_invalidated");
         }
-        plan
+        plan.map(|plan| PendingAgentTerminal {
+            plan,
+            route_id: route_id.into(),
+            record,
+            fence,
+        })
+    }
+
+    fn terminal_open_is_current(&self, pending: &PendingAgentTerminal) -> bool {
+        let inner = self.inner.lock();
+        inner.routes.get(&pending.route_id) == Some(&pending.record)
+            && inner
+                .sessions
+                .get(&pending.record.session_id)
+                .is_some_and(|session| {
+                    pending.fence.matches(session)
+                        && session.route_id.as_ref() == Some(&pending.route_id)
+                })
+    }
+
+    pub(crate) async fn revalidate_terminal_open(&self, pending: &PendingAgentTerminal) -> bool {
+        self.revalidate_terminal_open_with(pending, |proof| async move {
+            self.routes.revalidate(&proof).await
+        })
+        .await
+    }
+
+    async fn revalidate_terminal_open_with<F, Fut>(
+        &self,
+        pending: &PendingAgentTerminal,
+        provider: F,
+    ) -> bool
+    where
+        F: FnOnce(AgentRouteProof) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        self.terminal_open_is_current(pending)
+            && self
+                .revalidate_terminal_binding(&pending.record.session_id)
+                .await
+            && provider(pending.record.proof.clone()).await
+            && self
+                .revalidate_terminal_binding(&pending.record.session_id)
+                .await
+            && self.terminal_open_is_current(pending)
+    }
+
+    /// Recheck the token itself after asynchronous inspection, not just the session's newest
+    /// association. A fresh registration may have revoked it while provider I/O was pending.
+    fn route_record_is_current(&self, route_id: &str, record: &RouteRecord) -> bool {
+        let inner = self.inner.lock();
+        inner.routes.get(route_id) == Some(record)
+            && inner
+                .sessions
+                .get(&record.session_id)
+                .is_some_and(|session| {
+                    session.route_id.as_deref() == Some(route_id)
+                        && session.snapshot.process_generation == record.process_generation
+                        && session.terminal_binding == record.terminal_binding
+                })
+    }
+
+    /// Serialize a shared hook's final proof/application with observer registration. Status
+    /// and provider invalidation still use the CAS below; this guard is not ownership proof.
+    pub(crate) async fn shared_hook_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.registration_gate.clone().lock_owned().await
+    }
+
+    pub(crate) async fn associate_readonly_hook(
+        &self,
+        registered: &RegisteredAgentSession,
+        association: &crate::codex_terminal_status::HookAssociation,
+    ) -> Option<RegisteredAgentSession> {
+        let fresh = association.resolve().await;
+        self.finish_readonly_hook_association(registered, &association.binding, fresh)
+    }
+
+    fn finish_readonly_hook_association(
+        &self,
+        registered: &RegisteredAgentSession,
+        expected: &crate::codex_terminal_status::TerminalBinding,
+        fresh: Option<crate::codex_terminal_status::TerminalBinding>,
+    ) -> Option<RegisteredAgentSession> {
+        // Hook bodies carry no UI cursor/epoch. Only fresh, complete endpoint proof may
+        // mint a current-epoch receipt for this SAME opaque connection and process. History
+        // reconciliation can change its epoch without replacing that connection. Never
+        // refresh an old command/cursor, borrow another registration, or retry a failed CAS.
+        let mut current = registered.clone();
+        if let Some(proof) = fresh.as_ref() {
+            if !expected.same_incarnations(proof) || proof.generation < expected.generation {
+                return None;
+            }
+            let inner = self.inner.lock();
+            let session = inner.sessions.get(&registered.session_id)?;
+            if session.snapshot.process_generation != registered.process_generation
+                || session.bridge_disconnect_token != registered.disconnect_token
+                || session.terminal_binding.as_ref() != Some(expected)
+            {
+                return None;
+            }
+            current.snapshot_epoch = session.snapshot.snapshot_epoch;
+        }
+        // Atomic CAS retains the epoch check against the explicitly issued current receipt;
+        // even a concurrent change after issuance refuses rather than replaying the event.
+        self.commit_readonly_hook_association(&current, expected, fresh)
+            .then_some(current)
+    }
+
+    fn commit_readonly_hook_association(
+        &self,
+        registered: &RegisteredAgentSession,
+        expected: &crate::codex_terminal_status::TerminalBinding,
+        fresh: Option<crate::codex_terminal_status::TerminalBinding>,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        let Some(session) = inner.sessions.get_mut(&registered.session_id) else {
+            return false;
+        };
+        if session.snapshot.process_generation != registered.process_generation
+            || session.snapshot.snapshot_epoch != registered.snapshot_epoch
+            || session.bridge_disconnect_token != registered.disconnect_token
+            || session.terminal_binding.as_ref() != Some(expected)
+        {
+            return false;
+        }
+        let Some(fresh) = fresh else {
+            if let Some(old) = inner.sessions.remove(&registered.session_id) {
+                if let Some(route) = old.route_id {
+                    inner.routes.remove(&route);
+                }
+                record_ended_verdict(&mut inner.ended, &registered.session_id);
+            }
+            return false;
+        };
+        // The resolver, not this commit, supplies kernel-peer/foreground/attachment proof.
+        // Only the aggregate selection generation may advance; this is never a route-use
+        // exception. Old tokens are revoked even when both samples surround a focus ABA.
+        if !expected.same_incarnations(&fresh) || fresh.generation < expected.generation {
+            return false;
+        }
+        session.proof_revision = session.proof_revision.saturating_add(1);
+        if fresh != *expected {
+            let revoked = session.route_id.take();
+            session.terminal_binding = Some(fresh.clone());
+            downgrade_route(session, "terminal_binding_changed");
+            if let Some(candidate) = inner.shared_recovery.get_mut(&registered.session_id) {
+                candidate.registration.terminal_binding = Some(fresh);
+                candidate.ticket = random_id();
+            }
+            if let Some(route) = revoked {
+                inner.routes.remove(&route);
+            }
+        }
+        true
     }
 
     /// A shared hook's writer may outlive its terminal selection. Keep that independently
     /// authenticated association live only while its complete generation still agrees.
     pub(crate) async fn revalidate_terminal_binding(&self, session_id: &str) -> bool {
-        let binding = {
+        self.revalidate_terminal_binding_with(session_id, |proof, binding| async move {
+            match crate::storage::CiaoPaths::discover() {
+                Ok(paths) => proof.revalidate(&paths, &binding).await,
+                Err(_) => false,
+            }
+        })
+        .await
+    }
+
+    async fn revalidate_terminal_binding_with<F, Fut>(&self, session_id: &str, native: F) -> bool
+    where
+        F: FnOnce(
+            crate::codex_terminal_status::DerivedAdmission,
+            crate::codex_terminal_status::TerminalBinding,
+        ) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let (fence, derived) = {
             let inner = self.inner.lock();
             let Some(session) = inner.sessions.get(session_id) else {
                 return false;
             };
-            session.terminal_binding.clone()
+            (
+                SessionFence::capture(session),
+                session.derived_admission.clone(),
+            )
         };
-        let Some(binding) = binding else {
+        let Some(binding) = fence.binding.as_ref() else {
             return true;
         };
-        if crate::codex_terminal_status::revalidate(&binding).await {
+        let image_current = match derived {
+            Some(proof) => native(proof, binding.clone()).await,
+            None => true,
+        };
+        if image_current && crate::codex_terminal_status::revalidate(binding).await {
             return self
                 .inner
                 .lock()
                 .sessions
                 .get(session_id)
-                .is_some_and(|session| session.terminal_binding.as_ref() == Some(&binding));
+                .is_some_and(|session| fence.matches(session));
         }
-        self.remove_terminal_binding_if_current(session_id, &binding);
+        let _guard = self.shared_hook_guard().await;
+        self.remove_terminal_binding_if_current(&fence);
         false
     }
 
-    fn remove_terminal_binding_if_current(
-        &self,
-        session_id: &str,
-        binding: &crate::codex_terminal_status::TerminalBinding,
-    ) {
+    fn remove_terminal_binding_if_current(&self, fence: &SessionFence) {
+        let session_id = &fence.registered.session_id;
         let mut inner = self.inner.lock();
         if !inner
             .sessions
             .get(session_id)
-            .is_some_and(|session| session.terminal_binding.as_ref() == Some(binding))
+            .is_some_and(|session| fence.matches(session))
         {
             return;
         }
@@ -2522,6 +3206,20 @@ impl AgentSessionSupervisor {
     /// The daemon calls this periodically so a replaced pane removes native controls even when
     /// no command or terminal request happens to expose the loss first.
     pub(crate) async fn revalidate_live_routes(&self) {
+        self.revalidate_shared_with(|directory| async move {
+            crate::codex_terminal_status::live_bindings(&directory)
+                .await
+                .unwrap_or_default()
+        })
+        .await;
+        self.revalidate_provider_routes().await;
+    }
+
+    async fn revalidate_shared_with<F, Fut>(&self, mut discover: F)
+    where
+        F: FnMut(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Vec<crate::codex_terminal_status::TerminalBinding>>,
+    {
         // A live TUI can change its displayed thread without exiting or moving panes. Such
         // a change invalidates the observation itself, including rows with no resolved route.
         let mut directories: HashMap<PathBuf, Vec<_>> = HashMap::new();
@@ -2530,44 +3228,60 @@ impl AgentSessionSupervisor {
                 directories
                     .entry(binding.status_directory.clone())
                     .or_default()
-                    .push((id.clone(), binding.clone()));
+                    .push((id.clone(), SessionFence::capture(session)));
             }
         }
         // A single discovery already inspects every TUI in this directory. Sharing it across
         // this sweep keeps N live conversations from causing N full process/socket scans.
         for (directory, recorded) in directories {
-            let current = crate::codex_terminal_status::live_bindings(&directory)
-                .await
-                .unwrap_or_default();
-            for (id, binding) in recorded {
-                if !current.contains(&binding) {
-                    self.remove_terminal_binding_if_current(&id, &binding);
+            let current = discover(directory).await;
+            let _guard = self.shared_hook_guard().await;
+            for (_, fence) in recorded {
+                if !current.contains(fence.binding.as_ref().unwrap()) {
+                    self.remove_terminal_binding_if_current(&fence);
                 }
             }
         }
-        let records: Vec<_> = self
-            .inner
-            .lock()
-            .routes
-            .iter()
-            .map(|(route_id, record)| (route_id.clone(), record.clone()))
-            .collect();
-        let mut checks = JoinSet::new();
-        for (route_id, record) in records {
+    }
+
+    async fn revalidate_provider_routes(&self) {
+        self.revalidate_providers_with(|proof| {
             let routes = self.routes.clone();
+            async move { routes.revalidate(&proof).await }
+        })
+        .await;
+    }
+
+    async fn revalidate_providers_with<F, Fut>(&self, mut inspect: F)
+    where
+        F: FnMut(AgentRouteProof) -> Fut,
+        Fut: std::future::Future<Output = bool> + Send + 'static,
+    {
+        let records: Vec<_> = {
+            let inner = self.inner.lock();
+            inner
+                .routes
+                .iter()
+                .filter_map(|(route_id, record)| {
+                    Some((
+                        route_id.clone(),
+                        record.clone(),
+                        SessionFence::capture(inner.sessions.get(&record.session_id)?),
+                    ))
+                })
+                .collect()
+        };
+        let mut checks = JoinSet::new();
+        for (route_id, record, fence) in records {
+            let inspection = inspect(record.proof);
             checks.spawn(async move {
-                let valid = routes.revalidate(&record.proof).await;
-                (route_id, record, valid)
+                let valid = inspection.await;
+                (route_id, fence, valid)
             });
         }
-        while let Some(Ok((route_id, record, valid))) = checks.join_next().await {
+        while let Some(Ok((route_id, fence, valid))) = checks.join_next().await {
             if !valid {
-                self.downgrade_if_current(
-                    &route_id,
-                    &record.session_id,
-                    record.process_generation,
-                    "route_invalidated",
-                );
+                self.downgrade_if_current(&route_id, &fence, "route_invalidated");
             }
         }
     }
@@ -2601,6 +3315,55 @@ impl AgentSessionSupervisor {
         }
     }
 
+    /// Test driver for same-TUI peer controls; production polling lives in agent_bridge.
+    #[cfg(test)]
+    async fn recover_known_shared(&self) {
+        self.recover_shared_with(|directory| async move {
+            crate::codex_terminal_status::live_bindings(&directory)
+                .await
+                .unwrap_or_default()
+        })
+        .await;
+    }
+
+    #[cfg(test)]
+    async fn recover_shared_with<F, Fut>(&self, mut discover: F)
+    where
+        F: FnMut(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Vec<crate::codex_terminal_status::TerminalBinding>>,
+    {
+        let mut directories: HashMap<PathBuf, Vec<_>> = HashMap::new();
+        for receipt in self.shared_recovery_receipts() {
+            if let Some(directory) = receipt.directory() {
+                directories
+                    .entry(directory.to_owned())
+                    .or_default()
+                    .push(receipt);
+            }
+        }
+        for (directory, receipts) in directories {
+            let bindings = discover(directory).await;
+            for receipt in receipts {
+                let Some(candidate) = &receipt.candidate else {
+                    continue;
+                };
+                let old = candidate.registration.terminal_binding.as_ref().unwrap();
+                let mut matches = bindings.iter().filter(|fresh| {
+                    old.same_incarnations(fresh) && fresh.generation >= old.generation
+                });
+                let Some(fresh) = matches.next().cloned() else {
+                    continue;
+                };
+                if matches.next().is_some() {
+                    continue;
+                }
+                let mut registration = candidate.registration.clone();
+                registration.terminal_binding = Some(fresh);
+                let _ = self.commit_shared_recovery(&receipt, registration, None);
+            }
+        }
+    }
+
     /// Which agent session each live pane holds, keyed the way a workspace tab row names itself.
     /// The snapshot builder uses this to say "this tab is that conversation", which is the only
     /// thing that lets a terminal attached from the Hosts tab offer the controls a terminal
@@ -2625,9 +3388,10 @@ impl AgentSessionSupervisor {
     }
 
     async fn refresh_route(&self, session_id: &str) {
-        if !self.revalidate_terminal_binding(session_id).await {
-            return;
-        }
+        self.refresh_route_for(session_id, None).await;
+    }
+
+    async fn refresh_route_for(&self, session_id: &str, expected: Option<&SessionFence>) {
         let route_fence = {
             let inner = self.inner.lock();
             inner
@@ -2638,41 +3402,41 @@ impl AgentSessionSupervisor {
                 // daemon's own vendor child, and its None verdict must not rewrite the grant
                 // — one adopted-and-unavailable row makes phones reject the whole list.
                 .filter(|session| session.adapter_active && session.snapshot.topology != "adopted")
-                .map(|session| {
-                    (
-                        session.process_id,
-                        session.bridge_disconnect_token.clone(),
-                        session.snapshot.process_generation,
-                    )
-                })
+                .map(SessionFence::capture)
         };
-        let Some((process_id, disconnect_token, process_generation)) = route_fence else {
+        let Some(route_fence) = route_fence else {
             return;
         };
+        if expected.is_some_and(|expected| *expected != route_fence)
+            || !self.revalidate_terminal_binding(session_id).await
+        {
+            return;
+        }
+        let process_id = route_fence.process_id;
         let proof = self.routes.resolve(process_id).await;
         if !self.revalidate_terminal_binding(session_id).await {
             return;
         }
-        // Kept, at debug: resolution is the one step here that can fail transiently, and its
-        // outcome is invisible from the phone — an unresolved route renders as the conversation
-        // opening normally. `recover_missing_routes` retries, so a `none` followed by a
-        // continuity is the recovery working rather than a fault.
-        tracing::debug!(
-            session = session_id,
-            pid = process_id,
-            route = match proof.as_ref() {
-                Some(proof) => proof.continuity().wire(),
-                None => "none",
-            },
-            "agent route resolve"
-        );
+        self.commit_route_refresh(session_id, &route_fence, proof);
+    }
+
+    fn commit_route_refresh(
+        &self,
+        session_id: &str,
+        route_fence: &SessionFence,
+        proof: Option<AgentRouteProof>,
+    ) {
+        let process_id = route_fence.process_id;
+        let route_verdict = match proof.as_ref() {
+            Some(proof) => proof.continuity().wire(),
+            None => "none",
+        };
         let mut inner = self.inner.lock();
-        if !inner.sessions.get(session_id).is_some_and(|session| {
-            session.adapter_active
-                && session.process_id == process_id
-                && session.bridge_disconnect_token == disconnect_token
-                && session.snapshot.process_generation == process_generation
-        }) {
+        if !inner
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.adapter_active && route_fence.matches(session))
+        {
             return;
         }
         let old_route = inner
@@ -2711,6 +3475,7 @@ impl AgentSessionSupervisor {
                         RouteRecord {
                             session_id: session_id.to_owned(),
                             process_generation: session.snapshot.process_generation,
+                            terminal_binding: session.terminal_binding.clone(),
                             proof,
                         },
                     )),
@@ -2755,19 +3520,21 @@ impl AgentSessionSupervisor {
         if let Some((route_id, record)) = route_record {
             inner.routes.insert(route_id, record);
         }
+        // Report committed state, not a provider result that can still lose its CAS.
+        // Missing routes remain retryable by `recover_missing_routes`.
+        tracing::debug!(
+            session = session_id,
+            pid = process_id,
+            route = route_verdict,
+            "agent route resolve"
+        );
     }
 
-    fn downgrade_if_current(
-        &self,
-        route_id: &str,
-        session_id: &str,
-        process_generation: u64,
-        reason: &str,
-    ) {
+    fn downgrade_if_current(&self, route_id: &str, fence: &SessionFence, reason: &str) {
+        let session_id = &fence.registered.session_id;
         let mut inner = self.inner.lock();
         let current = inner.sessions.get(session_id).is_some_and(|session| {
-            session.route_id.as_deref() == Some(route_id)
-                && session.snapshot.process_generation == process_generation
+            session.route_id.as_deref() == Some(route_id) && fence.matches(session)
         });
         if !current {
             return;
@@ -3961,7 +4728,7 @@ struct AgentMetadataFile {
     receipts: Vec<CommandReceipt>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityMapping {
     upstream_digest: String,
@@ -3969,6 +4736,8 @@ struct IdentityMapping {
     process_nonce_digest: String,
     adapter_family: String,
     adapter_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_lineage: Option<crate::codex_terminal_status::BackendLineage>,
     process_generation: u64,
     snapshot_epoch: u64,
     revision_seed: u64,
@@ -4023,6 +4792,10 @@ impl AgentMetadataStore {
                 || mapping.process_generation == 0
                 || mapping.snapshot_epoch == 0
                 || mapping.revision_seed == 0
+                || mapping
+                    .backend_lineage
+                    .as_ref()
+                    .is_some_and(|lineage| !lineage.valid() || mapping.adapter_family != "Codex")
             {
                 bail!("Agent metadata mapping is invalid");
             }
@@ -4076,7 +4849,7 @@ impl AgentMetadataStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn register(
+    fn register_with_lineage(
         &mut self,
         upstream_identity: &str,
         preferred_session_id: Option<&str>,
@@ -4085,6 +4858,7 @@ impl AgentMetadataStore {
         adapter_version: &str,
         live_revision: Option<u64>,
         now: u64,
+        preserved_lineage: Option<crate::codex_terminal_status::BackendLineage>,
     ) -> Result<(String, u64, u64, u64)> {
         if let Some(preferred) = preferred_session_id {
             valid_opaque_id(preferred).map_err(|_| anyhow!("preferred session ID is invalid"))?;
@@ -4114,6 +4888,11 @@ impl AgentMetadataStore {
             }
             let mapping = &mut self.mappings[position];
             let same_process = mapping.process_nonce_digest == process_nonce_digest;
+            if let Some(lineage) = preserved_lineage {
+                mapping.backend_lineage = Some(lineage);
+            } else if !same_process || mapping.adapter_version != adapter_version {
+                mapping.backend_lineage = None;
+            }
             if !same_process {
                 mapping.process_generation = mapping.process_generation.saturating_add(1).max(1);
             }
@@ -4150,6 +4929,7 @@ impl AgentMetadataStore {
                 process_nonce_digest: process_nonce_digest.into(),
                 adapter_family: adapter_family.into(),
                 adapter_version: adapter_version.into(),
+                backend_lineage: None,
                 process_generation: 1,
                 snapshot_epoch: nonzero_random_u64(),
                 revision_seed: 1,
@@ -4166,6 +4946,29 @@ impl AgentMetadataStore {
         };
         self.persist()?;
         Ok(values)
+    }
+
+    fn record_hook_lineage(&mut self, registration: &NormalizedRegistration) -> Result<()> {
+        let digest = self.digest(&registration.upstream_identity);
+        if let Some(mapping) = self
+            .mappings
+            .iter_mut()
+            .find(|m| m.upstream_digest == digest)
+        {
+            mapping.backend_lineage = registration.terminal_binding.as_ref().map(|binding| {
+                crate::codex_terminal_status::BackendLineage::from_hook(
+                    binding,
+                    registration.adapter_version.clone(),
+                )
+            });
+            mapping
+                .adapter_family
+                .clone_from(&registration.adapter_family);
+            mapping
+                .adapter_version
+                .clone_from(&registration.adapter_version);
+        }
+        self.persist()
     }
 
     fn update_revision(&mut self, session_id: &str, revision: u64) -> Result<()> {
@@ -4593,6 +5396,536 @@ mod tests {
         registration
     }
 
+    fn seed_shared_recovery(
+        s: &AgentSessionSupervisor,
+        registration: &NormalizedRegistration,
+    ) -> RegisteredAgentSession {
+        let registered = s.register_new(registration.clone(), None).unwrap();
+        s.metadata.lock().record_hook_lineage(registration).unwrap();
+        s.remember_shared_recovery(&registered.session_id, registration.clone());
+        registered
+    }
+
+    fn recovered_history() -> crate::codex_history::ThreadHistory {
+        crate::codex_history::ThreadHistory {
+            entries: vec![entry("codex.history.fixture", 1, "fixture history")],
+            complete: true,
+            live_turn_prompt: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_terminal_open_original_receipt_survives_neither_spawn_nor_provider_races() {
+        for core in [false, true] {
+            for change in 0..6 {
+                let tmp = tempdir().unwrap();
+                let s = supervisor(&tmp.path().join("metadata.json"));
+                let registered = s
+                    .register_new(observer_registration("closing-fixture"), None)
+                    .unwrap();
+                let old_token = install_fixture_route(&s, &registered);
+                let make_pending = |token: String| {
+                    let inner = s.inner.lock();
+                    PendingAgentTerminal {
+                        plan: if core {
+                            AgentTerminalPlan::Core {
+                                session: "fixture".into(),
+                                tab: "fixture-tab".into(),
+                            }
+                        } else {
+                            AgentTerminalPlan::Command {
+                                program: "/bin/sleep".into(),
+                                args: vec!["60".into()],
+                                provider: crate::host_protocol::ProviderKind::Herdr,
+                            }
+                        },
+                        record: inner.routes[&token].clone(),
+                        fence: SessionFence::capture(&inner.sessions[&registered.session_id]),
+                        route_id: token,
+                    }
+                };
+                let pending = make_pending(old_token.clone());
+                let dimensions = crate::host_protocol::Dimensions {
+                    cols: 80,
+                    rows: 24,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                };
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let task_s = s.clone();
+                let closing = tokio::spawn(async move {
+                    let mut viewer = crate::terminal_session::TerminalSession::spawn_fixed_argv(
+                        dimensions,
+                        "/bin/sleep".into(),
+                        vec!["60".into()],
+                    )
+                    .await
+                    .unwrap();
+                    let mut exit = viewer.exit_watcher();
+                    let valid = task_s.revalidate_terminal_open_with(&pending, |_| async move {
+                        started_tx.send(()).unwrap();
+                        release_rx.await.unwrap()
+                    });
+                    let result = crate::daemon::terminal_opened_after_spawn(
+                        &mut viewer,
+                        dimensions,
+                        None,
+                        valid,
+                    )
+                    .await;
+                    // Refusal itself must have closed/reaped our viewer before it reports.
+                    assert!(matches!(result, Err(("stale_agent_route", _))));
+                    tokio::time::timeout(std::time::Duration::from_secs(3), exit.wait())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                });
+                started_rx.await.unwrap();
+                {
+                    let mut inner = s.inner.lock();
+                    let live = inner.sessions.get_mut(&registered.session_id).unwrap();
+                    match change {
+                        0 => live.snapshot.snapshot_epoch = nonzero_random_u64(),
+                        1 => live.bridge_disconnect_token = random_id(),
+                        2 => live.proof_revision += 1,
+                        3 => live.snapshot.process_generation += 1,
+                        4 => {
+                            inner.routes.remove(&old_token);
+                        }
+                        _ => {} // provider negative while identity is unchanged
+                    }
+                }
+                release_tx.send(change != 5).unwrap();
+                closing.await.unwrap();
+                assert!(
+                    process_exists(std::process::id()),
+                    "viewer cleanup must not signal owner"
+                );
+                // A freshly minted token and snapshot receipt, never the old pending plan.
+                let current =
+                    SessionFence::capture(&s.inner.lock().sessions[&registered.session_id])
+                        .registered;
+                let fresh_token = install_fixture_route(&s, &current);
+                let fresh = make_pending(fresh_token);
+                let mut viewer = crate::terminal_session::TerminalSession::spawn_fixed_argv(
+                    dimensions,
+                    "/bin/sleep".into(),
+                    vec!["60".into()],
+                )
+                .await
+                .unwrap();
+                let mut exit = viewer.exit_watcher();
+                let result = crate::daemon::terminal_opened_after_spawn(
+                    &mut viewer,
+                    dimensions,
+                    None,
+                    s.revalidate_terminal_open_with(&fresh, |_| std::future::ready(true)),
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Ok(crate::host_protocol::TerminalFrame::Opened(_))
+                ));
+                viewer
+                    .cleanup(crate::pty::CleanupReason::ExplicitClose)
+                    .await
+                    .unwrap();
+                exit.wait().await.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn idle_recreated_row_handoff_restores_history_without_reusing_epoch_or_route() {
+        let tmp = tempdir().unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let mut registration = shared_codex_registration();
+        let first = seed_shared_recovery(&s, &registration);
+        let old_route = install_fixture_route(&s, &first);
+        s.backfill_bridge_history(
+            &first.session_id,
+            Some(first.process_generation),
+            recovered_history().entries,
+            true,
+            None,
+        )
+        .unwrap();
+        let receipt = s.shared_recovery_receipts().pop().unwrap();
+        let old_epoch = s.snapshot(&first.session_id).unwrap().snapshot_epoch;
+        registration.terminal_binding.as_mut().unwrap().generation += 2;
+        let row = s
+            .commit_shared_recovery(&receipt, registration.clone(), None)
+            .unwrap();
+        assert_eq!(row.registered.session_id, first.session_id);
+        assert_eq!(row.registered.process_generation, first.process_generation);
+        assert_ne!(row.registered.snapshot_epoch, old_epoch);
+        assert!(s.session_for_route(&old_route).is_none());
+        let current = s
+            .backfill_recovered_shared(&row, recovered_history())
+            .unwrap();
+        assert_eq!(s.inner.lock().sessions[&first.session_id].history.len(), 1);
+        assert_eq!(
+            s.snapshot(&first.session_id).unwrap().capabilities.history,
+            "full"
+        );
+        assert_eq!(
+            current.fence,
+            SessionFence::capture(&s.inner.lock().sessions[&first.session_id])
+        );
+        let receipt = s.shared_recovery_receipts().pop().unwrap();
+        assert!(
+            s.commit_shared_recovery(&receipt, registration, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn idle_final_critical_section_refuses_history_proof_and_candidate_changes() {
+        for change in 0..4 {
+            let tmp = tempdir().unwrap();
+            let s = supervisor(&tmp.path().join("metadata.json"));
+            let mut registration = shared_codex_registration();
+            let first = seed_shared_recovery(&s, &registration);
+            s.upsert_bridge_entry(&first.session_id, entry("live-tail", 1, "live fixture"))
+                .unwrap();
+            let receipt = s.shared_recovery_receipts().pop().unwrap();
+            registration.terminal_binding.as_mut().unwrap().generation += 2;
+            let mut inner = s.inner.lock();
+            // Deterministic final-lock boundary, not a pre-await check. The exact production
+            // commit primitive receives this same lock, held continuously through replacement.
+            match change {
+                0 => s
+                    .reconcile_bridge_history_locked(
+                        &mut inner,
+                        &first.session_id,
+                        Some(first.process_generation),
+                        recovered_history().entries,
+                        ReconcileMode::Backfill { complete: true },
+                        None,
+                        TurnScope::default(),
+                        None,
+                    )
+                    .unwrap(),
+                1 => {
+                    inner
+                        .sessions
+                        .get_mut(&first.session_id)
+                        .unwrap()
+                        .bridge_disconnect_token = random_id()
+                }
+                2 => {
+                    inner
+                        .sessions
+                        .get_mut(&first.session_id)
+                        .unwrap()
+                        .proof_revision += 1
+                }
+                _ => {
+                    inner
+                        .shared_recovery
+                        .get_mut(&first.session_id)
+                        .unwrap()
+                        .ticket = random_id()
+                }
+            }
+            assert!(
+                s.commit_shared_recovery_locked(&mut inner, &receipt, registration.clone(), None)
+                    .is_none()
+            );
+            let fence = SessionFence::capture(&inner.sessions[&first.session_id]);
+            drop(inner);
+            assert_eq!(
+                SessionFence::capture(&s.inner.lock().sessions[&first.session_id]),
+                fence
+            );
+            let fresh = s.shared_recovery_receipts().pop().unwrap();
+            let mut inner = s.inner.lock();
+            let other = s.clone();
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || assert!(other.inner.try_lock().is_none()))
+                    .join()
+                    .unwrap();
+                assert!(
+                    s.commit_shared_recovery_locked(&mut inner, &fresh, registration, None)
+                        .is_some()
+                );
+                // No remove/reacquire gap: contenders still cannot mutate the replacement.
+                let other = s.clone();
+                scope
+                    .spawn(move || assert!(other.inner.try_lock().is_none()))
+                    .join()
+                    .unwrap();
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_history_before_and_during_provider_issues_only_exact_successor_receipt() {
+        for during_provider in [false, true] {
+            let tmp = tempdir().unwrap();
+            let s = supervisor(&tmp.path().join("metadata.json"));
+            let mut registration = shared_codex_registration();
+            let first = seed_shared_recovery(&s, &registration);
+            let old_route = install_fixture_route(&s, &first);
+            let proof = s.inner.lock().routes[&old_route].proof.clone();
+            let receipt = s.shared_recovery_receipts().pop().unwrap();
+            registration.terminal_binding.as_mut().unwrap().generation += 2;
+            let row = s
+                .commit_shared_recovery(&receipt, registration, None)
+                .unwrap();
+            s.upsert_bridge_entry(&first.session_id, entry("live-tail", 1, "live fixture"))
+                .unwrap();
+            let (release, withheld) = tokio::sync::oneshot::channel();
+            let pending_s = s.clone();
+            let pending_row = row.clone();
+            let pending = tokio::spawn(async move {
+                let proof = withheld.await.unwrap();
+                pending_s.commit_route_refresh(
+                    &pending_row.registered.session_id,
+                    &pending_row.fence,
+                    proof,
+                );
+            });
+            let current = s
+                .backfill_recovered_shared(&row, recovered_history())
+                .unwrap();
+            assert_ne!(
+                row.registered.snapshot_epoch,
+                current.registered.snapshot_epoch
+            );
+            assert_eq!(
+                row.registered.disconnect_token,
+                current.registered.disconnect_token
+            );
+            assert_eq!(row.binding, current.binding);
+            if during_provider {
+                release.send(Some(proof.clone())).unwrap();
+                pending.await.unwrap();
+                assert!(
+                    s.snapshot(&first.session_id)
+                        .unwrap()
+                        .terminal_fallback
+                        .route_id
+                        .is_none()
+                );
+            } else {
+                drop(release);
+                pending.abort();
+                let _ = pending.await;
+            }
+            // Ordered production handoff begins provider work with this successor. A fresh
+            // positive is immediate, without weakening the fence or waiting 15 ticks.
+            s.commit_route_refresh(&first.session_id, &current.fence, Some(proof));
+            assert!(
+                s.snapshot(&first.session_id)
+                    .unwrap()
+                    .terminal_fallback
+                    .route_id
+                    .is_some()
+            );
+            assert!(s.session_for_route(&old_route).is_none());
+            assert!(
+                s.backfill_recovered_shared(&row, recovered_history())
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_withheld_provider_positive_and_negative_cannot_cross_receipt_changes() {
+        for change in 0..3 {
+            for positive in [false, true] {
+                let tmp = tempdir().unwrap();
+                let s = supervisor(&tmp.path().join("metadata.json"));
+                let registered = seed_shared_recovery(&s, &shared_codex_registration());
+                let old = install_fixture_route(&s, &registered);
+                let fence = SessionFence::capture(&s.inner.lock().sessions[&registered.session_id]);
+                let proof = s.inner.lock().routes[&old].proof.clone();
+                let (release, withheld) = tokio::sync::oneshot::channel();
+                let pending_s = s.clone();
+                let id = registered.session_id.clone();
+                let pending = tokio::spawn(async move {
+                    pending_s.commit_route_refresh(&id, &fence, withheld.await.unwrap());
+                });
+                {
+                    let mut inner = s.inner.lock();
+                    let live = inner.sessions.get_mut(&registered.session_id).unwrap();
+                    match change {
+                        0 => live.bridge_disconnect_token = random_id(),
+                        1 => live.snapshot.snapshot_epoch = nonzero_random_u64(),
+                        _ => live.proof_revision += 1,
+                    }
+                }
+                release.send(positive.then_some(proof.clone())).unwrap();
+                pending.await.unwrap();
+                assert!(s.session_for_route(&old).is_some());
+                let current =
+                    SessionFence::capture(&s.inner.lock().sessions[&registered.session_id]);
+                s.commit_route_refresh(&registered.session_id, &current, Some(proof));
+                assert!(s.session_for_route(&old).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_pending_hook_and_new_tui_without_native_proof_refuse() {
+        let tmp = tempdir().unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let mut registration = shared_codex_registration();
+        seed_shared_recovery(&s, &registration);
+        let receipt = s.shared_recovery_receipts().pop().unwrap();
+        registration.terminal_binding.as_mut().unwrap().generation += 2;
+        let guard = s.shared_hook_guard().await;
+        assert!(
+            s.commit_shared_recovery(&receipt, registration.clone(), None)
+                .is_none()
+        );
+        drop(guard);
+        assert!(
+            s.commit_shared_recovery(&receipt, registration.clone(), None)
+                .is_some()
+        );
+        let receipt = s.shared_recovery_receipts().pop().unwrap();
+        registration.process_nonce.push_str("-new");
+        registration
+            .terminal_binding
+            .as_mut()
+            .unwrap()
+            .tui_identity
+            .push_str("-new");
+        assert!(s.recovery_needs_native(&receipt, &registration));
+        assert!(
+            s.commit_shared_recovery(&receipt, registration, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn idle_join_refuses_backend_directory_unknown_thread_and_missing_lineage() {
+        for change in 0..5 {
+            let tmp = tempdir().unwrap();
+            let s = supervisor(&tmp.path().join("metadata.json"));
+            let mut original = shared_codex_registration();
+            seed_shared_recovery(&s, &original);
+            let receipt = s.shared_recovery_receipts().pop().unwrap();
+            original.terminal_binding.as_mut().unwrap().generation += 2;
+            let mut changed = original.clone();
+            let binding = changed.terminal_binding.as_mut().unwrap();
+            match change {
+                0 => binding.server_pid += 1,
+                1 => binding.server_identity.push_str("-replacement"),
+                2 => binding.status_directory = "/synthetic/different-directory".into(),
+                3 => {
+                    binding.thread_id.push_str("-unknown");
+                    changed.upstream_identity.clone_from(&binding.thread_id);
+                }
+                _ => s.metadata.lock().mappings[0].backend_lineage = None,
+            }
+            assert!(s.commit_shared_recovery(&receipt, changed, None).is_none());
+            if change == 4 {
+                assert!(s.shared_recovery_receipts().is_empty());
+                s.metadata.lock().record_hook_lineage(&original).unwrap();
+            }
+            let fresh = s.shared_recovery_receipts().pop().unwrap();
+            assert!(s.commit_shared_recovery(&fresh, original, None).is_some());
+        }
+    }
+
+    #[test]
+    fn idle_legacy_metadata_roundtrip_requires_original_directory_for_new_tui() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        let s = supervisor(&path);
+        let original = shared_codex_registration();
+        seed_shared_recovery(&s, &original);
+        let lineage = s.shared_recovery_receipts()[0].lineage().clone();
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        disk["mappings"][0]["backend_lineage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("status_directory");
+        std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        let legacy = supervisor(&path);
+        let receipt = legacy.shared_recovery_receipts().pop().unwrap();
+        assert!(receipt.lineage().status_directory.is_none());
+        assert!(
+            !receipt
+                .lineage()
+                .admits_native_join(original.terminal_binding.as_ref().unwrap())
+        );
+        // Legacy exact-known-TUI rules survive; no legacy row can grant a new TUI.
+        assert!(receipt.lineage().matches(
+            original.terminal_binding.as_ref().unwrap(),
+            &original.adapter_version
+        ));
+        let mut replacement = original.clone();
+        replacement.process_nonce.push_str("-new");
+        replacement
+            .terminal_binding
+            .as_mut()
+            .unwrap()
+            .tui_identity
+            .push_str("-new");
+        assert!(
+            legacy
+                .commit_shared_recovery(&receipt, replacement, None)
+                .is_none()
+        );
+        legacy
+            .metadata
+            .lock()
+            .record_hook_lineage(&original)
+            .unwrap();
+        assert_eq!(
+            supervisor(&path).shared_recovery_receipts()[0].lineage(),
+            &lineage
+        );
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        disk["mappings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("backend_lineage");
+        std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(supervisor(&path).shared_recovery_receipts().is_empty());
+    }
+
+    #[test]
+    fn idle_history_rejects_replaced_token_generation_and_proof() {
+        for change in 0..3 {
+            let tmp = tempdir().unwrap();
+            let s = supervisor(&tmp.path().join("metadata.json"));
+            let mut registration = shared_codex_registration();
+            let first = seed_shared_recovery(&s, &registration);
+            let receipt = s.shared_recovery_receipts().pop().unwrap();
+            registration.terminal_binding.as_mut().unwrap().generation += 2;
+            let row = s
+                .commit_shared_recovery(&receipt, registration, None)
+                .unwrap();
+            {
+                let mut inner = s.inner.lock();
+                let live = inner.sessions.get_mut(&first.session_id).unwrap();
+                match change {
+                    0 => live.bridge_disconnect_token = random_id(),
+                    1 => live.snapshot.process_generation += 1,
+                    _ => live.proof_revision += 1,
+                }
+            }
+            assert!(
+                s.backfill_recovered_shared(&row, recovered_history())
+                    .is_err()
+            );
+            assert!(
+                s.inner.lock().sessions[&first.session_id]
+                    .history
+                    .is_empty()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn missing_shared_binding_closes_the_observation_without_signalling_a_process() {
         let temp = tempdir().unwrap();
@@ -4633,6 +5966,1320 @@ mod tests {
         );
     }
 
+    fn install_fixture_route(
+        supervisor: &AgentSessionSupervisor,
+        registered: &RegisteredAgentSession,
+    ) -> String {
+        let route_id = random_id();
+        let mut inner = supervisor.inner.lock();
+        let session = inner.sessions.get_mut(&registered.session_id).unwrap();
+        session.route_id = Some(route_id.clone());
+        session.snapshot.terminal_fallback.route_id = Some(route_id.clone());
+        session.snapshot.terminal_fallback.continuity = "exact_live".into();
+        session.snapshot.capabilities.terminal_continuity = "exact_live".into();
+        let record = RouteRecord {
+            session_id: registered.session_id.clone(),
+            process_generation: registered.process_generation,
+            terminal_binding: session.terminal_binding.clone(),
+            proof: AgentRouteProof::HerdrCore {
+                bridge_pid: session.process_id,
+                session_name: "fixture".into(),
+                tab_id: "fixture-tab".into(),
+                terminal_pid: session.process_id,
+            },
+        };
+        inner.routes.insert(route_id.clone(), record);
+        route_id
+    }
+
+    #[tokio::test]
+    async fn readonly_hook_history_reconcile_during_proof_issues_current_receipt_only() {
+        for changed_context in 0..5 {
+            let temp = tempdir().unwrap();
+            let supervisor = supervisor(&temp.path().join("metadata.json"));
+            let registration = shared_codex_registration();
+            let expected = registration.terminal_binding.clone().unwrap();
+            let registered = supervisor.register_new(registration.clone(), None).unwrap();
+            supervisor
+                .backfill_bridge_history(
+                    &registered.session_id,
+                    None,
+                    vec![entry("history-early", 1, "early")],
+                    true,
+                    None,
+                )
+                .unwrap();
+            supervisor
+                .upsert_bridge_entry(&registered.session_id, entry("live-prompt", 1, "live"))
+                .unwrap();
+            let (release, resolved) = tokio::sync::oneshot::channel();
+            let (waiting, started) = tokio::sync::oneshot::channel();
+            let pending_supervisor = supervisor.clone();
+            let pending_registered = registered.clone();
+            let pending_expected = expected.clone();
+            let pending = tokio::spawn(async move {
+                waiting.send(()).unwrap();
+                let proof = resolved.await.unwrap();
+                pending_supervisor.finish_readonly_hook_association(
+                    &pending_registered,
+                    &pending_expected,
+                    proof,
+                )
+            });
+            started.await.unwrap();
+            // Actual reconciliation, not a synthetic epoch increment: renumber held rows
+            // while the asynchronous endpoint proof is withheld.
+            supervisor
+                .backfill_bridge_history(
+                    &registered.session_id,
+                    Some(registered.process_generation),
+                    vec![entry("history-older", 1, "older")],
+                    true,
+                    None,
+                )
+                .unwrap();
+            let current_epoch = supervisor
+                .snapshot(&registered.session_id)
+                .unwrap()
+                .snapshot_epoch;
+            assert_ne!(current_epoch, registered.snapshot_epoch);
+            match changed_context {
+                1 => {
+                    supervisor
+                        .inner
+                        .lock()
+                        .sessions
+                        .get_mut(&registered.session_id)
+                        .unwrap()
+                        .snapshot
+                        .process_generation += 1
+                }
+                2 => {
+                    supervisor
+                        .refresh_observer_registration(&registration)
+                        .unwrap()
+                        .unwrap();
+                }
+                3 => {
+                    supervisor
+                        .inner
+                        .lock()
+                        .sessions
+                        .get_mut(&registered.session_id)
+                        .unwrap()
+                        .terminal_binding
+                        .as_mut()
+                        .unwrap()
+                        .generation += 1
+                }
+                _ => {}
+            }
+            release
+                .send((changed_context != 4).then_some(expected.clone()))
+                .unwrap();
+            let receipt = pending.await.unwrap();
+            if changed_context == 0 {
+                let receipt = receipt.expect("history-only epoch change refused fresh proof");
+                assert_eq!(receipt.snapshot_epoch, current_epoch);
+                assert_eq!(receipt.process_generation, registered.process_generation);
+                assert_eq!(receipt.disconnect_token, registered.disconnect_token);
+                // The original receipt is not upgraded, and the strict CAS still refuses it.
+                assert!(!supervisor.commit_readonly_hook_association(
+                    &registered,
+                    &expected,
+                    Some(expected.clone())
+                ));
+            } else {
+                assert!(receipt.is_none(), "changed context borrowed a new receipt");
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_hook_fresh_association_revokes_routes_after_generation_change_and_aba() {
+        for delta in [0, 1, 2] {
+            let temp = tempdir().unwrap();
+            let supervisor = supervisor(&temp.path().join("metadata.json"));
+            let registration = shared_codex_registration();
+            let expected = registration.terminal_binding.clone().unwrap();
+            let registered = supervisor.register_new(registration, None).unwrap();
+            let old_route = install_fixture_route(&supervisor, &registered);
+            let before = supervisor.snapshot(&registered.session_id).unwrap();
+            let mut fresh = expected.clone();
+            fresh.generation += delta;
+            assert!(
+                supervisor.commit_readonly_hook_association(
+                    &registered,
+                    &expected,
+                    Some(fresh.clone())
+                ),
+                "fresh read-only proof was rejected"
+            );
+            let after = supervisor.snapshot(&registered.session_id).unwrap();
+            assert_eq!(before.process_generation, after.process_generation);
+            assert_eq!(before.snapshot_epoch, after.snapshot_epoch);
+            assert_eq!(
+                supervisor.session_for_route(&old_route).is_some(),
+                delta == 0
+            );
+            if delta != 0 {
+                assert_eq!(after.terminal_fallback.continuity, "unavailable");
+                assert!(supervisor.commit_readonly_hook_association(
+                    &registered,
+                    &fresh,
+                    Some(fresh.clone())
+                ));
+                assert!(supervisor.session_for_route(&old_route).is_none());
+                let new_route = install_fixture_route(&supervisor, &registered);
+                assert_ne!(old_route, new_route);
+                assert!(supervisor.session_for_route(&new_route).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_hook_commit_never_changes_thread_or_process_incarnation() {
+        for change in 0..7 {
+            let temp = tempdir().unwrap();
+            let supervisor = supervisor(&temp.path().join("metadata.json"));
+            let registration = shared_codex_registration();
+            let expected = registration.terminal_binding.clone().unwrap();
+            let registered = supervisor.register_new(registration, None).unwrap();
+            let mut fresh = expected.clone();
+            match change {
+                0 => fresh.tui_pid += 1,
+                1 => fresh.tui_identity.push_str("-replacement"),
+                2 => fresh.server_pid += 1,
+                3 => fresh.server_identity.push_str("-replacement"),
+                4 => fresh.thread_id.push_str("-other"),
+                5 => fresh.status_directory = "/other-status".into(),
+                _ => fresh.generation = 0,
+            }
+            assert!(!supervisor.commit_readonly_hook_association(
+                &registered,
+                &expected,
+                Some(fresh)
+            ));
+            assert_eq!(
+                supervisor.inner.lock().sessions[&registered.session_id].terminal_binding,
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_hook_cas_refuses_a_registration_replaced_during_resolution() {
+        for success in [false, true] {
+            let temp = tempdir().unwrap();
+            let supervisor = supervisor(&temp.path().join("metadata.json"));
+            let registration = shared_codex_registration();
+            let expected = registration.terminal_binding.clone().unwrap();
+            let registered = supervisor.register_new(registration.clone(), None).unwrap();
+            let (release, resolved) = tokio::sync::oneshot::channel();
+            let pending_supervisor = supervisor.clone();
+            let pending_registered = registered.clone();
+            let pending = tokio::spawn(async move {
+                let proof = resolved.await.unwrap();
+                pending_supervisor.commit_readonly_hook_association(
+                    &pending_registered,
+                    &expected,
+                    proof,
+                )
+            });
+            // A different connection registers the SAME association while proof is pending.
+            let current = supervisor
+                .refresh_observer_registration(&registration)
+                .unwrap()
+                .unwrap();
+            assert_ne!(current.disconnect_token, registered.disconnect_token);
+            let current_route = install_fixture_route(&supervisor, &current);
+            release
+                .send(success.then(|| registration.terminal_binding.clone().unwrap()))
+                .unwrap();
+            assert!(!pending.await.unwrap());
+            assert!(supervisor.session_for_route(&current_route).is_some());
+        }
+    }
+
+    #[test]
+    fn readonly_hook_cas_refuses_changed_generation_epoch_binding_and_missing_proof() {
+        for change in 0..4 {
+            let temp = tempdir().unwrap();
+            let supervisor = supervisor(&temp.path().join("metadata.json"));
+            let registration = shared_codex_registration();
+            let expected = registration.terminal_binding.clone().unwrap();
+            let registered = supervisor.register_new(registration, None).unwrap();
+            let route = install_fixture_route(&supervisor, &registered);
+            {
+                let mut inner = supervisor.inner.lock();
+                let session = inner.sessions.get_mut(&registered.session_id).unwrap();
+                match change {
+                    0 => session.snapshot.process_generation += 1,
+                    1 => session.snapshot.snapshot_epoch += 1,
+                    2 => session.terminal_binding.as_mut().unwrap().generation += 1,
+                    _ => {}
+                }
+            }
+            assert!(!supervisor.commit_readonly_hook_association(&registered, &expected, None));
+            assert_eq!(
+                supervisor.snapshot(&registered.session_id).is_some(),
+                change != 3
+            );
+            assert_eq!(supervisor.session_for_route(&route).is_some(), change != 3);
+        }
+    }
+
+    #[test]
+    fn fresh_observer_binding_revokes_old_route_even_after_focus_aba() {
+        // No provider/socket timing: reproduce the authenticated registration commit itself.
+        for generation_delta in [1, 2] {
+            let temp = tempdir().unwrap();
+            let supervisor = supervisor(&temp.path().join("metadata.json"));
+            let mut registration = shared_codex_registration();
+            let registered = supervisor.register_new(registration.clone(), None).unwrap();
+            let route = install_fixture_route(&supervisor, &registered);
+            let before = supervisor.snapshot(&registered.session_id).unwrap();
+            registration.terminal_binding.as_mut().unwrap().generation += generation_delta;
+            supervisor
+                .refresh_observer_registration(&registration)
+                .unwrap()
+                .unwrap();
+            assert!(
+                supervisor.session_for_route(&route).is_none(),
+                "old selection token survived a fresh registration"
+            );
+            let after = supervisor.snapshot(&registered.session_id).unwrap();
+            assert_eq!(after.process_generation, before.process_generation);
+            assert_eq!(after.snapshot_epoch, before.snapshot_epoch);
+            assert!(after.revision > before.revision);
+            assert_eq!(after.terminal_fallback.continuity, "unavailable");
+            assert!(after.terminal_fallback.route_id.is_none());
+            supervisor
+                .refresh_observer_registration(&registration)
+                .unwrap()
+                .unwrap();
+            assert!(supervisor.session_for_route(&route).is_none());
+        }
+    }
+
+    #[test]
+    fn route_fence_rejects_replacement_while_inspection_is_pending() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("metadata.json"));
+        let mut registration = shared_codex_registration();
+        let registered = supervisor.register_new(registration.clone(), None).unwrap();
+        let old_route = install_fixture_route(&supervisor, &registered);
+        // This is the record terminal_plan holds across status/provider awaits. Commit the
+        // competing registration before resuming its final check; no scheduler sleeps.
+        let pending = supervisor.inner.lock().routes[&old_route].clone();
+        assert!(supervisor.route_record_is_current(&old_route, &pending));
+        registration.terminal_binding.as_mut().unwrap().generation += 2;
+        supervisor
+            .refresh_observer_registration(&registration)
+            .unwrap()
+            .unwrap();
+        let new_route = install_fixture_route(&supervisor, &registered);
+        let current = supervisor.inner.lock().routes[&new_route].clone();
+        assert!(!supervisor.route_record_is_current(&old_route, &pending));
+        assert!(!supervisor.route_record_is_current(&new_route, &pending));
+        assert!(supervisor.route_record_is_current(&new_route, &current));
+    }
+
+    #[test]
+    fn route_binding_fence_covers_incarnations_and_association_loss() {
+        for change in 0..5 {
+            let temp = tempdir().unwrap();
+            let supervisor = supervisor(&temp.path().join("metadata.json"));
+            let mut registration = shared_codex_registration();
+            let registered = supervisor.register_new(registration.clone(), None).unwrap();
+            let route = install_fixture_route(&supervisor, &registered);
+            let pending = supervisor.inner.lock().routes[&route].clone();
+            let binding = registration.terminal_binding.as_mut().unwrap();
+            match change {
+                0 => binding.tui_identity.push_str("-reused-pid"),
+                1 => binding.server_identity.push_str("-reused-pid"),
+                2 => binding.server_pid += 1,
+                3 => binding.status_directory = "/synthetic/replaced-status".into(),
+                _ => registration.terminal_binding = None,
+            }
+            supervisor
+                .refresh_observer_registration(&registration)
+                .unwrap()
+                .unwrap();
+            assert!(!supervisor.route_record_is_current(&route, &pending));
+            assert!(supervisor.session_for_route(&route).is_none());
+        }
+    }
+
+    #[test]
+    fn unchanged_observer_binding_keeps_its_current_route() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("metadata.json"));
+        let registration = shared_codex_registration();
+        let registered = supervisor.register_new(registration.clone(), None).unwrap();
+        let route = install_fixture_route(&supervisor, &registered);
+        supervisor
+            .refresh_observer_registration(&registration)
+            .unwrap()
+            .unwrap();
+        assert!(supervisor.session_for_route(&route).is_some());
+    }
+
+    // Native peer credentials cannot be simulated by an in-process PID assertion. This
+    // bounded owned process ports the independent review's Unix-status reproduction.
+    const RECOVERY_NATIVE_MOCK: &str = r#"
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#ifndef VERSION
+#define VERSION "0.169.0"
+#endif
+static void replace_image(int sig) {
+ char *p=getenv("IMAGE_REPLACEMENT");
+ // exec preserves the handler's blocked signal mask; permit the second real exec.
+ sigset_t set;sigemptyset(&set);sigaddset(&set,sig);sigprocmask(SIG_UNBLOCK,&set,NULL);
+ if(p){char *args[]={p,"app-server",NULL};execv(p,args);} _exit(4);
+}
+int main(int argc,char **argv) {
+ alarm(60); signal(SIGUSR1,replace_image);
+ if(argc>1 && !strcmp(argv[1],"--version")){ puts("codex-cli " VERSION);return 0; }
+ if(argc>1 && !strcmp(argv[1],"app-server")){ puts("READY");fflush(stdout);for(;;)pause(); }
+ char name[104]; if(snprintf(name,sizeof(name),"%s/%d.sock",getenv("STATUS_DIR"),getpid()) >= sizeof(name))return 3;
+ int s=socket(AF_UNIX,SOCK_STREAM,0);struct sockaddr_un a={0};a.sun_family=AF_UNIX;strcpy(a.sun_path,name);
+ if(bind(s,(struct sockaddr*)&a,sizeof(a))||chmod(name,0600)||listen(s,8))return 2;
+ puts("READY");fflush(stdout);
+ for(;;){int c=accept(s,0,0);if(c<0)continue;char req[256];read(c,req,sizeof(req));FILE*f=fopen(getenv("STATUS_JSON"),"r");if(f){char b[16385];size_t n=fread(b,1,sizeof(b),f);fclose(f);write(c,b,n);}close(c);}
+}
+"#;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    #[ignore = "requires explicitly built ordinary Ciao; owns compiled native/status peers"]
+    async fn idle_owned_native_composition_restart_and_actual_hook_lineage() {
+        use crate::{
+            codex_terminal_status::{self as status, DerivedAdmission},
+            native_codex_image as image,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let executable = PathBuf::from(
+            std::env::var_os("CIAO_TEST_NATIVE_IMAGE_CIAO").expect("ordinary Ciao required"),
+        );
+        assert!(executable.is_absolute());
+        let tmp = tempfile::Builder::new()
+            .prefix("cii-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let source = root.join("fixture.c");
+        let binary = root.join("codex");
+        let other_dir = root.join("other");
+        std::fs::create_dir(&other_dir).unwrap();
+        let other = other_dir.join("codex");
+        std::fs::write(&source, RECOVERY_NATIVE_MOCK).unwrap();
+        for (path, version) in [(&binary, "0.169.0"), (&other, "0.168.0")] {
+            assert!(
+                tokio::process::Command::new("cc")
+                    .arg(&source)
+                    .arg(format!("-DVERSION=\"{version}\""))
+                    .arg("-o")
+                    .arg(path)
+                    .status()
+                    .await
+                    .unwrap()
+                    .success()
+            );
+        }
+        let dir = root.join("s");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut paths = crate::storage::CiaoPaths::for_home(&root);
+        paths.run_dir = root.join("run");
+        std::fs::create_dir(&paths.run_dir).unwrap();
+        std::fs::set_permissions(&paths.run_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let json = root.join("status.json");
+        let mut backend = tokio::process::Command::new(&binary)
+            .arg("app-server")
+            .env_clear()
+            .env("IMAGE_REPLACEMENT", &other)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(backend.stdout.take().unwrap());
+        async fn ready(reader: &mut BufReader<tokio::process::ChildStdout>) {
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                reader.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(line, "READY\n");
+        }
+        ready(&mut reader).await;
+        let pid = backend.id().unwrap();
+        let identity = crate::process::terminal_identity(pid).await.unwrap();
+        let thread = "22222222-2222-4222-8222-222222222222";
+        let doc = serde_json::json!({"v":1,"generation":10,"displayed_thread_id":thread,"attached_thread_ids":[thread],"connection":{"kind":"local_daemon","state":"connected","server":{"pid":pid,"identity":identity}}});
+        std::fs::write(&json, format!("{doc}\n")).unwrap();
+        let mut old_tui = recovery_mock(&binary, &dir, &json, false).await;
+        let old_binding = status::resolve_shared(&dir, pid, thread)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata = root.join("metadata.json");
+        let s = supervisor(&metadata);
+        let mut registration = shared_codex_registration();
+        registration.adapter_version = "0.169.0".into();
+        registration.upstream_identity = thread.into();
+        registration.process_id = old_tui.id().unwrap();
+        registration.process_nonce = "old-owned-tui".into();
+        registration.terminal_binding = Some(old_binding);
+        let old = seed_shared_recovery(&s, &registration);
+        let token = install_fixture_route(&s, &old);
+        old_tui.kill().await.unwrap();
+        old_tui.wait().await.unwrap();
+        let mut tui = recovery_mock(&binary, &dir, &json, false).await;
+        let binding = status::resolve_shared(&dir, pid, thread)
+            .await
+            .unwrap()
+            .unwrap();
+        registration.process_id = tui.id().unwrap();
+        registration.process_nonce = "new-owned-tui".into();
+        registration.terminal_binding = Some(binding.clone());
+        let receipt = s.shared_recovery_receipts().pop().unwrap();
+        let original_lineage = receipt.lineage().clone();
+        assert!(s.recovery_needs_native(&receipt, &registration));
+        assert!(
+            s.commit_shared_recovery(&receipt, registration.clone(), None)
+                .is_none()
+        );
+        let observe = |pid, identity: String| {
+            let paths = paths.clone();
+            let executable = executable.clone();
+            async move { image::observe_fixture(&paths, pid, &identity, executable).await }
+        };
+        // Failure of either helper/identity is not version or association authority.
+        assert!(
+            image::observe_fixture(&paths, pid, &identity, root.join("missing-helper"))
+                .await
+                .is_none()
+        );
+        let backend_fact = observe(pid, identity.clone()).await.unwrap();
+        assert!(observe(pid, format!("{identity}0")).await.is_none());
+        assert!(image::revalidate_fixture(pid, &identity, &backend_fact, executable.clone()).await);
+        let tui_fact = observe(binding.tui_pid, binding.tui_identity.clone())
+            .await
+            .unwrap();
+        assert!(
+            !image::revalidate_fixture(
+                binding.tui_pid,
+                &binding.tui_identity,
+                &backend_fact,
+                executable.clone()
+            )
+            .await
+        );
+        assert!(
+            image::revalidate_fixture(
+                binding.tui_pid,
+                &binding.tui_identity,
+                &tui_fact,
+                executable.clone()
+            )
+            .await
+        );
+        let mut legacy = original_lineage.clone();
+        legacy.status_directory = None;
+        assert!(
+            DerivedAdmission::from_images(
+                &legacy,
+                &binding,
+                backend_fact.clone(),
+                tui_fact.clone()
+            )
+            .is_none()
+        );
+        let proof = DerivedAdmission::from_images(
+            &original_lineage,
+            &binding,
+            backend_fact.clone(),
+            tui_fact.clone(),
+        )
+        .unwrap();
+        assert!(status::revalidate(&binding).await);
+        let row = s
+            .commit_shared_recovery(&receipt, registration.clone(), Some(proof))
+            .unwrap();
+        assert!(s.session_for_route(&token).is_none());
+        assert!(row.registered.process_generation > old.process_generation);
+        assert_ne!(row.registered.snapshot_epoch, old.snapshot_epoch);
+        assert_eq!(s.shared_recovery_receipts()[0].lineage(), &original_lineage);
+        assert!(s.shared_recovery_receipts()[0].derived().is_some());
+        // Derived evidence is not serialized. Restart reacquires BOTH native facts, retaining
+        // original real-hook lineage instead of rewriting it to the admitted TUI.
+        let restarted = supervisor(&metadata);
+        let receipt = restarted.shared_recovery_receipts().pop().unwrap();
+        assert!(receipt.derived().is_none());
+        assert_eq!(receipt.lineage(), &original_lineage);
+        assert!(
+            restarted
+                .commit_shared_recovery(&receipt, registration.clone(), None)
+                .is_none()
+        );
+        let (backend_now, tui_now) = tokio::join!(
+            observe(pid, identity.clone()),
+            observe(binding.tui_pid, binding.tui_identity.clone())
+        );
+        let proof = DerivedAdmission::from_images(
+            &original_lineage,
+            &binding,
+            backend_now.unwrap(),
+            tui_now.unwrap(),
+        )
+        .unwrap();
+        assert!(status::revalidate(&binding).await);
+        assert!(image::revalidate_fixture(pid, &identity, &backend_fact, executable.clone()).await);
+        assert!(
+            image::revalidate_fixture(
+                binding.tui_pid,
+                &binding.tui_identity,
+                &tui_fact,
+                executable.clone()
+            )
+            .await
+        );
+        assert!(status::revalidate(&binding).await);
+        let recovered = restarted
+            .commit_shared_recovery(&receipt, registration.clone(), Some(proof))
+            .unwrap();
+        assert_eq!(
+            recovered.registered.process_generation,
+            row.registered.process_generation
+        );
+        assert_ne!(
+            recovered.registered.snapshot_epoch,
+            row.registered.snapshot_epoch
+        );
+        install_fixture_route(&restarted, &recovered.registered);
+        let guard = restarted.shared_hook_guard().await;
+        restarted
+            .register_observer_locked(registration.clone())
+            .unwrap();
+        drop(guard);
+        let hooked = restarted.shared_recovery_receipts().pop().unwrap();
+        assert!(hooked.derived().is_none());
+        assert_eq!(hooked.lineage().tui_pid, binding.tui_pid);
+        assert_ne!(hooked.lineage(), &original_lineage);
+        // Exercise the REAL bounded-cache insertion: choose its actual next victim, then
+        // native-admit that existing key without resizing/reordering the map.
+        let evicted = supervisor(&root.join("eviction-metadata.json"));
+        for index in 0..MAX_IDENTITY_MAPPINGS {
+            let mut known = registration.clone();
+            known.upstream_identity = format!("{index:08x}-2222-4222-8222-222222222222");
+            known.process_id = original_lineage.tui_pid;
+            known.process_nonce = "old-capacity-tui".into();
+            let known_binding = known.terminal_binding.as_mut().unwrap();
+            known_binding.thread_id.clone_from(&known.upstream_identity);
+            known_binding.tui_pid = original_lineage.tui_pid;
+            known_binding
+                .tui_identity
+                .clone_from(&original_lineage.tui_identity);
+            seed_shared_recovery(&evicted, &known);
+        }
+        let victim = evicted
+            .inner
+            .lock()
+            .shared_recovery
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let mut admitted = evicted.inner.lock().shared_recovery[&victim]
+            .registration
+            .clone();
+        let receipt = evicted
+            .shared_recovery_receipts()
+            .into_iter()
+            .find(|r| r.mapping.session_id == victim)
+            .unwrap();
+        let mut victim_doc = doc.clone();
+        victim_doc["displayed_thread_id"] = admitted.upstream_identity.clone().into();
+        victim_doc["attached_thread_ids"] = serde_json::json!([admitted.upstream_identity]);
+        std::fs::write(&json, format!("{victim_doc}\n")).unwrap();
+        let victim_binding = status::resolve_shared(&dir, pid, &admitted.upstream_identity)
+            .await
+            .unwrap()
+            .unwrap();
+        admitted.process_id = victim_binding.tui_pid;
+        admitted.process_nonce = "native-capacity-tui".into();
+        admitted.terminal_binding = Some(victim_binding.clone());
+        let native = DerivedAdmission::from_images(
+            receipt.lineage(),
+            &victim_binding,
+            backend_fact.clone(),
+            tui_fact.clone(),
+        )
+        .unwrap();
+        assert!(image::revalidate_fixture(pid, &identity, &backend_fact, executable.clone()).await);
+        assert!(
+            image::revalidate_fixture(
+                binding.tui_pid,
+                &binding.tui_identity,
+                &tui_fact,
+                executable.clone()
+            )
+            .await
+        );
+        let victim_row = evicted
+            .commit_shared_recovery(&receipt, admitted.clone(), Some(native))
+            .unwrap();
+        let victim_route = install_fixture_route(&evicted, &victim_row.registered);
+        assert_eq!(
+            evicted.inner.lock().shared_recovery.keys().next(),
+            Some(&victim)
+        );
+        evicted.remember_shared_recovery("ordinary-new-candidate", registration.clone());
+        assert!(!evicted.inner.lock().shared_recovery.contains_key(&victim));
+        assert!(evicted.session_for_route(&victim_route).is_some());
+        assert!(
+            evicted
+                .shared_recovery_receipts()
+                .iter()
+                .find(|r| r.mapping.session_id == victim)
+                .unwrap()
+                .derived()
+                .is_some()
+        );
+        assert!(
+            evicted
+                .revalidate_terminal_binding_with(&victim, |proof, binding| {
+                    let executable = executable.clone();
+                    async move { proof.revalidate_fixture(&binding, executable).await }
+                })
+                .await
+        );
+
+        // Same PID/kernel incarnation, genuinely different executable/version. Old image
+        // proof fails; a fresh measured 0.168 pair cannot enter this candidate lane.
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGUSR1,
+        )
+        .unwrap();
+        ready(&mut reader).await;
+        assert_eq!(
+            crate::process::terminal_identity(pid).await.as_ref(),
+            Some(&identity)
+        );
+        assert!(
+            !image::revalidate_fixture(pid, &identity, &backend_fact, executable.clone()).await
+        );
+        assert!(
+            status::revalidate(&victim_binding).await,
+            "status alone survives exec"
+        );
+        assert!(
+            !evicted
+                .revalidate_terminal_binding_with(&victim, |proof, binding| {
+                    let executable = executable.clone();
+                    async move { proof.revalidate_fixture(&binding, executable).await }
+                })
+                .await,
+            "capacity eviction must not convert native-required authority to hook authority"
+        );
+        assert!(evicted.session_for_route(&victim_route).is_none());
+        let replaced = observe(pid, identity.clone()).await.unwrap();
+        assert_eq!(replaced.version().as_str(), "0.168.0");
+        assert!(
+            DerivedAdmission::from_images(&original_lineage, &binding, replaced, tui_fact.clone())
+                .is_none()
+        );
+        assert!(
+            image::revalidate_fixture(
+                binding.tui_pid,
+                &binding.tui_identity,
+                &tui_fact,
+                executable.clone()
+            )
+            .await
+        );
+        // Return through a real exec to A and prove a complete fresh admission, not merely
+        // another negative nor a reused cached hook/version. Only owned fixture paths change.
+        let replacement = root.join("replacement");
+        std::fs::copy(&binary, &replacement).unwrap();
+        std::fs::rename(&replacement, &other).unwrap();
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGUSR1,
+        )
+        .unwrap();
+        ready(&mut reader).await;
+        let backend_again = observe(pid, identity.clone()).await.unwrap();
+        assert_eq!(backend_again.version().as_str(), "0.169.0");
+        let mut doc = doc;
+        doc["generation"] = 12.into();
+        std::fs::write(&json, format!("{doc}\n")).unwrap();
+        let binding = status::resolve_shared(&dir, pid, thread)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = DerivedAdmission::from_images(
+            &original_lineage,
+            &binding,
+            backend_again.clone(),
+            tui_fact.clone(),
+        )
+        .unwrap();
+        assert!(
+            image::revalidate_fixture(pid, &identity, &backend_again, executable.clone()).await
+        );
+        assert!(
+            image::revalidate_fixture(
+                binding.tui_pid,
+                &binding.tui_identity,
+                &tui_fact,
+                executable.clone()
+            )
+            .await
+        );
+        assert!(status::revalidate(&binding).await);
+        registration.terminal_binding = Some(binding);
+        let receipt = s.shared_recovery_receipts().pop().unwrap();
+        assert!(
+            s.commit_shared_recovery(&receipt, registration, Some(proof))
+                .is_some()
+        );
+        victim_doc["generation"] = 14.into();
+        std::fs::write(&json, format!("{victim_doc}\n")).unwrap();
+        let victim_binding = status::resolve_shared(&dir, pid, &admitted.upstream_identity)
+            .await
+            .unwrap()
+            .unwrap();
+        admitted.terminal_binding = Some(victim_binding.clone());
+        for helper_available in [true, false, true] {
+            if evicted.snapshot(&victim).is_none() {
+                let receipt = evicted
+                    .shared_recovery_receipts()
+                    .into_iter()
+                    .find(|r| r.mapping.session_id == victim)
+                    .unwrap();
+                let proof = DerivedAdmission::from_images(
+                    receipt.lineage(),
+                    &victim_binding,
+                    backend_again.clone(),
+                    tui_fact.clone(),
+                )
+                .unwrap();
+                assert!(
+                    proof
+                        .revalidate_fixture(&victim_binding, executable.clone())
+                        .await
+                );
+                assert!(status::revalidate(&victim_binding).await);
+                let row = evicted
+                    .commit_shared_recovery(&receipt, admitted.clone(), Some(proof))
+                    .unwrap();
+                install_fixture_route(&evicted, &row.registered);
+            }
+            let helper = if helper_available {
+                executable.clone()
+            } else {
+                root.join("missing-helper")
+            };
+            let valid = evicted
+                .revalidate_terminal_binding_with(&victim, |proof, binding| async move {
+                    proof.revalidate_fixture(&binding, helper).await
+                })
+                .await;
+            assert_eq!(valid, helper_available);
+        }
+        tui.kill().await.unwrap();
+        tui.wait().await.unwrap();
+        backend.kill().await.unwrap();
+        backend.wait().await.unwrap();
+        assert!(
+            std::fs::read_dir(paths.run_dir.join(if cfg!(target_os = "macos") {
+                "native-codex-image-v1"
+            } else {
+                "native-codex-linux-v1"
+            }))
+            .unwrap()
+            .all(|entry| entry.unwrap().file_name() == "lock")
+        );
+        println!(
+            "owned native facts: both images; helper/identity/legacy refusals; new TUI, restart, actual hook; same-PID exec refusal; children reaped"
+        );
+    }
+
+    async fn recovery_mock(
+        binary: &Path,
+        dir: &Path,
+        json: &Path,
+        backend: bool,
+    ) -> tokio::process::Child {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut command = tokio::process::Command::new(binary);
+        if backend {
+            command.arg("app-server");
+        }
+        let mut child = command
+            .env_clear()
+            .env("STATUS_DIR", dir)
+            .env("STATUS_JSON", json)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            BufReader::new(child.stdout.take().unwrap()).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(line.trim(), "READY");
+        child
+    }
+
+    #[tokio::test]
+    async fn recovery_real_same_tui_aba_and_status_negatives() {
+        use std::os::unix::fs::PermissionsExt;
+        // Short root is intentional: Darwin sockaddr_un has a 104-byte pathname bound.
+        let tmp = tempfile::Builder::new()
+            .prefix("cr-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let source = tmp.path().join("mock.c");
+        let binary = tmp.path().join("codex");
+        std::fs::write(&source, RECOVERY_NATIVE_MOCK).unwrap();
+        assert!(
+            tokio::process::Command::new("cc")
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let dir = tmp.path().join("s");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let json = tmp.path().join("response.json");
+        let mut backend = recovery_mock(&binary, &dir, &json, true).await;
+        let pid = backend.id().unwrap();
+        let identity = crate::process::terminal_identity(pid).await.unwrap();
+        let thread = "22222222-2222-4222-8222-222222222222";
+        let mut doc = serde_json::json!({"v":1,"generation":10,"displayed_thread_id":thread,"attached_thread_ids":[thread],"connection":{"kind":"local_daemon","state":"connected","server":{"pid":pid,"identity":identity}}});
+        let save = |value: &serde_json::Value| std::fs::write(&json, format!("{value}\n")).unwrap();
+        save(&doc);
+        let mut tui = recovery_mock(&binary, &dir, &json, false).await;
+        let binding = crate::codex_terminal_status::resolve_shared(&dir, pid, thread)
+            .await
+            .unwrap()
+            .unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let mut registration = shared_codex_registration();
+        registration.upstream_identity = thread.into();
+        registration.process_id = tui.id().unwrap();
+        registration.terminal_binding = Some(binding.clone());
+        let registered = s.register_observer(registration).await.unwrap();
+        let old = install_fixture_route(&s, &registered);
+        doc["generation"] = 12.into();
+        save(&doc);
+        s.revalidate_live_routes().await;
+        assert!(s.session_for_route(&old).is_none());
+        assert!(s.snapshot(&registered.session_id).is_none());
+        assert!(
+            s.inner
+                .lock()
+                .shared_recovery
+                .contains_key(&registered.session_id)
+        );
+        s.recover_known_shared().await;
+        s.recover_missing_routes().await;
+        assert!(
+            s.snapshot(&registered.session_id).is_some(),
+            "known candidate must survive the sweep and recover without a hook"
+        );
+        assert_eq!(
+            s.inner.lock().sessions[&registered.session_id]
+                .terminal_binding
+                .as_ref()
+                .unwrap()
+                .generation,
+            12
+        );
+        assert!(
+            s.session_for_route(&old).is_none(),
+            "ABA must never resurrect a token"
+        );
+        let association = crate::codex_terminal_status::HookAssociation {
+            binding,
+            peer_pid: pid,
+            peer_identity: identity.clone(),
+        };
+        assert!(association.resolve().await.is_some());
+        for case in 0..7 {
+            let mut bad = doc.clone();
+            match case {
+                0 => bad["displayed_thread_id"] = serde_json::Value::Null,
+                1 => bad["attached_thread_ids"] = serde_json::json!([]),
+                2 => bad["connection"]["kind"] = "remote".into(),
+                3 => bad["connection"]["state"] = "disconnected".into(),
+                4 => bad["connection"]["server"]["identity"] = format!("{identity}0").into(),
+                5 => bad["displayed_thread_id"] = "33333333-3333-4333-8333-333333333333".into(),
+                _ => bad["generation"] = 9.into(),
+            }
+            save(&bad);
+            assert!(association.resolve().await.is_none(), "negative {case}");
+            save(&doc);
+            assert!(
+                association.resolve().await.is_some(),
+                "restored control {case}"
+            );
+        }
+        let mut duplicate = recovery_mock(&binary, &dir, &json, false).await;
+        assert!(association.resolve().await.is_none());
+        duplicate.kill().await.unwrap();
+        duplicate.wait().await.unwrap();
+        assert!(association.resolve().await.is_some());
+        let mut wrong = association.clone();
+        wrong.peer_identity.push('0');
+        assert!(wrong.resolve().await.is_none());
+        wrong = association.clone();
+        wrong.binding.server_identity.push('0');
+        assert!(wrong.resolve().await.is_none());
+        tui.kill().await.unwrap();
+        tui.wait().await.unwrap();
+        assert!(association.resolve().await.is_none());
+        backend.kill().await.unwrap();
+        backend.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_withheld_discovery_cannot_erase_new_hook_or_history_epoch() {
+        for change in 0..3 {
+            let tmp = tempdir().unwrap();
+            let s = supervisor(&tmp.path().join("metadata.json"));
+            let registration = shared_codex_registration();
+            let original = s.register_new(registration.clone(), None).unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let task_s = s.clone();
+            let pending = tokio::spawn(async move {
+                let mut channels = Some((started_tx, release_rx));
+                task_s
+                    .revalidate_shared_with(|_| {
+                        let (started, release) = channels.take().unwrap();
+                        async move {
+                            started.send(()).unwrap();
+                            release.await.unwrap();
+                            Vec::new()
+                        }
+                    })
+                    .await;
+            });
+            started_rx.await.unwrap();
+            match change {
+                0 => {
+                    s.refresh_observer_registration(&registration)
+                        .unwrap()
+                        .unwrap();
+                }
+                1 => {
+                    s.inner
+                        .lock()
+                        .sessions
+                        .get_mut(&original.session_id)
+                        .unwrap()
+                        .snapshot
+                        .snapshot_epoch += 1;
+                }
+                _ => {
+                    let binding = registration.terminal_binding.as_ref().unwrap();
+                    assert!(s.commit_readonly_hook_association(
+                        &original,
+                        binding,
+                        Some(binding.clone())
+                    ));
+                }
+            }
+            let route = install_fixture_route(&s, &original);
+            release_tx.send(()).unwrap();
+            pending.await.unwrap();
+            assert!(s.snapshot(&original.session_id).is_some());
+            assert!(s.session_for_route(&route).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_withheld_provider_negative_is_registration_and_epoch_fenced() {
+        for change_epoch in [false, true] {
+            let tmp = tempdir().unwrap();
+            let s = supervisor(&tmp.path().join("metadata.json"));
+            let registration = shared_codex_registration();
+            let original = s.register_new(registration.clone(), None).unwrap();
+            let route = install_fixture_route(&s, &original);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let task_s = s.clone();
+            let task = tokio::spawn(async move {
+                let mut channels = Some((started_tx, release_rx));
+                task_s
+                    .revalidate_providers_with(|_| {
+                        let (started, release) = channels.take().unwrap();
+                        async move {
+                            started.send(()).unwrap();
+                            release.await.unwrap();
+                            false
+                        }
+                    })
+                    .await;
+            });
+            started_rx.await.unwrap();
+            if change_epoch {
+                s.inner
+                    .lock()
+                    .sessions
+                    .get_mut(&original.session_id)
+                    .unwrap()
+                    .snapshot
+                    .snapshot_epoch += 1;
+            } else {
+                s.refresh_observer_registration(&registration)
+                    .unwrap()
+                    .unwrap();
+            }
+            release_tx.send(()).unwrap();
+            task.await.unwrap();
+            assert!(
+                s.session_for_route(&route).is_some(),
+                "obsolete provider negative erased renewed authority"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_pending_hook_and_unchanged_polling_preserve_stop_receipt() {
+        let tmp = tempdir().unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let registration = shared_codex_registration();
+        let binding = registration.terminal_binding.clone().unwrap();
+        let (receipt, guard) = s
+            .register_shared_observer(registration.clone())
+            .await
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task_s = s.clone();
+        let discovered = binding.clone();
+        let task = tokio::spawn(async move {
+            let mut channels = Some((started_tx, release_rx));
+            task_s
+                .recover_shared_with(|_| {
+                    let (started, release) = channels.take().unwrap();
+                    let discovered = discovered.clone();
+                    async move {
+                        started.send(()).unwrap();
+                        release.await.unwrap();
+                        vec![discovered]
+                    }
+                })
+                .await;
+        });
+        started_rx.await.unwrap();
+        release_tx.send(()).unwrap();
+        // A history epoch changes while the same hook waits. Its fresh proof may issue a
+        // current receipt, but neither polling nor startup may borrow its connection.
+        s.inner
+            .lock()
+            .sessions
+            .get_mut(&receipt.session_id)
+            .unwrap()
+            .snapshot
+            .snapshot_epoch += 1;
+        let current = s
+            .finish_readonly_hook_association(&receipt, &binding, Some(binding.clone()))
+            .unwrap();
+        assert_eq!(current.disconnect_token, receipt.disconnect_token);
+        assert_ne!(current.snapshot_epoch, receipt.snapshot_epoch);
+        drop(guard);
+        task.await.unwrap();
+        let after = SessionFence::capture(&s.inner.lock().sessions[&receipt.session_id]).registered;
+        assert_eq!(after, current);
+        assert!(s.commit_readonly_hook_association(&current, &binding, Some(binding.clone())));
+        let completed = TurnState::Completed {
+            run_id: Some("recovered-stop".into()),
+        };
+        s.note_bridge_turn(&current.session_id, completed.clone())
+            .unwrap();
+        assert_eq!(s.snapshot(&current.session_id).unwrap().turn, completed);
+        assert!(!s.commit_readonly_hook_association(
+            &receipt,
+            registration.terminal_binding.as_ref().unwrap(),
+            registration.terminal_binding.clone()
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_withheld_positive_cannot_overwrite_new_registration() {
+        let tmp = tempdir().unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let registration = shared_codex_registration();
+        // Typed commit-boundary test: no background real provider discovery against the
+        // intentionally synthetic endpoint (the native test above covers that layer).
+        let original = s.register_new(registration.clone(), None).unwrap();
+        s.metadata
+            .lock()
+            .record_hook_lineage(&registration)
+            .unwrap();
+        s.remember_shared_recovery(&original.session_id, registration.clone());
+        let mut fresh = registration.terminal_binding.clone().unwrap();
+        fresh.generation += 2;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task_s = s.clone();
+        let task = tokio::spawn(async move {
+            let mut channels = Some((started_tx, release_rx));
+            task_s
+                .recover_shared_with(|_| {
+                    let (started, release) = channels.take().unwrap();
+                    let fresh = fresh.clone();
+                    async move {
+                        started.send(()).unwrap();
+                        release.await.unwrap();
+                        vec![fresh]
+                    }
+                })
+                .await;
+        });
+        started_rx.await.unwrap();
+        let replacement = s
+            .refresh_observer_registration(&registration)
+            .unwrap()
+            .unwrap();
+        s.remember_shared_recovery(&replacement.session_id, registration);
+        assert_ne!(original.disconnect_token, replacement.disconnect_token);
+        release_tx.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(
+            SessionFence::capture(&s.inner.lock().sessions[&original.session_id]).registered,
+            replacement
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_startup_sample_cannot_regress_retained_generation_after_erasure() {
+        let tmp = tempdir().unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let old = shared_codex_registration();
+        let mut newer = old.clone();
+        newer.terminal_binding.as_mut().unwrap().generation += 2;
+        let receipt = s.register_new(newer.clone(), None).unwrap();
+        s.metadata.lock().record_hook_lineage(&newer).unwrap();
+        s.remember_shared_recovery(&receipt.session_id, newer.clone());
+        let fence = SessionFence::capture(&s.inner.lock().sessions[&receipt.session_id]);
+        s.remove_terminal_binding_if_current(&fence);
+        assert!(s.rediscover_observer(old).await.is_err());
+        assert!(s.snapshot(&receipt.session_id).is_none());
+        assert!(s.rediscover_observer(newer).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn recovery_lineage_roundtrip_and_legacy_fail_closed() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        let registration = shared_codex_registration();
+        let s = supervisor(&path);
+        s.register_observer(registration.clone()).await.unwrap();
+        let lineage = s
+            .registered_backend_lineage(
+                &registration.upstream_identity,
+                &registration.process_nonce,
+            )
+            .unwrap();
+        let loaded = supervisor(&path);
+        assert_eq!(
+            loaded.registered_backend_lineage(
+                &registration.upstream_identity,
+                &registration.process_nonce
+            ),
+            Some(lineage)
+        );
+        assert!(
+            loaded
+                .rediscover_observer(registration.clone())
+                .await
+                .is_ok()
+        );
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        disk["mappings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("backend_lineage");
+        std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        let legacy = supervisor(&path);
+        assert!(
+            legacy
+                .rediscover_observer(registration.clone())
+                .await
+                .is_err()
+        );
+        legacy
+            .register_observer(registration.clone())
+            .await
+            .unwrap();
+        assert!(
+            legacy
+                .registered_backend_lineage(
+                    &registration.upstream_identity,
+                    &registration.process_nonce
+                )
+                .is_some()
+        );
+        assert!(legacy.rediscover_observer(registration).await.is_ok());
+        let valid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for invalid in [serde_json::json!(null), serde_json::json!(0)] {
+            let mut bad = valid.clone();
+            bad["mappings"][0]["backend_lineage"]["backend_pid"] = invalid;
+            std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(
+                AgentSessionSupervisor::load(&path, WorkspaceConfig::with_binary_dirs(Vec::new()))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_stale_sweep_cannot_remove_new_same_binding_hook() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("metadata.json"));
+        let registration = shared_codex_registration();
+        let first = supervisor.register_new(registration.clone(), None).unwrap();
+        let pending = SessionFence::capture(&supervisor.inner.lock().sessions[&first.session_id]);
+        let current = supervisor
+            .refresh_observer_registration(&registration)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.disconnect_token, current.disconnect_token);
+        let route = install_fixture_route(&supervisor, &current);
+        supervisor.remove_terminal_binding_if_current(&pending);
+        assert!(supervisor.snapshot(&current.session_id).is_some());
+        assert!(supervisor.session_for_route(&route).is_some());
+    }
+
     #[test]
     fn old_terminal_binding_verdict_cannot_remove_a_new_selection_generation() {
         let temp = tempdir().unwrap();
@@ -4640,6 +7287,8 @@ mod tests {
         let registration = shared_codex_registration();
         let old = registration.terminal_binding.clone().unwrap();
         let registered = supervisor.register_new(registration, None).unwrap();
+        let pending =
+            SessionFence::capture(&supervisor.inner.lock().sessions[&registered.session_id]);
         let mut current = old.clone();
         current.generation += 1;
         supervisor
@@ -4649,9 +7298,11 @@ mod tests {
             .get_mut(&registered.session_id)
             .unwrap()
             .terminal_binding = Some(current.clone());
-        supervisor.remove_terminal_binding_if_current(&registered.session_id, &old);
+        supervisor.remove_terminal_binding_if_current(&pending);
         assert_eq!(supervisor.active_count(), 1);
-        supervisor.remove_terminal_binding_if_current(&registered.session_id, &current);
+        let current =
+            SessionFence::capture(&supervisor.inner.lock().sessions[&registered.session_id]);
+        supervisor.remove_terminal_binding_if_current(&current);
         assert_eq!(supervisor.active_count(), 0);
         assert!(process_exists(std::process::id()));
     }

@@ -42,6 +42,7 @@ jobs:
           python3 scripts/host_notices.py --check
           python3 -m unittest scripts/test_release_build.py
           python3 -B -m unittest discover -s integrations/codex/terminal-status -p test_build_vendor.py
+          python3 -B -m unittest discover -s integrations/codex/terminal-status -p test_rehearse.py
       - name: Build tests
         run: cargo test --locked --workspace --no-run
       - name: Host tests (no live-probe flags)
