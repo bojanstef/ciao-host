@@ -1865,13 +1865,16 @@ mod tests {
                 .permissions(fs::Permissions::from_mode(0o700))
                 .tempdir_in("/tmp")
                 .unwrap();
-            std::os::unix::fs::symlink(tmux, directory.path().join("real-tmux")).unwrap();
+            // Some builds print argv[0]'s basename in their version response.
+            let bin = directory.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            std::os::unix::fs::symlink(tmux, bin.join("tmux")).unwrap();
             write_stub(
                 directory.path(),
                 "tmux",
                 r#"unset TMUX TMUX_TMPDIR
 dir=${0%/*}
-exec "$dir/real-tmux" -f /dev/null -S "$dir/socket" "$@""#,
+exec "$dir/bin/tmux" -f /dev/null -S "$dir/socket" "$@""#,
             );
             let config = WorkspaceConfig::with_binary_dirs(vec![directory.path().to_owned()]);
             let program = config.resolve(ProviderKind::Tmux).unwrap();
