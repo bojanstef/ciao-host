@@ -327,12 +327,15 @@ pub fn read_verified_archive(
     expected_sha256: &[u8; 32],
     signature: &Path,
 ) -> Result<Vec<ArchiveEntry>> {
+    let target = current_release_target()
+        .ok_or_else(|| anyhow!("this OS/architecture has no released Ciao artifact"))?;
     read_verified_archive_signed_by(
         archive,
         expected_version,
         expected_sha256,
         signature,
         RELEASE_SIGNING_KEY,
+        target,
     )
 }
 
@@ -342,9 +345,8 @@ fn read_verified_archive_signed_by(
     expected_sha256: &[u8; 32],
     signature: &Path,
     trusted_key: &str,
+    target: &str,
 ) -> Result<Vec<ArchiveEntry>> {
-    let target = current_release_target()
-        .ok_or_else(|| anyhow!("this OS/architecture has no released Ciao artifact"))?;
     if !valid_release_version(expected_version) {
         bail!("the requested version is not a valid release version");
     }
@@ -868,17 +870,16 @@ mod tests {
             digest,
             &signature_path(archive),
             &signing_key().public_line(),
+            FIXTURE_TARGET,
         )
     }
 
-    fn target() -> &'static str {
-        current_release_target().expect("test host is a release target")
-    }
+    const FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
 
     #[test]
     fn golden_archive_verifies_and_hostile_variants_fail_closed() {
         let temp = tempdir().unwrap();
-        let golden = golden_entries("0.2.0", target());
+        let golden = golden_entries("0.2.0", FIXTURE_TARGET);
         let (path, digest) = write_archive(temp.path(), &golden);
         let entries = read_test_archive(&path, "0.2.0", &digest).unwrap();
         assert_eq!(entries.len(), 5);
@@ -903,11 +904,29 @@ mod tests {
         // the release key itself refuses an archive the test key signed.
         let signature = fs::read(signature_path(&path)).unwrap();
         assert!(
-            read_verified_archive(&path, "0.2.0", &digest, &signature_path(&path))
-                .unwrap_err()
-                .to_string()
-                .contains("does not verify")
+            read_verified_archive_signed_by(
+                &path,
+                "0.2.0",
+                &digest,
+                &signature_path(&path),
+                RELEASE_SIGNING_KEY,
+                FIXTURE_TARGET,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not verify")
         );
+        let public_error = read_verified_archive(&path, "0.2.0", &digest, &signature_path(&path))
+            .unwrap_err()
+            .to_string();
+        if current_release_target().is_some() {
+            assert!(public_error.contains("does not verify"), "{public_error}");
+        } else {
+            assert!(
+                public_error.contains("no released Ciao artifact"),
+                "{public_error}"
+            );
+        }
         fs::write(
             signature_path(&path),
             signing_key().sign(
@@ -1125,7 +1144,7 @@ mod tests {
 
     #[test]
     fn manifest_parsing_is_bounded_and_tolerant_of_growth() {
-        let target = target();
+        let target = FIXTURE_TARGET;
         let good = format!(
             "{{\"v\":1,\"artifacts\":[{{\"version\":\"0.2.0\",\"target\":\"{target}\",\"file\":\"ciao-0.2.0-{target}.tar\",\"sha256\":\"{}\",\"bytes\":42}}]}}",
             "ab".repeat(32)
