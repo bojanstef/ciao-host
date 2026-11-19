@@ -10,9 +10,7 @@ use tokio::time::{Instant, sleep};
 use std::path::PathBuf;
 
 use crate::{
-    agent_integration::AgentIntegration,
-    claude_integration::installed_claude_version,
-    codex_integration::installed_codex_version,
+    agent_integration::{AgentIntegration, detect_agents},
     daemon,
     identity::{create_or_load_identity, load_identity},
     install::{
@@ -27,7 +25,6 @@ use crate::{
         request_unpair,
     },
     pairing::PairingStatus,
-    pi_integration::pi_detected,
     qr::render_terminal_qr,
     service::{
         CronReason, LingerStatus, Supervisor, current_executable, describe_supervisor,
@@ -495,22 +492,6 @@ fn parse_setup_answer(answer: &str) -> Option<bool> {
         "n" | "N" => Some(false),
         _ => None,
     }
-}
-
-/// Vendor presence, not integration state: the pre-selection a person confirms or edits. A
-/// probe that errors reads as absent — the picker still accepts that name typed explicitly.
-pub(crate) fn detect_agents(paths: &CiaoPaths) -> Vec<AgentIntegration> {
-    let mut detected = Vec::new();
-    if installed_claude_version(paths).ok().flatten().is_some() {
-        detected.push(AgentIntegration::Claude);
-    }
-    if installed_codex_version(paths).ok().flatten().is_some() {
-        detected.push(AgentIntegration::Codex);
-    }
-    if pi_detected(paths) {
-        detected.push(AgentIntegration::Pi);
-    }
-    detected
 }
 
 fn integration_list(integrations: &[AgentIntegration]) -> String {

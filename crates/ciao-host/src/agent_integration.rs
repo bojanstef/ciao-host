@@ -10,7 +10,8 @@ use clap::ValueEnum;
 use crate::{
     claude_adapter::PINNED_CLAUDE_VERSION,
     claude_integration::{
-        claude_integration_status, install_claude_plugin, uninstall_claude_plugin,
+        claude_integration_status, install_claude_plugin, installed_claude_version,
+        uninstall_claude_plugin,
     },
     claude_managed_integration::{
         install_managed_claude, managed_claude_status, uninstall_managed_claude,
@@ -18,11 +19,29 @@ use crate::{
     codex_adapter::PINNED_CODEX_VERSION,
     codex_integration::{
         CodexIntegrationStatus, codex_integration_status, install_codex_hooks,
-        require_pinned_codex_version, uninstall_codex_hooks,
+        installed_codex_version, require_pinned_codex_version, uninstall_codex_hooks,
     },
-    pi_integration::{install_pi_extension, pi_integration_status, uninstall_pi_extension},
+    pi_integration::{
+        install_pi_extension, pi_detected, pi_integration_status, uninstall_pi_extension,
+    },
     storage::CiaoPaths,
 };
+
+/// Vendor presence, not integration state: the pre-selection a person confirms or edits. A
+/// probe that errors reads as absent — the picker still accepts that name typed explicitly.
+pub(crate) fn detect_agents(paths: &CiaoPaths) -> Vec<AgentIntegration> {
+    let mut detected = Vec::new();
+    if installed_claude_version(paths).ok().flatten().is_some() {
+        detected.push(AgentIntegration::Claude);
+    }
+    if installed_codex_version(paths).ok().flatten().is_some() {
+        detected.push(AgentIntegration::Codex);
+    }
+    if pi_detected(paths) {
+        detected.push(AgentIntegration::Pi);
+    }
+    detected
+}
 
 fn install_claude_components(
     install_attached: impl FnOnce() -> Result<()>,

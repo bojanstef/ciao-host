@@ -4745,7 +4745,7 @@ fn nonzero_random_u64() -> u64 {
     random::<u64>().max(1)
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(1, |duration| duration.as_secs().max(1))
@@ -7471,7 +7471,7 @@ int main(int argc,char **argv) {
             .note_family_state(&reg, [background], Some(done.clone()))
             .unwrap()
             .unwrap();
-        assert_eq!(crate::agent_bridge::attention_kind_for_turn(&edge), None);
+        assert_eq!(crate::agent_attention::attention_kind_for_turn(&edge), None);
         visible(&work);
         assert_eq!(child("b", Waiting, 3), Some(wait.clone()));
         assert_eq!(child("a", Finished, 4), None);
@@ -7495,7 +7495,7 @@ int main(int argc,char **argv) {
         assert_eq!(child("b", Progress, 6), Some(work.clone()));
         let edge = child("b", Finished, 7).unwrap();
         assert_eq!(
-            crate::agent_bridge::attention_kind_for_turn(&edge),
+            crate::agent_attention::attention_kind_for_turn(&edge),
             Some("idle_prompt")
         );
         assert_eq!(child("b", Finished, 7), None);

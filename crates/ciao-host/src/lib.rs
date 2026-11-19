@@ -1,4 +1,5 @@
 pub(crate) mod agent_adapter;
+mod agent_attention;
 pub(crate) mod agent_bridge;
 #[cfg(test)]
 mod agent_conformance;

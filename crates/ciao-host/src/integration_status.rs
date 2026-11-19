@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use tokio::time::Instant;
 
 use crate::{
-    agent_integration::AgentIntegration,
+    agent_integration::{AgentIntegration, detect_agents},
     claude_integration::{ClaudeIntegrationStatus, claude_integration_status},
     codex_integration::{CodexIntegrationStatus, codex_integration_status},
     host_protocol::{AgentIntegrationEntry, IntegrationAgent, IntegrationState},
@@ -83,7 +83,7 @@ fn entry(agent: AgentIntegration, state: IntegrationState) -> AgentIntegrationEn
 pub(crate) async fn probe(paths: &CiaoPaths) -> Vec<AgentIntegrationEntry> {
     let blocking = paths.clone();
     let read = tokio::task::spawn_blocking(move || {
-        let detected = crate::cli::detect_agents(&blocking);
+        let detected = detect_agents(&blocking);
         let claude = detected
             .contains(&AgentIntegration::Claude)
             .then(|| claude_integration_status(&blocking));

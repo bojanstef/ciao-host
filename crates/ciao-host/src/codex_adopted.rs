@@ -1264,9 +1264,10 @@ async fn on_notification(
                 crate::child_activity::ChildReport::one(child_key(id), state, stamp)
             });
         if let Ok(Some(turn)) = supervisor.note_family_state(&runtime.registered, reports, None)
-            && let Some(kind) = crate::agent_bridge::attention_kind_for_turn(&turn)
+            && let Some(kind) = crate::agent_attention::attention_kind_for_turn(&turn)
         {
-            crate::agent_bridge::push_attention(supervisor, &runtime.notifier, session, kind).await;
+            crate::agent_attention::push_attention(supervisor, &runtime.notifier, session, kind)
+                .await;
         }
     }
     // Only the root's own notifications may change its transcript or interrupt target.
@@ -1300,10 +1301,15 @@ async fn on_notification(
                 _ => TurnState::Completed { run_id },
             };
             if let Ok(Some(turn)) = supervisor.note_bridge_turn(session, state)
-                && let Some(kind) = crate::agent_bridge::attention_kind_for_turn(&turn)
+                && let Some(kind) = crate::agent_attention::attention_kind_for_turn(&turn)
             {
-                crate::agent_bridge::push_attention(supervisor, &runtime.notifier, session, kind)
-                    .await;
+                crate::agent_attention::push_attention(
+                    supervisor,
+                    &runtime.notifier,
+                    session,
+                    kind,
+                )
+                .await;
             }
         }
         "item/started" | "item/completed" => {
@@ -1578,7 +1584,7 @@ async fn on_server_request(
                 // ADR 005, same moment as every other integration: the card blocks the turn,
                 // and this is the push that reaches a pocket. Managed and adopted were the two
                 // paths that could raise a card and not say so — this closes the adopted half.
-                crate::agent_bridge::push_attention(
+                crate::agent_attention::push_attention(
                     &runtime.supervisor,
                     &runtime.notifier,
                     session,
