@@ -1,0 +1,78 @@
+{
+  "complete": {
+    "v": 1,
+    "name": "changes.diff",
+    "size": 128,
+    "bases": [
+      {
+        "token": "uncommitted",
+        "label": "Uncommitted"
+      }
+    ],
+    "base": "uncommitted",
+    "coverage": {
+      "new_files_total": 1,
+      "new_files_shown": 1,
+      "omitted_names": []
+    }
+  },
+  "partial": {
+    "v": 1,
+    "name": "changes.diff",
+    "size": 128,
+    "bases": [
+      {
+        "token": "uncommitted",
+        "label": "Uncommitted"
+      }
+    ],
+    "base": "uncommitted",
+    "coverage": {
+      "new_files_total": 55,
+      "new_files_shown": 50,
+      "omitted_names": [
+        "new-051.txt",
+        "new-052.txt",
+        "new-053.txt",
+        "new-054.txt",
+        "new-055.txt"
+      ]
+    }
+  },
+  "omitted_only": {
+    "v": 1,
+    "name": "changes.diff",
+    "size": 0,
+    "bases": [
+      {
+        "token": "uncommitted",
+        "label": "Uncommitted"
+      }
+    ],
+    "base": "uncommitted",
+    "coverage": {
+      "new_files_total": 1,
+      "new_files_shown": 0,
+      "omitted_names": [
+        "oversize.txt"
+      ]
+    }
+  },
+  "legacy": {
+    "v": 1,
+    "name": "changes.diff",
+    "size": 128,
+    "bases": [
+      {
+        "token": "uncommitted",
+        "label": "Uncommitted"
+      }
+    ],
+    "base": "uncommitted"
+  },
+  "file": {
+    "v": 1,
+    "name": "image.png",
+    "size": 321
+  }
+}

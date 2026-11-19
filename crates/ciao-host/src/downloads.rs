@@ -140,6 +140,9 @@ pub struct GetOpen {
 
 /// The one non-file `kind` this stream understands.
 pub const GET_KIND_GIT_DIFF: &str = "git_diff";
+const GET_KIND_GIT_FILE: &str = "git_file";
+// Leave time to deliver a categorical error before the phone’s ten-second first-frame budget.
+const GIT_REVIEW_PREP_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,6 +161,9 @@ pub struct GetAccepted {
     /// Which of them produced this patch. The reader is always told what they are looking at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// Exact coverage of the untracked enumeration for a Git review. File previews omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<crate::git_diff::DiffCoverage>,
 }
 
 /// One selectable base: the token to ask for it by, and the words to show.
@@ -597,10 +603,15 @@ where
         .or(session_cwd);
 
     if open.kind.as_deref() == Some(GET_KIND_GIT_DIFF) {
-        return send_git_diff(send, cwd, open.base.as_deref()).await;
+        return send_git_diff(send, cwd, open.base.as_deref(), GIT_REVIEW_PREP_TIMEOUT).await;
     }
 
-    let path = match resolve_target(&open.path, cwd, home) {
+    let target = if open.kind.as_deref() == Some(GET_KIND_GIT_FILE) {
+        resolve_git_file(&open.path, cwd).await
+    } else {
+        resolve_target(&open.path, cwd, home)
+    };
+    let path = match target {
         Ok(path) => path,
         Err(failure) => return send_get_error(send, failure.code, failure.message).await,
     };
@@ -647,6 +658,7 @@ where
             // A file preview has no bases to choose between; both fields stay off the wire.
             bases: Vec::new(),
             base: None,
+            coverage: None,
         },
     )
     .await?;
@@ -678,6 +690,43 @@ where
     Ok(())
 }
 
+/// Review headers name literal repository-relative files. Ordinary terminal previews have
+/// their own resolution, including tilde expansion and compiler line suffixes.
+async fn resolve_git_file(token: &str, cwd: Option<&str>) -> Result<PathBuf, DownloadFailure> {
+    const INVALID: DownloadFailure = DownloadFailure::new(
+        DownloadErrorCode::Invalid,
+        "That review file is unavailable.",
+    );
+    let relative = Path::new(token);
+    if token.is_empty()
+        || token.len() > MAX_PATH_BYTES
+        || token.contains('\0')
+        || relative.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(INVALID);
+    }
+    let cwd = cwd
+        .filter(|dir| Path::new(dir).is_absolute())
+        .ok_or(INVALID)?;
+    let (_, root) = tokio::time::timeout(
+        GIT_REVIEW_PREP_TIMEOUT,
+        crate::git_diff::open_work_tree(Path::new(cwd)),
+    )
+    .await
+    .map_err(|_| DownloadFailure::new(DownloadErrorCode::Timeout, "Git didn't answer in time."))?
+    .map_err(|_| INVALID)?;
+    let path = existing_file(&root.join(relative))?;
+    if !path.starts_with(&root) {
+        return Err(INVALID);
+    }
+    Ok(path)
+}
+
 /// The workspace's diff for one chosen base, as one `changes.diff` the phone renders.
 ///
 /// The extension matters: it is what the app's renderer keys on, the same way `get_accepted`'s
@@ -686,6 +735,7 @@ async fn send_git_diff<W>(
     send: &mut W,
     cwd: Option<&str>,
     base: Option<&str>,
+    prepare_timeout: Duration,
 ) -> Result<(), HostProtocolError>
 where
     W: AsyncWrite + Unpin,
@@ -718,8 +768,18 @@ where
         },
     };
 
-    let patch = match crate::git_diff::diff(Path::new(cwd), selected).await {
-        Ok(patch) => patch,
+    // Only preparing the reply is time-bounded. Streaming its accepted body has no overall
+    // deadline. Dropping a timed-out preparation kills its current Git child.
+    let prepare = async {
+        let patch = crate::git_diff::diff(Path::new(cwd), selected).await?;
+        let options = crate::git_diff::available_bases(Path::new(cwd)).await;
+        Ok((patch, options))
+    };
+    let prepared = tokio::time::timeout(prepare_timeout, prepare)
+        .await
+        .unwrap_or(Err(crate::git_diff::GitDiffError::Timeout));
+    let (patch, options) = match prepared {
+        Ok(result) => result,
         Err(error) => {
             let (code, message) = match error {
                 crate::git_diff::GitDiffError::NotARepository => (
@@ -745,10 +805,7 @@ where
         }
     };
 
-    // Enumerated after the patch is in hand, so the picker describes the same repository state
-    // the reader is about to look at rather than one from before a slow diff.
-    let bases = crate::git_diff::available_bases(Path::new(cwd))
-        .await
+    let bases = options
         .into_iter()
         .map(|option| GetDiffBase {
             token: option.base.wire().to_owned(),
@@ -756,20 +813,27 @@ where
         })
         .collect();
 
-    let bytes = patch.as_bytes();
-    write_download_control(
-        send,
-        FRAME_GET_ACCEPTED,
-        &GetAccepted {
-            v: DOWNLOAD_JSON_VERSION,
-            name: "changes.diff".to_owned(),
-            size: bytes.len() as u64,
-            bases,
-            base: Some(selected.wire().to_owned()),
-        },
-    )
-    .await?;
+    let bytes = patch.patch.as_bytes();
+    let accepted = GetAccepted {
+        v: DOWNLOAD_JSON_VERSION,
+        name: "changes.diff".to_owned(),
+        size: bytes.len() as u64,
+        bases,
+        base: Some(selected.wire().to_owned()),
+        coverage: Some(patch.coverage),
+    };
+    send_download_bytes(send, &accepted, bytes).await
+}
 
+async fn send_download_bytes<W>(
+    send: &mut W,
+    accepted: &GetAccepted,
+    bytes: &[u8],
+) -> Result<(), HostProtocolError>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_download_control(send, FRAME_GET_ACCEPTED, accepted).await?;
     for chunk in bytes.chunks(MAX_DOWNLOAD_CHUNK_PAYLOAD) {
         let encoded = encode_download_frame(FRAME_GET_CHUNK, chunk)?;
         send.write_all(&encoded)
@@ -1107,6 +1171,167 @@ mod tests {
                 .any(|option| option.token == "uncommitted"),
             "the picker is drawn from this: {:?}",
             accepted.bases
+        );
+    }
+
+    #[tokio::test]
+    async fn real_diff_stream_reports_every_untracked_file_at_and_beyond_the_limit() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/fixtures/phase9/git-review-coverage-v1.json"
+        ))
+        .unwrap();
+        let git = crate::git_diff::resolve_git().expect("real Git");
+        let temp = temp_dir();
+        let root = temp.path().canonicalize().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new(&git)
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            out.stdout
+        };
+        run(&["init", "-q"]);
+        for count in [1_usize, 50, 51, 55] {
+            for n in 1..=count {
+                std::fs::write(root.join(format!("new-{n:03}.txt")), b"content\n").unwrap();
+            }
+            let independent = run(&["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+            assert_eq!(independent.iter().filter(|&&byte| byte == 0).count(), count);
+            let mut recv = io::Cursor::new(open_git_diff(Some(root.to_str().unwrap())));
+            let mut sent = Vec::new();
+            run_download_stream(
+                &mut recv,
+                &mut sent,
+                None,
+                None,
+                &no_agent_workspace,
+                DOWNLOAD_IDLE_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            let (accepted, body) = decode_host_frames(&sent);
+            let review = String::from_utf8(body).unwrap();
+            let coverage = accepted.coverage.unwrap();
+            let shown = count.min(50);
+            assert_eq!(
+                review
+                    .lines()
+                    .filter(|l| l.starts_with("diff --git "))
+                    .count(),
+                shown
+            );
+            assert_eq!(coverage.new_files_total as usize, count);
+            assert_eq!(coverage.new_files_shown as usize, shown);
+            assert_eq!(coverage.omitted_names.len(), count - shown);
+            for name in &coverage.omitted_names {
+                assert!(!review.contains(name));
+            }
+            if count == 1 || count == 55 {
+                let key = if count == 1 { "complete" } else { "partial" };
+                assert_eq!(
+                    serde_json::to_value(coverage).unwrap(),
+                    fixture[key]["coverage"]
+                );
+            }
+        }
+        for key in ["complete", "partial", "omitted_only", "legacy", "file"] {
+            let value: GetAccepted = serde_json::from_value(fixture[key].clone()).unwrap();
+            assert_eq!(serde_json::to_value(value).unwrap(), fixture[key]);
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_diff_headers_and_review_previews_agree_on_the_repository_root() {
+        let temp = temp_dir();
+        let root = temp.path().canonicalize().unwrap();
+        let nested = root.join("subdir");
+        std::fs::create_dir(&nested).unwrap();
+        let git = crate::git_diff::resolve_git().expect("real Git");
+        assert!(
+            std::process::Command::new(git)
+                .arg("-C")
+                .arg(&root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("a.png"), b"\x89PNG\0root").unwrap();
+        std::fs::write(nested.join("a.png"), b"\x89PNG\0nested").unwrap();
+        let session = |id: &str| (id == "session").then(|| nested.to_str().unwrap().to_owned());
+        let mut recv = io::Cursor::new(open_git_diff_full(None, None, Some("session")));
+        let mut sent = Vec::new();
+        run_download_stream(
+            &mut recv,
+            &mut sent,
+            None,
+            None,
+            &session,
+            DOWNLOAD_IDLE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let (metadata, body) = decode_host_frames(&sent);
+        assert_eq!(metadata.coverage.unwrap().new_files_shown, 2);
+        let patch = String::from_utf8(body).unwrap();
+        assert!(patch.contains("Binary files /dev/null and b/a.png differ"));
+        assert!(patch.contains("Binary files /dev/null and b/subdir/a.png differ"));
+        for (kind, expected) in [
+            (Some(GET_KIND_GIT_FILE), b"\x89PNG\0root".as_slice()),
+            (None, b"\x89PNG\0nested".as_slice()),
+        ] {
+            let message = GetOpen {
+                v: DOWNLOAD_JSON_VERSION,
+                path: "a.png".into(),
+                cwd: None,
+                kind: kind.map(str::to_owned),
+                base: None,
+                session: Some("session".into()),
+            };
+            let mut recv =
+                io::Cursor::new(encode_download_control(FRAME_GET_OPEN, &message).unwrap());
+            let mut sent = Vec::new();
+            run_download_stream(
+                &mut recv,
+                &mut sent,
+                None,
+                None,
+                &session,
+                DOWNLOAD_IDLE_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            let (metadata, bytes) = decode_host_frames(&sent);
+            assert!(metadata.coverage.is_none());
+            assert_eq!(bytes, expected);
+        }
+        let cwd = nested.to_str();
+        let other = temp_dir();
+        let outside = other.path().join("external.png");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link.png")).unwrap();
+        for name in ["link.png", "../a.png", "/a.png"] {
+            assert_eq!(
+                resolve_git_file(name, cwd).await.unwrap_err().code,
+                DownloadErrorCode::Invalid
+            );
+        }
+        assert!(resolve_git_file("a.png:3", cwd).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn diff_preparation_expiry_returns_an_error_before_accepting_any_bytes() {
+        let temp = temp_dir();
+        let mut sent = Vec::new();
+        send_git_diff(&mut sent, temp.path().to_str(), None, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_error(&sent).unwrap().code,
+            DownloadErrorCode::Timeout.wire()
         );
     }
 

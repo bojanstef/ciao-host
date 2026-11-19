@@ -1,7 +1,8 @@
 //! Spec 008 spike — the uncommitted diff of one workspace, as one patch string.
 //!
 //! Deliberately not Spec 008 §5.3's snapshot. There is no manifest, no per-file record, no
-//! opaque file IDs, no omission reasons, and no snapshot lifetime: this produces the bytes
+//! opaque file IDs, or snapshot lifetime. An uncommitted review includes bounded coverage of
+//! untracked files alongside the bytes
 //! `git diff` produces so the renderer can be judged against a real repository. The structured
 //! snapshot is the thing to build once the renderer decision is settled.
 //!
@@ -11,11 +12,14 @@
 //! stderr never leaves this module — a refusal must not become a filesystem probe.
 
 use std::{
+    ffi::OsStr,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 use crate::pty::{apply_clean_process_environment, is_absolute_executable};
@@ -61,79 +65,91 @@ pub(crate) fn resolve_git() -> Option<PathBuf> {
         .find(|candidate| is_absolute_executable(candidate))
 }
 
-struct GitOutput {
-    success: bool,
-    stdout: Vec<u8>,
-    truncated: bool,
+pub(super) struct GitOutput {
+    pub(super) exit_code: Option<i32>,
+    pub(super) stdout: Vec<u8>,
+    pub(super) truncated: bool,
+    pub(super) had_diagnostics: bool,
 }
 
-/// One fixed git invocation. `-C` carries the directory rather than `current_dir`, so the
-/// cleaned environment's own working directory stays untouched and the argv is the whole story.
-async fn run_git(git: &Path, workdir: &Path, args: &[&str]) -> Result<GitOutput, GitDiffError> {
+impl GitOutput {
+    pub(super) fn success(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+}
+
+/// Capture bounded stdout and only the presence of diagnostics. Git can report unreadable
+/// directories on stderr but exit successfully when enumerating untracked files.
+pub(super) async fn run_git(
+    git: &Path,
+    workdir: &Path,
+    args: &[&str],
+) -> Result<GitOutput, GitDiffError> {
     let mut command = Command::new(git);
     command
         .arg("-C")
         .arg(workdir)
-        // Config on the command line, so a repository's own .git/config cannot reintroduce a
-        // pager, an external diff driver, or a textconv filter that would run arbitrary
-        // programs on the owner's machine because a phone asked to look at a diff.
-        .args(["--no-pager", "-c", "core.pager=cat", "-c", "diff.external="])
+        .args([
+            "--no-pager",
+            "--no-optional-locks",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "diff.external=",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     apply_clean_process_environment(&mut command).map_err(|_| GitDiffError::Failed)?;
 
     let mut child = command.spawn().map_err(|_| GitDiffError::GitUnavailable)?;
-    let mut stdout = child.stdout.take().ok_or(GitDiffError::Failed)?;
+    let stdout = child.stdout.take().ok_or(GitDiffError::Failed)?;
+    let mut stderr = child.stderr.take().ok_or(GitDiffError::Failed)?;
 
     let collected = timeout(GIT_TIMEOUT, async {
-        // One byte past the cap, so "exactly at the cap" and "over it" are distinguishable
-        // rather than both reading as a full buffer.
         let mut buffer = Vec::new();
-        // On the heap, not the stack. An `async fn` holds its locals in its future, so a 64 KiB
-        // array here is 64 KiB in every future that awaits a git call — and those nest several
-        // deep by the time the download stream holds one. It overflowed a debug thread stack.
-        let mut chunk = vec![0_u8; 64 * 1024];
-        let mut truncated = false;
-        loop {
-            match stdout.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(count) => {
-                    if buffer.len() + count > MAX_DIFF_BYTES {
-                        truncated = true;
-                        break;
-                    }
-                    buffer.extend_from_slice(&chunk[..count]);
-                }
-                Err(_) => return Err(GitDiffError::Failed),
+        let read_stdout = async {
+            stdout
+                .take(MAX_DIFF_BYTES as u64 + 1)
+                .read_to_end(&mut buffer)
+                .await
+                .map_err(|_| GitDiffError::Failed)?;
+            if buffer.len() > MAX_DIFF_BYTES {
+                return Err(GitDiffError::TooLarge);
             }
-        }
-        let status = child.wait().await.map_err(|_| GitDiffError::Failed)?;
+            Ok(())
+        };
+        let drain_stderr = async {
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink())
+                .await
+                .map_err(|_| GitDiffError::Failed)
+        };
+        // Returning at the cap drops and kills the child. Waiting with a full stdout pipe
+        // would block its writer until the entire command deadline expired.
+        let (_, diagnostics, status) = tokio::try_join!(read_stdout, drain_stderr, async {
+            child.wait().await.map_err(|_| GitDiffError::Failed)
+        })?;
         Ok(GitOutput {
-            success: status.success(),
+            exit_code: status.code(),
             stdout: buffer,
-            truncated,
+            truncated: false,
+            had_diagnostics: diagnostics > 0,
         })
     })
     .await
-    .map_err(|_| GitDiffError::Timeout)??;
-
-    Ok(collected)
-}
-
-/// True when `workdir` is inside a non-bare work tree. Two questions, because a bare repository
-/// answers the first one "true" and has nothing to diff.
-async fn is_work_tree(git: &Path, workdir: &Path) -> bool {
-    let inside = run_git(git, workdir, &["rev-parse", "--is-inside-work-tree"]).await;
-    let inside = matches!(&inside, Ok(out) if out.success && out.stdout.starts_with(b"true"));
-    if !inside {
-        return false;
-    }
-    match run_git(git, workdir, &["rev-parse", "--is-bare-repository"]).await {
-        Ok(out) => out.success && out.stdout.starts_with(b"false"),
-        Err(_) => false,
+    .map_err(|_| GitDiffError::Timeout)?;
+    match collected {
+        Err(GitDiffError::TooLarge) => Ok(GitOutput {
+            exit_code: None,
+            stdout: Vec::new(),
+            truncated: true,
+            had_diagnostics: false,
+        }),
+        other => other,
     }
 }
 
@@ -185,13 +201,15 @@ pub(crate) struct DiffBaseOption {
 /// these is a ref this host chose — none of it comes from the phone.
 async fn base_branch(git: &Path, workdir: &Path) -> Option<String> {
     let remote = run_git(git, workdir, &["rev-parse", "--abbrev-ref", "origin/HEAD"]).await;
-    if let Ok(out) = remote {
+    if let Ok(out) = remote
+        && out.success()
+    {
         let name = String::from_utf8(out.stdout)
             .unwrap_or_default()
             .trim()
             .to_owned();
         // A repository whose origin/HEAD is unset can echo the symbolic name straight back.
-        if out.success && !name.is_empty() && name != "origin/HEAD" {
+        if !name.is_empty() && name != "origin/HEAD" {
             return Some(name);
         }
     }
@@ -202,7 +220,7 @@ async fn base_branch(git: &Path, workdir: &Path) -> Option<String> {
             &["rev-parse", "--verify", "--quiet", candidate],
         )
         .await;
-        if matches!(&found, Ok(out) if out.success) {
+        if matches!(&found, Ok(out) if out.success()) {
             return Some(candidate.to_owned());
         }
     }
@@ -219,7 +237,7 @@ async fn branch_merge_base(git: &Path, workdir: &Path) -> Option<(String, String
     let merge_base = run_git(git, workdir, &["merge-base", branch.as_str(), "HEAD"])
         .await
         .ok()?;
-    if !merge_base.success {
+    if !merge_base.success() {
         return None;
     }
     let merge_base = String::from_utf8(merge_base.stdout).ok()?.trim().to_owned();
@@ -227,7 +245,7 @@ async fn branch_merge_base(git: &Path, workdir: &Path) -> Option<(String, String
         return None;
     }
     let head = run_git(git, workdir, &["rev-parse", "HEAD"]).await.ok()?;
-    if !head.success {
+    if !head.success() {
         return None;
     }
     if String::from_utf8(head.stdout).ok()?.trim() == merge_base {
@@ -253,30 +271,88 @@ pub(crate) async fn available_bases(workdir: &Path) -> Vec<DiffBaseOption> {
         let shown = branch.strip_prefix("origin/").unwrap_or(&branch);
         options.push(DiffBaseOption {
             base: DiffBase::Branch,
-            label: format!("vs {shown}"),
+            label: if shown.len() <= 256 {
+                format!("vs {shown}")
+            } else {
+                "Branch changes".to_owned()
+            },
         });
     }
     options
 }
 
-/// The patch for one chosen base.
-pub(crate) async fn diff(workdir: &Path, base: DiffBase) -> Result<String, GitDiffError> {
-    match base {
-        DiffBase::Uncommitted => uncommitted_diff(workdir).await,
-        DiffBase::Branch => branch_diff(workdir).await,
+/// Counts cover every enumerated untracked file. Omitted names are a bounded sample for
+/// display only. The difference between total, shown and named is always available to the UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffCoverage {
+    pub new_files_total: u32,
+    pub new_files_shown: u32,
+    pub omitted_names: Vec<String>,
+}
+
+impl DiffCoverage {
+    const MAX_OMITTED_NAMES: usize = 32;
+    const MAX_ENCODED_NAMES: usize = 1536;
+
+    fn record_omission(&mut self, name: &[u8], bytes_left: &mut usize) {
+        if self.omitted_names.len() == Self::MAX_OMITTED_NAMES || name.len() > *bytes_left {
+            return;
+        }
+        let mut display = String::new();
+        for chunk in name.utf8_chunks() {
+            for ch in chunk.valid().chars() {
+                display.extend(ch.escape_debug());
+            }
+            for byte in chunk.invalid() {
+                use std::fmt::Write;
+                write!(display, "\\x{byte:02x}").expect("writing to String");
+            }
+        }
+        let encoded_bytes = serde_json::to_vec(&display)
+            .expect("string serialization")
+            .len()
+            + usize::from(!self.omitted_names.is_empty());
+        if encoded_bytes <= *bytes_left {
+            *bytes_left -= encoded_bytes;
+            self.omitted_names.push(display);
+        }
     }
 }
 
-/// The guard both bases share: git exists, and this is somewhere with a work tree to read.
-async fn open_work_tree(workdir: &Path) -> Result<PathBuf, GitDiffError> {
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct GitDiff {
+    pub patch: String,
+    pub coverage: DiffCoverage,
+}
+
+pub(crate) async fn diff(workdir: &Path, base: DiffBase) -> Result<GitDiff, GitDiffError> {
+    match base {
+        DiffBase::Uncommitted => uncommitted_diff(workdir).await,
+        DiffBase::Branch => Ok(GitDiff {
+            patch: branch_diff(workdir).await?,
+            coverage: DiffCoverage::default(),
+        }),
+    }
+}
+
+/// --show-toplevel fails for a bare repository or a directory outside any worktree.
+/// Use the root for every Git read, even when the terminal is inside a nested directory.
+pub(super) async fn open_work_tree(workdir: &Path) -> Result<(PathBuf, PathBuf), GitDiffError> {
     let git = resolve_git().ok_or(GitDiffError::GitUnavailable)?;
     if !workdir.is_dir() {
         return Err(GitDiffError::NotARepository);
     }
-    if !is_work_tree(&git, workdir).await {
+    let top = run_git(&git, workdir, &["rev-parse", "--show-toplevel"]).await?;
+    if !top.success() {
         return Err(GitDiffError::NotARepository);
     }
-    Ok(git)
+    let bytes = top.stdout.strip_suffix(b"\n").ok_or(GitDiffError::Failed)?;
+    let root = PathBuf::from(OsStr::from_bytes(bytes));
+    if !root.is_absolute() {
+        return Err(GitDiffError::Failed);
+    }
+    Ok((git, root))
 }
 
 /// Every commit on this branch that its base branch does not have, as one patch.
@@ -284,11 +360,12 @@ async fn open_work_tree(workdir: &Path) -> Result<PathBuf, GitDiffError> {
 /// Untracked and uncommitted work is deliberately absent: none of it is part of what a merge
 /// would bring, and this base exists to answer "what am I about to merge".
 async fn branch_diff(workdir: &Path) -> Result<String, GitDiffError> {
-    let git = open_work_tree(workdir).await?;
+    let (git, root) = open_work_tree(workdir).await?;
+    let workdir = root.as_path();
     let Some((merge_base, _)) = branch_merge_base(&git, workdir).await else {
         // This is only offered when it resolves, so arriving here means the branch moved under
-        // the reader between enumerating and asking. Empty is the honest answer, not an error.
-        return Ok(String::new());
+        // the reader between enumerating and asking, or Git failed to establish it.
+        return Err(GitDiffError::Failed);
     };
     let out = run_git(
         &git,
@@ -306,7 +383,7 @@ async fn branch_diff(workdir: &Path) -> Result<String, GitDiffError> {
     if out.truncated {
         return Err(GitDiffError::TooLarge);
     }
-    if !out.success {
+    if !out.success() || out.had_diagnostics {
         return Err(GitDiffError::Failed);
     }
     String::from_utf8(out.stdout).map_err(|_| GitDiffError::Failed)
@@ -316,7 +393,7 @@ async fn branch_diff(workdir: &Path) -> Result<String, GitDiffError> {
 /// nothing has been committed yet.
 async fn diff_base(git: &Path, workdir: &Path) -> &'static str {
     match run_git(git, workdir, &["rev-parse", "--verify", "HEAD"]).await {
-        Ok(out) if out.success => "HEAD",
+        Ok(out) if out.success() => "HEAD",
         _ => EMPTY_TREE,
     }
 }
@@ -327,68 +404,91 @@ async fn diff_base(git: &Path, workdir: &Path) -> &'static str {
 /// wants to see. The honest way to include them is `--no-index` against `/dev/null`, one call
 /// per file — the alternative, `--intent-to-add`, writes to the index, and this feature never
 /// mutates the worktree on the phone's behalf.
-async fn untracked_patch(git: &Path, workdir: &Path, budget: &mut usize) -> String {
+async fn append_untracked(
+    git: &Path,
+    root: &Path,
+    review: &mut GitDiff,
+) -> Result<(), GitDiffError> {
     let listed = run_git(
         git,
-        workdir,
+        root,
         &["ls-files", "--others", "--exclude-standard", "-z"],
     )
-    .await;
-    let Ok(listed) = listed else {
-        return String::new();
-    };
-    if !listed.success {
-        return String::new();
+    .await?;
+    if listed.truncated {
+        return Err(GitDiffError::TooLarge);
+    }
+    if !listed.success()
+        || listed.had_diagnostics
+        || (!listed.stdout.is_empty() && !listed.stdout.ends_with(&[0]))
+    {
+        return Err(GitDiffError::Failed);
     }
 
-    let mut patch = String::new();
+    // Each entry includes at least one byte and a NUL in the 1 MiB listing, so u32 is ample.
+    let mut sample_bytes = DiffCoverage::MAX_ENCODED_NAMES - 2; // JSON brackets
     for name in listed
         .stdout
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
-        .take(MAX_UNTRACKED_FILES)
     {
-        // Non-UTF-8 names are skipped rather than lossily converted: a name the renderer cannot
-        // round-trip is worse than an omission, and Spec 008 §5.2 owns the escaped-name design.
-        let Ok(name) = std::str::from_utf8(name) else {
-            continue;
-        };
-        // `--no-index` exits 1 precisely when there is a difference, which is the whole point,
-        // so success is not the check here — output is.
-        let Ok(out) = run_git(
-            git,
-            workdir,
-            &[
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-color",
-                "--no-index",
-                "--",
-                "/dev/null",
-                name,
-            ],
-        )
-        .await
-        else {
-            continue;
-        };
-        let Ok(text) = String::from_utf8(out.stdout) else {
-            continue;
-        };
-        if text.is_empty() || text.len() > *budget {
-            continue;
+        review.coverage.new_files_total += 1;
+        if review.coverage.new_files_total as usize <= MAX_UNTRACKED_FILES
+            && let Ok(name) = std::str::from_utf8(name)
+            && let Some(text) =
+                new_file_patch(git, root, name, MAX_DIFF_BYTES - review.patch.len()).await
+        {
+            review.patch.push_str(&text);
+            review.coverage.new_files_shown += 1;
+        } else {
+            review.coverage.record_omission(name, &mut sample_bytes);
         }
-        *budget -= text.len();
-        patch.push_str(&text);
     }
-    patch
+    Ok(())
+}
+
+async fn new_file_patch(git: &Path, root: &Path, name: &str, remaining: usize) -> Option<String> {
+    // Git lists an embedded untracked repository as a single directory ending in "/".
+    // --no-index compares /dev/null with its namesake inside a directory, so its patch
+    // could represent an unrelated file named "null" while appearing to cover the entry.
+    if remaining == 0 || name.ends_with('/') {
+        return None;
+    }
+    let out = run_git(
+        git,
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-index",
+            "--",
+            "/dev/null",
+            // --no-index still interprets a literal "-" as stdin after the options.
+            if name == "-" { "./-" } else { name },
+        ],
+    )
+    .await
+    .ok()?;
+    // --no-index exits one for a difference. A failing or capped process may have emitted a
+    // valid-looking prefix; never append any of its bytes.
+    if out.exit_code != Some(1)
+        || out.had_diagnostics
+        || out.truncated
+        || out.stdout.is_empty()
+        || out.stdout.len() > remaining
+    {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 /// Every uncommitted change in `workdir`, as one patch: staged and unstaged tracked changes
 /// against the base, then untracked files as additions.
-pub(crate) async fn uncommitted_diff(workdir: &Path) -> Result<String, GitDiffError> {
-    let git = open_work_tree(workdir).await?;
+async fn uncommitted_diff(workdir: &Path) -> Result<GitDiff, GitDiffError> {
+    let (git, root) = open_work_tree(workdir).await?;
+    let workdir = root.as_path();
 
     let base = diff_base(&git, workdir).await;
     let tracked = run_git(
@@ -400,16 +500,17 @@ pub(crate) async fn uncommitted_diff(workdir: &Path) -> Result<String, GitDiffEr
     if tracked.truncated {
         return Err(GitDiffError::TooLarge);
     }
-    if !tracked.success {
+    if !tracked.success() || tracked.had_diagnostics {
         return Err(GitDiffError::Failed);
     }
     // A patch the renderer cannot accept is not a patch. Spec 008 §5.2: no lossy replacement,
     // because a review that looks authoritative and is not is the worst outcome here.
-    let mut patch = String::from_utf8(tracked.stdout).map_err(|_| GitDiffError::Failed)?;
-
-    let mut budget = MAX_DIFF_BYTES.saturating_sub(patch.len());
-    patch.push_str(&untracked_patch(&git, workdir, &mut budget).await);
-    Ok(patch)
+    let mut review = GitDiff {
+        patch: String::from_utf8(tracked.stdout).map_err(|_| GitDiffError::Failed)?,
+        coverage: DiffCoverage::default(),
+    };
+    append_untracked(&git, workdir, &mut review).await?;
+    Ok(review)
 }
 
 #[cfg(test)]
@@ -454,7 +555,7 @@ mod tests {
 
         // Nothing is committed, so HEAD does not resolve; the empty-tree base is what makes
         // this a diff rather than a git error.
-        let patch = uncommitted_diff(&root).await.expect("diff");
+        let patch = uncommitted_diff(&root).await.expect("diff").patch;
         assert!(patch.contains("first.txt"), "names the file: {patch}");
         assert!(patch.contains("+hello"), "shows the addition: {patch}");
     }
@@ -478,7 +579,7 @@ mod tests {
         std::fs::write(root.join("new.txt"), "brand new\n").expect("write");
         std::fs::write(root.join("tracked.txt"), "one\ntwo\n").expect("write");
 
-        let patch = uncommitted_diff(&root).await.expect("diff");
+        let patch = uncommitted_diff(&root).await.expect("diff").patch;
         assert!(patch.contains("+two"), "tracked edit is present: {patch}");
         assert!(
             patch.contains("new.txt"),
@@ -515,7 +616,158 @@ mod tests {
             .expect("commit");
 
         // Clean is a state the reader is shown, not a failure (Spec 008 §2.1).
-        assert_eq!(uncommitted_diff(&root).await, Ok(String::new()));
+        assert_eq!(uncommitted_diff(&root).await, Ok(GitDiff::default()));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_untracked_file_has_no_partial_patch_and_does_not_hide_later_files() {
+        let (_temp, root, git) = repo_on_main().await.expect("real Git");
+        let oversize = root.join("oversize.txt");
+        std::fs::write(&oversize, vec![b'x'; MAX_DIFF_BYTES * 2]).unwrap();
+
+        // The child is still producing data when we reach the cap. This path used to wait
+        // on its full stdout pipe to the command deadline, or return an incomplete prefix.
+        let out = run_git(
+            &git,
+            &root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                "/dev/null",
+                "oversize.txt",
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(out.truncated);
+        assert!(out.stdout.is_empty());
+
+        let only = uncommitted_diff(&root).await.unwrap();
+        assert!(only.patch.is_empty());
+        assert_eq!(only.coverage.new_files_total, 1);
+        assert_eq!(only.coverage.new_files_shown, 0);
+        assert_eq!(only.coverage.omitted_names, ["oversize.txt"]);
+        std::fs::write(root.join("small.txt"), "included\n").unwrap();
+        let mixed = uncommitted_diff(&root).await.unwrap();
+        assert!(mixed.patch.contains("+included"));
+        assert!(!mixed.patch.contains("oversize.txt"));
+        assert_eq!(mixed.coverage.new_files_total, 2);
+        assert_eq!(mixed.coverage.new_files_shown, 1);
+        assert_eq!(mixed.coverage.omitted_names, ["oversize.txt"]);
+    }
+
+    #[tokio::test]
+    async fn cumulative_patch_budget_keeps_whole_files_and_failed_enumeration_refuses_coverage() {
+        let (_temp, root, git) = repo_on_main().await.expect("real Git");
+        let block = vec![b'a'; 600 * 1024];
+        std::fs::write(root.join("a.txt"), &block).unwrap();
+        std::fs::write(root.join("b.txt"), &block).unwrap();
+        std::fs::write(root.join("c.txt"), "still fits\n").unwrap();
+        let review = uncommitted_diff(&root).await.unwrap();
+        assert!(review.patch.len() <= MAX_DIFF_BYTES);
+        assert!(review.patch.contains("a.txt"));
+        assert!(!review.patch.contains("b.txt"));
+        assert!(review.patch.contains("+still fits"));
+        assert_eq!(review.coverage.new_files_total, 3);
+        assert_eq!(review.coverage.new_files_shown, 2);
+        assert_eq!(review.coverage.omitted_names, ["b.txt"]);
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let error = append_untracked(&git, elsewhere.path(), &mut GitDiff::default()).await;
+        assert_eq!(error, Err(GitDiffError::Failed));
+    }
+
+    #[tokio::test]
+    async fn embedded_untracked_repositories_are_named_without_diffing_an_unrelated_child() {
+        let (_temp, root, git) = repo_on_main().await.expect("real Git");
+        let embedded = root.join("embedded");
+        std::fs::create_dir(&embedded).unwrap();
+        assert!(
+            run_git(&git, &embedded, &["init", "-q"])
+                .await
+                .unwrap()
+                .success()
+        );
+        std::fs::write(embedded.join("null"), "unrelated content\n").unwrap();
+        let review = uncommitted_diff(&root).await.unwrap();
+        assert!(review.patch.is_empty());
+        assert_eq!(review.coverage.new_files_total, 1);
+        assert_eq!(review.coverage.new_files_shown, 0);
+        assert_eq!(review.coverage.omitted_names, ["embedded/"]);
+    }
+
+    #[tokio::test]
+    async fn a_nested_cwd_includes_siblings_renames_and_literal_dash_content() {
+        let (_temp, root, git) = repo_on_main().await.expect("real Git");
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        std::fs::write(root.join("-"), "literal dash contents\n").unwrap();
+        assert!(
+            run_git(&git, &root, &["mv", "base.txt", "renamed.txt"])
+                .await
+                .unwrap()
+                .success()
+        );
+        let review = uncommitted_diff(&root.join("subdir")).await.unwrap();
+        assert_eq!(review.coverage.new_files_total, 1);
+        assert_eq!(review.coverage.new_files_shown, 1);
+        assert!(review.coverage.omitted_names.is_empty());
+        assert!(review.patch.contains("+literal dash contents"));
+        assert!(review.patch.contains("rename from base.txt"));
+        assert!(review.patch.contains("rename to renamed.txt"));
+    }
+
+    #[tokio::test]
+    async fn untracked_non_utf8_content_is_named_without_inserting_a_partial_patch() {
+        let (_temp, root, _git) = repo_on_main().await.expect("real Git");
+        std::fs::write(root.join("bad\ncontent"), b"a\xffb\n").unwrap();
+        let review = uncommitted_diff(&root).await.unwrap();
+        assert!(review.patch.is_empty());
+        assert_eq!(review.coverage.new_files_total, 1);
+        assert_eq!(review.coverage.new_files_shown, 0);
+        assert_eq!(review.coverage.omitted_names, [r"bad\ncontent"]);
+    }
+
+    // APFS rejects invalid UTF-8 at creation. Linux can enumerate such a file from real Git.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_non_utf8_filename_has_an_escaped_display_name() {
+        let (_temp, root, _git) = repo_on_main().await.expect("real Git");
+        std::fs::write(
+            root.join(OsStr::from_bytes(b"mixed-\xff")),
+            b"valid content\n",
+        )
+        .unwrap();
+        let review = uncommitted_diff(&root).await.unwrap();
+        assert!(review.patch.is_empty());
+        assert_eq!(review.coverage.new_files_total, 1);
+        assert_eq!(review.coverage.new_files_shown, 0);
+        assert_eq!(review.coverage.omitted_names, [r"mixed-\xff"]);
+    }
+
+    #[test]
+    fn omitted_name_sample_obeys_entry_and_encoded_byte_budgets() {
+        let mut coverage = DiffCoverage::default();
+        let mut remaining = DiffCoverage::MAX_ENCODED_NAMES - 2;
+        for i in 0..70 {
+            coverage.record_omission(format!("x-{i}").as_bytes(), &mut remaining);
+        }
+        assert_eq!(
+            coverage.omitted_names.len(),
+            DiffCoverage::MAX_OMITTED_NAMES
+        );
+        let mut coverage = DiffCoverage::default();
+        let mut remaining = DiffCoverage::MAX_ENCODED_NAMES - 2;
+        let long = [b'\\'; 120];
+        for _ in 0..40 {
+            coverage.record_omission(&long, &mut remaining);
+        }
+        assert!(coverage.omitted_names.len() < DiffCoverage::MAX_OMITTED_NAMES);
+        assert!(
+            serde_json::to_vec(&coverage.omitted_names).unwrap().len()
+                <= DiffCoverage::MAX_ENCODED_NAMES
+        );
     }
 
     /// A repository on `main` with one commit, which is where both base tests start.
@@ -560,7 +812,10 @@ mod tests {
             "the branch base is offered and names main: {options:?}"
         );
 
-        let patch = diff(&root, DiffBase::Branch).await.expect("branch diff");
+        let patch = diff(&root, DiffBase::Branch)
+            .await
+            .expect("branch diff")
+            .patch;
         assert!(
             patch.contains("shipped.txt"),
             "the commit is there: {patch}"
@@ -580,7 +835,8 @@ mod tests {
         // And the other base still answers its own question.
         let uncommitted = diff(&root, DiffBase::Uncommitted)
             .await
-            .expect("uncommitted");
+            .expect("uncommitted")
+            .patch;
         assert!(uncommitted.contains("+edited"), "the edit: {uncommitted}");
         assert!(
             uncommitted.contains("scratch.txt"),
@@ -645,7 +901,7 @@ mod tests {
             .expect("config");
         std::fs::write(root.join("file.txt"), "one\ntwo\n").expect("write");
 
-        let patch = uncommitted_diff(&root).await.expect("diff");
+        let patch = uncommitted_diff(&root).await.expect("diff").patch;
         assert!(patch.contains("+two"), "still a real patch: {patch}");
     }
 }
