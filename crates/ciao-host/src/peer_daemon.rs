@@ -951,7 +951,9 @@ mod tests {
                 builder = builder.relay_mode(RelayMode::Custom(map));
             }
             let endpoint = builder.bind().await.unwrap();
-            let listener = super::super::bind_control_socket(&paths).await.unwrap();
+            let listener = super::super::bind_local_socket(&paths.socket_file)
+                .await
+                .unwrap();
             tasks.push(tokio::spawn(super::super::serve_ipc(
                 listener,
                 endpoint.clone(),

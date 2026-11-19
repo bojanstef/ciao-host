@@ -83,7 +83,7 @@ pub(crate) struct LaunchSpec {
 
 /// The worker launcher behind the directory. A host without an installed
 /// managed integration still uses `Worker`: pin resolution refuses every
-/// start/resume categorically with `runtime_unavailable`, while stop and
+/// start/resume with the unavailable component, while stop and
 /// listing keep their real semantics.
 #[derive(Debug)]
 pub(crate) enum ManagedLauncher {
@@ -136,10 +136,10 @@ impl WorkerLauncher {
                 )
                 .await;
                 if !restored {
-                    return Err(reason);
+                    return Err(reason.reason());
                 }
                 ManagedRuntime::resolve(&self.sdk_prefix, &self.worker_entrypoint)
-                    .map_err(|_| reason)?
+                    .map_err(|issue| issue.reason())?
             }
         };
         self.workers
@@ -153,7 +153,7 @@ impl WorkerLauncher {
                 spec.permission_mode.as_deref(),
                 spec.model.as_deref(),
             )
-            .map_err(|_| "runtime_unavailable")?;
+            .map_err(|_| "managed_worker_start_failed")?;
         Ok(LaunchedWorker {
             // A fresh worker has no vendor session until its first turn creates
             // one; the worker reports the real ID then. Grounded: the SDK is
@@ -2657,7 +2657,10 @@ mod tests {
         let outcome = directory
             .managed_start_at_path(&workspace, "cmd-start")
             .await;
-        assert_eq!(outcome.reason_code.as_deref(), Some("runtime_unavailable"));
+        assert_eq!(
+            outcome.reason_code.as_deref(),
+            Some("managed_worker_unavailable")
+        );
         assert_eq!(directory.live_count(), 0);
     }
 
