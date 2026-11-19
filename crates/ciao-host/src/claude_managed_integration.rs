@@ -692,9 +692,8 @@ mod tests {
         assert_eq!(heal_marker_note(&prefix), None);
 
         // A record whose PATH holds no npm: the attempt runs, fails at npm resolution, and
-        // says so durably. The fake node file satisfies the record's own validation.
-        let node = temp.path().join("node");
-        std::fs::write(&node, "#!/bin/sh\n").unwrap();
+        // says so durably. The stand-in interpreter is executable.
+        let node = Path::new("/bin/sh");
         std::fs::write(
             crate::managed_worker::runtime_record_file(&prefix),
             serde_json::json!({
