@@ -637,6 +637,13 @@ impl ManagedSessionDirectory {
         if let Some(existing) = self.deduplicated(command_id) {
             return existing;
         }
+        let Some((path, label)) = self.resolve_workspace(workspace_id).await else {
+            return self.refuse(command_id, "unknown_workspace");
+        };
+        self.start_in_workspace(path, label, command_id).await
+    }
+
+    pub(crate) async fn resolve_workspace(&self, workspace_id: &str) -> Option<(PathBuf, String)> {
         let workspace = {
             let store = self.store.lock();
             store
@@ -654,7 +661,7 @@ impl ManagedSessionDirectory {
         // to a path is to scan again and hash the candidates. Cheap next to launching a worker,
         // and it revalidates on the way — a checkout deleted since the list was drawn simply
         // stops matching and the start is refused rather than launching somewhere stale.
-        let workspace = match workspace {
+        match workspace {
             Some(known) => Some(known),
             None => {
                 // Scanned before the lock, same as the listing: no filesystem walk under the
@@ -675,11 +682,7 @@ impl ManagedSessionDirectory {
                         (path, label)
                     })
             }
-        };
-        let Some((path, label)) = workspace else {
-            return self.refuse(command_id, "unknown_workspace");
-        };
-        self.start_in_workspace(path, label, command_id).await
+        }
     }
 
     /// Host-CLI entry: an explicit local path may start the first session in a

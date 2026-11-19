@@ -1,7 +1,7 @@
 # Linked computers
 
-Ciao can explicitly introduce two computers so an agent on one can start a Ciao-managed
-Claude session on the other. It uses the daemons' existing Iroh identities and encrypted
+Ciao can explicitly introduce two computers so an agent on one can start Claude or native Codex
+in a granted workspace on the other. It uses the daemons' existing Iroh identities and encrypted
 transport. There is no account, public roster, SSH setup or shared private key.
 
 On the phone, hold any host card and choose **Linked Computers**. Every other computer has a
@@ -30,13 +30,31 @@ daemon build. A host selector is its exact display name or an unambiguous endpoi
 ```sh
 ciao peers list
 ciao peers workspaces --host 'Build Computer'
-ciao peers start --host 'Build Computer' --workspace <workspace-id> --request-id <unique-id>
+ciao peers start --host 'Build Computer' --workspace <workspace-id> --agent codex --request-id <unique-id>
 ciao peers snapshot --host 'Build Computer' <session-id>
 ciao peers send --host 'Build Computer' <session-id> --request-id <another-id> --prompt-file task.txt
 ciao peers follow --host 'Build Computer' <session-id> --seconds 60
 ciao peers interrupt --host 'Build Computer' <session-id> --request-id <another-id>
 ciao peers stop --host 'Build Computer' <session-id> --request-id <another-id>
 ```
+
+Any agent with shell access on the source can use these commands. Omit `--agent` for
+managed Claude, or pass `--agent claude` explicitly. Both hosts need the new CLI/daemon
+for Codex. A destination that supports the choice includes `codex` in the `agents`
+array returned by `workspaces`. Using `--agent codex` against an older destination
+returns `unsupported_peer_agent`.
+
+Install the complete native Codex distribution on the destination, including the tool
+executables shipped beside its binary. Sign in there as the user running Ciao. The
+destination daemon uses its recorded Codex executable, its own PATH, or the user's
+`~/.local/bin/codex`. Codex can use that user's eligible ChatGPT login. Each start
+creates a fresh thread.
+Use its returned Ciao session ID with send, follow, interrupt and stop. A phone can
+open that conversation and answer approvals. Closing the phone or disconnecting the
+source leaves it running. After a peer stop, snapshot, follow and send report
+`session_stopped`. Retrying the same stop ID recovers the original receipt. After
+terminal handback or a destination daemon restart, the peer run is unavailable.
+Codex retains its ordinary written conversation history on the destination.
 
 `--prompt-file -` reads a bounded UTF-8 prompt from stdin. Keep prompts out of shell arguments.
 A newly spawned worker may briefly answer `session_unavailable` until it registers; inspect
@@ -45,7 +63,7 @@ application. Tool approvals and questions are answered by the person through Cia
 these peer commands. `follow` polls canonical snapshots once per second for the specified
 interval; an unavailable connection is reported as an error, not as a stopped agent.
 
-Retry a lost start reply with the **same request ID and workspace**. A recorded outcome is
+Retry a lost start reply with the **same request ID, workspace and agent**. A recorded outcome is
 returned; an interrupted launch claim returns `outcome_unknown` and is never blindly launched
 again. Creating a new ID after an uncertain result may create another worker. Inspect the
 destination from your phone first. Prompt/interrupt receipts retain the existing canonical
@@ -75,7 +93,7 @@ Source-host settings and credentials are never copied. This is the same launch c
 by the phone and local CLI, rather than a peers-only mode. A selected project chooses its working directory; it does not contain filesystem
 or network access. Use an appropriate provider/OS sandbox when you need containment.
 
-The peer protocol permits selected-workspace discovery, managed Claude creation, and
+The peer protocol permits selected-workspace discovery, managed Claude and native Codex creation, and
 snapshot/prompt/interrupt/stop for sessions created under that exact grant. It exposes no
 terminal, arbitrary command/argv/environment API, other-session history, tool approval,
 permission-mode change, file transfer, port forward, or peer-administration operation.
@@ -96,7 +114,9 @@ snapshots, including its conversation content; Ciao adds no transcript persisten
 host. File/context transfer and Git coordination are explicit. Destination vendor/runtime gates
 still apply.
 
-Peer metadata lives in the destination-owned private `peers.json`, separate from paired phones.
-It contains grants, public identities, scope, session IDs and start outcomes, never prompt or
-timeline bodies. The authenticated peer's endpoint ID is checked before a request is decoded
-and its current grant is checked again before every effect.
+Peer grants and start reservations live in the destination-owned private `peers.json`.
+Native Codex outcomes use the adjacent private `peer-codex-receipts.json`. Older daemons
+can still read the grants and replay an explicit refusal for a Codex reservation.
+The files store public identities, scope, session IDs and lifecycle receipts. Prompt and timeline
+bodies stay out of both files. The destination checks the peer's authenticated endpoint ID
+before decoding a request and checks its current grant again before every effect.

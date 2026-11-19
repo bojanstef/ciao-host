@@ -240,6 +240,7 @@ impl ConnectionAdmissions {
 
 #[derive(Debug)]
 struct RuntimeState {
+    paths: CiaoPaths,
     peers: crate::peers::Peers,
     host_endpoint_id: EndpointId,
     online: AtomicBool,
@@ -817,6 +818,7 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     )?;
     let paired_devices = Arc::new(Mutex::new(paired_devices));
     let state = Arc::new(RuntimeState {
+        paths: paths.clone(),
         peers: crate::peers::Peers::load(&paths.peers_file)?,
         host_endpoint_id: identity.endpoint_id,
         online: AtomicBool::new(false),
@@ -3516,6 +3518,7 @@ async fn serve_agent_operation(
             //
             // A live session's snapshot and receiver are taken together: apart, a delta landing
             // between them reached neither and the phone sat a revision behind.
+            let _phone_hold = state.codex_adoptions.phone_conversation_hold(&session_id);
             let (live_snapshot, live_updates) = state
                 .agent_sessions
                 .subscribe_from_snapshot(&session_id)
@@ -3630,14 +3633,6 @@ async fn serve_agent_operation(
                 }
             }
             finish_agent_send(send).await;
-            // The phone closing the conversation is what ends an adopted hold (Spec 013 §5):
-            // the subscription stream is the "open" the ADR bounds the hold by.
-            if let Some(thread) = state.codex_adoptions.thread_for_session(&session_id) {
-                state.codex_adoptions.request_release(
-                    &thread,
-                    crate::codex_adopted::ReleaseReason::ConversationClosed,
-                );
-            }
         }
         _ => send_agent_error(send, "unsupported_operation").await,
     }
@@ -5240,6 +5235,7 @@ mod tests {
         .unwrap();
         let paired_devices = Arc::new(Mutex::new(PairedDeviceStore::load(paired_path).unwrap()));
         Arc::new(RuntimeState {
+            paths: CiaoPaths::for_home(paired_path.parent().unwrap()),
             peers: crate::peers::Peers::load(&paired_path.with_file_name("peers.json")).unwrap(),
             codex_adoptions: Arc::new(crate::codex_adopted::AdoptionRegistry::default()),
             host_endpoint_id,

@@ -1285,6 +1285,7 @@ fn reset_identity_files(paths: &CiaoPaths) -> Result<()> {
         // Revoke delegation before removing the identity. If this fails, a later setup
         // must not give a fresh host identity the old grants.
         &paths.peers_file,
+        &crate::peers::codex_receipts_path(&paths.peers_file),
         &paths.credentials_file,
         &paths.paired_devices_file,
         &paths.agent_metadata_file,
@@ -1721,6 +1722,8 @@ mod tests {
                         grant_id: "other-grant".into(),
                     });
                     store.starts.push(StartRecord {
+                        agent: crate::peers::PeerAgent::Claude,
+                        stop_request: None,
                         grant_id: "old-grant".into(),
                         request_id: "old-start".into(),
                         workspace_id: "workspace".into(),

@@ -109,6 +109,7 @@ export function generate({ binary = "codex", expectedVersion = PINNED_CODEX_VERS
 				"thread/read",
 				"thread/list",
 				"hooks/list",
+				"thread/start",
 				"thread/resume",
 				"thread/archive",
 				"turn/start",

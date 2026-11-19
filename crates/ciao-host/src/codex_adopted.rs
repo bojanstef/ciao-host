@@ -62,6 +62,7 @@ pub(crate) enum ReleaseReason {
     // drops the hold, then hands over `codex resume <id>`.
     ResumeInTerminal,
     ConnectionLost,
+    PeerStop,
 }
 
 impl ReleaseReason {
@@ -71,6 +72,7 @@ impl ReleaseReason {
             Self::ForeignTerminal => "foreign_terminal",
             Self::ForeignWriter => "foreign_writer",
             Self::ResumeInTerminal => "resume_in_terminal",
+            Self::PeerStop => "stopped",
             Self::ConnectionLost => "connection_lost",
         }
     }
@@ -213,8 +215,34 @@ const DISCOVERY_TTL: Duration = Duration::from_secs(30);
 /// many hosts contributed, not how many conversations exist on disk.
 const DISCOVERY_LIMIT: usize = 20;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldOwner {
+    Phone,
+    Peer(crate::agent_protocol::VendorVersionState),
+}
+
+pub(crate) struct PhoneConversationHold(mpsc::Sender<ReleaseReason>);
+
+impl Drop for PhoneConversationHold {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(ReleaseReason::ConversationClosed);
+    }
+}
+
+struct HeldThread {
+    registry: std::sync::Arc<AdoptionRegistry>,
+    thread_id: String,
+}
+
+impl Drop for HeldThread {
+    fn drop(&mut self) {
+        self.registry.remove(&self.thread_id);
+    }
+}
+
 #[derive(Debug)]
 struct AdoptionHandle {
+    owner: HoldOwner,
     session_id: String,
     child_pid: Option<u32>,
     release: mpsc::Sender<ReleaseReason>,
@@ -230,6 +258,7 @@ impl AdoptionRegistry {
         session_id: &str,
         child_pid: Option<u32>,
         release: mpsc::Sender<ReleaseReason>,
+        owner: HoldOwner,
     ) -> Result<()> {
         let mut inner = self.inner.lock().expect("adoption registry lock");
         if inner.contains_key(thread_id) {
@@ -238,6 +267,7 @@ impl AdoptionRegistry {
         inner.insert(
             thread_id.to_owned(),
             AdoptionHandle {
+                owner,
                 session_id: session_id.to_owned(),
                 child_pid,
                 release,
@@ -284,10 +314,45 @@ impl AdoptionRegistry {
             .lock()
             .expect("adoption registry lock")
             .get(thread_id)
+            .filter(|handle| {
+                reason != ReleaseReason::ConversationClosed || handle.owner == HoldOwner::Phone
+            })
             .map(|handle| handle.release.clone());
         if let Some(sender) = sender {
             let _ = sender.try_send(reason);
         }
+    }
+
+    /// Capture the actual writer when a phone subscribes. A late close from an older
+    /// subscription cannot release a later pickup of the same thread.
+    pub(crate) fn phone_conversation_hold(&self, session: &str) -> Option<PhoneConversationHold> {
+        self.inner
+            .lock()
+            .expect("adoption registry lock")
+            .values()
+            .find(|handle| handle.session_id == session && handle.owner == HoldOwner::Phone)
+            .map(|handle| PhoneConversationHold(handle.release.clone()))
+    }
+
+    pub(crate) fn peer_sessions(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("adoption registry lock")
+            .values()
+            .filter(|handle| matches!(handle.owner, HoldOwner::Peer(_)))
+            .map(|handle| handle.session_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn peer_worker(&self, session: &str) -> Option<mpsc::Sender<ReleaseReason>> {
+        self.inner
+            .lock()
+            .expect("adoption registry lock")
+            .values()
+            .find(|handle| {
+                handle.session_id == session && matches!(handle.owner, HoldOwner::Peer(_))
+            })
+            .map(|handle| handle.release.clone())
     }
 
     /// A registry that persists binary evidence and serves discovery. `load` reads whatever a
@@ -809,6 +874,92 @@ pub(crate) async fn adopt(
             return Err(AdoptRefusal::Vendor(error));
         }
     };
+    hold_thread(
+        supervisor,
+        registry,
+        notifier,
+        params,
+        (connection, events),
+        resumed,
+        HoldOwner::Phone,
+    )
+    .await
+    .map(|session| session.session_id)
+}
+
+/// A new thread has no persisted turn to resume. Keep its creating connection as its writer.
+pub(crate) async fn start_peer(
+    supervisor: AgentSessionSupervisor,
+    registry: std::sync::Arc<AdoptionRegistry>,
+    notifier: crate::notify::Notifier,
+    paths: &crate::storage::CiaoPaths,
+    workspace: &Path,
+    workspace_display: String,
+) -> std::result::Result<RegisteredAgentSession, &'static str> {
+    let binary = crate::codex_integration::codex_binary(paths)
+        .and_then(|path| path.canonicalize().ok())
+        .ok_or("codex_unavailable")?;
+    let version = crate::codex_hook::probe_binary_version(binary.clone(), Duration::from_secs(5))
+        .await
+        .map_err(|_| "codex_unavailable")?;
+    let version_state = if crate::codex_integration::codex_version_supported(&version) {
+        crate::agent_protocol::VendorVersionState::Grounded
+    } else if crate::codex_carry::admit_binary(paths, &version, &binary)
+        .await
+        .unwrap_or(false)
+    {
+        crate::agent_protocol::VendorVersionState::Carried
+    } else {
+        return Err("unsupported_version");
+    };
+    let (connection, events) = AppServerConnection::connect_in_workspace(&binary, Some(workspace))
+        .await
+        .map_err(|_| "codex_unavailable")?;
+    let started = connection
+        .request("thread/start", json!({"cwd": workspace}))
+        .await
+        .map_err(|_| "codex_start_failed")?;
+    let thread = &started["thread"];
+    let thread_id = thread["id"]
+        .as_str()
+        .filter(|id| codex_resume_command(id).is_some())
+        .ok_or("invalid_codex_thread")?;
+    let rollout = thread["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or("invalid_codex_thread")?;
+    let params = AdoptParams {
+        binary,
+        thread_id: thread_id.into(),
+        rollout: Some(rollout),
+        workspace_display,
+        workspace_path: Some(workspace.to_str().ok_or("unknown_workspace")?.into()),
+        adapter_version: version,
+    };
+    hold_thread(
+        supervisor,
+        registry,
+        notifier,
+        params,
+        (connection, events),
+        started,
+        HoldOwner::Peer(version_state),
+    )
+    .await
+    .map_err(|reason| reason.reason_code())
+}
+
+async fn hold_thread(
+    supervisor: AgentSessionSupervisor,
+    registry: std::sync::Arc<AdoptionRegistry>,
+    notifier: crate::notify::Notifier,
+    params: AdoptParams,
+    (mut connection, events): (AppServerConnection, mpsc::Receiver<AppServerEvent>),
+    resumed: Value,
+    owner: HoldOwner,
+) -> std::result::Result<RegisteredAgentSession, AdoptRefusal> {
+    let rollout = params.rollout.clone().ok_or(AdoptRefusal::NoContent)?;
     // The resume response carries `thread.turns` in the same shape `thread/read` answers, so
     // the Spec 012 history mapper applies unchanged. There is no live tail to exclude: the
     // empty run ID matches no turn.
@@ -816,7 +967,27 @@ pub(crate) async fn adopt(
     let models = model_surface(&connection, &resumed).await;
 
     let (command_sender, command_receiver) = mpsc::channel::<BridgeCommandEnvelope>(16);
-    let registration = adopted_registration(&params, &models);
+    let mut registration = adopted_registration(&params, &models);
+    if let HoldOwner::Peer(state) = owner {
+        registration.version_state = state.token().into();
+        // A later local pickup of this vendor thread must receive a new supervisor generation.
+        registration.process_nonce =
+            keyed_digest(CODEX_ADOPTED_DOMAIN, "peer-launch", &params.thread_id);
+    }
+    let (release_sender, release_receiver) = mpsc::channel(4);
+    registry
+        .claim(
+            &params.thread_id,
+            &registration.upstream_identity,
+            connection.pid(),
+            release_sender,
+            owner,
+        )
+        .map_err(|_| AdoptRefusal::AlreadyPickedUp)?;
+    let hold = HeldThread {
+        registry,
+        thread_id: params.thread_id.clone(),
+    };
     let registered = match supervisor.register(registration, command_sender).await {
         Ok(registered) => registered,
         Err(error) => {
@@ -834,6 +1005,11 @@ pub(crate) async fn adopt(
         history.complete,
         None,
     ) {
+        supervisor.end_adopted_session(
+            &registered.session_id,
+            registered.process_generation,
+            "registration_failed",
+        );
         connection.shutdown().await;
         return Err(AdoptRefusal::Vendor(error));
     }
@@ -850,36 +1026,21 @@ pub(crate) async fn adopt(
         supervisor.update_bridge_model_catalogue(&registered.session_id, models.catalogue.clone());
     }
 
-    let (release_sender, release_receiver) = mpsc::channel(4);
-    if registry
-        .claim(
-            &params.thread_id,
-            &registered.session_id,
-            connection.pid(),
-            release_sender,
-        )
-        .is_err()
-    {
-        connection.shutdown().await;
-        return Err(AdoptRefusal::AlreadyPickedUp);
-    }
-
-    let session_id = registered.session_id.clone();
+    let result = registered.clone();
     tokio::spawn(run_adopted(AdoptedRuntime {
         supervisor,
-        registry,
+        hold,
         notifier,
         connection,
         events,
         commands: command_receiver,
         release: release_receiver,
         registered,
-        thread_id: params.thread_id,
-        rollout: rollout.to_path_buf(),
+        rollout,
         models,
         carries_whereabouts: carries_whereabouts(&params.adapter_version),
     }));
-    Ok(session_id)
+    Ok(result)
 }
 
 /// Whether an adopted thread's recorded CLI version admits the write surface.
@@ -1028,14 +1189,13 @@ pub(crate) fn adopted_registration(
 
 struct AdoptedRuntime {
     supervisor: AgentSessionSupervisor,
-    registry: std::sync::Arc<AdoptionRegistry>,
+    hold: HeldThread,
     notifier: crate::notify::Notifier,
     connection: AppServerConnection,
     events: mpsc::Receiver<AppServerEvent>,
     commands: mpsc::Receiver<BridgeCommandEnvelope>,
     release: mpsc::Receiver<ReleaseReason>,
     registered: RegisteredAgentSession,
-    thread_id: String,
     rollout: PathBuf,
     /// The pickup-time surface, kept current as settings commands succeed: `current` is what
     /// the effort closed-check validates against, and `catalogue` is the closed set itself.
@@ -1076,7 +1236,7 @@ async fn run_adopted(mut runtime: AdoptedRuntime) {
                         .connection
                         .request(
                             "turn/interrupt",
-                            json!({"threadId": runtime.thread_id, "turnId": turn}),
+                            json!({"threadId": runtime.hold.thread_id, "turnId": turn}),
                         )
                         .await;
                 }
@@ -1107,7 +1267,7 @@ async fn run_adopted(mut runtime: AdoptedRuntime) {
                 let requested = requested.unwrap_or(ReleaseReason::ConversationClosed);
                 match requested {
                     // The person is at a terminal: yield now, mid-turn included (§5).
-                    ReleaseReason::ForeignTerminal | ReleaseReason::ForeignWriter => break requested,
+                    ReleaseReason::ForeignTerminal | ReleaseReason::ForeignWriter | ReleaseReason::PeerStop => break requested,
                     _ if tracking.vendor_turn_id.is_some() => {
                         deferred_release.get_or_insert((requested, time::Instant::now()));
                     }
@@ -1133,18 +1293,18 @@ async fn release(mut runtime: AdoptedRuntime, tracking: TurnTracking, reason: Re
     // A turn interrupted by a yield is reported as interrupted, never left claiming to run.
     if matches!(
         reason,
-        ReleaseReason::ForeignTerminal | ReleaseReason::ForeignWriter
+        ReleaseReason::ForeignTerminal | ReleaseReason::ForeignWriter | ReleaseReason::PeerStop
     ) && let Some(turn) = tracking.vendor_turn_id.clone()
     {
         let _ = runtime
             .connection
             .request(
                 "turn/interrupt",
-                json!({"threadId": runtime.thread_id, "turnId": turn}),
+                json!({"threadId": runtime.hold.thread_id, "turnId": turn}),
             )
             .await;
     }
-    runtime.registry.remove(&runtime.thread_id);
+
     runtime.connection.shutdown().await;
     tracing::info!(
         target: "codex_adopted",
@@ -1221,7 +1381,7 @@ async fn on_notification(
     let supervisor = &runtime.supervisor;
     let session = &runtime.registered.session_id;
     tracing::debug!(%method, "app-server notification");
-    let root = &runtime.thread_id;
+    let root = &runtime.hold.thread_id;
     let mut observations = Vec::new();
     if method == "thread/started" {
         let thread = &params["thread"];
@@ -1492,7 +1652,7 @@ async fn on_server_request(
     params: &Value,
 ) {
     if let Some(thread) = params["threadId"].as_str()
-        && thread != runtime.thread_id
+        && thread != runtime.hold.thread_id
         && !runtime
             .supervisor
             .knows_child(&runtime.registered, &child_key(thread))
@@ -1646,8 +1806,9 @@ async fn on_command(
             Some("foreign_terminal"),
         );
         runtime
+            .hold
             .registry
-            .request_release(&runtime.thread_id, ReleaseReason::ForeignTerminal);
+            .request_release(&runtime.hold.thread_id, ReleaseReason::ForeignTerminal);
         return;
     }
     let outcome = match &command.kind {
@@ -1666,7 +1827,7 @@ async fn on_command(
                 .connection
                 .request(
                     "turn/interrupt",
-                    json!({"threadId": runtime.thread_id, "turnId": turn}),
+                    json!({"threadId": runtime.hold.thread_id, "turnId": turn}),
                 )
                 .await
                 .map(|_| ()),
@@ -1729,7 +1890,7 @@ async fn send_text(
                 "turn/steer",
                 turn_params(
                     json!({
-                        "threadId": runtime.thread_id,
+                        "threadId": runtime.hold.thread_id,
                         "expectedTurnId": turn,
                         "input": input,
                     }),
@@ -1745,7 +1906,10 @@ async fn send_text(
         .connection
         .request(
             "turn/start",
-            turn_params(json!({"threadId": runtime.thread_id, "input": input}), note),
+            turn_params(
+                json!({"threadId": runtime.hold.thread_id, "input": input}),
+                note,
+            ),
         )
         .await
         .map(|_| ())
@@ -1795,7 +1959,7 @@ async fn set_model(runtime: &mut AdoptedRuntime, session: &str, model: String) -
         .connection
         .request(
             "thread/settings/update",
-            json!({"threadId": runtime.thread_id, "model": model}),
+            json!({"threadId": runtime.hold.thread_id, "model": model}),
         )
         .await?;
     runtime.models.current = Some(model.clone());
@@ -1809,7 +1973,7 @@ async fn set_effort(runtime: &mut AdoptedRuntime, session: &str, effort: String)
         .connection
         .request(
             "thread/settings/update",
-            json!({"threadId": runtime.thread_id, "effort": effort}),
+            json!({"threadId": runtime.hold.thread_id, "effort": effort}),
         )
         .await?;
     runtime.models.effort = Some(effort.clone());
@@ -2075,7 +2239,7 @@ mod tests {
         let registry = AdoptionRegistry::default();
         let (sender, mut receiver) = mpsc::channel(2);
         registry
-            .claim("thread-a", "session-a", Some(42), sender)
+            .claim("thread-a", "session-a", Some(42), sender, HoldOwner::Phone)
             .unwrap();
         assert_eq!(
             registry.session_for("thread-a").as_deref(),
@@ -2084,7 +2248,7 @@ mod tests {
         let (second, _second_receiver) = mpsc::channel(2);
         assert!(
             registry
-                .claim("thread-a", "session-b", None, second)
+                .claim("thread-a", "session-b", None, second, HoldOwner::Phone)
                 .is_err()
         );
 
@@ -2097,8 +2261,35 @@ mod tests {
         assert!(registry.session_for("thread-a").is_none());
     }
 
-    /// Spec 025: the note is filed as client context only for a Codex seen to take it, and the
-    /// person's words are never touched.
+    #[test]
+    fn closing_an_old_phone_subscription_never_releases_the_next_writer() {
+        let registry = AdoptionRegistry::default();
+        let (first, mut closed) = mpsc::channel(1);
+        registry
+            .claim("thread", "session", None, first, HoldOwner::Phone)
+            .unwrap();
+        let observed = registry.phone_conversation_hold("session").unwrap();
+        registry.remove("thread");
+        let (next, mut peer) = mpsc::channel(1);
+        registry
+            .claim(
+                "thread",
+                "session",
+                None,
+                next,
+                HoldOwner::Peer(crate::agent_protocol::VendorVersionState::Grounded),
+            )
+            .unwrap();
+        assert!(registry.phone_conversation_hold("session").is_none());
+        drop(observed);
+        assert_eq!(
+            closed.try_recv().unwrap(),
+            ReleaseReason::ConversationClosed
+        );
+        assert!(peer.try_recv().is_err());
+    }
+
+    /// Spec 025 carries this note as client context and preserves the user's prompt.
     #[test]
     fn the_whereabouts_note_rides_turn_params_only_where_codex_takes_it() {
         assert!(!carries_whereabouts("0.157.0"));
@@ -2125,7 +2316,7 @@ mod tests {
         let registry = AdoptionRegistry::default();
         let (sender, mut receiver) = mpsc::channel(2);
         registry
-            .claim("thread-a", "session-a", Some(42), sender)
+            .claim("thread-a", "session-a", Some(42), sender, HoldOwner::Phone)
             .unwrap();
         // Our own adopted child's hooks fire for our own turns; that is not a foreign owner.
         registry.note_hook_event("thread-a", 42);

@@ -9,6 +9,7 @@
 		"thread/read",
 		"thread/list",
 		"hooks/list",
+		"thread/start",
 		"thread/resume",
 		"thread/archive",
 		"turn/start",

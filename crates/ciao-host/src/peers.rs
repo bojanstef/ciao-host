@@ -2,7 +2,7 @@
 use std::{
     collections::HashSet,
     fs,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -131,16 +131,70 @@ pub(crate) struct Outgoing {
     pub grant_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PeerAgent {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl PeerAgent {
+    fn is_default(&self) -> bool {
+        *self == Self::Claude
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StartRecord {
     pub grant_id: String,
     pub request_id: String,
     pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "PeerAgent::is_default")]
+    pub agent: PeerAgent,
     pub outcome: Option<crate::agent_protocol::LifecycleOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_request: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+impl StartRecord {
+    // A legacy daemon can read and replay this refusal. It never receives a Codex session ID.
+    fn legacy_reservation(&self) -> Self {
+        Self {
+            agent: PeerAgent::Claude,
+            stop_request: None,
+            outcome: Some(crate::agent_protocol::LifecycleOutcome {
+                v: crate::agent_protocol::AGENT_PROTOCOL_VERSION,
+                command_id: command_id(&self.grant_id, &format!("start/{}", self.request_id)),
+                state: "refused".into(),
+                reason_code: Some("native_codex_required".into()),
+                session_id: None,
+                process_generation: None,
+                deduplicated: None,
+                resume_command: None,
+            }),
+            ..self.clone()
+        }
+    }
+
+    fn is_codex_reservation(&self) -> bool {
+        self.outcome.as_ref().and_then(|o| o.reason_code.as_deref())
+            == Some("native_codex_required")
+    }
+
+    // A human can later pick up the same Codex thread under its stable Ciao session ID.
+    pub fn includes_generation(&self, generation: u64) -> bool {
+        self.agent == PeerAgent::Claude
+            || self
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.process_generation)
+                == Some(generation)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Store {
     pub incoming: Vec<Incoming>,
@@ -149,6 +203,20 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    fn disk_records(&self) -> (Self, Vec<StartRecord>) {
+        let mut authority = self.clone();
+        let mut codex_receipts = Vec::new();
+        for record in &mut authority.starts {
+            if record.agent == PeerAgent::Codex {
+                if record.outcome.is_some() {
+                    codex_receipts.push(record.clone());
+                }
+                *record = record.legacy_reservation();
+            }
+        }
+        (authority, codex_receipts)
+    }
+
     fn validate(&self) -> Result<()> {
         if self.incoming.len() > MAX_PEERS
             || self.outgoing.len() > MAX_PEERS
@@ -185,6 +253,24 @@ impl Store {
             {
                 bail!("invalid_claim");
             }
+            if let Some(stop) = &claim.stop_request
+                && (!valid_id(stop)
+                    || claim.agent != PeerAgent::Codex
+                    || !claim
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|o| o.state == "accepted"))
+            {
+                bail!("invalid_stop_claim");
+            }
+            if claim.agent == PeerAgent::Codex
+                && claim.outcome.as_ref().is_some_and(|o| {
+                    o.state == "accepted"
+                        && (o.session_id.is_none() || o.process_generation.unwrap_or_default() == 0)
+                })
+            {
+                bail!("invalid_codex_claim");
+            }
             if let Some(outcome) = &claim.outcome {
                 outcome
                     .validate()
@@ -201,40 +287,83 @@ pub(crate) struct Peers {
     store: Mutex<Store>,
     /// Serializes policy changes with async effects. A successful revoke fences all later effects.
     pub effects: tokio::sync::Mutex<()>,
+    outbound: Mutex<std::collections::HashMap<EndpointId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     pub connections: Mutex<std::collections::HashMap<String, iroh::endpoint::Connection>>,
+}
+
+pub(crate) fn codex_receipts_path(authority: &Path) -> PathBuf {
+    authority.with_file_name("peer-codex-receipts.json")
+}
+
+fn load_private<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
+        result => result?,
+    };
+    validate_private_file(path)?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_STORE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STORE_BYTES {
+        bail!("peer_store_too_large");
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_private<T: Serialize>(path: &Path, value: &T) -> Result<(), &'static str> {
+    let bytes = serde_json::to_vec(value).map_err(|_| "storage_failed")?;
+    if bytes.len() as u64 > MAX_STORE_BYTES {
+        return Err("peer_limit");
+    }
+    atomic_write_private(path, &bytes).map_err(|_| "storage_failed")
 }
 
 impl Peers {
     pub fn load(path: &Path) -> Result<Self> {
-        let exists = match fs::symlink_metadata(path) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error.into()),
-        };
-        let store = if exists {
-            validate_private_file(path)?;
-            if fs::metadata(path)?.len() > MAX_STORE_BYTES {
-                bail!("peer_store_too_large");
+        let mut store: Store = load_private(path)?;
+        store.validate()?;
+        if store.starts.iter().any(StartRecord::is_codex_reservation) {
+            let receipts: Vec<StartRecord> = load_private(&codex_receipts_path(path))?;
+            if receipts.len() > MAX_STARTS {
+                bail!("peer_limit");
             }
-            let mut bytes = Vec::new();
-            fs::File::open(path)?
-                .take(MAX_STORE_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_STORE_BYTES {
-                bail!("peer_store_too_large");
+            for claim in store.starts.iter_mut().filter(|r| r.is_codex_reservation()) {
+                let receipt = receipts.iter().find(|r| {
+                    r.agent == PeerAgent::Codex
+                        && r.grant_id == claim.grant_id
+                        && r.request_id == claim.request_id
+                        && r.workspace_id == claim.workspace_id
+                });
+                if let Some(receipt) = receipt {
+                    *claim = receipt.clone();
+                } else {
+                    claim.agent = PeerAgent::Codex;
+                    claim.outcome = None;
+                }
             }
-            let store: Store = serde_json::from_slice(&bytes)?;
             store.validate()?;
-            store
-        } else {
-            Store::default()
-        };
+        }
         Ok(Self {
             path: path.into(),
             store: Mutex::new(store),
             effects: tokio::sync::Mutex::new(()),
+            outbound: Mutex::default(),
             connections: Mutex::new(Default::default()),
         })
+    }
+
+    /// A destination admits one connection from our endpoint. Concurrent local CLI requests
+    /// queue for that destination while requests to a different host can proceed.
+    pub fn outbound_lane(&self, id: EndpointId) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut lanes = self.outbound.lock();
+        if let Some(lane) = lanes.get(&id).and_then(std::sync::Weak::upgrade) {
+            return lane;
+        }
+        lanes.retain(|_, lane| lane.strong_count() > 0);
+        let lane = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        lanes.insert(id, std::sync::Arc::downgrade(&lane));
+        lane
     }
 
     pub fn snapshot(&self) -> Store {
@@ -249,11 +378,24 @@ impl Peers {
         let mut next = guard.clone();
         let value = change(&mut next)?;
         next.validate().map_err(|_| "invalid_peer_state")?;
-        let bytes = serde_json::to_vec(&next).map_err(|_| "storage_failed")?;
-        if bytes.len() as u64 > MAX_STORE_BYTES {
-            return Err("peer_limit");
+        // The legacy-readable grant and reservation are authoritative. Write them first. A
+        // missing receipt leaves an ambiguous claim, and a receipt without a grant grants nothing.
+        let (authority, receipts) = next.disk_records();
+        let (old_authority, old_receipts) = guard.disk_records();
+        if old_authority != authority {
+            write_private(&self.path, &authority)?;
         }
-        atomic_write_private(&self.path, &bytes).map_err(|_| "storage_failed")?;
+        if receipts != old_receipts
+            && let Err(error) = write_private(&codex_receipts_path(&self.path), &receipts)
+        {
+            // Once the authoritative grant is gone, its old receipts cannot grant access.
+            // Finish revocation (including closing the connection) if only pruning failed.
+            if old_authority != authority && receipts.iter().all(|r| old_receipts.contains(r)) {
+                tracing::warn!(%error, "could not prune revoked Codex peer receipts");
+            } else {
+                return Err(error);
+            }
+        }
         *guard = next;
         Ok(value)
     }
@@ -271,7 +413,7 @@ impl Peers {
     }
 
     /// The workspace in which `grant_id` started `session`, if it did.
-    fn started(&self, grant_id: &str, session: &str) -> Option<String> {
+    fn started(&self, grant_id: &str, session: &str) -> Option<StartRecord> {
         self.store
             .lock()
             .starts
@@ -282,15 +424,15 @@ impl Peers {
                         o.state == "accepted" && o.session_id.as_deref() == Some(session)
                     })
             })
-            .map(|r| r.workspace_id.clone())
+            .cloned()
     }
 
     /// Whether `grant` started `session` in a workspace it still covers. Narrowing a grant's
     /// scope fences its sessions outside the new scope the way revocation fences all of them:
     /// the worker keeps running under the person's control, and the peer loses its handle.
-    pub fn owns(&self, grant: &Incoming, session: &str) -> bool {
+    pub fn owned_start(&self, grant: &Incoming, session: &str) -> Option<StartRecord> {
         self.started(&grant.grant_id, session)
-            .is_some_and(|workspace| grant.scope.covers(&workspace))
+            .filter(|record| grant.scope.covers(&record.workspace_id))
     }
 
     /// Whether `grant` started `session` at all, whatever its scope is now. The live-worker
@@ -386,6 +528,8 @@ pub(crate) struct Request {
 pub(crate) enum Action {
     Workspaces {},
     Start {
+        #[serde(default, skip_serializing_if = "PeerAgent::is_default")]
+        agent: PeerAgent,
         request_id: String,
         workspace_id: String,
     },
@@ -394,6 +538,10 @@ pub(crate) enum Action {
     },
     Command {
         command: AgentCommand,
+    },
+    StopReceipt {
+        session_id: String,
+        request_id: String,
     },
     Stop {
         session_id: String,
@@ -412,8 +560,13 @@ impl Request {
             Action::Start {
                 request_id,
                 workspace_id,
+                ..
             } if valid_id(request_id) && valid_id(workspace_id) => {}
             Action::Snapshot { session_id } if valid_id(session_id) => {}
+            Action::StopReceipt {
+                session_id,
+                request_id,
+            } if valid_id(session_id) && valid_id(request_id) => {}
             Action::Stop {
                 session_id,
                 request_id,
@@ -445,6 +598,21 @@ pub(crate) fn command_id(grant: &str, id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_agent_selection_keeps_the_original_claude_wire_shape() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/fixtures/phase1/peer-admin-v1.json"
+        ))
+        .unwrap();
+        let cases = &fixture["agent_starts"];
+        for (name, expected) in [("default", PeerAgent::Claude), ("codex", PeerAgent::Codex)] {
+            let request: Request = serde_json::from_value(cases[name].clone()).unwrap();
+            assert!(matches!(request.action, Action::Start {agent, ..} if agent == expected));
+            assert_eq!(serde_json::to_value(request).unwrap(), cases[name]);
+        }
+        assert!(serde_json::from_value::<Request>(cases["unknown"].clone()).is_err());
+    }
 
     #[test]
     fn peer_shared_fixture_rejects_shell_paths_unknown_operations_and_invalid_ids() {
@@ -561,6 +729,59 @@ mod tests {
             },
         };
         assert_eq!(request.validate(), Err("invalid_request"));
+    }
+
+    #[test]
+    fn peer_missing_or_leftover_codex_receipts_never_restore_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("peers.json");
+        let peers = Peers::load(&path).unwrap();
+        let id = iroh::SecretKey::generate().public();
+        let grant = Incoming {
+            peer: Descriptor {
+                endpoint_id: id.to_string(),
+                name: "Source".into(),
+            },
+            grant_id: "grant".into(),
+            issuer: id.to_string(),
+            scope: GrantScope::All,
+        };
+        peers
+            .change(|s| {
+                s.incoming.push(grant.clone());
+                s.starts.push(StartRecord {
+                    grant_id: grant.grant_id.clone(),
+                    request_id: "start".into(),
+                    workspace_id: "workspace".into(),
+                    agent: PeerAgent::Codex,
+                    stop_request: None,
+                    outcome: Some(
+                        serde_json::from_value(serde_json::json!({
+                            "v":1, "command_id":"start", "state":"accepted",
+                            "session_id":"session", "process_generation":1
+                        }))
+                        .unwrap(),
+                    ),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let receipts = codex_receipts_path(&path);
+        let saved = temp.path().join("saved");
+        fs::rename(&receipts, &saved).unwrap();
+        let pending = Peers::load(&path).unwrap().snapshot().starts.remove(0);
+        assert_eq!(pending.agent, PeerAgent::Codex);
+        assert!(pending.outcome.is_none());
+
+        // A failed cleanup must still finish the revocation that already reached disk.
+        fs::create_dir(&receipts).unwrap();
+        peers.revoke(&id.to_string()).unwrap();
+        assert!(peers.incoming(id, None).is_none());
+        fs::remove_dir(&receipts).unwrap();
+        fs::rename(saved, receipts).unwrap();
+        let cold = Peers::load(&path).unwrap();
+        assert!(cold.incoming(id, None).is_none());
+        assert!(cold.snapshot().starts.is_empty());
     }
 
     #[test]

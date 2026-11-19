@@ -455,13 +455,15 @@ fn resolve_codex_binary(paths: &CiaoPaths, path: Option<&std::ffi::OsStr>) -> Op
     {
         return Some(proved);
     }
-    let mut probe = Command::new("codex");
-    probe.arg("--version");
-    if let Some(path) = path {
-        probe.env("PATH", path);
-    }
-    if probe.output().is_ok() {
-        return Some(PathBuf::from("codex"));
+    if let Some(binary) = path.and_then(|path| {
+        env::split_paths(path)
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join("codex"))
+            .find(|candidate| {
+                fs::metadata(candidate).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
+            })
+    }) {
+        return Some(binary);
     }
     let candidate = paths.home.join(".local/bin/codex");
     owned_regular_file(&candidate).then_some(candidate)
@@ -783,10 +785,10 @@ mod tests {
         let shell = Some(std::ffi::OsStr::new(&shell_path));
         let launchd = Some(std::ffi::OsStr::new(LAUNCHD_PATH));
 
-        // No record: today's answer, the bare name the shell resolves.
+        // Resolve before changing into the destination workspace.
         assert_eq!(
             resolve_codex_binary(&paths, shell),
-            Some(PathBuf::from("codex"))
+            Some(shell_bin.join("codex"))
         );
 
         // A record wins even where `PATH` has an answer: the daemon (launchd `PATH`), the hook
@@ -805,7 +807,7 @@ mod tests {
         fs::remove_file(&native).unwrap();
         assert_eq!(
             resolve_codex_binary(&paths, shell),
-            Some(PathBuf::from("codex"))
+            Some(shell_bin.join("codex"))
         );
         assert_eq!(resolve_codex_binary(&paths, launchd), None);
         fs::create_dir_all(&native).unwrap();

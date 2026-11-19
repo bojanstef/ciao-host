@@ -221,9 +221,16 @@ where
 }
 
 async fn probe_codex_version(binary: std::path::PathBuf) -> Result<String> {
+    probe_binary_version(binary, HOOK_VERSION_TIMEOUT).await
+}
+
+pub(crate) async fn probe_binary_version(
+    binary: std::path::PathBuf,
+    deadline: Duration,
+) -> Result<String> {
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
-    timeout(HOOK_VERSION_TIMEOUT, async {
+    timeout(deadline, async {
         let mut child = tokio::process::Command::new(binary)
             .arg("--version")
             .stdin(Stdio::null())
