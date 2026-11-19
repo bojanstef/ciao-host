@@ -1445,10 +1445,32 @@ mod tests {
     #[tokio::test]
     async fn diff_preparation_expiry_returns_an_error_before_accepting_any_bytes() {
         let temp = temp_dir();
+        let git = crate::git_diff::resolve_git().expect("real Git");
+        assert!(
+            std::process::Command::new(git)
+                .arg("-C")
+                .arg(temp.path())
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // No writer opens this disposable index. Git cannot finish preparing the review,
+        // even when process startup wins the race against the deadline.
+        nix::unistd::mkfifo(
+            &temp.path().join(".git/index"),
+            nix::sys::stat::Mode::S_IRUSR,
+        )
+        .unwrap();
         let mut sent = Vec::new();
-        send_git_diff(&mut sent, temp.path().to_str(), None, Duration::ZERO)
-            .await
-            .unwrap();
+        send_git_diff(
+            &mut sent,
+            temp.path().to_str(),
+            None,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             decode_error(&sent).unwrap().code,
             DownloadErrorCode::Timeout.wire()
