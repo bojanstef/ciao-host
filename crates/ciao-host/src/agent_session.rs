@@ -787,11 +787,12 @@ impl AgentSessionSupervisor {
             return None;
         }
         if self.recovery_needs_native(receipt, &registration)
-            && (registration.adapter_version != crate::codex_adapter::PINNED_CODEX_VERSION
-                || !registration.compatible
-                || !derived
-                    .as_ref()
-                    .is_some_and(|proof| proof.covers(receipt.lineage(), &binding)))
+            && (!registration.compatible
+                || !derived.as_ref().is_some_and(|proof| {
+                    let (_, tui_version) = proof.versions();
+                    registration.adapter_version == tui_version
+                        && proof.covers(receipt.lineage(), &binding)
+                }))
         {
             return None;
         }
@@ -857,17 +858,16 @@ impl AgentSessionSupervisor {
     pub(crate) fn backfill_recovered_shared(
         &self,
         row: &RecoveredSharedRow,
-        history: crate::codex_history::ThreadHistory,
+        entries: Vec<NormalizedTimelineEntry>,
+        complete: bool,
     ) -> Result<RecoveredSharedRow> {
         let mut inner = self.inner.lock();
         self.reconcile_bridge_history_locked(
             &mut inner,
             &row.registered.session_id,
             Some(row.registered.process_generation),
-            history.entries,
-            ReconcileMode::Backfill {
-                complete: history.complete,
-            },
+            entries,
+            ReconcileMode::Backfill { complete },
             None,
             TurnScope::default(),
             Some(&row.fence),
@@ -5406,12 +5406,8 @@ mod tests {
         registered
     }
 
-    fn recovered_history() -> crate::codex_history::ThreadHistory {
-        crate::codex_history::ThreadHistory {
-            entries: vec![entry("codex.history.fixture", 1, "fixture history")],
-            complete: true,
-            live_turn_prompt: None,
-        }
+    fn recovered_entries() -> Vec<NormalizedTimelineEntry> {
+        vec![entry("codex.history.fixture", 1, "fixture history")]
     }
 
     #[tokio::test]
@@ -5546,7 +5542,7 @@ mod tests {
         s.backfill_bridge_history(
             &first.session_id,
             Some(first.process_generation),
-            recovered_history().entries,
+            recovered_entries(),
             true,
             None,
         )
@@ -5562,7 +5558,7 @@ mod tests {
         assert_ne!(row.registered.snapshot_epoch, old_epoch);
         assert!(s.session_for_route(&old_route).is_none());
         let current = s
-            .backfill_recovered_shared(&row, recovered_history())
+            .backfill_recovered_shared(&row, recovered_entries(), true)
             .unwrap();
         assert_eq!(s.inner.lock().sessions[&first.session_id].history.len(), 1);
         assert_eq!(
@@ -5600,7 +5596,7 @@ mod tests {
                         &mut inner,
                         &first.session_id,
                         Some(first.process_generation),
-                        recovered_history().entries,
+                        recovered_entries(),
                         ReconcileMode::Backfill { complete: true },
                         None,
                         TurnScope::default(),
@@ -5689,7 +5685,7 @@ mod tests {
                 );
             });
             let current = s
-                .backfill_recovered_shared(&row, recovered_history())
+                .backfill_recovered_shared(&row, recovered_entries(), true)
                 .unwrap();
             assert_ne!(
                 row.registered.snapshot_epoch,
@@ -5727,7 +5723,7 @@ mod tests {
             );
             assert!(s.session_for_route(&old_route).is_none());
             assert!(
-                s.backfill_recovered_shared(&row, recovered_history())
+                s.backfill_recovered_shared(&row, recovered_entries(), true)
                     .is_err()
             );
         }
@@ -5915,7 +5911,7 @@ mod tests {
                 }
             }
             assert!(
-                s.backfill_recovered_shared(&row, recovered_history())
+                s.backfill_recovered_shared(&row, recovered_entries(), true)
                     .is_err()
             );
             assert!(
@@ -6514,6 +6510,12 @@ int main(int argc,char **argv) {
             tui_fact.clone(),
         )
         .unwrap();
+        let mut other_version = registration.clone();
+        other_version.adapter_version = "0.168.0".into();
+        assert!(
+            s.commit_shared_recovery(&receipt, other_version, Some(proof.clone()))
+                .is_none()
+        );
         assert!(status::revalidate(&binding).await);
         let row = s
             .commit_shared_recovery(&receipt, registration.clone(), Some(proof))

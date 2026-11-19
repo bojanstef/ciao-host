@@ -25,7 +25,7 @@ use serde_json::{Map, Value};
 use tokio::time::timeout;
 
 use crate::{
-    agent_adapter::{AttachedHookRegister, WireTextDelta, WireTimelineEntry},
+    agent_adapter::{AttachedHookRegister, WireTextDelta, WireTimelineEntry, workspace_display},
     agent_protocol::{
         MAX_RETAINED_TEXT_BYTES, MAX_TOOL_INPUT_PREVIEW_BYTES, MAX_TOOL_RESULT_PREVIEW_BYTES,
         TimelineBody, ToolTimelineBody, TurnState, classify_vendor_version, valid_opaque_id,
@@ -37,7 +37,6 @@ use crate::{
         HOOK_DELIVERY_TIMEOUT, bounded_preview, bounded_text, deliver, emit_prompt_context,
         keyed_digest, no_truncation, object, preview_truncation, read_bounded_stdin, required_bool,
         required_string, required_u64, session_start_resets_context, trace_outcome, unix_now,
-        workspace_display,
     },
     storage::{CiaoPaths, atomic_write_private, validate_private_file},
 };

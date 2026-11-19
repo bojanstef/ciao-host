@@ -107,30 +107,6 @@ pub(crate) fn parent_workspace(input: &serde_json::Map<String, Value>) -> Result
     })
 }
 
-/// The last path component, control characters removed, bounded — the name a person recognizes
-/// without the directory tree it sits in.
-pub(crate) fn workspace_display(cwd: &str) -> String {
-    let display = std::path::Path::new(cwd)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Workspace");
-    let sanitized: String = display
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect();
-    let sanitized = sanitized.trim();
-    truncate_utf8(
-        if sanitized.is_empty() {
-            "Workspace"
-        } else {
-            sanitized
-        },
-        256,
-    )
-    .0
-}
-
 /// A stable, namespaced digest of a vendor identifier. `domain` separates one vendor's hook
 /// protocol from another's, so the same upstream ID under two adapters never collides — and so
 /// changing one vendor's domain can never renumber another's live entries.
@@ -1236,12 +1212,5 @@ mod tests {
             assert!(start(Some(source)), "{source}");
         }
         assert!(start(Some("teleport")), "unfamiliar is not vouched for");
-    }
-
-    #[test]
-    fn a_workspace_name_is_the_basename_without_control_characters() {
-        assert_eq!(workspace_display("/private/synthetic/Fixture"), "Fixture");
-        assert_eq!(workspace_display("/"), "Workspace");
-        assert_eq!(workspace_display("/a/we\u{7}ird"), "weird");
     }
 }

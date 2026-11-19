@@ -575,49 +575,6 @@ async fn process_tty(pid: u32) -> Option<String> {
     process::tty(pid).await.filter(|tty| valid_tty(tty))
 }
 
-/// Whether a registered agent process is the interactive TUI the user launched, rather than a
-/// batch invocation of the same binary.
-///
-/// The test is per vendor because the giveaway is: Claude's is a flag, Codex's is a subcommand.
-/// A shared list would let `codex exec` in CI register as an attached session on the strength of
-/// Claude's flags not appearing in it.
-pub(crate) async fn process_looks_like_tui(pid: u32, adapter: &str) -> bool {
-    if adapter == "codex" {
-        return crate::codex_adapter::process_is_interactive(pid).await;
-    }
-    let Some(command) = process::command(pid).await else {
-        return false;
-    };
-    let mut arguments = command.split_ascii_whitespace().skip(1);
-    match adapter {
-        "claude" => !arguments.any(is_noninteractive_claude_argument),
-        // A dialect this test has never met is refused, not handed Claude's heuristic: a
-        // wrong "yes" here registers a batch process as an attached TUI.
-        _ => false,
-    }
-}
-
-fn is_noninteractive_claude_argument(argument: &str) -> bool {
-    matches!(
-        argument,
-        "-p" | "--print"
-            | "--input-format"
-            | "--output-format"
-            | "--json-schema"
-            | "--init-only"
-            | "--init"
-            | "--maintenance"
-    ) || (argument.starts_with("-p") && !argument.starts_with("--"))
-        || [
-            "--print=",
-            "--input-format=",
-            "--output-format=",
-            "--json-schema=",
-        ]
-        .iter()
-        .any(|prefix| argument.starts_with(prefix))
-}
-
 /// The process's start time, bounded by the opaque-identifier vocabulary a registration may
 /// carry, because that is what this fingerprint has to travel inside.
 pub(crate) async fn process_start_fingerprint(pid: u32) -> Option<String> {
@@ -1180,48 +1137,6 @@ esac
         };
         assert_eq!(provider, ProviderKind::Tmux);
         assert_eq!(args.first(), Some(&OsString::from("attach-session")));
-    }
-
-    #[test]
-    fn claude_headless_arguments_are_rejected_conservatively() {
-        for argument in [
-            "-p",
-            "-pSynthetic",
-            "--print",
-            "--output-format",
-            "--output-format=stream-json",
-            "--input-format",
-            "--json-schema",
-            "--init-only",
-            "--maintenance",
-        ] {
-            assert!(is_noninteractive_claude_argument(argument));
-        }
-        for argument in [
-            "--resume",
-            "--continue",
-            "--remote-control",
-            "synthetic-prompt",
-        ] {
-            assert!(!is_noninteractive_claude_argument(argument));
-        }
-    }
-
-    /// The `_` arm used to hand any future dialect Claude's argument heuristic, so a fifth
-    /// adapter would have inherited a TUI test written for someone else's flags. Refusal is
-    /// the conservative answer: a wrong "yes" registers a batch process as an attached TUI.
-    #[tokio::test]
-    async fn an_unknown_dialect_is_refused_rather_than_given_claudes_heuristic() {
-        // This test's own process is real and carries no Claude headless flags, so the old
-        // fallback would have said yes to it.
-        assert!(!process_looks_like_tui(std::process::id(), "fixture").await);
-    }
-
-    #[tokio::test]
-    async fn codex_route_guard_uses_the_native_argument_policy() {
-        // A native test process has neither a Codex executable name nor a Codex TUI role.
-        // The old first-argument-only heuristic incorrectly admitted this process.
-        assert!(!process_looks_like_tui(std::process::id(), "codex").await);
     }
 
     #[test]

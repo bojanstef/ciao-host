@@ -22,7 +22,7 @@ use crate::{
         AgentCommandKind, AgentProtocolError, MAX_BRIDGE_FRAME_BYTES, TimelineBody, Truncation,
         TurnState, decode_bridge_body, read_agent_frame_within, valid_token, write_agent_frame,
     },
-    agent_route::{AgentSighting, process_looks_like_tui, process_start_fingerprint},
+    agent_route::{AgentSighting, process_start_fingerprint},
     agent_session::{
         AgentSessionSupervisor, AttentionKind, NormalizedTimelineEntry, RegisteredAgentSession,
     },
@@ -478,6 +478,15 @@ async fn apply_adapter_event(
     Ok(EventOutcome::Continue)
 }
 
+/// Both hook registration and rediscovery consult the attached dialect's process policy.
+async fn process_looks_like_tui(pid: u32, adapter: &str) -> bool {
+    match adapter {
+        "claude" => crate::claude_adapter::process_is_interactive(pid).await,
+        "codex" => crate::codex_adapter::process_is_interactive(pid).await,
+        _ => false,
+    }
+}
+
 pub(crate) async fn handle_agent_bridge(
     mut stream: UnixStream,
     sessions: AgentSessionSupervisor,
@@ -522,13 +531,8 @@ pub(crate) async fn handle_agent_bridge(
     if !process_descends_from(peer_pid, selected.registration.process_id).await {
         bail!("agent bridge peer is not descended from its claimed process");
     }
-    let interactive = if selected.codec.id() == "codex" {
-        crate::codex_adapter::process_is_interactive(producer_process_id).await
-    } else if selected.codec.requires_tui_process() {
-        process_looks_like_tui(producer_process_id, selected.codec.id()).await
-    } else {
-        true
-    };
+    let interactive = !selected.codec.requires_tui_process()
+        || process_looks_like_tui(producer_process_id, selected.codec.id()).await;
     if !interactive {
         // The refusal is still the foreign-hook watch's signal (Spec 013 §5): this event is
         // same-uid and descent-proven, and a non-TUI Codex process — an app-server, ours or
@@ -1079,7 +1083,7 @@ async fn backfill_recovered_shared(
     };
     let count = history.entries.len();
     let complete = history.complete;
-    match sessions.backfill_recovered_shared(&row, history) {
+    match sessions.backfill_recovered_shared(&row, history.entries, complete) {
         Ok(current) => {
             adoptions.record_binary_evidence(binary);
             tracing::info!(session = %row.registered.session_id, count, complete, "Codex history reconciled");
@@ -1330,6 +1334,23 @@ mod tests {
     };
 
     use super::*;
+
+    /// The `_` arm used to hand any future dialect Claude's argument heuristic, so a fifth
+    /// adapter would have inherited a TUI test written for someone else's flags. Refusal is
+    /// the conservative answer: a wrong "yes" registers a batch process as an attached TUI.
+    #[tokio::test]
+    async fn an_unknown_dialect_is_refused_rather_than_given_claudes_heuristic() {
+        // This test's own process is real and carries no Claude headless flags, so the old
+        // fallback would have said yes to it.
+        assert!(!process_looks_like_tui(std::process::id(), "fixture").await);
+    }
+
+    #[tokio::test]
+    async fn codex_route_guard_uses_the_native_argument_policy() {
+        // A native test process has neither a Codex executable name nor a Codex TUI role.
+        // The old first-argument-only heuristic incorrectly admitted this process.
+        assert!(!process_looks_like_tui(std::process::id(), "codex").await);
+    }
 
     // Ported independent review reproductions: discovery is not a hook and a backend
     // incarnation cannot borrow the preceding producer's version.

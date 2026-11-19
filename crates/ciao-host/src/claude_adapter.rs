@@ -54,6 +54,38 @@ const DIALECT: AttachedHookDialect = AttachedHookDialect {
 
 pub(crate) struct ClaudeAttachedAdapter;
 
+/// A Claude hook can report a batch invocation. Only a TUI may register an attached session.
+pub(crate) async fn process_is_interactive(pid: u32) -> bool {
+    let Some(command) = crate::process::command(pid).await else {
+        return false;
+    };
+    !command
+        .split_ascii_whitespace()
+        .skip(1)
+        .any(is_noninteractive_claude_argument)
+}
+
+fn is_noninteractive_claude_argument(argument: &str) -> bool {
+    matches!(
+        argument,
+        "-p" | "--print"
+            | "--input-format"
+            | "--output-format"
+            | "--json-schema"
+            | "--init-only"
+            | "--init"
+            | "--maintenance"
+    ) || (argument.starts_with("-p") && !argument.starts_with("--"))
+        || [
+            "--print=",
+            "--input-format=",
+            "--output-format=",
+            "--json-schema=",
+        ]
+        .iter()
+        .any(|prefix| argument.starts_with(prefix))
+}
+
 /// Frames the Claude hook process serializes. This enum is the encode side of the dialect's
 /// vocabulary; the decode side is `decode_event` below, and the two must name the same set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -311,6 +343,31 @@ mod tests {
             "workspace_path": "/private/synthetic/Fixture workspace"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn claude_headless_arguments_are_rejected_conservatively() {
+        for argument in [
+            "-p",
+            "-pSynthetic",
+            "--print",
+            "--output-format",
+            "--output-format=stream-json",
+            "--input-format",
+            "--json-schema",
+            "--init-only",
+            "--maintenance",
+        ] {
+            assert!(is_noninteractive_claude_argument(argument));
+        }
+        for argument in [
+            "--resume",
+            "--continue",
+            "--remote-control",
+            "synthetic-prompt",
+        ] {
+            assert!(!is_noninteractive_claude_argument(argument));
+        }
     }
 
     #[test]

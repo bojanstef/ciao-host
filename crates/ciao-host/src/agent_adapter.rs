@@ -11,8 +11,9 @@ use serde_json::Value;
 use crate::{
     agent_protocol::{
         AgentCapabilities, AgentCommand, AgentProtocolError, CommandCapabilities,
-        InteractionCapabilities, MAX_BRIDGE_FRAME_BYTES, Observation, PendingInteraction,
-        TimelineBody, Truncation, TurnState, classify_vendor_version, valid_opaque_id, valid_token,
+        InteractionCapabilities, MAX_BRIDGE_FRAME_BYTES, MAX_WORKSPACE_DISPLAY_BYTES, Observation,
+        PendingInteraction, TimelineBody, Truncation, TurnState, classify_vendor_version,
+        valid_opaque_id, valid_token,
     },
     agent_route::AgentSighting,
     agent_session::{
@@ -635,6 +636,25 @@ impl AttachedHookRegister {
     }
 }
 
+/// The last path component, control characters removed, bounded — the name a person recognizes
+/// without the directory tree it sits in.
+pub(crate) fn workspace_display(cwd: &str) -> String {
+    let display = std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Workspace");
+    let sanitized: String = display
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        return "Workspace".into();
+    }
+    sanitized[..sanitized.floor_char_boundary(MAX_WORKSPACE_DISPLAY_BYTES)].into()
+}
+
 /// The registration an attached hook of `dialect` would have sent for a process a restarted
 /// daemon found itself. One owner for the rebuild, so a restored Claude and a restored Codex
 /// state exactly what their hooks state. The caller vouches for the process — it is accepted
@@ -655,7 +675,7 @@ pub(crate) fn readopted_hook_registration(
         session_id: sighting.vendor_session_id.clone(),
         process_nonce: hook_nonce,
         process_id: sighting.process_id,
-        workspace_display: crate::hook_common::workspace_display(&sighting.cwd),
+        workspace_display: workspace_display(&sighting.cwd),
         workspace_path: sighting.cwd.clone(),
         terminal_status_directory: None,
     }
@@ -736,4 +756,20 @@ pub(crate) fn frame_type(body: &[u8]) -> Result<(String, Value), AgentProtocolEr
         .ok_or(AgentProtocolError::MalformedJson)?
         .to_owned();
     Ok((message_type, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_workspace_name_is_the_basename_without_control_characters() {
+        assert_eq!(workspace_display("/private/synthetic/Fixture"), "Fixture");
+        assert_eq!(workspace_display("/"), "Workspace");
+        assert_eq!(workspace_display("/a/we\u{7}ird"), "weird");
+        let head = "a".repeat(MAX_WORKSPACE_DISPLAY_BYTES - 1);
+        assert_eq!(workspace_display(&format!("/a/{head}é")), head);
+        let exact = "é".repeat(MAX_WORKSPACE_DISPLAY_BYTES / 2);
+        assert_eq!(workspace_display(&format!("/a/{exact}x")), exact);
+    }
 }
