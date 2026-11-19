@@ -10,7 +10,7 @@ use std::{
 use crate::{
     agent_protocol::MAX_PROMPT_BYTES,
     ipc,
-    peers::{Action, Admin, Descriptor, GrantScope, Outgoing},
+    peers::{Action, Admin, Descriptor, GrantScope, Outgoing, PeerAgent},
 };
 
 /// `--workspace` (repeatable) or `--all`, exactly one.
@@ -69,8 +69,10 @@ pub(crate) enum Command {
         #[arg(long)]
         host: String,
     },
-    /// Start a managed Claude on a linked destination; reuse request-id to reconcile a lost reply
+    /// Start an agent in a workspace on a linked destination; reuse request-id to reconcile a lost reply
     Start {
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: PeerAgent,
         #[arg(long)]
         host: String,
         #[arg(long)]
@@ -147,11 +149,12 @@ pub(crate) async fn run(command: Command, socket: &Path) -> Result<()> {
             json!({"op":"call", "host":host, "action":Action::Workspaces {}})
         }
         Command::Start {
+            agent,
             host,
             workspace,
             request_id,
         } => {
-            json!({"op":"call", "host":host, "action":Action::Start {request_id, workspace_id:workspace}})
+            json!({"op":"call", "host":host, "action":Action::Start {agent, request_id, workspace_id:workspace}})
         }
         Command::Snapshot { host, session } => {
             json!({"op":"call", "host":host, "action":Action::Snapshot {session_id:session}})

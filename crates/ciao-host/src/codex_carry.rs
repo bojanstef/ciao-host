@@ -37,7 +37,8 @@ use sha2::{Digest, Sha256};
 use crate::agent_protocol::{VendorVersionState, classify_vendor_version};
 
 pub(crate) const VERDICT_FILE_NAME: &str = "codex-carry.json";
-const VERDICT_FILE_VERSION: u8 = 1;
+// Revision 2 includes native thread creation in the required client methods.
+const VERDICT_FILE_VERSION: u8 = 2;
 const MAX_VERDICT_BYTES: u64 = 16 * 1024;
 /// Schema generation is file output only and finishes well under a second on the grounded
 /// machine; ten seconds is process-start headroom, not a second budget.
@@ -317,6 +318,7 @@ pub(crate) fn distill_schema_dir(directory: &Path) -> Result<PinExtract> {
                 "thread/read",
                 "thread/list",
                 "hooks/list",
+                "thread/start",
                 "thread/resume",
                 "thread/archive",
                 "turn/start",
@@ -667,8 +669,7 @@ pub(crate) fn state_for(
     let Some(binary) = binary else {
         return classified;
     };
-    // `codex_binary` answers the bare name when PATH resolution worked; the verdict compares
-    // and stats the real file.
+    // The verdict names the executable used to produce the evidence.
     let binary = resolve_on_path(binary).unwrap_or_else(|| binary.to_owned());
     match load_verdict(run_dir) {
         Some(verdict) if verdict_covers(&verdict, version, &binary) && verdict.carried => {
@@ -796,7 +797,14 @@ fn clear_in_flight() {
 pub(crate) async fn verify_now(paths: &crate::storage::CiaoPaths, version: &str) -> Result<bool> {
     let binary = crate::codex_integration::codex_binary(paths)
         .ok_or_else(|| anyhow!("codex binary not found"))?;
-    let binary = resolve_on_path(&binary).unwrap_or(binary);
+    verify_binary(paths, version, binary).await
+}
+
+async fn verify_binary(
+    paths: &crate::storage::CiaoPaths,
+    version: &str,
+    binary: PathBuf,
+) -> Result<bool> {
     let (size, mtime) =
         binary_stat(&binary).ok_or_else(|| anyhow!("codex binary is not statable"))?;
     let hash_target = binary.clone();
@@ -857,18 +865,26 @@ pub(crate) async fn admit_interactively(
     paths: &crate::storage::CiaoPaths,
     version: &str,
 ) -> Result<bool> {
-    let binary = crate::codex_integration::codex_binary(paths);
-    if state_for(version, &paths.run_dir, binary.as_deref()) == VendorVersionState::Carried {
+    let binary = crate::codex_integration::codex_binary(paths)
+        .ok_or_else(|| anyhow!("codex binary not found"))?;
+    admit_binary(paths, version, &binary).await
+}
+
+pub(crate) async fn admit_binary(
+    paths: &crate::storage::CiaoPaths,
+    version: &str,
+    binary: &Path,
+) -> Result<bool> {
+    if state_for(version, &paths.run_dir, Some(binary)) == VendorVersionState::Carried {
         return Ok(true);
     }
     if !carry_eligible(version) {
         return Ok(false);
     }
-    verify_now(paths, version).await
+    verify_binary(paths, version, binary.to_owned()).await
 }
 
-/// `codex_binary` may answer the bare name `codex` when PATH resolution worked; the verdict
-/// cache needs the real file to stat and hash, so walk PATH the way the shell would.
+/// Resolve a command name before comparing its path and metadata with a persisted verdict.
 fn resolve_on_path(binary: &Path) -> Option<PathBuf> {
     if binary.is_absolute() {
         return Some(binary.to_owned());
@@ -987,7 +1003,7 @@ mod tests {
         assert_eq!(extract.counts.server_notifications, 2);
         assert_eq!(
             extract.required_client_methods,
-            vec!["thread/read", "thread/list", "turn/steer"],
+            vec!["thread/read", "thread/list", "thread/start", "turn/steer"],
             "fixed-list order is preserved, availability filters"
         );
         assert_eq!(

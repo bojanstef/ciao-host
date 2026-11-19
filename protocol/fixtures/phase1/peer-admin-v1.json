@@ -19,6 +19,11 @@
     {"v": 1, "grant_id": "g", "action": {"op": "grant", "peer": "another"}},
     {"v": 1, "grant_id": "g", "action": {"op": "start", "request_id": "bad/id", "workspace_id": "alpha"}}
   ],
+  "agent_starts": {
+    "default": {"v": 1, "grant_id": "g", "action": {"op": "start", "workspace_id": "alpha", "request_id": "r"}},
+    "codex": {"v": 1, "grant_id": "g", "action": {"op": "start", "agent": "codex", "workspace_id": "alpha", "request_id": "r"}},
+    "unknown": {"v": 1, "grant_id": "g", "action": {"op": "start", "agent": "shell", "workspace_id": "alpha", "request_id": "r"}}
+  },
   "admin_revision": 2,
   "revision_2": {
     "requests": {

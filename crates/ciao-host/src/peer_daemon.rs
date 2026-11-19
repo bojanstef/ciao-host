@@ -1,9 +1,10 @@
 //! The restricted peer transport and phone-authorized introduction path (Spec 026).
 use super::*;
 use crate::{
-    agent_protocol::{self, AgentCommand, AgentCommandKind},
+    agent_protocol::{self, AgentCommand, AgentCommandKind, LifecycleOutcome},
     peers::{
-        self, Action, Admin, Descriptor, GrantScope, Incoming, Outgoing, Request, StartRecord,
+        self, Action, Admin, Descriptor, GrantScope, Incoming, Outgoing, PeerAgent, Request,
+        StartRecord,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -358,10 +359,11 @@ async fn execute(
                 .filter(|w| grant.scope.covers(&w.workspace_id))
                 .collect();
             Ok(
-                json!({"workspaces":selected, "scan_incomplete":projects.scan_incomplete, "agent":"claude"}),
+                json!({"workspaces":selected, "scan_incomplete":projects.scan_incomplete, "agent":PeerAgent::Claude, "agents":[PeerAgent::Claude, PeerAgent::Codex]}),
             )
         }
         Action::Start {
+            agent,
             request_id,
             workspace_id,
         } => {
@@ -374,7 +376,7 @@ async fn execute(
                 .iter()
                 .find(|r| r.grant_id == grant.grant_id && r.request_id == request_id)
             {
-                if record.workspace_id != workspace_id {
+                if record.workspace_id != workspace_id || record.agent != agent {
                     return Err("request_id_reused");
                 }
                 return record
@@ -389,6 +391,12 @@ async fn execute(
                 .into_iter()
                 .filter(|s| s.presence == "live" && state.peers.launched(&grant, &s.session_id))
                 .count()
+                + state
+                    .codex_adoptions
+                    .peer_sessions()
+                    .iter()
+                    .filter(|id| state.peers.launched(&grant, id))
+                    .count()
                 + store
                     .starts
                     .iter()
@@ -402,6 +410,8 @@ async fn execute(
                     return Err("request_limit");
                 }
                 s.starts.push(StartRecord {
+                    agent,
+                    stop_request: None,
                     grant_id: grant.grant_id.clone(),
                     request_id: request_id.clone(),
                     workspace_id: workspace_id.clone(),
@@ -410,24 +420,70 @@ async fn execute(
                 Ok(())
             })?;
             let command_id = peers::command_id(&grant.grant_id, &format!("start/{request_id}"));
-            let outcome = state
-                .managed_sessions
-                .managed_start(&workspace_id, &command_id)
-                .await;
-            state.peers.change(|s| {
-                let record = s
-                    .starts
-                    .iter_mut()
-                    .find(|r| r.grant_id == grant.grant_id && r.request_id == request_id)
-                    .ok_or("outcome_unknown")?;
-                record.outcome = Some(outcome.clone());
-                Ok(())
-            })?;
+            let outcome = match agent {
+                PeerAgent::Claude => {
+                    state
+                        .managed_sessions
+                        .managed_start(&workspace_id, &command_id)
+                        .await
+                }
+                PeerAgent::Codex => {
+                    let session = match state
+                        .managed_sessions
+                        .resolve_workspace(&workspace_id)
+                        .await
+                    {
+                        Some((workspace, label)) if workspace.is_dir() => {
+                            // Keep vendor initialization off the stack of every peer RPC.
+                            Box::pin(crate::codex_adopted::start_peer(
+                                state.agent_sessions.clone(),
+                                state.codex_adoptions.clone(),
+                                state.notifier.clone(),
+                                &state.paths,
+                                &workspace,
+                                label,
+                            ))
+                            .await
+                            .map(|registered| {
+                                (registered.session_id, registered.process_generation)
+                            })
+                        }
+                        _ => Err("unknown_workspace"),
+                    };
+                    codex_outcome(&command_id, session)
+                }
+            };
+            state
+                .peers
+                .change(|s| {
+                    let record = s
+                        .starts
+                        .iter_mut()
+                        .find(|r| r.grant_id == grant.grant_id && r.request_id == request_id)
+                        .ok_or("outcome_unknown")?;
+                    record.outcome = Some(outcome.clone());
+                    Ok(())
+                })
+                .map_err(|_| "outcome_unknown")?;
             Ok(json!(outcome))
         }
         Action::Snapshot { session_id } => {
-            if !state.peers.owns(&grant, &session_id) {
-                return Err("authorization_denied");
+            let start = state
+                .peers
+                .owned_start(&grant, &session_id)
+                .ok_or("authorization_denied")?;
+            if start.agent == PeerAgent::Codex {
+                let live = state.codex_adoptions.peer_worker(&session_id).is_some();
+                if start.stop_request.is_some() {
+                    return Err(if live {
+                        "session_stopping"
+                    } else {
+                        "session_stopped"
+                    });
+                }
+                if !live {
+                    return Err("session_unavailable");
+                }
             }
             let snapshot = state
                 .agent_sessions
@@ -437,6 +493,7 @@ async fn execute(
                         .managed_sessions
                         .stored_snapshot(&session_id, &HashSet::new())
                 })
+                .filter(|snapshot| start.includes_generation(snapshot.process_generation))
                 .ok_or("session_unavailable")?;
             let snapshot = agent_protocol::fit_snapshot_with_envelope(snapshot, |s| {
                 agent_protocol::encoded_frame_len(&crate::ipc::success_response(
@@ -447,8 +504,21 @@ async fn execute(
             Ok(json!(snapshot))
         }
         Action::Command { mut command } => {
-            if !state.peers.owns(&grant, &command.session_id) {
-                return Err("authorization_denied");
+            let start = state
+                .peers
+                .owned_start(&grant, &command.session_id)
+                .ok_or("authorization_denied")?;
+            if start.stop_request.is_some() {
+                return Err("session_stopped");
+            }
+            if (start.agent == PeerAgent::Codex
+                && state
+                    .codex_adoptions
+                    .peer_worker(&command.session_id)
+                    .is_none())
+                || !start.includes_generation(command.expected_generation)
+            {
+                return Err("session_unavailable");
             }
             command.command_id = peers::command_id(&grant.grant_id, &command.command_id);
             // This is automation, not evidence that the person is using the phone (Spec 025).
@@ -456,25 +526,129 @@ async fn execute(
                 state.agent_sessions.submit_peer_command(command).await
             ))
         }
+        Action::StopReceipt {
+            session_id,
+            request_id,
+        } => {
+            let start = state
+                .peers
+                .owned_start(&grant, &session_id)
+                .ok_or("authorization_denied")?;
+            if let Some(worker) = state.codex_adoptions.peer_worker(&session_id) {
+                if start.stop_request.as_deref() != Some(&request_id) {
+                    return Err("session_unavailable");
+                }
+                worker.closed().await;
+            }
+            let generation = start.outcome.as_ref().and_then(|o| o.process_generation);
+            let command_id = peers::command_id(&grant.grant_id, &format!("stop/{request_id}"));
+            let result = generation
+                .filter(|_| start.stop_request.as_deref() == Some(&request_id))
+                .map(|generation| (session_id, generation))
+                .ok_or("session_stopped");
+            Ok(json!(codex_outcome(&command_id, result)))
+        }
         Action::Stop {
             session_id,
             request_id,
             expected_generation,
         } => {
-            if !state.peers.owns(&grant, &session_id) {
-                return Err("authorization_denied");
-            }
-            let outcome = state
-                .managed_sessions
-                .managed_stop(
-                    &session_id,
-                    expected_generation,
-                    &peers::command_id(&grant.grant_id, &format!("stop/{request_id}")),
-                )
-                .await;
+            let start = state
+                .peers
+                .owned_start(&grant, &session_id)
+                .ok_or("authorization_denied")?;
+            let command_id = peers::command_id(&grant.grant_id, &format!("stop/{request_id}"));
+            let outcome = match start.agent {
+                PeerAgent::Claude => {
+                    state
+                        .managed_sessions
+                        .managed_stop(&session_id, expected_generation, &command_id)
+                        .await
+                }
+                PeerAgent::Codex => {
+                    let result = stop_native_codex(
+                        state,
+                        &start,
+                        &session_id,
+                        &request_id,
+                        expected_generation,
+                    )
+                    .await;
+                    codex_outcome(&command_id, result)
+                }
+            };
             Ok(json!(outcome))
         }
     }
+}
+
+async fn stop_native_codex(
+    state: &RuntimeState,
+    start: &StartRecord,
+    session: &str,
+    request_id: &str,
+    generation: u64,
+) -> Result<(String, u64), &'static str> {
+    if !start.includes_generation(generation) {
+        return Err("stale_generation");
+    }
+    let worker = state.codex_adoptions.peer_worker(session);
+    if let Some(previous) = &start.stop_request {
+        if previous != request_id {
+            return Err("session_stopped");
+        }
+        if let Some(worker) = worker {
+            worker.closed().await;
+        }
+    } else {
+        let worker = worker.ok_or("session_unavailable")?;
+        state.peers.change(|store| {
+            let record = store
+                .starts
+                .iter_mut()
+                .find(|r| r.grant_id == start.grant_id && r.request_id == start.request_id)
+                .ok_or("outcome_unknown")?;
+            record.stop_request = Some(request_id.into());
+            Ok(())
+        })?;
+        // Once durably requested, a stop must finish even if this peer loses its connection.
+        tokio::spawn(async move {
+            let _ = worker
+                .send(crate::codex_adopted::ReleaseReason::PeerStop)
+                .await;
+            worker.closed().await;
+        })
+        .await
+        .map_err(|_| "outcome_unknown")?;
+    }
+    Ok((session.into(), generation))
+}
+
+fn codex_outcome(
+    command_id: &str,
+    result: Result<(String, u64), &'static str>,
+) -> LifecycleOutcome {
+    let mut outcome = LifecycleOutcome {
+        v: agent_protocol::AGENT_PROTOCOL_VERSION,
+        command_id: command_id.into(),
+        state: "accepted".into(),
+        session_id: None,
+        process_generation: None,
+        reason_code: None,
+        deduplicated: None,
+        resume_command: None,
+    };
+    match result {
+        Ok((session, generation)) => {
+            outcome.session_id = Some(session);
+            outcome.process_generation = Some(generation);
+        }
+        Err(reason) => {
+            outcome.state = "refused".into();
+            outcome.reason_code = Some(reason.into());
+        }
+    }
+    outcome
 }
 
 #[derive(Deserialize)]
@@ -549,18 +723,33 @@ pub(super) async fn ipc(
             session_id,
             request_id,
         } => {
-            let snapshot: agent_protocol::AgentSessionSnapshot = serde_json::from_value(
-                call(
-                    &host,
-                    Action::Snapshot {
-                        session_id: session_id.clone(),
-                    },
-                    endpoint,
-                    state,
-                )
-                .await?,
+            let value = match call(
+                &host,
+                Action::Snapshot {
+                    session_id: session_id.clone(),
+                },
+                endpoint,
+                state,
             )
-            .map_err(|_| "invalid_response")?;
+            .await
+            {
+                Ok(value) => value,
+                Err("session_stopped" | "session_stopping") => {
+                    return call(
+                        &host,
+                        Action::StopReceipt {
+                            session_id,
+                            request_id,
+                        },
+                        endpoint,
+                        state,
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            };
+            let snapshot: agent_protocol::AgentSessionSnapshot =
+                serde_json::from_value(value).map_err(|_| "invalid_response")?;
             call(
                 &host,
                 Action::Stop {
@@ -596,6 +785,11 @@ async fn call(
         return Err("unknown_or_ambiguous_peer");
     };
     let id: EndpointId = link.peer.endpoint_id.parse().map_err(|_| "invalid_peer")?;
+    let lane = state.peers.outbound_lane(id);
+    let _turn = lane.lock().await;
+    if !state.peers.snapshot().outgoing.contains(link) {
+        return Err("unknown_or_ambiguous_peer");
+    }
     let request = Request {
         v: 1,
         grant_id: link.grant_id.clone(),
@@ -653,7 +847,22 @@ async fn exchange(connection: &Connection, request: &Request) -> Result<Value, &
         if response.v != 1 {
             return Err("unsupported_version");
         }
+        // The destination closes after it releases this endpoint's admission slot. Returning
+        // on just the reply allowed the next snapshot/send to race that release.
+        let _ = timeout(Duration::from_secs(5), connection.closed()).await;
         match (response.result, response.error) {
+            (None, Some(code))
+                if code == "invalid_request"
+                    && matches!(
+                        request.action,
+                        Action::Start {
+                            agent: PeerAgent::Codex,
+                            ..
+                        }
+                    ) =>
+            {
+                Err("unsupported_peer_agent")
+            }
             (Some(result), None) => Ok(result),
             (None, Some(code)) => Err(remote_error(&code)),
             _ => Err("invalid_response"),
@@ -678,6 +887,8 @@ fn remote_error(code: &str) -> &'static str {
         "outcome_unknown" => "outcome_unknown",
         "request_id_reused" => "request_id_reused",
         "session_unavailable" => "session_unavailable",
+        "session_stopped" => "session_stopped",
+        "session_stopping" => "session_stopping",
         "unknown_workspace" => "unknown_workspace",
         _ => "peer_refused",
     }
@@ -831,6 +1042,7 @@ mod tests {
             req(
                 grant,
                 Action::Start {
+                    agent: PeerAgent::Claude,
                     request_id: id.into(),
                     workspace_id: workspace.into(),
                 },
@@ -892,6 +1104,276 @@ mod tests {
         receiver
     }
 
+    /// A deterministic vendor subprocess. It asserts the actual launch cwd and writes
+    /// commands to the test workspace so this covers the app-server transport as well.
+    fn install_codex_fixture(paths: &CiaoPaths) {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = paths.home.join(".local/bin/codex-fixture");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        let script = r#"#!/usr/bin/python3
+import json, os, sys, uuid
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli TESTED_VERSION")
+    sys.exit()
+assert sys.argv[1:] == ["app-server"]
+thread = str(uuid.uuid4())
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    method = msg["method"]
+    params = msg.get("params", {})
+    result = {}
+    if method == "thread/start":
+        assert os.path.samefile(params["cwd"], os.getcwd())
+        assert set(params) == {"cwd"}
+        result = {"thread": {"id": thread, "path": os.path.join(os.getcwd(), "rollout"), "turns": []}}
+    elif method == "turn/start":
+        assert params["threadId"] == thread
+        with open("received", "a") as received:
+            print(params["input"][0]["text"], file=received)
+        result = {"turn": {"id": "t", "status": "inProgress"}}
+    print(json.dumps({"id": msg["id"], "result": result}), flush=True)
+"#;
+        fs::write(
+            &binary,
+            script.replace("TESTED_VERSION", crate::codex_adapter::PINNED_CODEX_VERSION),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let evidence = crate::codex_adopted::runtime_file(paths);
+        fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+        fs::write(evidence, json!({"binary":binary}).to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_native_codex_launch_command_stop_and_ownership() {
+        let (_temp, state, source, ids, grant) = fixture().await;
+        install_codex_fixture(&state.paths);
+        let call = |action| execute(source, req(&grant, action), &state);
+        let launch = Action::Start {
+            agent: PeerAgent::Codex,
+            request_id: "new".into(),
+            workspace_id: ids[0].clone(),
+        };
+        let first = call(launch.clone()).await.unwrap();
+        assert_eq!(first["state"], "accepted", "{first}");
+        assert_eq!(call(launch).await.unwrap(), first);
+        let session = first["session_id"].as_str().unwrap().to_owned();
+        let generation = first["process_generation"].as_u64().unwrap();
+        assert_eq!(
+            call(Action::Start {
+                agent: PeerAgent::Claude,
+                request_id: "new".into(),
+                workspace_id: ids[0].clone()
+            })
+            .await
+            .unwrap_err(),
+            "request_id_reused"
+        );
+        let get = Action::Snapshot {
+            session_id: session.clone(),
+        };
+        let snapshot = call(get.clone()).await.unwrap();
+        assert_eq!(snapshot["adapter"]["family"], "Codex");
+        let thread = state.codex_adoptions.thread_for_session(&session).unwrap();
+        state.codex_adoptions.request_release(
+            &thread,
+            crate::codex_adopted::ReleaseReason::ConversationClosed,
+        );
+        let send = Action::Command {
+            command: AgentCommand {
+                v: 1,
+                command_id: "prompt".into(),
+                session_id: session.clone(),
+                snapshot_epoch: snapshot["snapshot_epoch"].as_u64().unwrap(),
+                expected_generation: generation,
+                expected_revision: None,
+                kind: AgentCommandKind::Prompt {
+                    text: "fixture task".into(),
+                },
+            },
+        };
+        let (_, mut updates) = state
+            .agent_sessions
+            .subscribe_from_snapshot(&session)
+            .unwrap();
+        call(send.clone()).await.unwrap();
+        let path = state
+            .managed_sessions
+            .resolve_workspace(&ids[0])
+            .await
+            .unwrap()
+            .0
+            .join("received");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state
+                    .agent_sessions
+                    .snapshot(&session)
+                    .unwrap()
+                    .latest_command_receipts
+                    .iter()
+                    .any(|receipt| receipt.state == "applied")
+                {
+                    break;
+                }
+                updates.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        call(send.clone()).await.unwrap();
+        start(&state, source, &grant, "claude", &ids[1]).await;
+        assert_eq!(
+            call(Action::Start {
+                agent: PeerAgent::Codex,
+                request_id: "third".into(),
+                workspace_id: ids[0].clone()
+            })
+            .await
+            .unwrap_err(),
+            "worker_limit"
+        );
+        admin(
+            update(source, GrantScope::Selected(vec![ids[1].clone()])),
+            None,
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(call(get.clone()).await.unwrap_err(), "authorization_denied");
+        admin(update(source, GrantScope::All), None, &state)
+            .await
+            .unwrap();
+        let stop = Action::Stop {
+            session_id: session.clone(),
+            request_id: "stop".into(),
+            expected_generation: generation,
+        };
+        assert_eq!(
+            call(Action::Stop {
+                session_id: session.clone(),
+                request_id: "wrong".into(),
+                expected_generation: generation + 1
+            })
+            .await
+            .unwrap()["reason_code"],
+            "stale_generation"
+        );
+        let stopped = call(stop.clone()).await.unwrap();
+        assert_eq!(stopped["state"], "accepted");
+        assert_eq!(call(stop).await.unwrap(), stopped);
+        assert!(state.codex_adoptions.peer_sessions().is_empty());
+        assert_eq!(fs::read_to_string(path).unwrap(), "fixture task\n");
+        let receipt = Action::StopReceipt {
+            session_id: session.clone(),
+            request_id: "stop".into(),
+        };
+        assert_eq!(call(receipt.clone()).await.unwrap(), stopped);
+        let cold = super::super::tests::test_state(
+            state.host_endpoint_id,
+            &_temp.path().join("paired.json"),
+        );
+        assert_eq!(
+            execute(source, req(&grant, receipt), &cold).await.unwrap(),
+            stopped
+        );
+        assert_eq!(
+            execute(source, req(&grant, get.clone()), &cold)
+                .await
+                .unwrap_err(),
+            "session_stopped"
+        );
+        let legacy: Value =
+            serde_json::from_slice(&fs::read(_temp.path().join("peers.json")).unwrap()).unwrap();
+        let reservation = legacy["starts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["request_id"] == "new")
+            .unwrap();
+        assert!(reservation.get("agent").is_none() && reservation.get("stop_request").is_none());
+        assert_eq!(reservation["outcome"]["state"], "refused");
+        assert!(reservation["outcome"].get("session_id").is_none());
+        // A new generation with the same stable ID is under the person's control.
+        let _human = register(&state, &session).await;
+        assert_eq!(call(get).await.unwrap_err(), "session_stopped");
+        let mut new_command = match send {
+            Action::Command { command } => command,
+            _ => unreachable!(),
+        };
+        new_command.expected_generation = state
+            .agent_sessions
+            .snapshot(&session)
+            .unwrap()
+            .process_generation;
+        assert_eq!(
+            call(Action::Command {
+                command: new_command
+            })
+            .await
+            .unwrap_err(),
+            "session_stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_codex_handback_fences_the_later_human_writer() {
+        let (_temp, state, source, ids, grant) = fixture().await;
+        install_codex_fixture(&state.paths);
+        let call = |action| execute(source, req(&grant, action), &state);
+        let first = call(Action::Start {
+            agent: PeerAgent::Codex,
+            request_id: "new".into(),
+            workspace_id: ids[0].clone(),
+        })
+        .await
+        .unwrap();
+        let session = first["session_id"].as_str().unwrap();
+        let worker = state.codex_adoptions.peer_worker(session).unwrap();
+        worker
+            .send(crate::codex_adopted::ReleaseReason::ResumeInTerminal)
+            .await
+            .unwrap();
+        worker.closed().await;
+        let _human = register(&state, session).await;
+        let human = state.agent_sessions.snapshot(session).unwrap();
+        assert_ne!(
+            Some(human.process_generation),
+            first["process_generation"].as_u64()
+        );
+        assert_eq!(
+            call(Action::Snapshot {
+                session_id: session.into()
+            })
+            .await
+            .unwrap_err(),
+            "session_unavailable"
+        );
+        let command = AgentCommand {
+            v: 1,
+            command_id: "new-turn".into(),
+            session_id: session.into(),
+            snapshot_epoch: human.snapshot_epoch,
+            expected_generation: human.process_generation,
+            expected_revision: None,
+            kind: AgentCommandKind::Prompt {
+                text: "test".into(),
+            },
+        };
+        assert_eq!(
+            call(Action::Command { command }).await.unwrap_err(),
+            "session_unavailable"
+        );
+        let stop = Action::Stop {
+            session_id: session.into(),
+            request_id: "later".into(),
+            expected_generation: human.process_generation,
+        };
+        assert_eq!(call(stop).await.unwrap()["reason_code"], "stale_generation");
+    }
+
     #[tokio::test]
     async fn peer_authority_scopes_workspace_session_replay_and_worker_limit() {
         let (_temp, state, source, ids, grant) = fixture().await;
@@ -908,6 +1390,7 @@ mod tests {
                 req(
                     &grant,
                     Action::Start {
+                        agent: PeerAgent::Claude,
                         request_id: "bad-workspace".into(),
                         workspace_id: "ungranted".into()
                     }
@@ -933,6 +1416,7 @@ mod tests {
                 req(
                     &grant,
                     Action::Start {
+                        agent: PeerAgent::Claude,
                         request_id: "first".into(),
                         workspace_id: ids[1].clone()
                     }
@@ -1015,6 +1499,7 @@ mod tests {
                 req(
                     &grant,
                     Action::Start {
+                        agent: PeerAgent::Claude,
                         request_id: "third".into(),
                         workspace_id: ids[0].clone()
                     }
@@ -1069,6 +1554,7 @@ mod tests {
                 req(
                     &grant,
                     Action::Start {
+                        agent: PeerAgent::Claude,
                         request_id: "alpha-again".into(),
                         workspace_id: ids[0].clone()
                     }
@@ -1360,6 +1846,8 @@ mod tests {
             .peers
             .change(|s| {
                 s.starts.push(StartRecord {
+                    agent: PeerAgent::Claude,
+                    stop_request: None,
                     grant_id: grant.clone(),
                     request_id: "interrupted".into(),
                     workspace_id: ids[0].clone(),
@@ -1378,6 +1866,7 @@ mod tests {
                 req(
                     &grant,
                     Action::Start {
+                        agent: PeerAgent::Claude,
                         request_id: "interrupted".into(),
                         workspace_id: ids[0].clone()
                     }
@@ -1546,6 +2035,7 @@ mod tests {
             req(
                 &grant,
                 Action::Start {
+                    agent: PeerAgent::Claude,
                     request_id: "network-start".into(),
                     workspace_id: ids[0].clone(),
                 },
