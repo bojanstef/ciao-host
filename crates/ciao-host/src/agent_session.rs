@@ -2627,18 +2627,19 @@ impl AgentSessionSupervisor {
         if human_device {
             self.whereabouts.note_device_input();
         }
-        if let Some(existing) = self.metadata.lock().receipt(&command.command_id) {
-            if existing.session_id == command.session_id
-                && existing.snapshot_epoch == command.snapshot_epoch
-                && existing.process_generation == command.expected_generation
-            {
-                return existing;
-            }
-            return rejected_receipt(&command, "rejected", "duplicate_command_id", now);
-        }
-
         let (sender, receipt) = {
             let mut inner = self.inner.lock();
+            // Duplicate detection and admission share one critical section. Another stream
+            // cannot insert a receipt between this lookup and the record-before-forward.
+            if let Some(existing) = self.metadata.lock().receipt(&command.command_id) {
+                if existing.session_id == command.session_id
+                    && existing.snapshot_epoch == command.snapshot_epoch
+                    && existing.process_generation == command.expected_generation
+                {
+                    return existing;
+                }
+                return rejected_receipt(&command, "rejected", "duplicate_command_id", now);
+            }
             let Some(session) = inner.sessions.get_mut(&command.session_id) else {
                 return rejected_receipt(&command, "unavailable", "session_unavailable", now);
             };
@@ -9588,6 +9589,83 @@ int main(int argc,char **argv) {
                 <= MAX_HOST_TIMELINE_BYTES
         );
         assert!(session.history.first().unwrap().sequence > 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_recovers_the_applied_command_once_when_the_reply_is_lost() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("agent-metadata.json"));
+        let (sender, mut provider) = mpsc::channel(4);
+        let registered = supervisor
+            .register(registration("nonce-a"), sender)
+            .await
+            .unwrap();
+        let session = &registered.session_id;
+
+        for sequence in 0..12 {
+            let (initial, unread) = supervisor.subscribe_from_snapshot(session).unwrap();
+            let command = AgentCommand {
+                v: 1,
+                command_id: format!("lost-receipt-{sequence}"),
+                session_id: session.clone(),
+                snapshot_epoch: initial.snapshot_epoch,
+                expected_generation: initial.process_generation,
+                expected_revision: (sequence % 2 == 1).then_some(initial.revision),
+                kind: AgentCommandKind::Prompt {
+                    text: "Fixture prompt".into(),
+                },
+            };
+            // Real concurrent admissions of the same ID must return the same receipt,
+            // even when an intervening admission has advanced the session revision.
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let admit = || {
+                let supervisor = supervisor.clone();
+                let command = command.clone();
+                let gate = gate.clone();
+                tokio::task::spawn_blocking(move || {
+                    gate.wait();
+                    tokio::runtime::Handle::current().block_on(supervisor.submit_command(command))
+                })
+            };
+            let (first, duplicate) = tokio::join!(admit(), admit());
+            let first = first.unwrap();
+            assert_eq!(first, duplicate.unwrap());
+            assert_eq!(first.state, "sending");
+
+            let delivered = provider
+                .try_recv()
+                .expect("provider received the admitted command");
+            assert_eq!(delivered.command.command_id, command.command_id);
+            assert_eq!(delivered.command.kind, command.kind);
+            supervisor
+                .record_bridge_receipt(
+                    session,
+                    &command.command_id,
+                    "applied",
+                    Some("fixture_input"),
+                    None,
+                )
+                .unwrap();
+            drop(unread); // the phone reads neither the command receipt nor the corresponding delta
+            let (fresh, _subscription) = supervisor.subscribe_from_snapshot(session).unwrap();
+            let receipt = fresh
+                .latest_command_receipts
+                .iter()
+                .find(|r| r.command_id == command.command_id)
+                .unwrap();
+            assert_eq!(receipt.state, "applied");
+            assert_eq!(
+                receipt.application_evidence.as_deref(),
+                Some("fixture_input")
+            );
+            assert_eq!(receipt.snapshot_epoch, initial.snapshot_epoch);
+            assert_eq!(receipt.process_generation, initial.process_generation);
+            assert_eq!(supervisor.submit_command(command).await, *receipt);
+            assert!(matches!(
+                provider.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[tokio::test]
