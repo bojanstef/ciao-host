@@ -2222,44 +2222,56 @@ impl AgentSessionSupervisor {
         &self,
         live_vendor_owners: &std::collections::HashMap<String, String>,
     ) -> AgentSessionList {
-        let inner = self.inner.lock();
-        let descriptors: Vec<_> = inner
+        self.list_with_prompt_reader(live_vendor_owners, read_transcript_prompt)
+    }
+
+    pub(crate) fn list(&self) -> AgentSessionList {
+        self.list_with_managed_owners(&HashMap::new())
+    }
+
+    fn list_with_prompt_reader(
+        &self,
+        live_vendor_owners: &HashMap<String, String>,
+        read_prompt: impl Fn(&str) -> Option<String>,
+    ) -> AgentSessionList {
+        // Capture each descriptor and the identity that supplied it together. Transcript I/O
+        // enriches only this returned list; a later registration cannot be changed by the read.
+        let rows: Vec<_> = self
+            .inner
+            .lock()
             .sessions
             .values()
             .map(|session| {
-                let mut descriptor = descriptor_for(session);
+                let (mut descriptor, prompt) = descriptor_for(session);
                 if descriptor.topology == "attached" {
                     descriptor.managed_session_id =
                         live_vendor_owners.get(&session.upstream_identity).cloned();
                 }
+                (descriptor, prompt)
+            })
+            .collect();
+        let descriptors = rows
+            .into_iter()
+            .map(|(mut descriptor, prompt)| {
+                descriptor.recent_prompt = prompt.resolve(&read_prompt);
                 descriptor
             })
             .collect();
         bounded_session_list(descriptors, 0)
     }
 
-    pub(crate) fn list(&self) -> AgentSessionList {
-        let inner = self.inner.lock();
-        let descriptors: Vec<_> = inner.sessions.values().map(descriptor_for).collect();
-        // One list frame remains below the 64 KiB wire bound. Oldest descriptors are omitted
-        // categorically if long display labels would exceed it.
-        bounded_session_list(descriptors, 0)
-    }
-
     /// What an ADR 005 notification says about a session: where it is and what it last said. All
     /// of it is sealed under the pairing key, so none of it reaches the relay.
     ///
-    /// Async only for the tab, which is a live provider question the notification path is the
-    /// only caller of. The lock is dropped before it, because a provider call must never be made
-    /// with the supervisor held.
+    /// Both the transcript lookup and the provider's live tab lookup run after the snapshot.
     pub(crate) async fn notification_facts(&self, session_id: &str) -> Option<NotificationFacts> {
-        let (mut facts, proof) = {
+        let (mut facts, prompt, proof) = {
             let inner = self.inner.lock();
             let session = inner.sessions.get(session_id)?;
             let facts = NotificationFacts {
                 workspace: session.workspace_display.clone(),
                 tab: None,
-                subject: recent_prompt_for(session, |_| true),
+                subject: None,
                 reply: recent_reply_for(session),
             };
             let proof = inner
@@ -2267,8 +2279,9 @@ impl AgentSessionSupervisor {
                 .values()
                 .find(|record| record.session_id == session_id)
                 .map(|record| record.proof.clone());
-            (facts, proof)
+            (facts, recent_prompt_for(session, |_| true), proof)
         };
+        facts.subject = prompt.resolve(read_transcript_prompt);
         if let Some(proof) = proof {
             facts.tab = self.routes.tab_label(&proof).await;
         }
@@ -4399,10 +4412,10 @@ fn drift_note_for(registration: &NormalizedRegistration) -> Option<DriftNote> {
 
 mod directory_preview;
 
-fn descriptor_for(session: &LiveSession) -> AgentSessionDescriptor {
+fn descriptor_for(session: &LiveSession) -> (AgentSessionDescriptor, RecentPrompt) {
     let turn = session.visible_turn();
     let context_preview = directory_preview::for_session(session, &turn);
-    AgentSessionDescriptor {
+    let descriptor = AgentSessionDescriptor {
         v: AGENT_PROTOCOL_VERSION,
         session_id: session.snapshot.session_id.clone(),
         adapter_family: session.snapshot.adapter.family.clone(),
@@ -4417,9 +4430,7 @@ fn descriptor_for(session: &LiveSession) -> AgentSessionDescriptor {
         capabilities: session.snapshot.capabilities.clone(),
         workspace_display: session.workspace_display.clone(),
         terminal_fallback: session.snapshot.terminal_fallback.clone(),
-        recent_prompt: recent_prompt_for(session, |text| {
-            directory_preview::incoming(&session.snapshot.adapter.family, text).is_none()
-        }),
+        recent_prompt: None,
         // Filled in by the caller, which is the only place that can see both directories.
         managed_session_id: None,
         takeover: session
@@ -4433,7 +4444,11 @@ fn descriptor_for(session: &LiveSession) -> AgentSessionDescriptor {
         drift: session.snapshot.drift.clone(),
         revision: session.snapshot.revision,
         updated_at: session.updated_at,
-    }
+    };
+    let prompt = recent_prompt_for(session, |text| {
+        directory_preview::incoming(&session.snapshot.adapter.family, text).is_none()
+    });
+    (descriptor, prompt)
 }
 
 /// Undoes `note_bridge_attention` once the conversation actually moves again.
@@ -4492,7 +4507,26 @@ fn has_resumable_conversation(
     observed_a_prompt || transcript_prompt().is_some()
 }
 
-fn recent_prompt_for(session: &LiveSession, prefer: impl Fn(&str) -> bool) -> Option<String> {
+/// A missing Claude prompt may be read from its upstream transcript once the lock is released.
+enum RecentPrompt {
+    Observed(Option<String>),
+    Transcript(String),
+}
+
+impl RecentPrompt {
+    fn resolve(self, read: impl FnOnce(&str) -> Option<String>) -> Option<String> {
+        match self {
+            Self::Observed(prompt) => prompt,
+            Self::Transcript(id) => read(&id),
+        }
+    }
+}
+
+fn read_transcript_prompt(id: &str) -> Option<String> {
+    crate::claude_transcript::recent_prompt(id, MAX_RECENT_PROMPT_BYTES)
+}
+
+fn recent_prompt_for(session: &LiveSession, prefer: impl Fn(&str) -> bool) -> RecentPrompt {
     let mut prompts = session.history.iter().rev().filter_map(|entry| {
         if entry.kind != "user_message" {
             return None;
@@ -4513,19 +4547,17 @@ fn recent_prompt_for(session: &LiveSession, prefer: impl Fn(&str) -> bool) -> Op
         // outlived its last prompt — a daemon restart, a `--resume` — leaves the conversation
         // unnamed here while Claude still holds it on disk. Claude only: another adapter's
         // upstream identity names nothing in Claude's store, and searching for it is wasted.
-        if session.snapshot.adapter.family != "Claude" {
-            return None;
-        }
-        return crate::claude_transcript::recent_prompt(
-            &session.upstream_identity,
-            MAX_RECENT_PROMPT_BYTES,
-        );
+        return if session.snapshot.adapter.family == "Claude" {
+            RecentPrompt::Transcript(session.upstream_identity.clone())
+        } else {
+            RecentPrompt::Observed(None)
+        };
     };
 
-    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
-    let bounded = truncate_on_char_boundary(line, MAX_RECENT_PROMPT_BYTES);
-    // Validation rejects an empty string, so never advertise one.
-    (!bounded.is_empty()).then_some(bounded)
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty());
+    RecentPrompt::Observed(
+        line.map(|line| truncate_on_char_boundary(line, MAX_RECENT_PROMPT_BYTES)),
+    )
 }
 
 /// The beginning of what the agent last said, which is what a person reads to decide whether the
@@ -5087,6 +5119,41 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_transcript_name_is_resolved_outside_the_supervisor_lock() {
+        let tmp = tempdir().unwrap();
+        let supervisor = supervisor(&tmp.path().join("metadata.json"));
+        let mut registration = observer_registration("directory-fallback");
+        registration.adapter_family = "Claude".into();
+        let original_turn = registration.turn.clone();
+        let registered = supervisor.register_new(registration, None).unwrap();
+        let listed = supervisor.list_with_prompt_reader(&HashMap::new(), |upstream| {
+            assert_eq!(upstream, "fixture-upstream-a");
+            assert!(
+                supervisor.inner.try_lock().is_some(),
+                "transcript I/O blocks other sessions"
+            );
+            supervisor
+                .note_bridge_turn(
+                    &registered.session_id,
+                    TurnState::Completed { run_id: None },
+                )
+                .unwrap();
+            Some("Recovered topic".into())
+        });
+        assert_eq!(listed.sessions.len(), 1);
+        assert_eq!(listed.sessions[0].session_id, registered.session_id);
+        assert_eq!(listed.sessions[0].turn, original_turn);
+        assert_eq!(
+            supervisor.snapshot(&registered.session_id).unwrap().turn,
+            TurnState::Completed { run_id: None }
+        );
+        assert_eq!(
+            listed.sessions[0].recent_prompt.as_deref(),
+            Some("Recovered topic")
+        );
+    }
 
     fn registration(nonce: &str) -> NormalizedRegistration {
         registration_with(nonce, "fixture-upstream-a", std::process::id())
