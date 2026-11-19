@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 use crate::{
-    git_diff::{GitDiffError, open_work_tree, run_git},
+    git_diff::{GitDiffError, open_work_tree, run_git, valid_revision},
     pty::{apply_clean_process_environment, is_absolute_executable},
 };
 
@@ -97,13 +97,6 @@ enum Conclusion {
     StartupFailure,
     #[serde(other)]
     Unknown,
-}
-
-fn valid_revision(value: &str) -> bool {
-    matches!(value.len(), 40 | 64)
-        && value
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 /// Recognize only standard github.com clone URLs. Never forward raw configuration: a URL

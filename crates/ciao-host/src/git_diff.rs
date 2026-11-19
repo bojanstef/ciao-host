@@ -41,10 +41,6 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// agent that just scaffolded a project can produce hundreds, and each costs its own git call.
 const MAX_UNTRACKED_FILES: usize = 50;
 
-/// Git's empty tree. Diffing against this is how an unborn repository — one where `HEAD` does
-/// not resolve because nothing is committed yet — still shows its work.
-const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitDiffError {
     /// No git binary in the fixed directories.
@@ -367,19 +363,29 @@ async fn branch_diff(workdir: &Path) -> Result<String, GitDiffError> {
         // the reader between enumerating and asking, or Git failed to establish it.
         return Err(GitDiffError::Failed);
     };
-    let out = run_git(
-        &git,
-        workdir,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            merge_base.as_str(),
-            "HEAD",
-        ],
-    )
-    .await?;
+    tracked_patch(&git, workdir, &merge_base, Some("HEAD")).await
+}
+
+/// Review always includes changed gitlinks as metadata, even if this checkout hides them
+/// in ordinary Git commands or configures inline diffs of the child repository.
+async fn tracked_patch(
+    git: &Path,
+    workdir: &Path,
+    base: &str,
+    end: Option<&str>,
+) -> Result<String, GitDiffError> {
+    let mut args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--ignore-submodules=none",
+        "--submodule=short",
+        base,
+    ];
+    args.extend(end);
+    args.push("--"); // an object ID can also be a filename in the worktree
+    let out = run_git(git, workdir, &args).await?;
     if out.truncated {
         return Err(GitDiffError::TooLarge);
     }
@@ -389,13 +395,59 @@ async fn branch_diff(workdir: &Path) -> Result<String, GitDiffError> {
     String::from_utf8(out.stdout).map_err(|_| GitDiffError::Failed)
 }
 
-/// The base every uncommitted change is measured against: `HEAD` normally, the empty tree when
-/// nothing has been committed yet.
-async fn diff_base(git: &Path, workdir: &Path) -> &'static str {
-    match run_git(git, workdir, &["rev-parse", "--verify", "HEAD"]).await {
-        Ok(out) if out.success() => "HEAD",
-        _ => EMPTY_TREE,
+/// Resolve the actual commit so a later branch switch cannot change the selected base.
+async fn diff_base(git: &Path, workdir: &Path) -> Result<String, GitDiffError> {
+    let head = run_git(
+        git,
+        workdir,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )
+    .await?;
+    if head.exit_code != Some(1) || head.had_diagnostics {
+        return object_id(head);
     }
+
+    // A failed commit lookup also occurs for a corrupt ref or a missing commit object.
+    // Only an intact symbolic HEAD targeting a genuinely absent local branch is unborn.
+    let symbolic = run_git(git, workdir, &["symbolic-ref", "--quiet", "HEAD"]).await?;
+    if !symbolic.success()
+        || symbolic.had_diagnostics
+        || !symbolic.stdout.starts_with(b"refs/heads/")
+    {
+        return Err(GitDiffError::Failed);
+    }
+    // Git resolves the symbolic name itself, including ref names that are not UTF-8.
+    let exists = run_git(
+        git,
+        workdir,
+        &["show-ref", "--head", "--verify", "--quiet", "HEAD"],
+    )
+    .await?;
+    if exists.exit_code != Some(1) || exists.had_diagnostics {
+        return Err(GitDiffError::Failed);
+    }
+
+    // stdin is /dev/null. Without -w, hash-object computes this repository's empty-tree
+    // ID (SHA-1 or SHA-256) without creating an object in the user's checkout.
+    object_id(run_git(git, workdir, &["hash-object", "-t", "tree", "--stdin"]).await?)
+}
+
+pub(super) fn valid_revision(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn object_id(output: GitOutput) -> Result<String, GitDiffError> {
+    if !output.success() || output.had_diagnostics {
+        return Err(GitDiffError::Failed);
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| GitDiffError::Failed)?;
+    text.strip_suffix('\n')
+        .filter(|id| valid_revision(id))
+        .map(str::to_owned)
+        .ok_or(GitDiffError::Failed)
 }
 
 /// Untracked, non-ignored files rendered as whole-file additions.
@@ -490,23 +542,9 @@ async fn uncommitted_diff(workdir: &Path) -> Result<GitDiff, GitDiffError> {
     let (git, root) = open_work_tree(workdir).await?;
     let workdir = root.as_path();
 
-    let base = diff_base(&git, workdir).await;
-    let tracked = run_git(
-        &git,
-        workdir,
-        &["diff", "--no-ext-diff", "--no-textconv", "--no-color", base],
-    )
-    .await?;
-    if tracked.truncated {
-        return Err(GitDiffError::TooLarge);
-    }
-    if !tracked.success() || tracked.had_diagnostics {
-        return Err(GitDiffError::Failed);
-    }
-    // A patch the renderer cannot accept is not a patch. Spec 008 §5.2: no lossy replacement,
-    // because a review that looks authoritative and is not is the worst outcome here.
+    let base = diff_base(&git, workdir).await?;
     let mut review = GitDiff {
-        patch: String::from_utf8(tracked.stdout).map_err(|_| GitDiffError::Failed)?,
+        patch: tracked_patch(&git, workdir, &base, None).await?,
         coverage: DiffCoverage::default(),
     };
     append_untracked(&git, workdir, &mut review).await?;
@@ -558,6 +596,115 @@ mod tests {
         let patch = uncommitted_diff(&root).await.expect("diff").patch;
         assert!(patch.contains("first.txt"), "names the file: {patch}");
         assert!(patch.contains("+hello"), "shows the addition: {patch}");
+    }
+
+    #[tokio::test]
+    async fn unborn_sha256_reviews_the_live_staged_path_without_writing_an_empty_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let git = resolve_git().expect("real Git");
+        let init = run_git(&git, &root, &["init", "-q", "--object-format=sha256"])
+            .await
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(root.join("first.txt"), "staged\n").unwrap();
+        assert!(
+            run_git(&git, &root, &["add", "first.txt"])
+                .await
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("first.txt"), "live first revision\n").unwrap();
+        let id = diff_base(&git, &root).await.unwrap();
+        assert_eq!(id.len(), 64);
+        let review = diff(&root, DiffBase::Uncommitted).await.unwrap();
+        assert!(review.patch.contains("+live first revision"));
+        assert_eq!(review.coverage.new_files_total, 0);
+        assert!(
+            !root
+                .join(".git/objects")
+                .join(&id[..2])
+                .join(&id[2..])
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_missing_commit_objects_cannot_use_the_unborn_base() {
+        let (_temp, root, git) = repo_on_main().await.unwrap();
+        let width = diff_base(&git, &root).await.unwrap().len();
+        let branch_ref = root.join(".git/refs/heads/main");
+        for broken in [
+            "invalid ref contents\n".to_owned(),
+            format!("{}\n", "1".repeat(width)),
+        ] {
+            std::fs::write(&branch_ref, broken).unwrap();
+            assert_eq!(
+                diff(&root, DiffBase::Uncommitted).await,
+                Err(GitDiffError::Failed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ignored_submodules_still_show_short_gitlink_metadata_in_both_comparisons() {
+        let (_temp, root, git) = repo_on_main().await.unwrap();
+        let module = root.join("module");
+        std::fs::create_dir(&module).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new(&git)
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            out.stdout
+        };
+        run(&module, &["init", "-q"]);
+        std::fs::write(module.join("source.txt"), "first child revision\n").unwrap();
+        run(&module, &["add", "source.txt"]);
+        let commit = [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qam",
+            "update",
+        ];
+        run(&module, &commit);
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"module\"]\n\tpath = module\n\turl = ./module\n",
+        )
+        .unwrap();
+        run(&root, &["add", ".gitmodules", "module"]);
+        run(&root, &commit);
+        run(&root, &["config", "submodule.module.ignore", "all"]);
+        run(&root, &["config", "diff.submodule", "diff"]);
+        std::fs::write(module.join("source.txt"), "new child content\n").unwrap();
+        let status = run(
+            &root,
+            &["status", "--porcelain=v2", "--ignore-submodules=none"],
+        );
+        assert!(String::from_utf8(status).unwrap().contains(" S.M."));
+        let working = diff(&root, DiffBase::Uncommitted).await.unwrap();
+        assert!(working.patch.contains("diff --git a/module b/module"));
+        assert!(working.patch.contains("-dirty"));
+        assert!(!working.patch.contains("new child content"));
+        run(&root, &["checkout", "-qb", "feature"]);
+        run(&module, &commit);
+        // The project's ignore preference also applies to command-line staging.
+        run(
+            &root,
+            &["-c", "submodule.module.ignore=none", "add", "module"],
+        );
+        run(&root, &commit);
+        let branch = diff(&root, DiffBase::Branch).await.unwrap();
+        assert!(branch.patch.contains("diff --git a/module b/module"));
+        assert!(branch.patch.contains("+Subproject commit "));
+        assert!(!branch.patch.contains("new child content"));
     }
 
     #[tokio::test]
