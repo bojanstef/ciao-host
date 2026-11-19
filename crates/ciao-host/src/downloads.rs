@@ -136,13 +136,18 @@ pub struct GetOpen {
     /// Absent from every request the terminal makes, so that path is the exact bytes it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The local evidence sample acknowledged by the person choosing a GitHub lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_target: Option<crate::git_evidence::EvidenceTarget>,
 }
 
-/// The one non-file `kind` this stream understands.
+/// Structured retrieval modes sharing the bounded download stream.
 pub const GET_KIND_GIT_DIFF: &str = "git_diff";
 const GET_KIND_GIT_FILE: &str = "git_file";
 // Leave time to deliver a categorical error before the phone’s ten-second first-frame budget.
 const GIT_REVIEW_PREP_TIMEOUT: Duration = Duration::from_secs(8);
+const GET_KIND_EVIDENCE: &str = "git_evidence";
+const GET_KIND_GITHUB_EVIDENCE: &str = "git_evidence_github";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -576,6 +581,18 @@ where
         .await;
     }
 
+    let kind = open.kind.as_deref();
+    if matches!(kind, Some(GET_KIND_EVIDENCE | GET_KIND_GITHUB_EVIDENCE)) {
+        return send_git_evidence(open, agent_workspace, &mut reader, recv, send).await;
+    }
+    if open.evidence_target.is_some() {
+        return send_get_error(
+            send,
+            DownloadErrorCode::Invalid,
+            "That preview request is invalid.",
+        )
+        .await;
+    }
     // A named session outranks both the VT's report and the attached terminal, and a named
     // session that does not resolve ends the request. Falling back here would answer with
     // whatever directory happened to be nearby, which is the wrong-workspace failure rather
@@ -725,6 +742,105 @@ async fn resolve_git_file(token: &str, cwd: Option<&str>) -> Result<PathBuf, Dow
         return Err(INVALID);
     }
     Ok(path)
+}
+
+/// An evidence request belongs exclusively to a named conversation. The terminal's cwd and
+/// the selected path are intentionally unavailable to the Git and GitHub queries.
+async fn send_git_evidence<R, W>(
+    open: GetOpen,
+    agent_workspace: &(dyn Fn(&str) -> Option<String> + Sync),
+    reader: &mut DownloadFrameReader,
+    recv: &mut R,
+    send: &mut W,
+) -> Result<(), HostProtocolError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let github = open.kind.as_deref() == Some(GET_KIND_GITHUB_EVIDENCE);
+    let Some((session, path)) = open
+        .session
+        .as_deref()
+        .filter(|_| {
+            open.path == "."
+                && open.cwd.is_none()
+                && open.base.is_none()
+                && github == open.evidence_target.is_some()
+        })
+        .and_then(|id| agent_workspace(id).map(|path| (id, path)))
+    else {
+        return send_get_error(
+            send,
+            DownloadErrorCode::Invalid,
+            "This conversation's checkout is unavailable.",
+        )
+        .await;
+    };
+    let work = timeout(
+        Duration::from_secs(9),
+        crate::git_evidence::Evidence::read(
+            session,
+            Path::new(&path),
+            open.evidence_target.as_ref(),
+        ),
+    );
+    tokio::pin!(work);
+    let result = tokio::select! {
+        biased;
+        control = reader.next(recv) => match control {
+            Ok(DownloadClientFrame::Cancel) => return send_get_error(send, DownloadErrorCode::Cancelled, "The evidence request was cancelled.").await,
+            // Request half-close is valid. A reset or partial control is not.
+            Err(HostProtocolError::Truncated) if reader.buffered.is_empty() => work.await,
+            Err(HostProtocolError::Io(error)) => return Err(HostProtocolError::Io(error)),
+            _ => return send_get_error(send, DownloadErrorCode::Invalid, "The evidence request was malformed.").await,
+        },
+        result = &mut work => result,
+    };
+    let evidence = match result {
+        Ok(Ok(evidence)) => evidence,
+        Ok(Err(crate::git_diff::GitDiffError::NotARepository)) => {
+            return send_get_error(
+                send,
+                DownloadErrorCode::NotAFile,
+                "This conversation has no Git checkout.",
+            )
+            .await;
+        }
+        Err(_) | Ok(Err(crate::git_diff::GitDiffError::Timeout)) => {
+            return send_get_error(
+                send,
+                DownloadErrorCode::Timeout,
+                "The checkout did not answer in time.",
+            )
+            .await;
+        }
+        Ok(Err(_)) => {
+            return send_get_error(
+                send,
+                DownloadErrorCode::Io,
+                "The checkout could not be read.",
+            )
+            .await;
+        }
+    };
+    let bytes = serde_json::to_vec(&evidence).map_err(|_| HostProtocolError::MalformedJson)?;
+    if bytes.len() > 32 * 1024 {
+        return send_get_error(
+            send,
+            DownloadErrorCode::TooLarge,
+            "The evidence report was too large.",
+        )
+        .await;
+    }
+    let accepted = GetAccepted {
+        v: DOWNLOAD_JSON_VERSION,
+        name: "evidence.json".into(),
+        size: bytes.len() as u64,
+        bases: Vec::new(),
+        base: None,
+        coverage: None,
+    };
+    send_download_bytes(send, &accepted, &bytes).await
 }
 
 /// The workspace's diff for one chosen base, as one `changes.diff` the phone renders.
@@ -996,6 +1112,7 @@ mod tests {
                 kind: None,
                 base: None,
                 session: None,
+                evidence_target: None,
             },
         )
         .expect("encode open");
@@ -1039,6 +1156,7 @@ mod tests {
                 kind: None,
                 base: None,
                 session: None,
+                evidence_target: None,
             },
         )
         .expect("encode open");
@@ -1115,6 +1233,7 @@ mod tests {
                 kind: Some(GET_KIND_GIT_DIFF.into()),
                 base: base.map(str::to_owned),
                 session: session.map(str::to_owned),
+                evidence_target: None,
             },
         )
         .expect("encode open")
@@ -1290,6 +1409,7 @@ mod tests {
                 kind: kind.map(str::to_owned),
                 base: None,
                 session: Some("session".into()),
+                evidence_target: None,
             };
             let mut recv =
                 io::Cursor::new(encode_download_control(FRAME_GET_OPEN, &message).unwrap());
@@ -1501,6 +1621,104 @@ mod tests {
             "a refusal never names the path: {}",
             error.message
         );
+    }
+
+    #[tokio::test]
+    async fn evidence_download_is_bound_to_the_exact_registered_session() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/fixtures/phase9/git-evidence-v1.json"
+        ))
+        .unwrap();
+        let temp = temp_dir();
+        let workspace = temp.path().canonicalize().unwrap().join("field-notes");
+        std::fs::create_dir(&workspace).unwrap();
+        let git = crate::git_diff::resolve_git().unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:example/field-notes.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new(&git)
+                    .arg("-C")
+                    .arg(&workspace)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        write_file(&workspace, "draft.txt", b"draft");
+        let resolve =
+            |id: &str| (id == "session-1").then(|| workspace.to_string_lossy().into_owned());
+        let request = &fixture["local_request"];
+        let mut recv = io::Cursor::new(encode_download_control(FRAME_GET_OPEN, request).unwrap());
+        let mut sent = Vec::new();
+        run_download_stream(
+            &mut recv,
+            &mut sent,
+            None,
+            Some("/other"),
+            &resolve,
+            DOWNLOAD_IDLE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let (accepted, body) = decode_host_frames(&sent);
+        assert_eq!(accepted.name, "evidence.json");
+        assert_eq!(accepted.size as usize, body.len());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            fixture["unborn"]
+        );
+
+        for change in [
+            serde_json::json!({"session":"unknown"}),
+            serde_json::json!({"session":null}),
+            serde_json::json!({"cwd":"/other"}),
+            serde_json::json!({"path":"/other"}),
+            serde_json::json!({"base":"branch"}),
+            serde_json::json!({"kind":"git_evidence_github"}),
+            serde_json::json!({"evidence_target":fixture["github_request"]["evidence_target"]}),
+        ] {
+            let mut invalid = request.clone();
+            for (key, value) in change.as_object().unwrap() {
+                invalid[key] = value.clone();
+            }
+            let mut recv =
+                io::Cursor::new(encode_download_control(FRAME_GET_OPEN, &invalid).unwrap());
+            let mut sent = Vec::new();
+            run_download_stream(
+                &mut recv,
+                &mut sent,
+                None,
+                workspace.to_str(),
+                &resolve,
+                DOWNLOAD_IDLE_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert_eq!(decode_error(&sent).unwrap().code, "invalid", "{invalid}");
+        }
+        let mut frames = encode_download_control(FRAME_GET_OPEN, request).unwrap();
+        frames.extend(encode_download_frame(FRAME_GET_CANCEL, &[]).unwrap());
+        let mut sent = Vec::new();
+        run_download_stream(
+            &mut io::Cursor::new(frames),
+            &mut sent,
+            None,
+            None,
+            &resolve,
+            DOWNLOAD_IDLE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decode_error(&sent).unwrap().code, "cancelled");
     }
 
     fn decode_host_frames(bytes: &[u8]) -> (GetAccepted, Vec<u8>) {

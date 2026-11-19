@@ -1,0 +1,115 @@
+{
+  "local_request": {
+    "v": 1,
+    "path": ".",
+    "session": "session-1",
+    "kind": "git_evidence"
+  },
+  "github_request": {
+    "v": 1,
+    "path": ".",
+    "session": "session-1",
+    "kind": "git_evidence_github",
+    "evidence_target": {
+      "repository": "example/field-notes",
+      "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "branch": "main"
+    }
+  },
+  "local": {
+    "v": 1,
+    "session": "session-1",
+    "workspace": "field-notes",
+    "branch": "main",
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "worktree": "clean",
+    "repository": "example/field-notes",
+    "checks": {
+      "state": "not_requested",
+      "total": 0,
+      "runs": [],
+      "other_revision": null,
+      "other_lookup_unavailable": false
+    }
+  },
+  "exact": {
+    "v": 1,
+    "session": "session-1",
+    "workspace": "field-notes",
+    "branch": "main",
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "worktree": "clean",
+    "repository": "example/field-notes",
+    "checks": {
+      "state": "loaded",
+      "total": 1,
+      "runs": [
+        {
+          "id": 12345,
+          "attempt": 2,
+          "name": "Unit tests",
+          "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ],
+      "other_revision": null,
+      "other_lookup_unavailable": false
+    }
+  },
+  "other": {
+    "v": 1,
+    "session": "session-1",
+    "workspace": "field-notes",
+    "branch": "main",
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "worktree": "modified",
+    "repository": "example/field-notes",
+    "checks": {
+      "state": "loaded",
+      "total": 0,
+      "runs": [],
+      "other_revision": {
+        "id": 12344,
+        "attempt": 2,
+        "name": "Unit tests",
+        "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "status": "completed",
+        "conclusion": "success"
+      },
+      "other_lookup_unavailable": false
+    }
+  },
+  "unavailable": {
+    "v": 1,
+    "session": "session-1",
+    "workspace": "field-notes",
+    "branch": "main",
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "worktree": "clean",
+    "repository": "example/field-notes",
+    "checks": {
+      "state": "unavailable",
+      "total": 0,
+      "runs": [],
+      "other_revision": null,
+      "other_lookup_unavailable": false
+    }
+  },
+  "unborn": {
+    "v": 1,
+    "session": "session-1",
+    "workspace": "field-notes",
+    "branch": "main",
+    "revision": null,
+    "worktree": "modified",
+    "repository": "example/field-notes",
+    "checks": {
+      "state": "not_requested",
+      "total": 0,
+      "runs": [],
+      "other_revision": null,
+      "other_lookup_unavailable": false
+    }
+  }
+}

@@ -29,6 +29,7 @@ pub(crate) mod downloads;
 pub(crate) mod drift;
 pub mod forward;
 pub(crate) mod git_diff;
+pub(crate) mod git_evidence;
 pub(crate) mod herdr_core;
 pub(crate) mod hook_common;
 pub(crate) mod host_info;
