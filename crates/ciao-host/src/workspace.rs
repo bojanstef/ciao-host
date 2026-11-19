@@ -1836,6 +1836,9 @@ fn cap_herdr_sessions(mut sessions: Vec<HerdrSessionEntry>) -> (Vec<HerdrSession
 }
 
 #[cfg(test)]
+pub(crate) use tests::IsolatedTmux;
+
+#[cfg(test)]
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt, time::Instant as StdInstant};
 
@@ -1844,22 +1847,70 @@ mod tests {
 
     use super::*;
 
-    /// The pre-create has to leave a session standing, and it has to be cheap: it sits on the
-    /// path of every `tmux.create` open. Uses the production socket deliberately — the same
-    /// reason `tmux_created_session_is_rediscovered_by_production_snapshot` does, since
-    /// `run_bounded` clears the environment and a test-only `TMUX_TMPDIR` would not survive it.
+    /// Routes every test command, including subprocesses with a cleaned environment, to
+    /// the same real tmux on a private socket. Production code sees a normal provider path.
+    pub(crate) struct IsolatedTmux {
+        directory: tempfile::TempDir,
+        pub(crate) config: WorkspaceConfig,
+        pub(crate) program: PathBuf,
+    }
+
+    impl IsolatedTmux {
+        pub(crate) fn new() -> Option<Self> {
+            let account = crate::pty::resolve_account().unwrap();
+            let tmux = WorkspaceConfig::for_home(&account.home).resolve(ProviderKind::Tmux)?;
+            // Both macOS and Linux limit Unix socket path length.
+            let directory = tempfile::Builder::new()
+                .prefix("ciao-tmux-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")
+                .unwrap();
+            std::os::unix::fs::symlink(tmux, directory.path().join("real-tmux")).unwrap();
+            write_stub(
+                directory.path(),
+                "tmux",
+                r#"unset TMUX TMUX_TMPDIR
+dir=${0%/*}
+exec "$dir/real-tmux" -f /dev/null -S "$dir/socket" "$@""#,
+            );
+            let config = WorkspaceConfig::with_binary_dirs(vec![directory.path().to_owned()]);
+            let program = config.resolve(ProviderKind::Tmux).unwrap();
+            Some(Self {
+                directory,
+                config,
+                program,
+            })
+        }
+
+        fn socket(&self) -> PathBuf {
+            self.directory.path().join("socket")
+        }
+    }
+
+    impl Drop for IsolatedTmux {
+        fn drop(&mut self) {
+            if self.socket().exists() {
+                // This program always supplies this fixture's private -S path, even on unwind.
+                let _ = std::process::Command::new(&self.program)
+                    .arg("kill-server")
+                    .output();
+            }
+        }
+    }
+
+    /// The pre-create must leave a session standing and fit the tmux.create latency budget.
     #[cfg(unix)]
     #[tokio::test]
     async fn detached_pre_create_leaves_a_session_standing_and_costs_little() {
-        let config = WorkspaceConfig::for_home(&crate::pty::resolve_account().unwrap().home);
-        let Some(tmux) = config.resolve(crate::host_protocol::ProviderKind::Tmux) else {
-            return; // No tmux on this machine; nothing to prove.
+        let Some(fixture) = IsolatedTmux::new() else {
+            return;
         };
+        let tmux = &fixture.program;
         let home = crate::pty::resolve_account().unwrap().home;
         let session = format!("ciao-precreate-{}", rand::random::<u32>());
 
         let began = StdInstant::now();
-        let created = ensure_detached_tmux_session(&tmux, &session, &home).await;
+        let created = ensure_detached_tmux_session(tmux, &session, &home).await;
         let elapsed = began.elapsed();
         assert!(
             created,
@@ -1868,10 +1919,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(6)).await;
         let target = format!("={session}");
-        let alive = run_bounded(&tmux, &["has-session", "-t", &target])
+        let alive = run_bounded(tmux, &["has-session", "-t", &target])
             .await
             .is_ok_and(|output| output.status_success);
-        let _ = run_bounded(&tmux, &["kill-session", "-t", &target]).await;
+        let _ = run_bounded(tmux, &["kill-session", "-t", &target]).await;
         assert!(
             alive,
             "the pre-created session did not outlive its own creation"
@@ -2609,29 +2660,15 @@ mod tests {
     /// disposable socket keeps both missing and stale-socket probes off the user's server.
     #[tokio::test]
     async fn tmux_snapshot_without_a_server_is_available_on_real_binary() {
-        let account = crate::pty::resolve_account().unwrap();
-        let Some(tmux) = WorkspaceConfig::for_home(&account.home).resolve(ProviderKind::Tmux)
-        else {
+        let Some(fixture) = IsolatedTmux::new() else {
             eprintln!("real tmux absence check skipped: tmux not installed");
             return;
         };
-        // Unix socket paths are short even when the platform's ordinary temp path is long.
-        let directory = tempfile::Builder::new()
-            .prefix("ciao-tmux-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let socket = directory.path().join("socket");
-        write_stub(
-            directory.path(),
-            "tmux",
-            &format!("exec '{}' -S '{}' \"$@\"", tmux.display(), socket.display()),
-        );
-        let config = WorkspaceConfig::with_binary_dirs(vec![directory.path().to_owned()]);
         for stale in [false, true] {
             if stale {
-                drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+                drop(std::os::unix::net::UnixListener::bind(fixture.socket()).unwrap());
             }
-            let (provider, omitted) = snapshot_tmux(&config, None).await;
+            let (provider, omitted) = snapshot_tmux(&fixture.config, None).await;
             assert_eq!(provider.state, PROVIDER_STATE_AVAILABLE, "stale={stale}");
             assert!(provider.version.is_some());
             assert_eq!(provider.sessions.as_deref(), Some(&[][..]));

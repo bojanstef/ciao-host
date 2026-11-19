@@ -1252,28 +1252,36 @@ mod tests {
         assert!(marks.output_bytes <= HOST_PENDING_OUTPUT_BYTES);
     }
 
-    /// Runs the production tmux attach argv with one extra test-only environment variable
-    /// (`TMUX_TMPDIR`) so the test talks to an isolated tmux server instead of the user's.
-    struct IsolatedTmuxAttachFactory {
-        program: PathBuf,
-        args: Vec<OsString>,
-        socket_dir: PathBuf,
-    }
-
-    impl CommandFactory for IsolatedTmuxAttachFactory {
-        fn build(&self, account: &AccountRecord) -> Result<CommandBuilder, PtyError> {
-            let mut command = CommandBuilder::new(&self.program);
-            command.args(&self.args);
-            configure_clean_environment(&mut command, account);
-            command.env("TMUX_TMPDIR", &self.socket_dir);
-            Ok(command)
+    async fn assert_tmux_client_attached(program: &Path, name: &str, client: &mut PtySession) {
+        timeout(Duration::from_secs(5), client.next_output())
+            .await
+            .expect("tmux produced no output before the deadline")
+            .expect("tmux client exited before producing output");
+        // PTY output can be an error; prove the private server has this session and Ciao client.
+        let tty = client.client_tty().expect("tmux client must have a tty");
+        let target = format!("={name}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let listing = crate::workspace::run_bounded(
+                program,
+                &["list-clients", "-t", &target, "-F", "#{client_tty}"],
+            )
+            .await;
+            if listing.is_ok_and(|listing| {
+                listing.status_success
+                    && listing
+                        .stdout
+                        .split(|byte| *byte == b'\n')
+                        .any(|line| line == tty.as_os_str().as_encoded_bytes())
+            }) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Ciao client never attached to {name}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
-
-    fn isolated_tmux(tmux: &Path, socket_dir: &Path) -> Command {
-        let mut command = Command::new(tmux);
-        command.env("TMUX_TMPDIR", socket_dir).env_remove("TMUX");
-        command
     }
 
     /// Spec 003 §5.3/§12: closing a session-target terminal kills only the provider *client*.
@@ -1283,15 +1291,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tmux_session_and_sleeper_survive_ciao_client_detach() {
-        let config = crate::workspace::WorkspaceConfig::for_home(&resolve_account().unwrap().home);
-        let tmux = config
-            .resolve(crate::host_protocol::ProviderKind::Tmux)
-            .expect("tmux is required on the target Mac for the detach-survival test");
-        let socket_dir = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace::IsolatedTmux::new().expect("tmux required for this test");
+        let tmux = &fixture.program;
         let session_name = format!("ciao-detach-{}", rand::random::<u32>());
         let target = format!("={session_name}");
 
-        let created = isolated_tmux(&tmux, socket_dir.path())
+        let created = Command::new(tmux)
             .args(["new-session", "-d", "-s", &session_name, "sleep 300"])
             .status()
             .unwrap();
@@ -1303,7 +1308,7 @@ mod tests {
         // Find the pane process; retry briefly while the fresh server settles.
         let mut pane_pid = None;
         for _ in 0..40 {
-            let output = isolated_tmux(&tmux, socket_dir.path())
+            let output = Command::new(tmux)
                 .args(["list-panes", "-t", &target, "-F", "#{pane_pid}"])
                 .output()
                 .unwrap();
@@ -1320,37 +1325,26 @@ mod tests {
         }
         let pane_pid = pane_pid.expect("isolated tmux session has a pane process");
 
-        // Attach exactly like production: the workspace argv table plus the isolation variable.
+        // Attach through the production argv table and cleaned PTY environment.
         let account = resolve_account().unwrap();
         let (program, args) = crate::workspace::target_command(
             crate::host_protocol::TerminalTarget::TmuxAttach,
             &session_name,
-            &tmux,
+            tmux,
             &account.home,
         )
         .unwrap();
-        let mut client = PtySession::spawn_with_factory(
-            dimensions(),
-            Arc::new(IsolatedTmuxAttachFactory {
-                program,
-                args,
-                socket_dir: socket_dir.path().to_owned(),
-            }),
-        )
-        .await
-        .unwrap();
+        let mut client = PtySession::spawn_fixed_argv(dimensions(), program, args)
+            .await
+            .unwrap();
         let client_pid = client.child_pid();
-        // The attached client paints the screen; seeing output proves the attach succeeded.
-        assert!(
-            client.next_output().await.is_some(),
-            "tmux attach produced no output"
-        );
+        assert_tmux_client_attached(tmux, &session_name, &mut client).await;
 
         // Close from Ciao: the Phase 1 escalation path must kill only the client.
         client.cleanup(CleanupReason::ExplicitClose).await.unwrap();
         assert!(matches!(getsid(Some(client_pid)), Err(Errno::ESRCH)));
 
-        let survives = isolated_tmux(&tmux, socket_dir.path())
+        let survives = Command::new(tmux)
             .args(["has-session", "-t", &target])
             .status()
             .unwrap();
@@ -1364,10 +1358,7 @@ mod tests {
         );
 
         // The test cleans up its own isolated server and session.
-        let killed = isolated_tmux(&tmux, socket_dir.path())
-            .args(["kill-server"])
-            .status()
-            .unwrap();
+        let killed = Command::new(tmux).args(["kill-server"]).status().unwrap();
         assert!(killed.success());
         for _ in 0..40 {
             if matches!(getsid(Some(pane_pid)), Err(Errno::ESRCH)) {
@@ -1385,14 +1376,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tmux_interactive_shell_survives_targeted_ciao_client_detach() {
-        let config = crate::workspace::WorkspaceConfig::for_home(&resolve_account().unwrap().home);
-        let tmux = config
-            .resolve(crate::host_protocol::ProviderKind::Tmux)
-            .expect("tmux is required on the target Mac for the interactive detach test");
+        let fixture = crate::workspace::IsolatedTmux::new().expect("tmux required for this test");
+        let tmux = &fixture.program;
         let session_name = format!("ciao-interactive-{}", rand::random::<u32>());
         let target = format!("={session_name}");
-        let created = Command::new(&tmux)
-            .env_remove("TMUX")
+        let created = Command::new(tmux)
             .args(["new-session", "-d", "-s", &session_name, "/bin/sh"])
             .status()
             .unwrap();
@@ -1400,8 +1388,7 @@ mod tests {
             created.success(),
             "could not create interactive tmux session"
         );
-        let pane_pid: i32 = Command::new(&tmux)
-            .env_remove("TMUX")
+        let pane_pid: i32 = Command::new(tmux)
             .args(["list-panes", "-t", &target, "-F", "#{pane_pid}"])
             .output()
             .unwrap()
@@ -1416,24 +1403,21 @@ mod tests {
         let (program, args) = crate::workspace::target_command(
             crate::host_protocol::TerminalTarget::TmuxAttach,
             &session_name,
-            &tmux,
+            tmux,
             &account.home,
         )
         .unwrap();
         let mut client = PtySession::spawn_fixed_argv(dimensions(), program, args)
             .await
             .unwrap();
-        timeout(Duration::from_secs(5), client.next_output())
-            .await
-            .expect("tmux attach produced no output");
+        assert_tmux_client_attached(tmux, &session_name, &mut client).await;
         let client_tty = client.client_tty().unwrap().to_owned();
-        assert!(crate::workspace::detach_tmux_client(&tmux, &client_tty).await);
+        assert!(crate::workspace::detach_tmux_client(tmux, &client_tty).await);
         client.cleanup(CleanupReason::ExplicitClose).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert!(
-            Command::new(&tmux)
-                .env_remove("TMUX")
+            Command::new(tmux)
                 .args(["has-session", "-t", &target])
                 .status()
                 .unwrap()
@@ -1445,8 +1429,7 @@ mod tests {
             "interactive pane did not survive targeted client detach"
         );
         assert!(
-            Command::new(&tmux)
-                .env_remove("TMUX")
+            Command::new(tmux)
                 .args(["kill-session", "-t", &target])
                 .status()
                 .unwrap()
@@ -1462,86 +1445,42 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tmux_created_session_survives_ciao_client_cleanup() {
-        let config = crate::workspace::WorkspaceConfig::for_home(&resolve_account().unwrap().home);
-        let tmux = config
-            .resolve(crate::host_protocol::ProviderKind::Tmux)
-            .expect("tmux is required on the target Mac for the create-survival test");
-        let socket_dir = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace::IsolatedTmux::new().expect("tmux required for this test");
+        let tmux = &fixture.program;
         let session_name = format!("ciao-create-{}", rand::random::<u32>());
         let account = resolve_account().unwrap();
         let (program, args) = crate::workspace::target_command(
             crate::host_protocol::TerminalTarget::TmuxCreate,
             &session_name,
-            &tmux,
+            tmux,
             &account.home,
         )
         .unwrap();
-        let mut client = PtySession::spawn_with_factory(
-            dimensions(),
-            Arc::new(IsolatedTmuxAttachFactory {
-                program,
-                args,
-                socket_dir: socket_dir.path().to_owned(),
-            }),
-        )
-        .await
-        .unwrap();
-        timeout(Duration::from_secs(5), client.next_output())
+        let mut client = PtySession::spawn_fixed_argv(dimensions(), program, args)
             .await
-            .expect("tmux create produced no output");
+            .unwrap();
+        assert_tmux_client_attached(tmux, &session_name, &mut client).await;
 
-        // Establishment is a precondition, not a nicety. First client output does not mean the
-        // server has created the session, so cleaning up here used to run *before* the session
-        // existed and then observe the one the already-forked server went on to create. That
-        // passed while asserting nothing, which is why the failure looked intermittent.
         let target = format!("={session_name}");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let established = loop {
-            if isolated_tmux(&tmux, socket_dir.path())
-                .args(["has-session", "-t", &target])
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert!(
-            established,
-            "tmux never established the session, so the survival assertion would be vacuous"
-        );
-
         // Mirror the production close sequence. `cleanup_terminal` detaches the tmux client
         // before tearing the PTY down; calling `cleanup` alone kills the client while it is
         // still attached, which takes the freshly created server with it. That is a path
         // production never takes, so asserting against it measured the wrong thing.
-        // `detach_tmux_client` cannot be reused here because it invokes tmux without this
-        // test's `-S` socket and would address the production server instead.
         let client_tty = client
             .client_tty()
-            .map(|tty| tty.to_string_lossy().into_owned())
-            .expect("the tmux client must have a tty to detach");
-        let detached = isolated_tmux(&tmux, socket_dir.path())
-            .args(["detach-client", "-t", &client_tty])
-            .status()
-            .unwrap()
-            .success();
+            .expect("the tmux client must have a tty");
+        let detached = crate::workspace::detach_tmux_client(tmux, client_tty).await;
         assert!(detached, "could not detach the tmux client before cleanup");
 
         client.cleanup(CleanupReason::ExplicitClose).await.unwrap();
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let survived = isolated_tmux(&tmux, socket_dir.path())
+        let survived = Command::new(tmux)
             .args(["has-session", "-t", &target])
             .status()
             .unwrap()
             .success();
         if survived {
-            let _ = isolated_tmux(&tmux, socket_dir.path())
-                .args(["kill-server"])
-                .status();
+            let _ = Command::new(tmux).args(["kill-server"]).status();
         }
         assert!(survived, "new tmux session died with the Ciao client");
     }
@@ -1556,30 +1495,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tmux_session_survives_cleanup_of_a_client_that_was_never_detached() {
-        let config = crate::workspace::WorkspaceConfig::for_home(&resolve_account().unwrap().home);
-        let tmux = config
-            .resolve(crate::host_protocol::ProviderKind::Tmux)
-            .expect("tmux is required on the target Mac for the undetached-cleanup test");
-        let socket_dir = tempfile::tempdir().unwrap();
+        let fixture = crate::workspace::IsolatedTmux::new().expect("tmux required for this test");
+        let tmux = &fixture.program;
         let session_name = format!("ciao-undetached-{}", rand::random::<u32>());
         let account = resolve_account().unwrap();
 
-        // What the daemon now does before spawning the terminal: create the session detached,
-        // as a child of this process rather than of the PTY. Run against the test's own socket,
-        // so `ensure_detached_tmux_session`'s production argv is mirrored rather than called.
-        let created = isolated_tmux(&tmux, socket_dir.path())
-            .args([
-                "-u",
-                "new-session",
-                "-A",
-                "-d",
-                "-s",
-                &session_name,
-                "-c",
-                account.home.to_str().unwrap(),
-            ])
-            .status()
-            .is_ok_and(|status| status.success());
+        // Create the session detached as the daemon does, independently of the PTY.
+        let created =
+            crate::workspace::ensure_detached_tmux_session(tmux, &session_name, &account.home)
+                .await;
         assert!(
             created,
             "the detached pre-create must establish the session"
@@ -1588,23 +1512,14 @@ mod tests {
         let (program, args) = crate::workspace::target_command(
             crate::host_protocol::TerminalTarget::TmuxCreate,
             &session_name,
-            &tmux,
+            tmux,
             &account.home,
         )
         .unwrap();
-        let mut client = PtySession::spawn_with_factory(
-            dimensions(),
-            Arc::new(IsolatedTmuxAttachFactory {
-                program,
-                args,
-                socket_dir: socket_dir.path().to_owned(),
-            }),
-        )
-        .await
-        .unwrap();
-        timeout(Duration::from_secs(5), client.next_output())
+        let mut client = PtySession::spawn_fixed_argv(dimensions(), program, args)
             .await
-            .expect("tmux attach produced no output");
+            .unwrap();
+        assert_tmux_client_attached(tmux, &session_name, &mut client).await;
 
         // No detach. The ladder runs against an attached client, exactly as it does when
         // `detach_tmux_client` fails or a reattach is already in flight.
@@ -1612,14 +1527,12 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let target = format!("={session_name}");
-        let survived = isolated_tmux(&tmux, socket_dir.path())
+        let survived = Command::new(tmux)
             .args(["has-session", "-t", &target])
             .status()
             .unwrap()
             .success();
-        let _ = isolated_tmux(&tmux, socket_dir.path())
-            .args(["kill-server"])
-            .status();
+        let _ = Command::new(tmux).args(["kill-server"]).status();
         assert!(
             survived,
             "the tmux session died with an undetached Ciao client, so a reattach has nothing \
@@ -1666,65 +1579,36 @@ mod tests {
         );
     }
 
-    /// Uses the production socket/environment rather than a test-only TMUX_TMPDIR: a session
-    /// created through Ciao must be visible to the next production workspace snapshot.
+    /// A session created through the production PTY path must appear in the next workspace snapshot.
     // Spec 004 §8.3: portable across the accepted Unix hosts; Linux cleanup semantics are
     // additionally proven on the grounded VM/LXC profiles during physical acceptance.
     #[cfg(unix)]
     #[tokio::test]
     async fn tmux_created_session_is_rediscovered_by_production_snapshot() {
-        let config = crate::workspace::WorkspaceConfig::for_home(&resolve_account().unwrap().home);
-        let tmux = config
-            .resolve(crate::host_protocol::ProviderKind::Tmux)
-            .expect("tmux is required on the target Mac for the rediscovery test");
+        let fixture = crate::workspace::IsolatedTmux::new().expect("tmux required for this test");
+        let tmux = &fixture.program;
         let session_name = format!("ciao-rediscover-{}", rand::random::<u32>());
         let account = resolve_account().unwrap();
         let (program, args) = crate::workspace::target_command(
             crate::host_protocol::TerminalTarget::TmuxCreate,
             &session_name,
-            &tmux,
+            tmux,
             &account.home,
         )
         .unwrap();
         let mut client = PtySession::spawn_fixed_argv(dimensions(), program, args)
             .await
             .unwrap();
-        timeout(Duration::from_secs(5), client.next_output())
-            .await
-            .expect("tmux create produced no output");
+        assert_tmux_client_attached(tmux, &session_name, &mut client).await;
 
-        // Same two corrections as the survival test above: wait for the server to actually
-        // establish the session, then detach the way `cleanup_terminal` does before tearing
-        // the PTY down. On the production socket the real helper is usable directly.
-        let target = format!("={session_name}");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let established = loop {
-            if Command::new(&tmux)
-                .env_remove("TMUX")
-                .args(["has-session", "-t", &target])
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
+        let tty = client.client_tty().unwrap();
         assert!(
-            established,
-            "tmux never established the session, so rediscovery would be vacuous"
+            crate::workspace::detach_tmux_client(tmux, tty).await,
+            "could not detach the tmux client before cleanup"
         );
-        if let Some(tty) = client.client_tty().map(|tty| tty.to_owned()) {
-            assert!(
-                crate::workspace::detach_tmux_client(&tmux, &tty).await,
-                "could not detach the tmux client before cleanup"
-            );
-        }
         client.cleanup(CleanupReason::ExplicitClose).await.unwrap();
 
-        let snapshot = crate::workspace::capture_snapshot(&config, None).await;
+        let snapshot = crate::workspace::capture_snapshot(&fixture.config, None).await;
         let rediscovered = snapshot
             .providers
             .tmux
@@ -1733,8 +1617,7 @@ mod tests {
             .is_some_and(|sessions| sessions.iter().any(|session| session.name == session_name));
 
         let target = format!("={session_name}");
-        let cleanup = Command::new(&tmux)
-            .env_remove("TMUX")
+        let cleanup = Command::new(tmux)
             .args(["kill-session", "-t", &target])
             .status()
             .unwrap();
