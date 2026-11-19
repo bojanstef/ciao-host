@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use tokio::time::{Instant, sleep};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     agent_integration::{AgentIntegration, detect_agents},
@@ -22,13 +22,13 @@ use crate::{
     ipc,
     ipc::{
         DaemonStatus, request_create_pairing, request_pairing_status, request_status,
-        request_unpair,
+        request_status_from, request_unpair,
     },
     pairing::PairingStatus,
     qr::render_terminal_qr,
     service::{
         CronReason, LingerStatus, Supervisor, current_executable, describe_supervisor,
-        install_service, uninstall_service,
+        install_service, service_problem, uninstall_service,
     },
     storage::{CiaoPaths, PairedDeviceStore, validate_endpoint_id},
 };
@@ -670,6 +670,10 @@ async fn setup_ready(paths: &CiaoPaths, yes: bool) -> Result<bool> {
     let supervisor = match installation {
         Ok(supervisor) => supervisor,
         Err(error) => {
+            #[cfg(target_os = "linux")]
+            if !error.is::<crate::service::NoSupervisor>() {
+                return Err(error).context("repair the Ciao service");
+            }
             println!("skipped");
             print_unsupervised_note(&error);
             return Ok(false);
@@ -681,10 +685,11 @@ async fn setup_ready(paths: &CiaoPaths, yes: bool) -> Result<bool> {
         paths,
         setup.identity.endpoint_id.to_string(),
         env!("CARGO_PKG_VERSION"),
+        supervisor.expected_pid,
     )
     .await?;
-    println!("{}", supervisor_done_label(supervisor));
-    print_supervisor_note(supervisor);
+    println!("{}", supervisor_done_label(supervisor.supervisor));
+    print_supervisor_note(supervisor.supervisor);
 
     print!("Waiting for Iroh relay… ");
     io::stdout().flush()?;
@@ -736,7 +741,7 @@ fn print_supervisor_note(supervisor: Supervisor) {
         Supervisor::CronReboot {
             reason: CronReason::LingeringDisabled,
         } => println!(
-            "\nNote: lingering is disabled for this account, so a systemd user service would stop\nwhen you log out and would not start at boot. Ciao uses a `@reboot` crontab entry\ninstead, which survives both. It is not restarted if it stops unexpectedly; enabling\nlingering with `loginctl enable-linger` and rerunning setup adds that. `ciao reset`\nremoves the entry.\n"
+            "\nNote: lingering is disabled for this account, so a systemd user service would stop\nwhen you log out and would not start at boot. Ciao uses a `@reboot` crontab entry\ninstead, which survives both. To enable crash restart, run:\n\n    sudo loginctl enable-linger $USER\n\nThen rerun `ciao setup`. `ciao reset` removes the entry.\n"
         ),
     }
 }
@@ -746,7 +751,7 @@ fn print_linger_note(linger: LingerStatus) {
         // Spec 004 §8.2.5: explain the exact consequence and the explicit remedy. Enabling
         // lingering may prompt for authorization; Ciao never invokes sudo itself.
         println!(
-            "\nNote: lingering is disabled for this account, so the Ciao service stops when you\nlog out and does not start after a reboot until you log in. To keep it running, run:\n\n    loginctl enable-linger\n"
+            "\nNote: lingering is disabled for this account, so the Ciao service stops when you\nlog out and does not start after a reboot until you log in. To keep it running, run:\n\n    sudo loginctl enable-linger $USER\n\nThen rerun `ciao setup`.\n"
         );
     }
 }
@@ -789,11 +794,13 @@ async fn install_command(paths: &CiaoPaths, arguments: InstallArguments) -> Resu
         let chats = ManagedChatsToRestore::capture(paths).await;
         chats.announce();
         swap_with_previous(paths)?;
-        if let Err(error) = setup_service_and_check_health(paths, None).await {
+        if let Err(error) =
+            setup_service_and_check_health(paths, &stable_binary_path(paths), None).await
+        {
             // Failed rollback: put the newer binary back so the host is not left on a
             // version that just failed its health check.
             let _ = swap_with_previous(paths);
-            let _ = setup_service_and_check_health(paths, None).await;
+            let _ = setup_service_and_check_health(paths, &stable_binary_path(paths), None).await;
             chats.restore().await;
             return Err(error.context("rollback failed; the newer version was restored"));
         }
@@ -1036,6 +1043,21 @@ async fn update_command(paths: &CiaoPaths, release_base: Option<String>) -> Resu
         .and_then(|status| status.version.as_deref())
         .unwrap_or(env!("CARGO_PKG_VERSION"));
     let Some(artifact) = update_artifact(&manifest, target, current)? else {
+        if crate::service::current_release_needs_repair(paths, status.is_some()).await? {
+            println!("Repairing the Ciao {current} service…");
+            let stable = stable_binary_path(paths);
+            let executable = if stable.try_exists()? {
+                stable
+            } else if current == env!("CARGO_PKG_VERSION") {
+                current_executable()?
+            } else {
+                bail!(
+                    "the Ciao {current} executable is missing from {}",
+                    stable.display()
+                );
+            };
+            setup_service_and_check_health(paths, &executable, Some(current)).await?;
+        }
         println!("Ciao {current} is already the newest release.");
         return Ok(());
     };
@@ -1104,7 +1126,13 @@ async fn run_verified_install(
         stage_and_swap(paths, &entries, Some(version))
     })?;
 
-    let result = match setup_service_and_check_health(paths, Some(version)).await {
+    let result = match setup_service_and_check_health(
+        paths,
+        &stable_binary_path(paths),
+        Some(version),
+    )
+    .await
+    {
         Ok(()) => {
             println!(
                 "Ciao {version} is installed at {} and healthy.",
@@ -1115,7 +1143,8 @@ async fn run_verified_install(
         Err(error) if had_previous => {
             // Spec 004 §9.2.8: restore the previous binary and service on health failure.
             restore_previous(paths)?;
-            let restore = setup_service_and_check_health(paths, None).await;
+            let restore =
+                setup_service_and_check_health(paths, &stable_binary_path(paths), None).await;
             match restore {
                 Ok(()) => Err(error.context(
                     "the new version failed its health check; the previous version was restored",
@@ -1154,11 +1183,12 @@ fn spinning<T>(label: &str, work: impl FnOnce() -> Result<T>) -> Result<T> {
     outcome
 }
 
-/// Runs the accepted idempotent setup routines against the stable binary path, then requires
+/// Runs the accepted idempotent setup routines against the chosen binary, then requires
 /// authenticated local health within 15 seconds (Spec 004 §15): daemon reachable, identity
 /// unchanged, and — when given — the expected version running.
 async fn setup_service_and_check_health(
     paths: &CiaoPaths,
+    executable: &Path,
     expected_version: Option<&str>,
 ) -> Result<()> {
     // Bootstrapping the service is the slowest step in an update on macOS — launchctl, then a
@@ -1166,7 +1196,7 @@ async fn setup_service_and_check_health(
     // had already said everything it was going to say.
     let (setup, supervisor) = spinning("Starting the Ciao service", || {
         let setup = create_or_load_identity(paths)?;
-        let supervisor = install_service(paths, &stable_binary_path(paths))?;
+        let supervisor = install_service(paths, executable)?;
         Ok((setup, supervisor))
     })?;
     let expected_endpoint = setup.identity.endpoint_id.to_string();
@@ -1177,7 +1207,7 @@ async fn setup_service_and_check_health(
         // started, one running the wrong version, and one whose reply this CLI could not parse
         // — three problems with three different fixes, reported identically and pointing at a
         // log that only the first of them ever writes to.
-        let refused = match request_status(&paths.socket_file).await {
+        let refused = match request_status_from(&paths.socket_file, supervisor.expected_pid).await {
             Ok(status) => {
                 if status.daemon == "running"
                     && status.host_endpoint_id == expected_endpoint
@@ -1185,7 +1215,7 @@ async fn setup_service_and_check_health(
                         .is_none_or(|version| status.version.as_deref() == Some(version))
                 {
                     waiting.clear();
-                    print_supervisor_note(supervisor);
+                    print_supervisor_note(supervisor.supervisor);
                     return Ok(());
                 }
                 match expected_version {
@@ -1509,8 +1539,13 @@ async fn status_command(paths: &CiaoPaths, json_output: bool, strict: bool) -> R
         }
     };
 
+    let problem = service_problem(paths)?;
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        let mut value = serde_json::to_value(&status)?;
+        if let Some(problem) = problem {
+            value["service_problem"] = serde_json::json!(problem.description());
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("Ciao is configured.");
         println!("Daemon: {}", status.daemon);
@@ -1549,7 +1584,12 @@ async fn status_command(paths: &CiaoPaths, json_output: bool, strict: bool) -> R
         // This trailing line is the only guidance most operators read, so it has to match the
         // state above it. Sending someone to `ciao pair` while nothing is answering just
         // produces a second, worse error, and "another device" is wrong when none are paired.
-        if !reachable {
+        if let Some(problem) = problem {
+            println!(
+                "\n{}. Run `ciao setup` to repair the service.",
+                problem.description()
+            );
+        } else if !reachable {
             println!(
                 "\nThe daemon is not running. Start it, then pair from another shell:\n\n    ciao daemon\n    ciao pair"
             );
@@ -1560,6 +1600,12 @@ async fn status_command(paths: &CiaoPaths, json_output: bool, strict: bool) -> R
         }
     }
 
+    if strict && let Some(problem) = problem {
+        bail!(
+            "{}. Run `ciao setup` to repair the service.",
+            problem.description()
+        );
+    }
     if strict && !reachable {
         bail!(
             "Ciao daemon is unreachable. Start it with `ciao daemon`, or rerun \
@@ -1582,11 +1628,12 @@ async fn wait_for_daemon(
     paths: &CiaoPaths,
     expected_endpoint_id: String,
     expected_version: &str,
+    expected_pid: Option<i32>,
 ) -> Result<()> {
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;
     let mut answered_version: Option<String> = None;
     loop {
-        if let Ok(status) = request_status(&paths.socket_file).await
+        if let Ok(status) = request_status_from(&paths.socket_file, expected_pid).await
             && status.host_endpoint_id == expected_endpoint_id
         {
             if status.version.as_deref() == Some(expected_version) {
@@ -1599,7 +1646,7 @@ async fn wait_for_daemon(
         if Instant::now() >= deadline {
             if let Some(running) = answered_version {
                 bail!(
-                    "the daemon answering is still version {running}, not the {expected_version} just installed. The old daemon did not stop; stop it and rerun `ciao setup --yes`. Inspect {}.",
+                    "the daemon answering is still version {running}, not the {expected_version} just installed. Inspect {} and rerun `ciao setup --yes` to repair the service.",
                     paths.log_hint()
                 );
             }

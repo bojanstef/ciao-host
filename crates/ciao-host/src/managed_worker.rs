@@ -71,6 +71,32 @@ fn binary_identity(path: &Path) -> Option<(u64, i64)> {
     Some((metadata.len(), modified))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeIssue {
+    #[error("managed worker entrypoint is missing or inaccessible")]
+    Worker,
+    #[error("cannot read the installed Agent SDK metadata for this platform")]
+    Sdk,
+    #[error("cannot read the managed Claude executable")]
+    Executable,
+    #[error("recorded Node.js runtime or its search path is unavailable")]
+    Interpreter,
+    #[error("managed SDK or executable failed version or checksum verification")]
+    UnsupportedVersion,
+}
+
+impl RuntimeIssue {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Worker => "managed_worker_unavailable",
+            Self::Sdk => "managed_sdk_unavailable",
+            Self::Executable => "managed_cli_unavailable",
+            Self::Interpreter => "managed_node_unavailable",
+            Self::UnsupportedVersion => "unsupported_version",
+        }
+    }
+}
+
 impl ManagedRuntime {
     /// Resolves the Ciao-owned SDK prefix and verifies the pinned pair by
     /// digest. Any mismatch refuses categorically rather than running an
@@ -78,9 +104,9 @@ impl ManagedRuntime {
     pub(crate) fn resolve(
         sdk_prefix: &Path,
         worker_entrypoint: &Path,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, RuntimeIssue> {
         if !worker_entrypoint.is_file() {
-            return Err("runtime_unavailable");
+            return Err(RuntimeIssue::Worker);
         }
         let wrapper = sdk_prefix
             .join("node_modules")
@@ -88,7 +114,7 @@ impl ManagedRuntime {
         let manifest_path = wrapper.join("manifest.json");
         let package_path = wrapper.join("package.json");
         if !manifest_path.is_file() || !package_path.is_file() {
-            return Err("runtime_unavailable");
+            return Err(RuntimeIssue::Sdk);
         }
 
         #[derive(Deserialize)]
@@ -105,24 +131,24 @@ impl ManagedRuntime {
             platforms: HashMap<String, Platform>,
         }
 
-        let package: Package = read_json(&package_path).ok_or("runtime_unavailable")?;
-        let manifest: Manifest = read_json(&manifest_path).ok_or("runtime_unavailable")?;
+        let package: Package = read_json(&package_path).ok_or(RuntimeIssue::Sdk)?;
+        let manifest: Manifest = read_json(&manifest_path).ok_or(RuntimeIssue::Sdk)?;
         if package.version != PINNED_CLAUDE_SDK_VERSION
             || manifest.version != PINNED_MANAGED_CLI_VERSION
         {
-            return Err("unsupported_version");
+            return Err(RuntimeIssue::UnsupportedVersion);
         }
-        let platform = current_platform_token().ok_or("runtime_unavailable")?;
+        let platform = current_platform_token().ok_or(RuntimeIssue::Sdk)?;
         let expected = manifest
             .platforms
             .get(platform)
             .map(|entry| entry.checksum.clone())
-            .ok_or("runtime_unavailable")?;
+            .ok_or(RuntimeIssue::Sdk)?;
         let cli_path = sdk_prefix
             .join("node_modules")
             .join(format!("@anthropic-ai/claude-agent-sdk-{platform}"))
             .join("claude");
-        let identity = binary_identity(&cli_path).ok_or("runtime_unavailable")?;
+        let identity = binary_identity(&cli_path).ok_or(RuntimeIssue::Executable)?;
         let cached = {
             let guard = VERIFIED_BINARIES.lock();
             guard
@@ -135,9 +161,9 @@ impl ManagedRuntime {
                 })
         };
         if !cached {
-            let bytes = std::fs::read(&cli_path).map_err(|_| "runtime_unavailable")?;
+            let bytes = std::fs::read(&cli_path).map_err(|_| RuntimeIssue::Executable)?;
             if hex(&Sha256::digest(&bytes)) != expected {
-                return Err("unsupported_version");
+                return Err(RuntimeIssue::UnsupportedVersion);
             }
             *VERIFIED_BINARIES.lock() =
                 Some((cli_path.clone(), identity.0, identity.1, expected.clone()));
@@ -146,7 +172,7 @@ impl ManagedRuntime {
         // runtime is unusable rather than silently falling back to a lookup
         // that works in a shell and fails under launchd.
         let (node_path, tool_path) =
-            read_recorded_runtime(sdk_prefix).ok_or("runtime_unavailable")?;
+            read_recorded_runtime(sdk_prefix).ok_or(RuntimeIssue::Interpreter)?;
         Ok(Self {
             sdk_prefix: sdk_prefix.to_owned(),
             worker_entrypoint: worker_entrypoint.to_owned(),
@@ -167,7 +193,7 @@ pub(crate) fn runtime_record_file(sdk_prefix: &Path) -> PathBuf {
 pub(crate) fn read_recorded_runtime(sdk_prefix: &Path) -> Option<(PathBuf, String)> {
     let recorded: RecordedRuntime = read_json(&runtime_record_file(sdk_prefix))?;
     let node = PathBuf::from(recorded.node.trim());
-    node.is_file().then_some((node, recorded.path))
+    crate::pty::is_absolute_executable(&node).then_some((node, recorded.path))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -446,12 +472,12 @@ mod tests {
         // No prefix at all is a runtime problem, not a version problem.
         assert_eq!(
             ManagedRuntime::resolve(&home.path().join("missing"), &entrypoint).unwrap_err(),
-            "runtime_unavailable"
+            RuntimeIssue::Sdk
         );
         // A missing entrypoint refuses before anything is executed.
         assert_eq!(
             ManagedRuntime::resolve(home.path(), &home.path().join("absent.mjs")).unwrap_err(),
-            "runtime_unavailable"
+            RuntimeIssue::Worker
         );
 
         // A wrong wrapper version is an unsupported pair.
@@ -473,7 +499,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             ManagedRuntime::resolve(home.path(), &entrypoint).unwrap_err(),
-            "unsupported_version"
+            RuntimeIssue::UnsupportedVersion
         );
 
         // The right versions with a wrong binary digest still refuse.
@@ -500,7 +526,7 @@ mod tests {
         std::fs::write(binary.join("claude"), b"not the pinned binary").unwrap();
         assert_eq!(
             ManagedRuntime::resolve(home.path(), &entrypoint).unwrap_err(),
-            "unsupported_version"
+            RuntimeIssue::UnsupportedVersion
         );
 
         // A verified pair with no recorded interpreter is still unusable: the
@@ -518,10 +544,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             ManagedRuntime::resolve(home.path(), &entrypoint).unwrap_err(),
-            "runtime_unavailable"
+            RuntimeIssue::Interpreter
         );
 
-        // Recording the interpreter completes the install.
+        // A recorded interpreter without execute permission used to make status report
+        // "installed" while the daemon failed at process launch.
+        let node = home.path().join("node");
+        std::fs::write(&node, b"fixture").unwrap();
+        std::fs::write(
+            runtime_record_file(home.path()),
+            serde_json::json!({ "node": node, "path": "/usr/bin:/bin" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            ManagedRuntime::resolve(home.path(), &entrypoint).unwrap_err(),
+            RuntimeIssue::Interpreter
+        );
+        // Recording an executable interpreter completes the install.
         std::fs::write(
             runtime_record_file(home.path()),
             serde_json::json!({ "node": "/usr/bin/env", "path": "/usr/bin:/bin" }).to_string(),
@@ -541,7 +580,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             ManagedRuntime::resolve(home.path(), &entrypoint).unwrap_err(),
-            "runtime_unavailable"
+            RuntimeIssue::Interpreter
         );
     }
 

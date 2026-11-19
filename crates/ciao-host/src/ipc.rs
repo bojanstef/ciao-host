@@ -392,7 +392,7 @@ async fn send_request_within(
     operation: Value,
     ceiling: Duration,
 ) -> Result<Value, IpcError> {
-    timeout(ceiling, send_request_inner(path, operation))
+    timeout(ceiling, send_request_inner(path, operation, None))
         .await
         .map_err(|_| IpcError::Timeout)?
 }
@@ -401,7 +401,11 @@ async fn send_lifecycle_request(path: &Path, operation: Value) -> Result<Value, 
     send_request_within(path, operation, IPC_LIFECYCLE_TIMEOUT).await
 }
 
-async fn send_request_inner(path: &Path, mut operation: Value) -> Result<Value, IpcError> {
+async fn send_request_inner(
+    path: &Path,
+    mut operation: Value,
+    expected_pid: Option<i32>,
+) -> Result<Value, IpcError> {
     let request_id = format!("{:032x}", rand::random::<u128>());
     let object = operation
         .as_object_mut()
@@ -416,6 +420,14 @@ async fn send_request_inner(path: &Path, mut operation: Value) -> Result<Value, 
     encoded.push(b'\n');
 
     let mut stream = UnixStream::connect(path).await?;
+    if let Some(pid) = expected_pid {
+        let peer = stream.peer_cred()?;
+        if peer.pid() != Some(pid) || peer.uid() != nix::unistd::Uid::effective().as_raw() {
+            return Err(IpcError::Io(io::Error::other(
+                "the answering socket belongs to a different process than the installed service",
+            )));
+        }
+    }
     stream.write_all(&encoded).await?;
     let mut reader = BufReader::new(stream);
     let response_bytes = read_bounded_line(&mut reader).await?;
@@ -463,7 +475,19 @@ pub async fn request_unpair(path: &Path, endpoint_id: &str) -> Result<bool, IpcE
 }
 
 pub async fn request_status(path: &Path) -> Result<DaemonStatus, IpcError> {
-    let result = send_request(path, json!({ "op": "status" })).await?;
+    request_status_from(path, None).await
+}
+
+pub(crate) async fn request_status_from(
+    path: &Path,
+    expected_pid: Option<i32>,
+) -> Result<DaemonStatus, IpcError> {
+    let result = timeout(
+        IPC_TIMEOUT,
+        send_request_inner(path, json!({ "op": "status" }), expected_pid),
+    )
+    .await
+    .map_err(|_| IpcError::Timeout)??;
     serde_json::from_value(result).map_err(|error| IpcError::Malformed(error.to_string()))
 }
 

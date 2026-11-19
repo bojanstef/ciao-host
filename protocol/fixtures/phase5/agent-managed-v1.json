@@ -499,6 +499,36 @@
     },
     {
       "v": 1,
+      "command_id": "start-managed-worker-unavailable",
+      "state": "refused",
+      "reason_code": "managed_worker_unavailable"
+    },
+    {
+      "v": 1,
+      "command_id": "start-managed-sdk-unavailable",
+      "state": "refused",
+      "reason_code": "managed_sdk_unavailable"
+    },
+    {
+      "v": 1,
+      "command_id": "start-managed-cli-unavailable",
+      "state": "refused",
+      "reason_code": "managed_cli_unavailable"
+    },
+    {
+      "v": 1,
+      "command_id": "start-managed-node-unavailable",
+      "state": "refused",
+      "reason_code": "managed_node_unavailable"
+    },
+    {
+      "v": 1,
+      "command_id": "start-managed-worker-start-failed",
+      "state": "refused",
+      "reason_code": "managed_worker_start_failed"
+    },
+    {
+      "v": 1,
       "command_id": "lifecycle-start-record-limit",
       "state": "refused",
       "reason_code": "record_limit"

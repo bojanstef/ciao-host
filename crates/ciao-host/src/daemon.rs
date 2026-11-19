@@ -5,8 +5,8 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fs,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -746,6 +746,13 @@ impl PathRxWatch {
 
 pub async fn run(paths: CiaoPaths) -> Result<()> {
     paths.ensure_layout()?;
+    // Take ownership before loading workers or opening the persistent relay identity.
+    // The directory inode survives unlink/rebind of either public socket name.
+    let _instance = lock_daemon(&paths)?;
+    #[cfg(target_os = "linux")]
+    crate::service::retire_legacy_on_start(&paths)?;
+    let listener = bind_local_socket(&paths.socket_file).await?;
+    let agent_listener = bind_local_socket(&paths.agent_socket_file).await?;
     if refresh_installed_managed_worker(&paths)? {
         tracing::info!("installed managed worker refreshed to this Ciao version");
     }
@@ -840,8 +847,6 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
         integrations: crate::integration_status::IntegrationStatusCache::for_host(paths.clone()),
     });
 
-    let listener = bind_control_socket(&paths).await?;
-    let agent_listener = bind_agent_socket(&paths).await?;
     // Spec 017 §4.2: from here on, unrecognized vendor input is tallied durably. Before the
     // bind, notes land in memory and are merged in.
     crate::drift::bind(&paths.run_dir);
@@ -938,41 +943,58 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     let _ = runtime_warmer.await;
     release_meta_poller.abort();
     let _ = release_meta_poller.await;
-    remove_socket_if_present(&paths.socket_file)?;
-    remove_socket_if_present(&paths.agent_socket_file)?;
+    // Closing the listeners releases the sockets. Leave the directory entries for
+    // the next lock holder: even a stat followed by unlink can erase a replacement
+    // installed between those two calls.
     crate::drift::flush();
     tracing::info!("Ciao daemon stopped");
     result
 }
 
-async fn bind_control_socket(paths: &CiaoPaths) -> Result<UnixListener> {
-    if paths.socket_file.exists() {
-        if UnixStream::connect(&paths.socket_file).await.is_ok() {
-            bail!(
-                "another Ciao daemon is already listening at {}",
-                paths.socket_file.display()
-            );
-        }
-        remove_socket_if_present(&paths.socket_file)?;
-    }
-    let listener = UnixListener::bind(&paths.socket_file)
-        .with_context(|| format!("bind Unix socket {}", paths.socket_file.display()))?;
-    fs::set_permissions(&paths.socket_file, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("secure Unix socket {}", paths.socket_file.display()))?;
-    Ok(listener)
+fn lock_daemon(paths: &CiaoPaths) -> Result<fs::File> {
+    let dir = fs::File::open(&paths.state_dir).context("open daemon state directory")?;
+    dir.try_lock()
+        .context("cannot take daemon ownership (another Ciao daemon may be running)")?;
+    Ok(dir)
 }
 
-async fn bind_agent_socket(paths: &CiaoPaths) -> Result<UnixListener> {
-    if paths.agent_socket_file.exists() {
-        if UnixStream::connect(&paths.agent_socket_file).await.is_ok() {
-            bail!("another Ciao agent bridge listener is already active");
+async fn bind_local_socket(path: &Path) -> Result<UnixListener> {
+    // Only reclaim a stale, same-user socket under the instance lock. A timeout,
+    // permissions failure or full listen queue is never evidence of a dead owner.
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.file_type().is_socket() || meta.uid() != nix::unistd::Uid::effective().as_raw()
+            {
+                bail!("refusing to replace a foreign file at {}", path.display());
+            }
+            match timeout(Duration::from_secs(3), UnixStream::connect(path))
+                .await
+                .context("existing daemon listener probe timed out")?
+            {
+                Ok(_) => bail!(
+                    "another Ciao daemon is already listening at {}",
+                    path.display()
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // Include the identity from before the probe. A changed entry
+                    // must be examined by its own bind attempt.
+                    let now = fs::symlink_metadata(path)?;
+                    if now.dev() != meta.dev() || now.ino() != meta.ino() {
+                        bail!("socket path changed while checking {}", path.display());
+                    }
+                    remove_socket_if_present(path)?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err).with_context(|| format!("probe {}", path.display())),
+            }
         }
-        remove_socket_if_present(&paths.agent_socket_file)?;
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("inspect {}", path.display())),
     }
     let listener =
-        UnixListener::bind(&paths.agent_socket_file).context("bind agent bridge socket")?;
-    fs::set_permissions(&paths.agent_socket_file, fs::Permissions::from_mode(0o600))
-        .context("secure agent bridge socket")?;
+        UnixListener::bind(path).with_context(|| format!("bind Unix socket {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("secure Unix socket {}", path.display()))?;
     Ok(listener)
 }
 
@@ -4966,6 +4988,30 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn daemon_ownership_survives_socket_replacement() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let paths = CiaoPaths::for_linux_home(temp.path(), None, None, None);
+        paths.ensure_layout().unwrap();
+        let owner = lock_daemon(&paths).unwrap();
+        let listener = bind_local_socket(&paths.socket_file).await.unwrap();
+        fs::remove_file(&paths.socket_file).unwrap();
+        assert!(lock_daemon(&paths).is_err());
+        fs::write(&paths.socket_file, b"someone else's file").unwrap();
+        assert!(lock_daemon(&paths).is_err());
+        drop(listener);
+        drop(owner);
+        let _next = lock_daemon(&paths).unwrap();
+        assert!(bind_local_socket(&paths.socket_file).await.is_err());
+        assert_eq!(
+            fs::read(&paths.socket_file).unwrap(),
+            b"someone else's file"
+        );
+        fs::remove_file(&paths.socket_file).unwrap();
+        drop(bind_local_socket(&paths.socket_file).await.unwrap());
+        assert!(bind_local_socket(&paths.socket_file).await.is_ok());
+    }
+
     #[tokio::test]
     async fn idle_spawn_completion_must_refuse_stale_before_opened_and_reap_only_viewer() {
         use super::*;

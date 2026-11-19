@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+mod linux_process;
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -190,14 +193,26 @@ pub fn describe_supervisor() -> String {
     }
 }
 
+/// Readiness must come from the process the selected supervisor started.
+pub struct InstalledService {
+    pub supervisor: Supervisor,
+    pub expected_pid: Option<i32>,
+    // Serializes rung changes until the caller finishes verifying local health.
+    _transaction: Option<fs::File>,
+}
+
 /// Installs or repairs the platform per-user service with fixed argv: launchd on macOS,
 /// a per-user systemd unit on Linux (Spec 004 §8.2). Identity and pairing files are never
 /// touched here.
-pub fn install_service(paths: &CiaoPaths, executable: &Path) -> Result<Supervisor> {
+pub fn install_service(paths: &CiaoPaths, executable: &Path) -> Result<InstalledService> {
     #[cfg(target_os = "macos")]
     {
         install_launch_agent(paths, executable)?;
-        Ok(Supervisor::Launchd)
+        Ok(InstalledService {
+            supervisor: Supervisor::Launchd,
+            expected_pid: None,
+            _transaction: None,
+        })
     }
     #[cfg(target_os = "linux")]
     {
@@ -469,50 +484,114 @@ pub fn parse_linger(output: &str) -> LingerStatus {
     }
 }
 
-/// Picks the best supervisor this host offers, strongest first. A reachable systemd user
-/// manager always wins; cron is reached only when there is no such manager at all, never as
-/// a preference and never to paper over a systemd unit that exists but failed to start.
+/// Both automatic rungs are unavailable, so setup can still explain foreground use.
 #[cfg(target_os = "linux")]
-fn install_linux_service(paths: &CiaoPaths, executable: &Path) -> Result<Supervisor> {
-    let probe = systemctl_user(&["--user", "is-system-running"]).output();
-    let state = match &probe {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-        Err(_) => String::new(),
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct NoSupervisor(String);
+
+#[cfg(target_os = "linux")]
+fn install_linux_service(paths: &CiaoPaths, executable: &Path) -> Result<InstalledService> {
+    paths.ensure_layout()?;
+    let transaction = fs::File::open(&paths.run_dir)?;
+    transaction
+        .try_lock()
+        .context("another Ciao service installation is in progress")?;
+    let manager = user_manager();
+    let (mut supervisor, linger) = selected_linux_supervisor(manager);
+    if matches!(supervisor, Supervisor::CronReboot { .. }) {
+        // Try the boot task before retiring any existing service. If cron is
+        // unavailable, the login-only systemd rung is still an option.
+        if let Err(error) = install_cron_entry(paths, executable) {
+            if manager != UserManager::Ready {
+                return Err(NoSupervisor(format!(
+                    "{}; boot task unavailable: {error:#}",
+                    no_user_bus_reason()
+                ))
+                .into());
+            }
+            supervisor = Supervisor::SystemdUser { linger };
+        }
+    }
+    if matches!(supervisor, Supervisor::SystemdUser { .. }) {
+        let unit = systemd_unit(executable, &paths.stdout_log, &paths.stderr_log)?;
+        atomic_write_private(&paths.service_file, unit.as_bytes())?;
+        run_systemctl(&["--user", "daemon-reload"], paths)?;
+        remove_cron_entry()?;
+        run_systemctl(&["--user", "stop", SYSTEMD_UNIT_NAME], paths)?;
+    } else if paths.service_file.exists() {
+        if manager == UserManager::Ready {
+            let disabled = run_systemctl(&["--user", "disable", "--now", SYSTEMD_UNIT_NAME], paths);
+            // Losing the last login can take the manager away between the probe
+            // and disable. A reachable manager's error must still propagate.
+            if let Err(err) = disabled
+                && user_manager() == UserManager::Ready
+            {
+                return Err(err);
+            }
+        }
+        disable_boot_link(paths)?;
+    }
+    // A stopped unit cannot respawn while we retire cron or unlinked legacy listeners.
+    linux_process::stop(paths)?;
+    let pid = match supervisor {
+        Supervisor::SystemdUser { .. } => {
+            run_systemctl(&["--user", "enable", "--now", SYSTEMD_UNIT_NAME], paths)?;
+            systemd_main_pid()?.context("the Ciao user unit did not start a main process")?
+        }
+        Supervisor::CronReboot { .. } => start_cron_daemon(paths, executable)?,
+        Supervisor::Launchd => unreachable!("launchd is not a Linux rung"),
     };
-    let manager = classify_user_manager(probe.is_ok(), &state);
+    Ok(InstalledService {
+        supervisor,
+        expected_pid: Some(pid),
+        _transaction: Some(transaction),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn selected_linux_supervisor(manager: UserManager) -> (Supervisor, LingerStatus) {
     let linger = if manager == UserManager::Ready {
         detect_linger()
     } else {
         LingerStatus::Unknown
     };
+    (preferred_linux_rung(manager, linger), linger)
+}
 
-    match preferred_linux_rung(manager, linger) {
-        Supervisor::SystemdUser { .. } => {
-            // Errors past this point are real failures of a supervisor that *is* available,
-            // so they propagate instead of silently downgrading the host to a weaker rung.
-            let linger = install_systemd_service(paths, executable)?;
-            Ok(Supervisor::SystemdUser { linger })
-        }
-        Supervisor::CronReboot { reason } => match install_cron_service(paths, executable) {
-            Ok(()) => Ok(Supervisor::CronReboot { reason }),
-            // A reachable manager is still better than nothing when cron is absent: the unit
-            // will not survive logout, which setup says plainly rather than implying otherwise.
-            Err(cron_error) if manager == UserManager::Ready => {
-                let linger = install_systemd_service(paths, executable).with_context(|| {
-                    format!("no boot task could be installed either: {cron_error:#}")
-                })?;
-                Ok(Supervisor::SystemdUser { linger })
+#[cfg(target_os = "linux")]
+fn user_manager() -> UserManager {
+    let probe = systemctl_user(&["--user", "is-system-running"]).output();
+    let state = match &probe {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        Err(_) => String::new(),
+    };
+    classify_user_manager(probe.is_ok(), &state)
+}
+
+#[cfg(target_os = "linux")]
+fn disable_boot_link(paths: &CiaoPaths) -> Result<()> {
+    // `systemctl --user disable` needs a bus on Debian even with --no-reload.
+    // Our unit has exactly one WantedBy target. Remove only its own enable link.
+    let link = paths
+        .service_dir
+        .join("default.target.wants")
+        .join(SYSTEMD_UNIT_NAME);
+    match fs::read_link(&link) {
+        Ok(target) => {
+            let parent = link.parent().expect("unit enable link has a parent");
+            if fs::canonicalize(parent.join(target))? != fs::canonicalize(&paths.service_file)? {
+                bail!(
+                    "refusing to disable an unrelated unit at {}",
+                    link.display()
+                );
             }
-            Err(cron_error) => Err(cron_error).with_context(|| {
-                format!(
-                    "no per-user systemd manager is usable here, and the boot-task fallback \
-                     also failed.\n\n{}",
-                    no_user_bus_reason()
-                )
-            }),
-        },
-        Supervisor::Launchd => unreachable!("launchd is not a Linux rung"),
+            fs::remove_file(link)?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("inspect the Ciao user unit enable link"),
     }
+    Ok(())
 }
 
 /// Reads the operator's crontab. `crontab -l` exits non-zero when the user simply has none,
@@ -521,12 +600,18 @@ fn install_linux_service(paths: &CiaoPaths, executable: &Path) -> Result<Supervi
 fn read_crontab() -> Result<String> {
     let output = Command::new("crontab")
         .arg("-l")
+        .env("LC_ALL", "C")
         .output()
         .context("run `crontab -l` (is cron installed?)")?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not allowed to use this program") {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, stderr.trim()).into(),
+        );
+    }
     if stderr.contains("no crontab") {
         Ok(String::new())
     } else {
@@ -562,83 +647,146 @@ fn write_crontab(contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// How long a daemon gets to finish its own shutdown before the reinstall gives up on it.
-/// Generous on purpose: the relay drain alone is allowed six seconds, and a slow shutdown
-/// should delay an install rather than fail one.
 #[cfg(target_os = "linux")]
-const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) fn retire_legacy_on_start(paths: &CiaoPaths) -> Result<()> {
+    let legacy = linux_process::holders(paths)?;
+    if !legacy.is_empty() {
+        // A pre-lock updater can install this binary using its old service
+        // installer. Only the confirmed unit can complete that pending handoff.
+        if systemd_main_pid().ok().flatten() == i32::try_from(std::process::id()).ok()
+            && fs::read_to_string("/proc/self/cgroup")?
+                .lines()
+                .any(|line| line.ends_with("/ciao.service"))
+        {
+            remove_cron_entry()?;
+            return linux_process::stop_holders(legacy);
+        }
+        bail!("another Ciao daemon owns this instance; run `ciao setup` to repair it");
+    }
+    Ok(())
+}
 
-/// Stops the daemon holding the control socket, if one is holding it.
-///
-/// The socket names its own owner: connecting and reading `SO_PEERCRED` yields the pid of the
-/// process actually listening. That is exact, where matching a command line is a guess that
-/// eventually signals the wrong process — and this runs as part of an install, where being
-/// approximately right is not good enough.
-///
-/// `SIGTERM` only. The daemon owns live PTYs and managed workers, and a graceful stop is the
-/// difference between closing them and orphaning them. One that will not leave is reported
-/// rather than escalated to `SIGKILL`: a refused reinstall is recoverable, and a daemon killed
-/// mid-write may not be.
 #[cfg(target_os = "linux")]
-fn stop_running_daemon(paths: &CiaoPaths) -> Result<()> {
-    use nix::{
-        errno::Errno,
-        sys::{
-            signal::{Signal, kill},
-            socket::{getsockopt, sockopt::PeerCredentials},
-        },
-        unistd::{Pid, Uid},
-    };
-    use std::os::unix::net::UnixStream;
+fn systemd_main_pid() -> Result<Option<i32>> {
+    let output = systemctl_user(&[
+        "--user",
+        "show",
+        "--property=MainPID",
+        "--value",
+        SYSTEMD_UNIT_NAME,
+    ])
+    .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 1))
+}
 
-    // A socket nobody answers is stale, and the daemon removes it itself when it next binds.
-    let Ok(stream) = UnixStream::connect(&paths.socket_file) else {
-        return Ok(());
-    };
-    let credentials =
-        getsockopt(&stream, PeerCredentials).context("read control socket peer credentials")?;
-    drop(stream);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceProblem {
+    MultipleDaemons,
+    MissingControlSocket,
+}
 
-    // Only ever our own daemon. The socket is 0600, so another user holding it means something
-    // is wrong that a signal would make worse rather than fix.
-    if credentials.uid() != Uid::effective().as_raw() {
-        bail!("the Ciao control socket is held by another user's process");
+impl ServiceProblem {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::MultipleDaemons => "multiple Ciao daemons are running for this host",
+            Self::MissingControlSocket => {
+                "ciao.service is active but the control socket is missing"
+            }
+        }
     }
-    let raw_pid = credentials.pid();
-    if raw_pid <= 1 {
-        bail!("the Ciao control socket reported an implausible owning process");
-    }
-    let pid = Pid::from_raw(raw_pid);
+}
 
-    match kill(pid, Signal::SIGTERM) {
-        // It exited between the connection and the signal, which is the outcome we wanted.
-        Ok(()) | Err(Errno::ESRCH) => {}
-        Err(error) => return Err(error).context("stop the running Ciao daemon"),
+pub fn service_problem(paths: &CiaoPaths) -> Result<Option<ServiceProblem>> {
+    #[cfg(target_os = "linux")]
+    {
+        if linux_process::holders(paths)?.len() > 1 {
+            return Ok(Some(ServiceProblem::MultipleDaemons));
+        }
+        if !paths.socket_file.try_exists()?
+            && systemctl_user(&["--user", "is-active", SYSTEMD_UNIT_NAME])
+                .output()
+                .is_ok_and(|output| ciao_unit_active(&String::from_utf8_lossy(&output.stdout)))
+        {
+            return Ok(Some(ServiceProblem::MissingControlSocket));
+        }
     }
+    let _ = paths;
+    Ok(None)
+}
 
-    // Wait for the process to leave, not for its socket to stop answering. A draining daemon
-    // keeps accepting for as long as its shutdown takes — the relay alone gets six seconds — and
-    // it unlinks both socket files on the way out. Starting a new daemon against a merely closed
-    // listener therefore loses either way: it refuses on "another Ciao daemon is already
-    // listening", or it binds and then has its socket deleted by the old process's cleanup.
-    // Process exit is the only edge that means all of that has finished.
-    let deadline = Instant::now() + DAEMON_STOP_TIMEOUT;
-    while Instant::now() < deadline {
-        if kill(pid, None) == Err(Errno::ESRCH) {
+/// A current release may still have a broken service or an obsolete boot rung.
+pub(crate) async fn current_release_needs_repair(
+    paths: &CiaoPaths,
+    reachable: bool,
+) -> Result<bool> {
+    if service_problem(paths)?.is_some() {
+        return Ok(true);
+    }
+    #[cfg(target_os = "linux")]
+    if paths.credentials_file.is_file() {
+        let manager = user_manager();
+        let (preferred, _) = selected_linux_supervisor(manager);
+        let main_pid = if manager == UserManager::Ready {
+            systemd_main_pid()?
+        } else {
+            None
+        };
+        let cron = read_crontab()
+            .ok()
+            .map(|table| table.lines().any(|line| line.trim() == CRON_BEGIN));
+        if matches!(preferred, Supervisor::CronReboot { .. }) {
+            if let Some(has_entry) = cron {
+                return Ok(!reachable || main_pid.is_some() || !has_entry);
+            }
+            // No usable cron: a reachable manager can still provide a login-only unit.
+            if manager != UserManager::Ready {
+                return Ok(false);
+            }
+        }
+        return Ok(match main_pid {
+            Some(pid) if reachable && cron != Some(true) => {
+                crate::ipc::request_status_from(&paths.socket_file, Some(pid))
+                    .await
+                    .is_err()
+            }
+            _ => true,
+        });
+    }
+    let _ = reachable;
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_cron_entry() -> Result<()> {
+    // A systemd-only account may have no crontab command or no permission to use it.
+    let existing = match read_crontab() {
+        Ok(table) => table,
+        Err(err)
+            if err.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                )
+            }) =>
+        {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        Err(err) => return Err(err),
+    };
+    if existing.lines().any(|line| line.trim() == CRON_BEGIN) {
+        write_crontab(&crontab_without_ciao(&existing))?;
     }
-    bail!(
-        "the running Ciao daemon did not stop within {} seconds; stop it and retry",
-        DAEMON_STOP_TIMEOUT.as_secs()
-    )
+    Ok(())
 }
 
 /// Installs the `@reboot` boot task. The operator's existing entries are read, our managed
 /// block is replaced in place, and everything else is written back untouched.
 #[cfg(target_os = "linux")]
-fn install_cron_service(paths: &CiaoPaths, executable: &Path) -> Result<()> {
+fn install_cron_entry(paths: &CiaoPaths, executable: &Path) -> Result<()> {
     paths.ensure_layout()?;
     let command = cron_command(executable, &paths.stderr_log)?;
     let existing = read_crontab()?;
@@ -651,15 +799,11 @@ fn install_cron_service(paths: &CiaoPaths, executable: &Path) -> Result<()> {
             bail!("refusing to write a crontab that would drop an existing entry: {line:?}");
         }
     }
-    write_crontab(&updated)?;
+    write_crontab(&updated)
+}
 
-    // No supervisor owns this rung, so nothing else will retire the daemon already running.
-    // Spawning past it binds nothing — the new process exits on "another Ciao daemon is already
-    // listening" and the old binary keeps serving, which made a reinstall look successful while
-    // changing nothing. launchd and systemd both stop the old process as part of a restart; this
-    // is that step, by hand, because cron will not do it.
-    stop_running_daemon(paths)?;
-
+#[cfg(target_os = "linux")]
+fn start_cron_daemon(paths: &CiaoPaths, executable: &Path) -> Result<i32> {
     // The boot task only fires at boot, so start the daemon now: nobody should have to reboot
     // to reach a host they just set up. This is a plain start of the service cron owns from
     // here on, the same thing `systemctl start` does after a unit is written — Ciao still
@@ -669,52 +813,14 @@ fn install_cron_service(paths: &CiaoPaths, executable: &Path) -> Result<()> {
         .append(true)
         .open(&paths.stderr_log)
         .with_context(|| format!("open {}", paths.stderr_log.display()))?;
-    Command::new(executable)
+    let child = Command::new(executable)
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().context("clone the daemon log handle")?)
         .stderr(log)
         .spawn()
         .context("start the Ciao daemon")?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn install_systemd_service(paths: &CiaoPaths, executable: &Path) -> Result<LingerStatus> {
-    paths.ensure_layout()?;
-
-    // 2. Deterministic unit written atomically. `ensure_layout` above created the log
-    //    directory; `append:` fails the unit if it does not exist.
-    let unit = systemd_unit(executable, &paths.stdout_log, &paths.stderr_log)?;
-    atomic_write_private(&paths.service_file, unit.as_bytes())?;
-
-    // 3. Idempotent reload, enable, restart — all fixed argv.
-    run_systemctl(&["--user", "daemon-reload"], paths)?;
-    run_systemctl(&["--user", "enable", SYSTEMD_UNIT_NAME], paths)?;
-    run_systemctl(&["--user", "restart", SYSTEMD_UNIT_NAME], paths)?;
-
-    // 4. Bounded wait for the unit itself to be active. The authenticated local status IPC
-    //    check is performed by the caller against the daemon socket.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let output = systemctl_user(&["--user", "is-active", SYSTEMD_UNIT_NAME])
-            .output()
-            .context("execute systemctl is-active")?;
-        if ciao_unit_active(&String::from_utf8_lossy(&output.stdout)) {
-            break;
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "{SYSTEMD_UNIT_NAME} did not become active. The host identity was preserved. \
-                 Inspect {} and rerun `ciao setup --yes`.",
-                paths.log_hint()
-            );
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-
-    // 5. Linger detection without sudo.
-    Ok(detect_linger())
+    Ok(i32::try_from(child.id())?)
 }
 
 /// `systemctl --user` needs `XDG_RUNTIME_DIR` to locate the user manager. A process outside a
@@ -831,12 +937,8 @@ pub fn uninstall_service(paths: &CiaoPaths) -> Result<()> {
         // Reset must not leave a boot task pointing at a host that no longer exists. A missing
         // crontab is the already-clean case; only write back when we actually removed a block,
         // so a reset never rewrites a crontab it had no reason to touch.
-        if let Ok(existing) = read_crontab() {
-            let cleaned = crontab_without_ciao(&existing);
-            if cleaned != existing {
-                let _ = write_crontab(&cleaned);
-            }
-        }
+        remove_cron_entry()?;
+        linux_process::stop(paths)?;
     }
     match fs::remove_file(&paths.service_file) {
         Ok(()) => {}
