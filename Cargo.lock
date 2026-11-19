@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "ciao-host"
-version = "0.1.65"
+version = "0.1.66"
 dependencies = [
  "anyhow",
  "base64",
