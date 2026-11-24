@@ -25,6 +25,10 @@ pub(crate) const MAX_PEERS: usize = 16;
 /// Requests one source endpoint may have running at once on `ciao/peer/2`, across its current
 /// and superseded connections.
 pub(crate) const MAX_SOURCE_REQUESTS: usize = 4;
+/// Watches one source endpoint may have waiting at once, so they never hold all its slots.
+pub(crate) const MAX_SOURCE_WATCHES: usize = 2;
+/// The longest a `watch` waits for a change before replying with the unchanged snapshot.
+pub(crate) const MAX_WATCH_WAIT_MS: u32 = 15_000;
 /// A destination closes a `ciao/peer/2` connection after this long with no request in flight.
 pub(crate) const INBOUND_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 /// A source stops using a kept connection after this long without a request. It is shorter
@@ -67,14 +71,53 @@ impl PeerProtocol {
 #[derive(Debug, Clone)]
 pub(crate) struct SourceBudget {
     pub requests: std::sync::Arc<tokio::sync::Semaphore>,
+    pub watches: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl SourceBudget {
     fn new() -> Self {
         Self {
             requests: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SOURCE_REQUESTS)),
+            watches: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SOURCE_WATCHES)),
         }
     }
+}
+
+/// The version of a session snapshot a source already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SnapshotVersion {
+    pub snapshot_epoch: u64,
+    pub process_generation: u64,
+    pub revision: u64,
+}
+
+impl SnapshotVersion {
+    pub fn of(snapshot: &crate::agent_protocol::AgentSessionSnapshot) -> Self {
+        Self {
+            snapshot_epoch: snapshot.snapshot_epoch,
+            process_generation: snapshot.process_generation,
+            revision: snapshot.revision,
+        }
+    }
+
+    pub fn of_value(snapshot: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            snapshot_epoch: snapshot.get("snapshot_epoch")?.as_u64()?,
+            process_generation: snapshot.get("process_generation")?.as_u64()?,
+            revision: snapshot.get("revision")?.as_u64()?,
+        })
+    }
+}
+
+/// How a follow reply came, which sets when the source asks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FollowMode {
+    /// The destination replied on a change or after the requested wait.
+    Pushed,
+    /// A plain snapshot from a destination that cannot wait for changes.
+    Polled,
 }
 
 /// A source connection a destination admitted. At most one per source endpoint.
@@ -801,6 +844,13 @@ pub(crate) enum Action {
         request_id: String,
         expected_generation: u64,
     },
+    /// `ciao/peer/2` only: the session's snapshot once it no longer matches `after`, or after
+    /// `wait_ms`, whichever comes first.
+    Watch {
+        session_id: String,
+        after: SnapshotVersion,
+        wait_ms: u32,
+    },
 }
 
 impl Action {
@@ -808,7 +858,10 @@ impl Action {
     pub fn has_effect(&self) -> bool {
         match self {
             Self::Start { .. } | Self::Command { .. } | Self::Stop { .. } => true,
-            Self::Workspaces {} | Self::Snapshot { .. } | Self::StopReceipt { .. } => false,
+            Self::Workspaces {}
+            | Self::Snapshot { .. }
+            | Self::StopReceipt { .. }
+            | Self::Watch { .. } => false,
         }
     }
 }
@@ -826,6 +879,11 @@ impl Request {
                 ..
             } if valid_id(request_id) && valid_id(workspace_id) => {}
             Action::Snapshot { session_id } if valid_id(session_id) => {}
+            Action::Watch {
+                session_id,
+                wait_ms,
+                ..
+            } if valid_id(session_id) && (1..=MAX_WATCH_WAIT_MS).contains(wait_ms) => {}
             Action::StopReceipt {
                 session_id,
                 request_id,

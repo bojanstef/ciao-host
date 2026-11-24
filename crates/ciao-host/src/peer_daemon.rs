@@ -3,8 +3,8 @@ use super::*;
 use crate::{
     agent_protocol::{self, AgentCommand, AgentCommandKind, LifecycleOutcome},
     peers::{
-        self, Action, Admin, AdmissionRefused, Descriptor, GrantScope, Incoming, Outgoing,
-        PeerAgent, PeerProtocol, Request, SourceBudget, StartRecord,
+        self, Action, Admin, AdmissionRefused, Descriptor, FollowMode, GrantScope, Incoming,
+        Outgoing, PeerAgent, PeerProtocol, Request, SnapshotVersion, SourceBudget, StartRecord,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -318,7 +318,7 @@ async fn serve_within(connection: Connection, state: Arc<RuntimeState>, idle: Du
             if let Ok(Ok((send, recv))) =
                 timeout(Duration::from_secs(10), connection.accept_bi()).await
             {
-                answer(send, recv, id, &state).await;
+                answer(send, recv, id, &state, None).await;
             }
         }
         // Each request is a finite exchange on its own stream, with the grant rechecked as for
@@ -362,9 +362,9 @@ async fn serve_streams(
             },
             _ = connection.closed() => break,
         };
-        let state = state.clone();
+        let (state, watches) = (state.clone(), budget.watches.clone());
         requests.spawn(async move {
-            answer(send, recv, id, &state).await;
+            answer(send, recv, id, &state, Some(&watches)).await;
             drop(slot);
         });
     }
@@ -373,16 +373,21 @@ async fn serve_streams(
 }
 
 /// Read one request, execute it and reply. The request stays in flight until the source has
-/// acknowledged the reply, so no close can discard an answer.
+/// acknowledged the reply, so no close can discard an answer. Only `ciao/peer/2` passes the
+/// source's watch slots; without them a watch is an unknown request.
 async fn answer(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     id: EndpointId,
     state: &Arc<RuntimeState>,
+    watches: Option<&Arc<tokio::sync::Semaphore>>,
 ) {
     let result = timeout(DEADLINE, async {
         let request: Request = read_request(&mut recv, Duration::from_secs(10)).await?;
-        execute(id, request, state).await
+        match (&request.action, watches) {
+            (Action::Watch { .. }, Some(watches)) => watch(id, request, watches, state).await,
+            _ => execute(id, request, state).await,
+        }
     })
     .await
     .unwrap_or(Err("timeout"));
@@ -532,41 +537,10 @@ async fn execute(
             Ok(json!(outcome))
         }
         Action::Snapshot { session_id } => {
-            let start = state
-                .peers
-                .owned_start(&grant, &session_id)
-                .ok_or("authorization_denied")?;
-            if start.agent == PeerAgent::Codex {
-                let live = state.codex_adoptions.peer_worker(&session_id).is_some();
-                if start.stop_request.is_some() {
-                    return Err(if live {
-                        "session_stopping"
-                    } else {
-                        "session_stopped"
-                    });
-                }
-                if !live {
-                    return Err("session_unavailable");
-                }
-            }
-            let snapshot = state
-                .agent_sessions
-                .snapshot(&session_id)
-                .or_else(|| {
-                    state
-                        .managed_sessions
-                        .stored_snapshot(&session_id, &HashSet::new())
-                })
-                .filter(|snapshot| start.includes_generation(snapshot.process_generation))
-                .ok_or("session_unavailable")?;
-            let snapshot = agent_protocol::fit_snapshot_with_envelope(snapshot, |s| {
-                agent_protocol::encoded_frame_len(&crate::ipc::success_response(
-                    &"x".repeat(crate::ipc::MAX_IPC_REQUEST_ID_BYTES),
-                    json!(s),
-                ))
-            });
-            Ok(json!(snapshot))
+            snapshot_for(state, &grant, &session_id).map(|s| json!(s))
         }
+        // Served by `watch` on `ciao/peer/2` only.
+        Action::Watch { .. } => Err("invalid_request"),
         Action::Command { mut command } => {
             let start = state
                 .peers
@@ -642,6 +616,100 @@ async fn execute(
                 }
             };
             Ok(json!(outcome))
+        }
+    }
+}
+
+/// The session snapshot `grant` may read: its own start, still in scope, in the generation it
+/// launched. Snapshot and every watch reply come from here.
+fn snapshot_for(
+    state: &RuntimeState,
+    grant: &Incoming,
+    session_id: &str,
+) -> Result<agent_protocol::AgentSessionSnapshot, &'static str> {
+    let start = state
+        .peers
+        .owned_start(grant, session_id)
+        .ok_or("authorization_denied")?;
+    if start.agent == PeerAgent::Codex {
+        let live = state.codex_adoptions.peer_worker(session_id).is_some();
+        if start.stop_request.is_some() {
+            return Err(if live {
+                "session_stopping"
+            } else {
+                "session_stopped"
+            });
+        }
+        if !live {
+            return Err("session_unavailable");
+        }
+    }
+    let snapshot = state
+        .agent_sessions
+        .snapshot(session_id)
+        .or_else(|| {
+            state
+                .managed_sessions
+                .stored_snapshot(session_id, &HashSet::new())
+        })
+        .filter(|snapshot| start.includes_generation(snapshot.process_generation))
+        .ok_or("session_unavailable")?;
+    Ok(agent_protocol::fit_snapshot_with_envelope(snapshot, |s| {
+        agent_protocol::encoded_frame_len(&crate::ipc::success_response(
+            &"x".repeat(crate::ipc::MAX_IPC_REQUEST_ID_BYTES),
+            json!(s),
+        ))
+    }))
+}
+
+/// Reply once the session's snapshot no longer matches `after`, or when the wait runs out.
+/// The session's change feed only wakes the wait. Each reading takes the effects gate and
+/// rechecks the grant, exactly as `snapshot` does, so narrowing, revocation, stop and a
+/// handback end a watch the way they end a snapshot.
+async fn watch(
+    id: EndpointId,
+    request: Request,
+    watches: &Arc<tokio::sync::Semaphore>,
+    state: &Arc<RuntimeState>,
+) -> Result<Value, &'static str> {
+    request.validate()?;
+    let Action::Watch {
+        session_id,
+        after,
+        wait_ms,
+    } = request.action
+    else {
+        return Err("invalid_request");
+    };
+    let _waiting = watches
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "watch_limit")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(wait_ms));
+    // Subscribed before the first reading, so a change between the two still wakes the wait.
+    let mut changes = state
+        .agent_sessions
+        .subscribe_from_snapshot(&session_id)
+        .map(|(_, changes)| changes);
+    loop {
+        let current = {
+            let _effects = state.peers.effects.lock().await;
+            let grant = state
+                .peers
+                .incoming(id, Some(&request.grant_id))
+                .ok_or("authorization_denied")?;
+            snapshot_for(state, &grant, &session_id)?
+        };
+        if SnapshotVersion::of(&current) != after || tokio::time::Instant::now() >= deadline {
+            return Ok(json!(current));
+        }
+        match changes.as_mut() {
+            Some(feed) => match tokio::time::timeout_at(deadline, feed.recv()).await {
+                Err(_) | Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                // The session left the live registry: read it once more, then wait out the rest.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => changes = None,
+            },
+            None => tokio::time::sleep_until(deadline).await,
         }
     }
 }
@@ -736,6 +804,14 @@ enum Local {
         session_id: String,
         request_id: String,
     },
+    /// The session's next snapshot for `ciao peers follow`, and how it came.
+    Follow {
+        host: String,
+        session_id: String,
+        #[serde(default)]
+        after: Option<SnapshotVersion>,
+        wait_ms: u32,
+    },
 }
 
 pub(super) async fn ipc(
@@ -782,6 +858,12 @@ pub(super) async fn ipc(
             };
             call(&host, Action::Command { command }, endpoint, state).await
         }
+        Local::Follow {
+            host,
+            session_id,
+            after,
+            wait_ms,
+        } => follow(&host, &session_id, after, wait_ms, endpoint, state).await,
         Local::Stop {
             host,
             session_id,
@@ -829,12 +911,68 @@ pub(super) async fn ipc(
     }
 }
 
+/// One follow step. A `ciao/peer/2` destination waits for a change; anything else, or a
+/// destination whose watches are busy or unknown, answers with a plain snapshot to poll.
+async fn follow(
+    host: &str,
+    session_id: &str,
+    after: Option<SnapshotVersion>,
+    wait_ms: u32,
+    endpoint: &Endpoint,
+    state: &Arc<RuntimeState>,
+) -> Result<Value, &'static str> {
+    let snapshot = || Action::Snapshot {
+        session_id: session_id.into(),
+    };
+    let watched = call_negotiated(host, endpoint, state, |protocol| match (protocol, after) {
+        (PeerProtocol::Streams, Some(after)) => Action::Watch {
+            session_id: session_id.into(),
+            after,
+            wait_ms,
+        },
+        _ => snapshot(),
+    })
+    .await;
+    let (mode, value) = match watched {
+        Ok((PeerProtocol::Streams, value)) => (FollowMode::Pushed, value),
+        Ok((PeerProtocol::SingleRequest, value)) => (FollowMode::Polled, value),
+        Err("watch_limit" | "peer_refused") if after.is_some() => (
+            FollowMode::Polled,
+            call(host, snapshot(), endpoint, state).await?,
+        ),
+        Err(error) => return Err(error),
+    };
+    let snapshot: agent_protocol::AgentSessionSnapshot =
+        serde_json::from_value(value).map_err(|_| "invalid_response")?;
+    // The local reply wraps the snapshot, so it must fit with the wrapper.
+    let snapshot = agent_protocol::fit_snapshot_with_envelope(snapshot, |s| {
+        agent_protocol::encoded_frame_len(&crate::ipc::success_response(
+            &"x".repeat(crate::ipc::MAX_IPC_REQUEST_ID_BYTES),
+            json!({"mode": mode, "snapshot": s}),
+        ))
+    });
+    Ok(json!({"mode": mode, "snapshot": snapshot}))
+}
+
 async fn call(
     host: &str,
     action: Action,
     endpoint: &Endpoint,
     state: &Arc<RuntimeState>,
 ) -> Result<Value, &'static str> {
+    call_negotiated(host, endpoint, state, |_| action.clone())
+        .await
+        .map(|(_, value)| value)
+}
+
+/// Send one request to a linked destination and say which protocol carried it. `action` may
+/// depend on that protocol; both forms are validated before anything is sent.
+async fn call_negotiated(
+    host: &str,
+    endpoint: &Endpoint,
+    state: &Arc<RuntimeState>,
+    action: impl Fn(PeerProtocol) -> Action,
+) -> Result<(PeerProtocol, Value), &'static str> {
     if host.is_empty() || host.len() > 128 {
         return Err("invalid_peer");
     }
@@ -849,17 +987,21 @@ async fn call(
         return Err("unknown_or_ambiguous_peer");
     };
     let id: EndpointId = link.peer.endpoint_id.parse().map_err(|_| "invalid_peer")?;
-    let request = Request {
+    let request = |protocol| Request {
         v: 1,
         grant_id: link.grant_id.clone(),
-        action,
+        action: action(protocol),
     };
-    request.validate()?;
+    for protocol in PeerProtocol::ACCEPTED {
+        request(protocol).validate()?;
+    }
+    let streams =
+        |result: Result<Value, &'static str>| result.map(|value| (PeerProtocol::Streams, value));
     // Requests on a kept connection run side by side and never wait for the lane.
     if let Some(kept) = state.peers.outbound.reuse(id)
-        && let Sent::Answered(result) = ask(&kept.connection, &request).await
+        && let Sent::Answered(result) = ask(&kept.connection, &request(PeerProtocol::Streams)).await
     {
-        return result;
+        return streams(result);
     }
     // Nothing was sent: the kept connection had closed or expired, or no stream opened.
     let lane = state.peers.outbound_lane(id);
@@ -878,7 +1020,11 @@ async fn call(
             match PeerProtocol::negotiated(connection.alpn()) {
                 Some(PeerProtocol::Streams) => state.peers.outbound.adopt(id, connection),
                 // A destination that closes after one request. Hold the lane until it has.
-                Some(PeerProtocol::SingleRequest) => return exchange(&connection, &request).await,
+                Some(PeerProtocol::SingleRequest) => {
+                    return exchange(&connection, &request(PeerProtocol::SingleRequest))
+                        .await
+                        .map(|value| (PeerProtocol::SingleRequest, value));
+                }
                 None => {
                     connection.close(VarInt::from_u32(0), b"peer protocol unsupported");
                     return Err("unsupported_version");
@@ -887,8 +1033,8 @@ async fn call(
         }
     };
     drop(turn);
-    match ask(&kept.connection, &request).await {
-        Sent::Answered(result) => result,
+    match ask(&kept.connection, &request(PeerProtocol::Streams)).await {
+        Sent::Answered(result) => streams(result),
         Sent::NotSent => Err("connection_lost"),
     }
 }
@@ -1315,33 +1461,235 @@ mod tests {
         pair.close().await;
     }
 
-    /// The CLI's follow loop with the lab's clock: one snapshot, then the next one second after
-    /// the reply. Returns when each snapshot arrived and its revision.
+    /// The CLI's follow loop with the lab's clock. Returns when each snapshot arrived and its
+    /// revision.
     async fn follow_for_lab(
         client: &Endpoint,
         source: &Arc<RuntimeState>,
         session: &str,
         seconds: Duration,
     ) -> Vec<(std::time::Instant, u64)> {
-        let until = tokio::time::Instant::now() + seconds;
         let mut seen = Vec::new();
-        loop {
-            let value = ipc(
-                json!({"op":"call","host":"Build","action":{"op":"snapshot","session_id":session}}),
+        crate::peer_cli::follow(
+            &LabFollow {
                 client,
                 source,
-            )
+                session,
+            },
+            seconds,
+            |snapshot| {
+                seen.push((
+                    std::time::Instant::now(),
+                    snapshot["revision"].as_u64().unwrap(),
+                ));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        seen
+    }
+
+    impl Pair {
+        fn spawn_local(&self, body: Value) -> tokio::task::JoinHandle<Result<Value, &'static str>> {
+            let (client, source) = (self.client.clone(), self.source.clone());
+            tokio::spawn(async move { ipc(body, &client, &source).await })
+        }
+
+        fn budget(&self) -> SourceBudget {
+            self.destination.peers.connections.lock()[&self.client.id().to_string()]
+                .budget
+                .clone()
+        }
+    }
+
+    fn follow_body(session: &str, after: Option<SnapshotVersion>, wait_ms: u32) -> Value {
+        json!({"op":"follow","host":"Build","session_id":session,"after":after,"wait_ms":wait_ms})
+    }
+
+    #[tokio::test]
+    async fn peer_follow_waits_for_a_change_and_replies_within_its_wait() {
+        let pair = pair(accepted_alpns()).await;
+        let (session, drain) = pair.start_live("one").await;
+        let first = pair.local(follow_body(&session, None, 1000)).await.unwrap();
+        assert_eq!(first["mode"], "pushed");
+        let held = SnapshotVersion::of_value(&first["snapshot"]).unwrap();
+        // Unchanged: the reply comes when the wait runs out, with the same version.
+        let began = std::time::Instant::now();
+        let same = pair
+            .local(follow_body(&session, Some(held), 300))
             .await
             .unwrap();
-            seen.push((
-                std::time::Instant::now(),
-                value["revision"].as_u64().unwrap(),
-            ));
-            let next = tokio::time::Instant::now() + Duration::from_secs(1);
-            if next >= until {
-                return seen;
-            }
-            tokio::time::sleep_until(next).await;
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        assert_eq!(SnapshotVersion::of_value(&same["snapshot"]), Some(held));
+        // A change ends the wait at once.
+        let waiting = pair.spawn_local(follow_body(&session, Some(held), 10_000));
+        let budget = pair.budget();
+        until(|| budget.watches.available_permits() == peers::MAX_SOURCE_WATCHES - 1).await;
+        let changed = std::time::Instant::now();
+        pair.destination
+            .agent_sessions
+            .update_bridge_permission_mode(&session, "plan".into());
+        let reply = waiting.await.unwrap().unwrap();
+        assert!(changed.elapsed() < Duration::from_secs(5));
+        let seen = SnapshotVersion::of_value(&reply["snapshot"]).unwrap();
+        assert!(seen.revision > held.revision);
+        // A version the source holds is already stale: the reply is immediate.
+        let began = std::time::Instant::now();
+        let stale = pair
+            .local(follow_body(&session, Some(held), 10_000))
+            .await
+            .unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert_eq!(SnapshotVersion::of_value(&stale["snapshot"]), Some(seen));
+        assert_eq!(pair.accepted(), 1);
+        drain.abort();
+        pair.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_follow_rechecks_the_grant_for_every_reply() {
+        let pair = pair(accepted_alpns()).await;
+        let (session, drain) = pair.start_live("one").await;
+        let first = pair.local(follow_body(&session, None, 1000)).await.unwrap();
+        let held = SnapshotVersion::of_value(&first["snapshot"]).unwrap();
+        let waiting = pair.spawn_local(follow_body(&session, Some(held), 10_000));
+        let budget = pair.budget();
+        until(|| budget.watches.available_permits() == peers::MAX_SOURCE_WATCHES - 1).await;
+        // Narrowing keeps the connection open, so the waiting reply must be refused itself.
+        admin(
+            update(
+                pair.client.id(),
+                GrantScope::Selected(vec![pair.ids[1].clone()]),
+            ),
+            None,
+            &pair.destination,
+        )
+        .await
+        .unwrap();
+        pair.destination
+            .agent_sessions
+            .update_bridge_permission_mode(&session, "plan".into());
+        assert_eq!(waiting.await.unwrap().unwrap_err(), "authorization_denied");
+        assert_eq!(
+            pair.local(follow_body(&session, Some(held), 1000))
+                .await
+                .unwrap_err(),
+            "authorization_denied"
+        );
+        drain.abort();
+        pair.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_follow_ends_when_a_codex_session_is_handed_back() {
+        let pair = pair(accepted_alpns()).await;
+        install_codex_fixture(&pair.destination.paths);
+        let started = pair
+            .call(json!({"op":"start","agent":"codex","request_id":"codex","workspace_id":pair.ids[0]}))
+            .await
+            .unwrap();
+        let session = started["session_id"].as_str().unwrap().to_owned();
+        let first = pair.local(follow_body(&session, None, 1000)).await.unwrap();
+        let held = SnapshotVersion::of_value(&first["snapshot"]).unwrap();
+        let waiting = pair.spawn_local(follow_body(&session, Some(held), 10_000));
+        let budget = pair.budget();
+        until(|| budget.watches.available_permits() == peers::MAX_SOURCE_WATCHES - 1).await;
+        let began = std::time::Instant::now();
+        let worker = pair
+            .destination
+            .codex_adoptions
+            .peer_worker(&session)
+            .unwrap();
+        worker
+            .send(crate::codex_adopted::ReleaseReason::ResumeInTerminal)
+            .await
+            .unwrap();
+        worker.closed().await;
+        let _human = register(&pair.destination, &session).await;
+        assert_eq!(waiting.await.unwrap().unwrap_err(), "session_unavailable");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the handback woke the wait"
+        );
+        pair.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_follow_polls_when_watches_are_busy_or_the_destination_is_single_request() {
+        let pair = pair(accepted_alpns()).await;
+        let (session, drain) = pair.start_live("one").await;
+        let first = pair.local(follow_body(&session, None, 1000)).await.unwrap();
+        let held = SnapshotVersion::of_value(&first["snapshot"]).unwrap();
+        let waiting: Vec<_> = (0..peers::MAX_SOURCE_WATCHES)
+            .map(|_| pair.spawn_local(follow_body(&session, Some(held), 10_000)))
+            .collect();
+        let budget = pair.budget();
+        until(|| budget.watches.available_permits() == 0).await;
+        let began = std::time::Instant::now();
+        let polled = pair
+            .local(follow_body(&session, Some(held), 10_000))
+            .await
+            .unwrap();
+        assert_eq!(polled["mode"], "polled");
+        assert!(began.elapsed() < Duration::from_secs(5));
+        pair.destination
+            .agent_sessions
+            .update_bridge_permission_mode(&session, "plan".into());
+        for waiting in waiting {
+            assert_eq!(waiting.await.unwrap().unwrap()["mode"], "pushed");
+        }
+        drain.abort();
+        pair.close().await;
+
+        let pair = self::pair(vec![peers::ALPN.to_vec()]).await;
+        let (session, drain) = pair.start_live("one").await;
+        let first = pair.local(follow_body(&session, None, 1000)).await.unwrap();
+        assert_eq!(first["mode"], "polled");
+        let held = SnapshotVersion::of_value(&first["snapshot"]).unwrap();
+        let began = std::time::Instant::now();
+        let polled = pair
+            .local(follow_body(&session, Some(held), 10_000))
+            .await
+            .unwrap();
+        assert_eq!(polled["mode"], "polled");
+        assert!(began.elapsed() < Duration::from_secs(5));
+        drain.abort();
+        pair.close().await;
+    }
+
+    /// The CLI's follow loop, reading through the source daemon's IPC handler in process.
+    struct LabFollow<'a> {
+        client: &'a Endpoint,
+        source: &'a Arc<RuntimeState>,
+        session: &'a str,
+    }
+
+    impl crate::peer_cli::FollowSource for LabFollow<'_> {
+        async fn changed(
+            &self,
+            after: Option<SnapshotVersion>,
+            wait: Duration,
+        ) -> anyhow::Result<Option<crate::peer_cli::FollowStep>> {
+            let wait_ms = u32::try_from(wait.as_millis()).unwrap();
+            let value = ipc(
+                follow_body(self.session, after, wait_ms),
+                self.client,
+                self.source,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            Ok(Some(serde_json::from_value(value)?))
+        }
+
+        async fn snapshot(&self) -> anyhow::Result<Value> {
+            ipc(
+                json!({"op":"call","host":"Build","action":{"op":"snapshot","session_id":self.session}}),
+                self.client,
+                self.source,
+            )
+            .await
+            .map_err(anyhow::Error::msg)
         }
     }
 

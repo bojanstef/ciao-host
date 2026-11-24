@@ -10,8 +10,123 @@ use std::{
 use crate::{
     agent_protocol::MAX_PROMPT_BYTES,
     ipc,
-    peers::{Action, Admin, Descriptor, GrantScope, Outgoing, PeerAgent},
+    peers::{
+        Action, Admin, Descriptor, FollowMode, GrantScope, Outgoing, PeerAgent, SnapshotVersion,
+    },
 };
+
+/// While nothing changes, follow still prints a snapshot this often.
+const FOLLOW_HEARTBEAT: Duration = Duration::from_secs(1);
+/// Follow asks again no sooner than this after its last request, so a burst of changes
+/// prints at most four lines a second.
+const FOLLOW_MIN_INTERVAL: Duration = Duration::from_millis(250);
+/// The polling period against a destination that cannot wait for changes.
+const FOLLOW_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One follow reply: a session snapshot, and how it came.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct FollowStep {
+    pub mode: FollowMode,
+    pub snapshot: Value,
+}
+
+/// Where `follow` reads a remote session from.
+pub(crate) trait FollowSource {
+    /// The snapshot once it no longer matches `after`, or after `wait`. `None` when the
+    /// local daemon predates this request.
+    async fn changed(
+        &self,
+        after: Option<SnapshotVersion>,
+        wait: Duration,
+    ) -> Result<Option<FollowStep>>;
+
+    /// The current snapshot.
+    async fn snapshot(&self) -> Result<Value>;
+}
+
+/// Print a remote session for `seconds`: a line on each change, and at least one a second.
+/// Against a destination or daemon that cannot wait for changes, poll once a second.
+pub(crate) async fn follow(
+    source: &impl FollowSource,
+    seconds: Duration,
+    mut emit: impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
+    let until = tokio::time::Instant::now() + seconds;
+    let mut after = None;
+    let mut changes = true;
+    let mut printed = tokio::time::Instant::now();
+    loop {
+        let asked = tokio::time::Instant::now();
+        let step = if changes {
+            // Wait no later than the next heartbeat line, and no later than the end.
+            let wait = (printed + FOLLOW_HEARTBEAT)
+                .min(until)
+                .saturating_duration_since(asked)
+                .clamp(Duration::from_millis(1), FOLLOW_HEARTBEAT);
+            source.changed(after, wait).await?
+        } else {
+            None
+        };
+        let step = match step {
+            Some(step) => step,
+            None => {
+                changes = false;
+                FollowStep {
+                    mode: FollowMode::Polled,
+                    snapshot: source.snapshot().await?,
+                }
+            }
+        };
+        emit(&step.snapshot)?;
+        after = SnapshotVersion::of_value(&step.snapshot);
+        let now = tokio::time::Instant::now();
+        printed = now;
+        let next = match step.mode {
+            FollowMode::Pushed => asked + FOLLOW_MIN_INTERVAL,
+            FollowMode::Polled => now + FOLLOW_POLL_INTERVAL,
+        };
+        if now >= until || next >= until {
+            return Ok(());
+        }
+        tokio::time::sleep_until(next).await;
+    }
+}
+
+/// The local daemon, which reaches the destination.
+struct DaemonFollow<'a> {
+    socket: &'a Path,
+    host: String,
+    session: String,
+}
+
+impl FollowSource for DaemonFollow<'_> {
+    async fn changed(
+        &self,
+        after: Option<SnapshotVersion>,
+        wait: Duration,
+    ) -> Result<Option<FollowStep>> {
+        let wait_ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
+        match ipc::request_peers(
+            self.socket,
+            json!({"op":"follow", "host":self.host, "session_id":self.session, "after":after, "wait_ms":wait_ms}),
+        )
+        .await
+        {
+            Ok(value) => Ok(Some(serde_json::from_value(value)?)),
+            // An older daemon does not know this request.
+            Err(ipc::IpcError::Daemon { code, .. }) if code == "invalid_request" => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn snapshot(&self) -> Result<Value> {
+        Ok(ipc::request_peers(
+            self.socket,
+            json!({"op":"call", "host":self.host, "action":Action::Snapshot {session_id:self.session.clone()}}),
+        )
+        .await?)
+    }
+}
 
 /// `--workspace` (repeatable) or `--all`, exactly one.
 #[derive(Debug, clap::Args)]
@@ -86,7 +201,7 @@ pub(crate) enum Command {
         host: String,
         session: String,
     },
-    /// Poll a remote session for a bounded interval; each snapshot is one JSON line
+    /// Follow a remote session for a bounded interval; each snapshot is one JSON line
     Follow {
         #[arg(long)]
         host: String,
@@ -185,17 +300,16 @@ pub(crate) async fn run(command: Command, socket: &Path) -> Result<()> {
             session,
             seconds,
         } => {
-            let until = tokio::time::Instant::now() + Duration::from_secs(seconds);
-            loop {
-                let value = ipc::request_peers(socket, json!({"op":"call", "host":host, "action":Action::Snapshot {session_id:session.clone()}})).await?;
-                println!("{}", serde_json::to_string(&value)?);
-                let next = tokio::time::Instant::now() + Duration::from_secs(1);
-                if next >= until {
-                    break;
-                }
-                tokio::time::sleep_until(next).await;
-            }
-            return Ok(());
+            let source = DaemonFollow {
+                socket,
+                host,
+                session,
+            };
+            return follow(&source, Duration::from_secs(seconds), |snapshot| {
+                println!("{}", serde_json::to_string(snapshot)?);
+                Ok(())
+            })
+            .await;
         }
     };
     let value: Value = ipc::request_peers(socket, body).await?;
@@ -215,4 +329,160 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
         bail!("input must contain 1..{limit} bytes");
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use tokio::time::Instant;
+
+    /// One request the loop made: when, with which version, and the wait (none for a poll).
+    struct Asked {
+        at: Duration,
+        after: Option<SnapshotVersion>,
+        wait: Option<Duration>,
+    }
+
+    /// A destination whose session changes every `change_every`, if at all.
+    struct Scripted {
+        mode: Option<FollowMode>,
+        change_every: Option<Duration>,
+        began: Instant,
+        asked: RefCell<Vec<Asked>>,
+        polls: Cell<usize>,
+    }
+
+    impl Scripted {
+        fn new(mode: Option<FollowMode>, change_every: Option<Duration>) -> Self {
+            Self {
+                mode,
+                change_every,
+                began: Instant::now(),
+                asked: RefCell::default(),
+                polls: Cell::new(0),
+            }
+        }
+
+        fn current(&self) -> Value {
+            let revision = self.change_every.map_or(1, |every| {
+                1 + (self.began.elapsed().as_millis() / every.as_millis()) as u64
+            });
+            json!({"snapshot_epoch":1, "process_generation":1, "revision":revision})
+        }
+    }
+
+    impl FollowSource for Scripted {
+        async fn changed(
+            &self,
+            after: Option<SnapshotVersion>,
+            wait: Duration,
+        ) -> Result<Option<FollowStep>> {
+            self.asked.borrow_mut().push(Asked {
+                at: self.began.elapsed(),
+                after,
+                wait: Some(wait),
+            });
+            let Some(mode) = self.mode else {
+                return Ok(None);
+            };
+            if mode == FollowMode::Pushed
+                && after.is_some()
+                && SnapshotVersion::of_value(&self.current()) == after
+            {
+                let until_change = self.change_every.map_or(wait, |every| {
+                    every
+                        - Duration::from_millis(
+                            (self.began.elapsed().as_millis() % every.as_millis()) as u64,
+                        )
+                });
+                tokio::time::sleep(wait.min(until_change)).await;
+            }
+            Ok(Some(FollowStep {
+                mode,
+                snapshot: self.current(),
+            }))
+        }
+
+        async fn snapshot(&self) -> Result<Value> {
+            self.asked.borrow_mut().push(Asked {
+                at: self.began.elapsed(),
+                after: None,
+                wait: None,
+            });
+            self.polls.set(self.polls.get() + 1);
+            Ok(self.current())
+        }
+    }
+
+    async fn run(source: &Scripted, seconds: u64) -> Vec<Duration> {
+        let mut lines = Vec::new();
+        follow(source, Duration::from_secs(seconds), |_| {
+            lines.push(source.began.elapsed());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        lines
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_follow_prints_every_second_while_unchanged_and_soon_after_a_change() {
+        let quiet = Scripted::new(Some(FollowMode::Pushed), None);
+        let lines = run(&quiet, 5).await;
+        {
+            let asked = quiet.asked.borrow();
+            assert!(asked[0].after.is_none() && asked[1..].iter().all(|a| a.after.is_some()));
+            assert!(asked.iter().all(|a| a.wait.unwrap() <= FOLLOW_HEARTBEAT));
+        }
+        assert!(lines.windows(2).all(|w| w[1] - w[0] <= FOLLOW_HEARTBEAT));
+        assert!(*lines.last().unwrap() <= Duration::from_secs(5));
+        assert_eq!(quiet.polls.get(), 0);
+
+        // Constant change: a line per request, requests at least 250 ms apart.
+        let busy = Scripted::new(Some(FollowMode::Pushed), Some(Duration::from_millis(10)));
+        let lines = run(&busy, 2).await;
+        assert!(
+            busy.asked
+                .borrow()
+                .windows(2)
+                .all(|w| w[1].at - w[0].at >= FOLLOW_MIN_INTERVAL)
+        );
+        assert!(lines.len() <= 9, "{lines:?}");
+
+        // A change after a quiet stretch prints at once.
+        let once = Scripted::new(Some(FollowMode::Pushed), Some(Duration::from_millis(2600)));
+        let lines = run(&once, 4).await;
+        assert!(lines.contains(&Duration::from_millis(2600)), "{lines:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_follow_polls_once_a_second_against_older_destinations_and_daemons() {
+        let old_destination = Scripted::new(Some(FollowMode::Polled), None);
+        let lines = run(&old_destination, 4).await;
+        assert!(
+            lines
+                .windows(2)
+                .all(|w| w[1] - w[0] >= FOLLOW_POLL_INTERVAL)
+        );
+        assert_eq!(lines.len(), 4);
+
+        // A daemon that does not know `follow` is asked once, then polled for snapshots.
+        let old_daemon = Scripted::new(None, None);
+        let lines = run(&old_daemon, 4).await;
+        let waits = old_daemon
+            .asked
+            .borrow()
+            .iter()
+            .filter(|a| a.wait.is_some())
+            .count();
+        assert_eq!(waits, 1);
+        assert_eq!(old_daemon.polls.get(), lines.len());
+        assert!(
+            lines
+                .windows(2)
+                .all(|w| w[1] - w[0] >= FOLLOW_POLL_INTERVAL)
+        );
+        assert_eq!(lines.len(), 4);
+    }
 }
