@@ -57,6 +57,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Pair this host to local Orca. Pipe an Orca runtime pairing link into stdin.
+    #[command(name = "orca-pair")]
+    OrcaPair,
     /// Explicit host links and remote managed-agent work (JSON output)
     Peers {
         #[command(subcommand)]
@@ -195,6 +198,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = CiaoPaths::discover()?;
     match cli.command {
+        Some(Command::OrcaPair) => crate::orca::session::pair(&paths).await,
         Some(Command::Peers { action }) => crate::peer_cli::run(action, &paths.socket_file).await,
         Some(Command::Setup { yes }) => {
             interruptible_install(async move { setup_command(&paths, yes).await }).await
@@ -1285,6 +1289,7 @@ fn reset_identity_files(paths: &CiaoPaths) -> Result<()> {
         // Revoke delegation before removing the identity. If this fails, a later setup
         // must not give a fresh host identity the old grants.
         &paths.peers_file,
+        &paths.orca_pairing_file(),
         &crate::peers::codex_receipts_path(&paths.peers_file),
         &paths.credentials_file,
         &paths.paired_devices_file,
@@ -1775,6 +1780,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "orca-pair",
                 "peers",
                 "setup",
                 "pair",

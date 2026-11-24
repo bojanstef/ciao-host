@@ -15,6 +15,9 @@ anyhow.workspace = true
 base64.workspace = true
 chacha20poly1305.workspace = true
 clap.workspace = true
+crypto_secretbox = "0.1.1"
+futures-util = "0.3"
+hkdf = "0.12"
 iroh.workspace = true
 iroh-relay.workspace = true
 iroh-tickets.workspace = true
@@ -23,15 +26,17 @@ parking_lot.workspace = true
 portable-pty.workspace = true
 qrcode.workspace = true
 rand.workspace = true
+salsa20 = "0.10.2"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite = "0.28.0"
 tracing.workspace = true
 tracing-subscriber.workspace = true
-x25519-dalek.workspace = true
+x25519-dalek = { workspace = true, features = ["static_secrets"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 ciao-native-process = { path = "../ciao-native-process" }

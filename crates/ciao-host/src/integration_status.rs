@@ -382,6 +382,7 @@ mod tests {
         let result = crate::host_protocol::WorkspaceSnapshotResult {
             v: crate::host_protocol::HOST_PROTOCOL_VERSION,
             providers: crate::host_protocol::WorkspaceProviders {
+                orca: None,
                 tmux: crate::host_protocol::TmuxProviderSnapshot {
                     state: "not_installed".into(),
                     version: None,

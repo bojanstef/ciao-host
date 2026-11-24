@@ -62,6 +62,7 @@ pub(crate) enum PtyError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PtyExit {
+    Closed,
     Exited(u32),
     Signaled(String),
 }

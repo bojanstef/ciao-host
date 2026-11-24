@@ -36,6 +36,20 @@ This downloads and runs an installer; read [the script](scripts/install.sh) firs
 
 The host is free software, **MIT OR Apache-2.0**. In the app, pairing, watching, notifications and interrupting are free. Native message sends and interaction answers get 20 free actions, then require Pro; model/effort/permission-mode changes are not metered. Subscription introductory offers depend on Apple eligibility. See the app for current local pricing; host licensing is separate from app purchases.
 
+## Orca terminals
+
+On a host running Orca, a Ciao app that negotiates `workspace.snapshot.v4` can browse local Git repositories, worktrees, tabs and split panes. The host reads Orca’s private runtime metadata from the usual per-user profile or an absolute `ORCA_USER_DATA_PATH` set for the Ciao daemon. Discovery and management use the authenticated local Unix socket.
+
+To enable live terminal viewing, create a dedicated **runtime access link** in Orca for this Ciao host. The Orca CLI generates this kind of link with `orca pair`. Orca controls its own listener settings when it creates a link. On macOS, copy the link and run the following command.
+
+```sh
+pbpaste | ciao orca-pair
+```
+
+On Linux, pipe the link from your clipboard utility or redirect a private file into `ciao orca-pair`. The command verifies the local Orca runtime and stores the credential in the Ciao user state directory with mode `0600`. Revoke this client in Orca to stop live access. A Ciao host reset also removes its local copy. The iPhone uses its existing Ciao pairing.
+
+Live viewing uses Orca’s encrypted WebSocket on loopback. Detaching closes the viewer and keeps the shell running. Closing a tab ends its processes. Removing a worktree runs Orca’s archive hooks, honors dirty-checkout refusals and keeps the Git branch. The removal action requires Orca’s explicit branch-retention capability.
+
 ## What can read what?
 
 | Component | Access |

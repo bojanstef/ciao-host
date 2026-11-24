@@ -96,6 +96,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | crossbeam-utils | 0.8.22 | MIT OR Apache-2.0 |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
 | crypto-common | 0.2.2 | MIT OR Apache-2.0 |
+| crypto_secretbox | 0.1.1 | Apache-2.0 OR MIT |
 | ctr | 0.9.2 | MIT OR Apache-2.0 |
 | ctutils | 0.4.6 | Apache-2.0 OR MIT |
 | curve25519-dalek | 4.1.3 | BSD-3-Clause |
@@ -151,6 +152,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | generator | 0.8.9 | MIT/Apache-2.0 |
 | generic-array | 0.14.7 | MIT |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 |
+| getrandom | 0.3.4 | MIT OR Apache-2.0 |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 |
 | ghash | 0.5.1 | Apache-2.0 OR MIT |
 | gloo-timers | 0.3.0 | MIT OR Apache-2.0 |
@@ -162,6 +164,8 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | hickory-net | 0.26.3 | MIT OR Apache-2.0 |
 | hickory-proto | 0.26.3 | MIT OR Apache-2.0 |
 | hickory-resolver | 0.26.3 | MIT OR Apache-2.0 |
+| hkdf | 0.12.4 | MIT OR Apache-2.0 |
+| hmac | 0.12.1 | MIT OR Apache-2.0 |
 | http | 1.4.2 | MIT OR Apache-2.0 |
 | http-body | 1.1.0 | MIT |
 | http-body-util | 0.1.4 | MIT |
@@ -268,6 +272,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT |
 | pkcs8 | 0.11.0 | Apache-2.0 OR MIT |
 | plist | 1.10.0 | MIT |
+| poly1305 | 0.8.0 | Apache-2.0 OR MIT |
 | poly1305 | 0.9.1 | Apache-2.0 OR MIT |
 | polyval | 0.6.2 | Apache-2.0 OR MIT |
 | portable-atomic | 1.14.0 | Apache-2.0 OR MIT |
@@ -277,16 +282,21 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | postcard-derive | 0.2.2 | MIT OR Apache-2.0 |
 | potential_utf | 0.1.5 | Unicode-3.0 |
 | powerfmt | 0.2.0 | MIT OR Apache-2.0 |
+| ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 |
 | prefix-trie | 0.8.4 | MIT OR Apache-2.0 |
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
 | qrcode | 0.14.1 | MIT OR Apache-2.0 |
 | quick-xml | 0.41.0 | MIT |
 | quote | 1.0.47 | MIT OR Apache-2.0 |
+| r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
 | rand | 0.10.2 | MIT OR Apache-2.0 |
+| rand | 0.9.5 | MIT OR Apache-2.0 |
+| rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
 | rand_core | 0.10.1 | MIT OR Apache-2.0 |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |
+| rand_core | 0.9.5 | MIT OR Apache-2.0 |
 | rand_pcg | 0.10.2 | MIT OR Apache-2.0 |
 | redox_syscall | 0.5.18 | MIT |
 | regex-automata | 0.4.16 | MIT OR Apache-2.0 |
@@ -305,6 +315,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | rustls-webpki | 0.103.16 | ISC |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
+| salsa20 | 0.10.2 | MIT OR Apache-2.0 |
 | same-file | 1.0.6 | Unlicense/MIT |
 | schannel | 0.1.29 | MIT |
 | scoped-tls | 1.0.1 | MIT/Apache-2.0 |
@@ -321,6 +332,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | serde_json | 1.0.150 | MIT OR Apache-2.0 |
 | serdect | 0.4.3 | Apache-2.0 OR MIT |
 | serial2 | 0.2.37 | BSD-2-Clause OR Apache-2.0 |
+| sha1 | 0.10.7 | MIT OR Apache-2.0 |
 | sha1_smol | 1.0.1 | BSD-3-Clause |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 |
 | sha2 | 0.11.0 | MIT OR Apache-2.0 |
@@ -369,6 +381,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | tokio-macros | 2.7.1 | MIT |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 |
 | tokio-stream | 0.1.18 | MIT |
+| tokio-tungstenite | 0.28.0 | MIT |
 | tokio-util | 0.7.18 | MIT |
 | tokio-websockets | 0.13.3 | MIT |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |
@@ -384,6 +397,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | tracing-log | 0.2.0 | MIT |
 | tracing-subscriber | 0.3.23 | MIT |
 | try-lock | 0.2.5 | MIT |
+| tungstenite | 0.28.0 | MIT OR Apache-2.0 |
 | typenum | 1.20.1 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |
@@ -392,6 +406,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | universal-hash | 0.6.1 | MIT OR Apache-2.0 |
 | untrusted | 0.9.0 | ISC |
 | url | 2.5.8 | MIT OR Apache-2.0 |
+| utf-8 | 0.7.6 | MIT OR Apache-2.0 |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT |
 | uuid | 1.24.0 | Apache-2.0 OR MIT |
@@ -403,6 +418,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | walkdir | 2.5.0 | Unlicense/MIT |
 | want | 0.3.1 | MIT |
 | wasi | 0.11.1+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| wasip2 | 1.0.4+wasi-0.2.12 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | wasm-bindgen | 0.2.126 | MIT OR Apache-2.0 |
 | wasm-bindgen-futures | 0.4.76 | MIT OR Apache-2.0 |
 | wasm-bindgen-macro | 0.2.126 | MIT OR Apache-2.0 |
@@ -452,6 +468,7 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | winnow | 1.0.4 | MIT |
 | winreg | 0.10.1 | MIT |
+| wit-bindgen | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | wmi | 0.18.4 | MIT OR Apache-2.0 |
 | writeable | 0.6.3 | Unicode-3.0 |
 | ws_stream_wasm | 0.7.5 | Unlicense |
@@ -460,6 +477,8 @@ Only Ciao-authored integration code and protocol descriptions are included here.
 | xmltree | 0.10.3 | MIT |
 | yoke | 0.8.3 | Unicode-3.0 |
 | yoke-derive | 0.8.2 | Unicode-3.0 |
+| zerocopy | 0.8.64 | BSD-2-Clause OR Apache-2.0 OR MIT |
+| zerocopy-derive | 0.8.64 | BSD-2-Clause OR Apache-2.0 OR MIT |
 | zerofrom | 0.1.8 | Unicode-3.0 |
 | zerofrom-derive | 0.1.7 | Unicode-3.0 |
 | zeroize | 1.9.0 | Apache-2.0 OR MIT |

@@ -45,6 +45,7 @@ pub mod native_codex_image;
 #[cfg(test)]
 mod netlab;
 pub(crate) mod notify;
+mod orca;
 pub mod pairing;
 pub(crate) mod peer_cli;
 pub(crate) mod peers;

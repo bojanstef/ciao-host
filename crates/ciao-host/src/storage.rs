@@ -63,6 +63,10 @@ pub struct CiaoPaths {
 }
 
 impl CiaoPaths {
+    pub(crate) fn orca_pairing_file(&self) -> PathBuf {
+        self.state_dir.join("orca-pairing.json")
+    }
+
     pub fn discover() -> Result<Self> {
         let home = env::var_os("HOME")
             .filter(|value| !value.is_empty())

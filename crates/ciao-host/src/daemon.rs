@@ -457,6 +457,7 @@ fn target_is_resumable(
     has_agent_plan: bool,
 ) -> bool {
     has_agent_plan
+        || target == Some(crate::host_protocol::TerminalTarget::OrcaAttach)
         || target
             .and_then(crate::host_protocol::TerminalTarget::provider)
             .is_some()
@@ -2206,6 +2207,17 @@ async fn hello_phase_rpc(
             let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
             Ok(HelloPhaseOutcome::KeepWaiting)
         }
+        Ok(RpcRequest::OrcaManagement(request)) => {
+            send_rpc_error_code(
+                send,
+                Some(request.request_id),
+                "not_ready",
+                "The Ciao host connection is not ready for this request.",
+            )
+            .await;
+            let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
+            Ok(HelloPhaseOutcome::KeepWaiting)
+        }
         Ok(RpcRequest::HerdrManagement(request)) => {
             send_rpc_error_code(
                 send,
@@ -2363,19 +2375,34 @@ async fn ready_phase_rpc(
                 }
                 Ok(guard) => {
                     let capture_began = Instant::now();
-                    let v3 = request.method == METHOD_WORKSPACE_SNAPSHOT_V3;
-                    let mut result = capture_snapshot_version(
+                    let v4 = request.method == crate::host_protocol::METHOD_WORKSPACE_SNAPSHOT_V4;
+                    let v3 = v4 || request.method == METHOD_WORKSPACE_SNAPSHOT_V3;
+                    let agents = request
+                        .params
+                        .tabs
+                        .then(|| state.agent_sessions.agent_tabs());
+                    let capture = capture_snapshot_version(
                         &state.workspace,
-                        request
-                            .params
-                            .tabs
-                            .then(|| state.agent_sessions.agent_tabs())
-                            .as_ref(),
+                        agents.as_ref(),
                         v3 || request.method == "workspace.snapshot.v2",
-                    )
-                    .await;
+                    );
+                    let (mut result, orca) = tokio::join!(capture, async {
+                        if v4 {
+                            Some(
+                                crate::orca::snapshot(
+                                    &state.workspace.orca_profile,
+                                    request.params.tabs,
+                                    Some(&state.paths.orca_pairing_file()),
+                                )
+                                .await,
+                            )
+                        } else {
+                            None
+                        }
+                    });
+                    result.providers.orca = orca.map(Box::new);
                     drop(guard);
-                    // Spec 029: v3 alone carries the integrations, read from the cache so a
+                    // Spec 029: v3 and later carry integrations, read from the cache so a
                     // sweep never waits on an agent CLI. Absent until the first probe lands.
                     if v3 {
                         result.agent_integrations = state.integrations.current();
@@ -2402,6 +2429,45 @@ async fn ready_phase_rpc(
                             .await;
                         }
                     }
+                }
+            }
+        }
+        Ok(RpcRequest::OrcaManagement(request)) => {
+            if require_finished_request(send, recv, Some(request.request_id.clone()))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            if !state.paired_devices.lock().contains(remote_id) {
+                send_rpc_error_code(
+                    send,
+                    Some(request.request_id),
+                    "authorization_denied",
+                    "This installation is no longer authorized.",
+                )
+                .await;
+                return Ok(());
+            }
+            static MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let Ok(_guard) = MUTATION.try_lock() else {
+                send_rpc_error_code(
+                    send,
+                    Some(request.request_id),
+                    "busy",
+                    "An Orca operation is in progress.",
+                )
+                .await;
+                return Ok(());
+            };
+            match crate::orca::manage::execute(&state.workspace.orca_profile, &request).await {
+                Ok(result) => {
+                    write_rpc(send,&serde_json::json!({"v":1,"type":"response","request_id":request.request_id,"result":result})).await?;
+                    finish_rpc_send(send).await;
+                }
+                Err(failure) => {
+                    let (code, message) = failure.wire();
+                    send_rpc_error_code(send, Some(request.request_id), code, message).await;
                 }
             }
         }
@@ -4383,6 +4449,7 @@ async fn send_terminal_exit(
     exit: PtyExit,
 ) {
     let (kind, code, signal) = match exit {
+        PtyExit::Closed => ("closed", None, None),
         PtyExit::Exited(code) => ("exited", Some(code), None),
         PtyExit::Signaled(signal) => ("signaled", None, Some(signal)),
     };
@@ -4541,6 +4608,24 @@ fn spawn_terminal_child(
             "stale_agent_route",
             "The Agent Session terminal route is no longer available.",
         ));
+    }
+    if target == crate::host_protocol::TerminalTarget::OrcaAttach {
+        let workspace = open.session.clone().ok_or_else(invalid_target_error)?;
+        let pane = open.tab.clone().ok_or_else(invalid_target_error)?;
+        let profile = state.workspace.orca_profile.clone();
+        let credentials = state.paths.orca_pairing_file();
+        let dimensions = open.dimensions;
+        return Ok(tokio::spawn(async move {
+            crate::orca::session::OrcaSession::attach(
+                profile,
+                credentials,
+                workspace,
+                pane,
+                dimensions,
+            )
+            .await
+            .map(crate::terminal_session::TerminalSession::Orca)
+        }));
     }
     let Some(kind) = target.provider() else {
         return Ok(tokio::spawn(

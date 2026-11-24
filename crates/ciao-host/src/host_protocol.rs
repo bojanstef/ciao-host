@@ -161,6 +161,7 @@ pub const PROVIDER_STATE_ERROR: &str = "error";
 
 /// Spec 029: the newest workspace snapshot, `v2`'s result plus `agent_integrations`. The older
 /// methods never carry that field, because the apps that ask them decode results strictly.
+pub const METHOD_WORKSPACE_SNAPSHOT_V4: &str = "workspace.snapshot.v4";
 pub const METHOD_WORKSPACE_SNAPSHOT_V3: &str = "workspace.snapshot.v3";
 /// Spec 029 §2 bounds: one entry per agent the host detects, and short `[a-z_]` tokens.
 pub const MAX_AGENT_INTEGRATION_ENTRIES: usize = 8;
@@ -291,6 +292,7 @@ pub enum TerminalTarget {
     HerdrAttach,
     HerdrCreate,
     HerdrCoreAttach,
+    OrcaAttach,
     AgentRoute,
 }
 
@@ -302,6 +304,7 @@ impl TerminalTarget {
             "tmux.create" => Some(Self::TmuxCreate),
             "herdr.attach" => Some(Self::HerdrAttach),
             "herdr.create" => Some(Self::HerdrCreate),
+            "orca.attach" => Some(Self::OrcaAttach),
             "herdr_core.attach" => Some(Self::HerdrCoreAttach),
             "agent_route" => Some(Self::AgentRoute),
             _ => None,
@@ -316,13 +319,14 @@ impl TerminalTarget {
             Self::HerdrAttach => "herdr.attach",
             Self::HerdrCreate => "herdr.create",
             Self::HerdrCoreAttach => "herdr_core.attach",
+            Self::OrcaAttach => "orca.attach",
             Self::AgentRoute => "agent_route",
         }
     }
 
     pub const fn provider(self) -> Option<ProviderKind> {
         match self {
-            Self::Shell => None,
+            Self::Shell | Self::OrcaAttach => None,
             Self::TmuxAttach | Self::TmuxCreate => Some(ProviderKind::Tmux),
             Self::HerdrAttach | Self::HerdrCreate => Some(ProviderKind::Herdr),
             Self::HerdrCoreAttach => Some(ProviderKind::HerdrCore),
@@ -957,7 +961,10 @@ impl WorkspaceSnapshotRequest {
         validate_request_id(&self.request_id)?;
         if !matches!(
             self.method.as_str(),
-            "workspace.snapshot" | "workspace.snapshot.v2" | METHOD_WORKSPACE_SNAPSHOT_V3
+            "workspace.snapshot"
+                | "workspace.snapshot.v2"
+                | METHOD_WORKSPACE_SNAPSHOT_V3
+                | METHOD_WORKSPACE_SNAPSHOT_V4
         ) {
             return Err(HostProtocolError::UnsupportedMethod);
         }
@@ -1330,6 +1337,7 @@ pub enum RpcRequest {
     TerminalCommands(TerminalCommandsRequest),
     TerminalTabCreate(TerminalTabCreateRequest),
     HerdrManagement(herdr_management::Request),
+    OrcaManagement(crate::orca::manage::Request),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1452,6 +1460,8 @@ pub struct HerdrProviderSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceProviders {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orca: Option<Box<crate::orca::OrcaSnapshot>>,
     pub tmux: TmuxProviderSnapshot,
     pub herdr: HerdrProviderSnapshot,
     /// Emitted only for workspace.snapshot.v2. The legacy response must retain exactly
@@ -1689,6 +1699,9 @@ impl WorkspaceSnapshotResult {
             |session: &HerdrSessionEntry| session.name.as_str(),
             |session: &HerdrSessionEntry| session.tabs.as_deref(),
         )?;
+        if let Some(orca) = &self.providers.orca {
+            orca.validate()?;
+        }
         if let Some(core) = &self.providers.herdr_core {
             validate_provider_shape(
                 &core.state,
@@ -1741,7 +1754,7 @@ impl WorkspaceSnapshotResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotRpcResponse {
-    Snapshot(WorkspaceSnapshotResponse),
+    Snapshot(Box<WorkspaceSnapshotResponse>),
     Error(RpcErrorResponse),
 }
 
@@ -1878,6 +1891,15 @@ pub fn encode_snapshot_response_bounded(
         // built to fix. A quarter at a time rather than one tab at a time: shedding singly is
         // the same end state reached in thousands of re-encodes, and a listing this long is
         // being scanned, not counted.
+        if response
+            .result
+            .providers
+            .orca
+            .as_deref_mut()
+            .is_some_and(crate::orca::OrcaSnapshot::shorten)
+        {
+            continue;
+        }
         if shorten_longest_tab_list(&mut response) {
             continue;
         }
@@ -2021,7 +2043,10 @@ pub fn decode_rpc_request(body: &[u8]) -> Result<RpcRequest, HostProtocolError> 
             request.validate()?;
             Ok(RpcRequest::HostInfo(request))
         }
-        "workspace.snapshot" | "workspace.snapshot.v2" | METHOD_WORKSPACE_SNAPSHOT_V3 => {
+        "workspace.snapshot"
+        | "workspace.snapshot.v2"
+        | METHOD_WORKSPACE_SNAPSHOT_V3
+        | METHOD_WORKSPACE_SNAPSHOT_V4 => {
             let request: WorkspaceSnapshotRequest =
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             request.validate()?;
@@ -2038,6 +2063,9 @@ pub fn decode_rpc_request(body: &[u8]) -> Result<RpcRequest, HostProtocolError> 
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             request.validate()?;
             Ok(RpcRequest::LiveActivityRegister(request))
+        }
+        crate::orca::manage::METHOD => {
+            crate::orca::manage::Request::decode(body).map(RpcRequest::OrcaManagement)
         }
         herdr_management::SPACES
         | herdr_management::CREATE
@@ -2159,7 +2187,7 @@ pub fn decode_snapshot_response(body: &[u8]) -> Result<SnapshotRpcResponse, Host
             let response: WorkspaceSnapshotResponse =
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             response.validate()?;
-            Ok(SnapshotRpcResponse::Snapshot(response))
+            Ok(SnapshotRpcResponse::Snapshot(Box::new(response)))
         }
         "error" => {
             let response: RpcErrorResponse =
@@ -2355,7 +2383,19 @@ impl TerminalOpen {
             (Some(session), true) if valid_session_name(session) => {}
             _ => return Err(HostProtocolError::InvalidTarget),
         }
-        if target == TerminalTarget::HerdrCoreAttach {
+        if target == TerminalTarget::OrcaAttach {
+            if !self
+                .session
+                .as_deref()
+                .is_some_and(crate::orca::valid_workspace_id)
+                || !self
+                    .tab
+                    .as_deref()
+                    .is_some_and(crate::orca::session::valid_pane)
+            {
+                return Err(HostProtocolError::InvalidTarget);
+            }
+        } else if target == TerminalTarget::HerdrCoreAttach {
             if !self.tab.as_deref().is_some_and(valid_herdr_core_tab_id) {
                 return Err(HostProtocolError::InvalidTarget);
             }
@@ -4145,7 +4185,7 @@ mod tests {
         let (encoded, kept) = encode_snapshot_response_bounded(response.clone()).unwrap();
         assert_eq!(kept, response, "nothing was dropped to fit");
         let reparsed = decode_snapshot_response(&encoded[4..]).unwrap();
-        assert_eq!(reparsed, SnapshotRpcResponse::Snapshot(response));
+        assert_eq!(reparsed, SnapshotRpcResponse::Snapshot(Box::new(response)));
 
         let legacy: WorkspaceSnapshotResponse =
             serde_json::from_value(fixture.get("snapshot_legacy_response").unwrap().clone())
@@ -4345,6 +4385,7 @@ mod tests {
             WorkspaceSnapshotResult {
                 v: 1,
                 providers: WorkspaceProviders {
+                    orca: None,
                     herdr_core: None,
                     tmux: TmuxProviderSnapshot {
                         state: PROVIDER_STATE_AVAILABLE.into(),
@@ -4412,6 +4453,7 @@ mod tests {
             WorkspaceSnapshotResult {
                 v: 1,
                 providers: WorkspaceProviders {
+                    orca: None,
                     herdr_core: None,
                     tmux: TmuxProviderSnapshot {
                         state: PROVIDER_STATE_AVAILABLE.into(),
@@ -4478,6 +4520,7 @@ mod tests {
             WorkspaceSnapshotResult {
                 v: 1,
                 providers: WorkspaceProviders {
+                    orca: None,
                     herdr_core: None,
                     tmux: TmuxProviderSnapshot {
                         state: PROVIDER_STATE_AVAILABLE.into(),
@@ -4802,6 +4845,7 @@ mod tests {
             WorkspaceSnapshotResult {
                 v: 1,
                 providers: WorkspaceProviders {
+                    orca: None,
                     herdr_core: None,
                     tmux: TmuxProviderSnapshot {
                         state: PROVIDER_STATE_AVAILABLE.into(),

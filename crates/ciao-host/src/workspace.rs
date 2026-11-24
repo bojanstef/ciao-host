@@ -88,6 +88,7 @@ const MAX_HERDR_TAB_QUERIES: usize = 8;
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceConfig {
     binary_dirs: Vec<PathBuf>,
+    pub(crate) orca_profile: PathBuf,
     pub(crate) herdr_config: PathBuf,
     pub(crate) core: crate::herdr_core::CoreConfig,
 }
@@ -105,6 +106,7 @@ impl WorkspaceConfig {
         );
         Self {
             binary_dirs,
+            orca_profile: crate::orca::profile(home),
             herdr_config: home.join(".config/herdr"),
             core: crate::herdr_core::CoreConfig::for_home(home),
         }
@@ -117,6 +119,7 @@ impl WorkspaceConfig {
             .unwrap_or_else(|| PathBuf::from("/nonexistent-ciao-test"));
         Self {
             binary_dirs,
+            orca_profile: crate::orca::profile(&home),
             herdr_config: home.join(".config/herdr"),
             core: crate::herdr_core::CoreConfig::at(home.join(".local/state/herdr-core")),
         }
@@ -169,7 +172,10 @@ pub(crate) fn target_command(
         ],
         TerminalTarget::HerdrAttach => vec!["session".into(), "attach".into(), session.into()],
         TerminalTarget::HerdrCreate => vec!["--session".into(), session.into()],
-        TerminalTarget::Shell | TerminalTarget::AgentRoute | TerminalTarget::HerdrCoreAttach => {
+        TerminalTarget::Shell
+        | TerminalTarget::AgentRoute
+        | TerminalTarget::OrcaAttach
+        | TerminalTarget::HerdrCoreAttach => {
             return Err(HostProtocolError::UnsupportedTarget);
         }
     };
@@ -498,6 +504,7 @@ pub(crate) async fn capture_snapshot_version(
     WorkspaceSnapshotResult {
         v: crate::host_protocol::HOST_PROTOCOL_VERSION,
         providers: WorkspaceProviders {
+            orca: None,
             tmux,
             herdr,
             herdr_core,
