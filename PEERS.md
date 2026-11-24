@@ -56,12 +56,28 @@ source leaves it running. After a peer stop, snapshot, follow and send report
 terminal handback or a destination daemon restart, the peer run is unavailable.
 Codex retains its ordinary written conversation history on the destination.
 
+Calls to one computer share one encrypted connection, so each call after the first costs about
+one network round trip instead of three. The source closes it after 20 seconds without a call. A
+computer on Ciao 0.1.66 or earlier still gets one connection per call, so update both for the faster
+path. If a connection fails after a request was sent, the command reports `outcome_unknown` (or
+`connection_lost` for a read) and sends nothing again; retry with the same request ID.
+
 `--prompt-file -` reads a bounded UTF-8 prompt from stdin. Keep prompts out of shell arguments.
 A newly spawned worker may briefly answer `session_unavailable` until it registers; inspect
 its snapshot before sending. A canonical command receipt distinguishes submission from
 application. Tool approvals and questions are answered by the person through Ciao, not by
-these peer commands. `follow` polls canonical snapshots once per second for the specified
-interval; an unavailable connection is reported as an error, not as a stopped agent.
+these peer commands. For the specified interval, `follow` prints the canonical snapshot as one
+JSON line when it first reads it, and again only when it changes (soon after the change, at most
+four a second). After each second with no change it prints a small heartbeat line instead:
+
+```json
+{"type":"heartbeat","session_id":"<session-id>","snapshot_epoch":3,"process_generation":2,"revision":41}
+```
+
+A heartbeat names the snapshot already printed and carries no conversation content. Snapshot
+lines have no `type` field. The output is the same against a computer on Ciao 0.1.66 or earlier,
+which this side polls once a second. An unavailable connection is reported as an error, never as
+a heartbeat or a stopped agent.
 
 Retry a lost start reply with the **same request ID, workspace and agent**. A recorded outcome is
 returned; an interrupted launch claim returns `outcome_unknown` and is never blindly launched

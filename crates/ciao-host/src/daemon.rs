@@ -610,6 +610,16 @@ fn endpoint_mode(value: Option<&OsStr>) -> EndpointMode {
     }
 }
 
+/// Every ALPN the daemon's endpoint accepts. The peer protocols keep their preference order,
+/// because the accepting side chooses.
+fn endpoint_alpns() -> Vec<Vec<u8>> {
+    [PAIRING_ALPN, HOST_ALPN]
+        .into_iter()
+        .chain(crate::peers::PeerProtocol::ACCEPTED.map(crate::peers::PeerProtocol::alpn))
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
 fn host_transport_config() -> QuicTransportConfig {
     QuicTransportConfig::builder()
         .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(MAX_INCOMING_BIDI_STREAMS)))
@@ -771,11 +781,7 @@ pub async fn run(paths: CiaoPaths) -> Result<()> {
     let mode = endpoint_mode(std::env::var_os(RELAY_ONLY_ENV).as_deref());
     let mut endpoint_builder = Endpoint::builder(presets::N0)
         .secret_key(identity.secret_key)
-        .alpns(vec![
-            PAIRING_ALPN.to_vec(),
-            HOST_ALPN.to_vec(),
-            crate::peers::ALPN.to_vec(),
-        ])
+        .alpns(endpoint_alpns())
         .transport_config(host_transport_config());
     // Ciao's own relays replace Number 0's for packet relaying. This errors rather than
     // returning `None` in a release build, so a shipped daemon can never quietly relay
@@ -1751,7 +1757,9 @@ async fn handle_authenticated_connection(connection: Connection, state: Arc<Runt
             handle_pairing_connection(connection, state).await;
         }
         HOST_ALPN => handle_host_connection(connection, state).await,
-        crate::peers::ALPN => peer::serve(connection, state).await,
+        alpn if crate::peers::PeerProtocol::negotiated(alpn).is_some() => {
+            peer::serve(connection, state).await;
+        }
         _ => connection.close(
             VarInt::from_u32(CONNECTION_PROTOCOL_VIOLATION),
             b"host protocol violation",

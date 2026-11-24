@@ -17,13 +17,256 @@ use crate::{
     storage::{atomic_write_private, validate_private_file},
 };
 
+/// `ciao/peer/1`: one request per connection (Spec 026).
 pub(crate) const ALPN: &[u8] = b"ciao/peer/1";
+/// `ciao/peer/2`: one request per stream on a kept connection (Spec 026, 2026-11-23).
+pub(crate) const ALPN_STREAMS: &[u8] = b"ciao/peer/2";
 pub(crate) const MAX_PEERS: usize = 16;
+/// Requests one source endpoint may have running at once on `ciao/peer/2`, across its current
+/// and superseded connections.
+pub(crate) const MAX_SOURCE_REQUESTS: usize = 4;
+/// Watches one source endpoint may have waiting at once, so they never hold all its slots.
+pub(crate) const MAX_SOURCE_WATCHES: usize = 2;
+/// The longest a `watch` waits for a change before replying with the unchanged snapshot.
+pub(crate) const MAX_WATCH_WAIT_MS: u32 = 15_000;
+/// A destination closes a `ciao/peer/2` connection after this long with no request in flight.
+pub(crate) const INBOUND_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+/// A source stops using a kept connection after this long without a request. It is shorter
+/// than [`INBOUND_IDLE`], so a source never sends on a connection its destination is closing.
+pub(crate) const OUTBOUND_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
 pub(crate) const MAX_WORKSPACES: usize = 32;
 pub(crate) const MAX_STARTS: usize = 256;
 pub(crate) const MAX_LIVE: usize = 2;
 pub(crate) const MAX_REPLY_BYTES: usize = crate::agent_protocol::MAX_AGENT_FRAME_BYTES + 1024;
 const MAX_STORE_BYTES: u64 = 512 * 1024;
+
+/// The peer protocol a connection negotiated by ALPN. The TLS server picks, in the order of
+/// [`PeerProtocol::ACCEPTED`]; a source offers both in one handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerProtocol {
+    /// One request per connection; the destination closes once its reply is acknowledged.
+    SingleRequest,
+    /// One request per stream; the connection is kept for later requests.
+    Streams,
+}
+
+impl PeerProtocol {
+    /// Most preferred first. The destination's endpoint lists them in this order.
+    pub const ACCEPTED: [Self; 2] = [Self::Streams, Self::SingleRequest];
+
+    pub const fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::SingleRequest => ALPN,
+            Self::Streams => ALPN_STREAMS,
+        }
+    }
+
+    pub fn negotiated(alpn: &[u8]) -> Option<Self> {
+        Self::ACCEPTED.into_iter().find(|p| p.alpn() == alpn)
+    }
+}
+
+/// What one source endpoint may run at once on a destination. A superseding connection
+/// inherits it, so reconnecting cannot multiply a source's running requests.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceBudget {
+    pub requests: std::sync::Arc<tokio::sync::Semaphore>,
+    pub watches: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl SourceBudget {
+    fn new() -> Self {
+        Self {
+            requests: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SOURCE_REQUESTS)),
+            watches: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SOURCE_WATCHES)),
+        }
+    }
+}
+
+/// The version of a session snapshot a source already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SnapshotVersion {
+    pub snapshot_epoch: u64,
+    pub process_generation: u64,
+    pub revision: u64,
+}
+
+impl SnapshotVersion {
+    pub fn of(snapshot: &crate::agent_protocol::AgentSessionSnapshot) -> Self {
+        Self {
+            snapshot_epoch: snapshot.snapshot_epoch,
+            process_generation: snapshot.process_generation,
+            revision: snapshot.revision,
+        }
+    }
+
+    pub fn of_value(snapshot: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            snapshot_epoch: snapshot.get("snapshot_epoch")?.as_u64()?,
+            process_generation: snapshot.get("process_generation")?.as_u64()?,
+            revision: snapshot.get("revision")?.as_u64()?,
+        })
+    }
+}
+
+/// How a follow reply came, which sets when the source asks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FollowMode {
+    /// The destination replied on a change or after the requested wait.
+    Pushed,
+    /// A plain snapshot from a destination that cannot wait for changes.
+    Polled,
+}
+
+/// A source connection a destination admitted. At most one per source endpoint.
+#[derive(Debug)]
+pub(crate) struct Admitted {
+    pub connection: iroh::endpoint::Connection,
+    pub budget: SourceBudget,
+}
+
+/// Why a destination refused to admit a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionRefused {
+    Busy,
+}
+
+/// When a kept connection last finished a request, on both clocks.
+#[derive(Debug, Clone, Copy)]
+struct IdleSince {
+    monotonic: std::time::Instant,
+    wall: std::time::SystemTime,
+}
+
+impl IdleSince {
+    fn now() -> Self {
+        Self {
+            monotonic: std::time::Instant::now(),
+            wall: std::time::SystemTime::now(),
+        }
+    }
+
+    /// A suspended computer stops the monotonic clock but not the wall clock, while the
+    /// destination keeps counting. Either clock reaching [`OUTBOUND_IDLE`] ends reuse, and so
+    /// does a wall clock that went backwards.
+    fn expired(&self, now: Self) -> bool {
+        now.monotonic.saturating_duration_since(self.monotonic) >= OUTBOUND_IDLE
+            || now
+                .wall
+                .duration_since(self.wall)
+                .is_ok_and(|idle| idle >= OUTBOUND_IDLE)
+            || now.wall < self.wall
+    }
+}
+
+/// A destination's kept connection on the source, with its use. The source owns these; they
+/// are separate from the connections it admits as a destination.
+#[derive(Debug)]
+struct Kept {
+    connection: iroh::endpoint::Connection,
+    in_flight: usize,
+    idle_since: IdleSince,
+}
+
+type KeptMap = std::sync::Arc<Mutex<std::collections::HashMap<EndpointId, Kept>>>;
+
+/// The source's kept `ciao/peer/2` connections, one per destination.
+#[derive(Debug, Default)]
+pub(crate) struct OutboundConnections {
+    kept: KeptMap,
+}
+
+/// One request's use of a kept connection. Dropping it ends the use.
+#[derive(Debug)]
+pub(crate) struct KeptUse {
+    kept: KeptMap,
+    destination: EndpointId,
+    pub connection: iroh::endpoint::Connection,
+}
+
+impl Drop for KeptUse {
+    fn drop(&mut self) {
+        if let Some(entry) = self.kept.lock().get_mut(&self.destination)
+            && entry.connection.stable_id() == self.connection.stable_id()
+        {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            if entry.in_flight == 0 {
+                entry.idle_since = IdleSince::now();
+            }
+        }
+    }
+}
+
+impl OutboundConnections {
+    /// The kept connection to `destination`, unless it has closed or gone idle. Nothing has
+    /// been sent on a connection this returns `None` for, so dialing again is always safe.
+    pub fn reuse(&self, destination: EndpointId) -> Option<KeptUse> {
+        let mut kept = self.kept.lock();
+        let entry = kept.get_mut(&destination)?;
+        if entry.connection.close_reason().is_some()
+            || (entry.in_flight == 0 && entry.idle_since.expired(IdleSince::now()))
+        {
+            let stale = kept.remove(&destination)?;
+            stale
+                .connection
+                .close(iroh::endpoint::VarInt::from_u32(0), b"peer idle");
+            return None;
+        }
+        entry.in_flight += 1;
+        Some(KeptUse {
+            kept: self.kept.clone(),
+            destination,
+            connection: entry.connection.clone(),
+        })
+    }
+
+    /// Keep a newly dialed `ciao/peer/2` connection, replacing any older one.
+    pub fn adopt(
+        &self,
+        destination: EndpointId,
+        connection: iroh::endpoint::Connection,
+    ) -> KeptUse {
+        let replaced = self.kept.lock().insert(
+            destination,
+            Kept {
+                connection: connection.clone(),
+                in_flight: 1,
+                idle_since: IdleSince::now(),
+            },
+        );
+        if let Some(replaced) = replaced {
+            replaced
+                .connection
+                .close(iroh::endpoint::VarInt::from_u32(0), b"peer replaced");
+        }
+        KeptUse {
+            kept: self.kept.clone(),
+            destination,
+            connection,
+        }
+    }
+
+    /// Close the kept connection to `destination`, if any. Its requests in flight fail.
+    pub fn discard(&self, destination: &str) {
+        let Ok(destination) = destination.parse::<EndpointId>() else {
+            return;
+        };
+        if let Some(kept) = self.kept.lock().remove(&destination) {
+            kept.connection
+                .close(iroh::endpoint::VarInt::from_u32(0), b"peer link changed");
+        }
+    }
+
+    #[cfg(test)]
+    pub fn kept(&self, destination: EndpointId) -> Option<iroh::endpoint::Connection> {
+        self.kept
+            .lock()
+            .get(&destination)
+            .map(|k| k.connection.clone())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -287,8 +530,11 @@ pub(crate) struct Peers {
     store: Mutex<Store>,
     /// Serializes policy changes with async effects. A successful revoke fences all later effects.
     pub effects: tokio::sync::Mutex<()>,
-    outbound: Mutex<std::collections::HashMap<EndpointId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-    pub connections: Mutex<std::collections::HashMap<String, iroh::endpoint::Connection>>,
+    lanes: Mutex<std::collections::HashMap<EndpointId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Source connections this host admitted as a destination, by source endpoint ID.
+    pub connections: Mutex<std::collections::HashMap<String, Admitted>>,
+    /// Connections this host keeps to its destinations as a source.
+    pub outbound: OutboundConnections,
 }
 
 pub(crate) fn codex_receipts_path(authority: &Path) -> PathBuf {
@@ -348,15 +594,17 @@ impl Peers {
             path: path.into(),
             store: Mutex::new(store),
             effects: tokio::sync::Mutex::new(()),
-            outbound: Mutex::default(),
+            lanes: Mutex::default(),
             connections: Mutex::new(Default::default()),
+            outbound: OutboundConnections::default(),
         })
     }
 
-    /// A destination admits one connection from our endpoint. Concurrent local CLI requests
-    /// queue for that destination while requests to a different host can proceed.
+    /// A destination admits one connection from our endpoint. Dialing it is single-flight, and
+    /// a `ciao/peer/1` call holds the lane until the destination closes, so concurrent local
+    /// CLI requests queue for that destination while requests to a different host proceed.
     pub fn outbound_lane(&self, id: EndpointId) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        let mut lanes = self.outbound.lock();
+        let mut lanes = self.lanes.lock();
         if let Some(lane) = lanes.get(&id).and_then(std::sync::Weak::upgrade) {
             return lane;
         }
@@ -441,8 +689,54 @@ impl Peers {
         self.started(&grant.grant_id, session).is_some()
     }
 
+    /// Admit `connection` from source `endpoint`. The caller holds the effects gate and has
+    /// checked the grant. One connection per endpoint: a `ciao/peer/2` connection supersedes
+    /// the endpoint's older one and inherits its budget; `ciao/peer/1` is refused instead.
+    pub fn admit(
+        &self,
+        endpoint: &str,
+        connection: &iroh::endpoint::Connection,
+        protocol: PeerProtocol,
+    ) -> Result<SourceBudget, AdmissionRefused> {
+        let mut connections = self.connections.lock();
+        let budget = match connections.get(endpoint) {
+            Some(_) if protocol == PeerProtocol::SingleRequest => {
+                return Err(AdmissionRefused::Busy);
+            }
+            Some(older) => {
+                older.connection.close(
+                    iroh::endpoint::VarInt::from_u32(crate::host_protocol::CONNECTION_SUPERSEDED),
+                    b"peer superseded",
+                );
+                older.budget.clone()
+            }
+            None if connections.len() >= MAX_PEERS => return Err(AdmissionRefused::Busy),
+            None => SourceBudget::new(),
+        };
+        connections.insert(
+            endpoint.into(),
+            Admitted {
+                connection: connection.clone(),
+                budget: budget.clone(),
+            },
+        );
+        Ok(budget)
+    }
+
+    /// Forget `connection` once it is done, unless a newer one has replaced it or a revoke
+    /// already removed it.
+    pub fn release(&self, endpoint: &str, connection: &iroh::endpoint::Connection) {
+        let mut connections = self.connections.lock();
+        if connections
+            .get(endpoint)
+            .is_some_and(|held| held.connection.stable_id() == connection.stable_id())
+        {
+            connections.remove(endpoint);
+        }
+    }
+
     pub fn close(&self, endpoint: &str) {
-        if let Some(connection) = self.connections.lock().remove(endpoint) {
+        if let Some(Admitted { connection, .. }) = self.connections.lock().remove(endpoint) {
             connection.close(
                 iroh::endpoint::VarInt::from_u32(
                     crate::host_protocol::CONNECTION_AUTHORIZATION_DENIED,
@@ -476,7 +770,9 @@ impl Peers {
         self.change(|s| {
             s.outgoing.retain(|g| g.peer.endpoint_id != endpoint);
             Ok(())
-        })
+        })?;
+        self.outbound.discard(endpoint);
+        Ok(())
     }
 }
 
@@ -548,6 +844,26 @@ pub(crate) enum Action {
         request_id: String,
         expected_generation: u64,
     },
+    /// `ciao/peer/2` only: the session's snapshot once it no longer matches `after`, or after
+    /// `wait_ms`, whichever comes first.
+    Watch {
+        session_id: String,
+        after: SnapshotVersion,
+        wait_ms: u32,
+    },
+}
+
+impl Action {
+    /// Whether the destination may have changed something when the reply is lost.
+    pub fn has_effect(&self) -> bool {
+        match self {
+            Self::Start { .. } | Self::Command { .. } | Self::Stop { .. } => true,
+            Self::Workspaces {}
+            | Self::Snapshot { .. }
+            | Self::StopReceipt { .. }
+            | Self::Watch { .. } => false,
+        }
+    }
 }
 
 impl Request {
@@ -563,6 +879,11 @@ impl Request {
                 ..
             } if valid_id(request_id) && valid_id(workspace_id) => {}
             Action::Snapshot { session_id } if valid_id(session_id) => {}
+            Action::Watch {
+                session_id,
+                wait_ms,
+                ..
+            } if valid_id(session_id) && (1..=MAX_WATCH_WAIT_MS).contains(wait_ms) => {}
             Action::StopReceipt {
                 session_id,
                 request_id,
@@ -598,6 +919,45 @@ pub(crate) fn command_id(grant: &str, id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_kept_connection_expires_by_either_clock() {
+        use std::time::{Duration, Instant, SystemTime};
+        let since = IdleSince::now();
+        let at = |monotonic: Duration, wall: Duration| IdleSince {
+            monotonic: since.monotonic + monotonic,
+            wall: since.wall + wall,
+        };
+        let short = OUTBOUND_IDLE - Duration::from_secs(1);
+        assert!(!since.expired(at(short, short)));
+        assert!(since.expired(at(OUTBOUND_IDLE, short)));
+        // A sleeping computer: the monotonic clock stood still, the wall clock moved on.
+        assert!(since.expired(at(Duration::ZERO, Duration::from_secs(3600))));
+        let backwards = IdleSince {
+            monotonic: Instant::now(),
+            wall: SystemTime::UNIX_EPOCH,
+        };
+        assert!(since.expired(backwards));
+        assert!(!since.expired(since));
+        assert!(OUTBOUND_IDLE < INBOUND_IDLE);
+    }
+
+    #[test]
+    fn peer_protocols_are_offered_and_accepted_newest_first() {
+        assert_eq!(PeerProtocol::ACCEPTED[0], PeerProtocol::Streams);
+        for protocol in PeerProtocol::ACCEPTED {
+            assert_eq!(PeerProtocol::negotiated(protocol.alpn()), Some(protocol));
+        }
+        assert_eq!(
+            PeerProtocol::negotiated(b"ciao/peer/1"),
+            Some(PeerProtocol::SingleRequest)
+        );
+        assert_eq!(PeerProtocol::negotiated(b"ciao/peer/3"), None);
+        assert_eq!(
+            PeerProtocol::negotiated(crate::host_protocol::HOST_ALPN),
+            None
+        );
+    }
 
     #[test]
     fn peer_agent_selection_keeps_the_original_claude_wire_shape() {
