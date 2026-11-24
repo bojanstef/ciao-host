@@ -56,6 +56,12 @@ source leaves it running. After a peer stop, snapshot, follow and send report
 terminal handback or a destination daemon restart, the peer run is unavailable.
 Codex retains its ordinary written conversation history on the destination.
 
+Calls to one computer share one encrypted connection, so each call after the first costs about
+one network round trip instead of three. The source closes it after 20 seconds without a call. A
+computer on Ciao 0.1.66 or earlier still gets one connection per call, so update both for the faster
+path. If a connection fails after a request was sent, the command reports `outcome_unknown` (or
+`connection_lost` for a read) and sends nothing again; retry with the same request ID.
+
 `--prompt-file -` reads a bounded UTF-8 prompt from stdin. Keep prompts out of shell arguments.
 A newly spawned worker may briefly answer `session_unavailable` until it registers; inspect
 its snapshot before sending. A canonical command receipt distinguishes submission from

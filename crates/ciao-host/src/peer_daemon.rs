@@ -3,8 +3,8 @@ use super::*;
 use crate::{
     agent_protocol::{self, AgentCommand, AgentCommandKind, LifecycleOutcome},
     peers::{
-        self, Action, Admin, Descriptor, GrantScope, Incoming, Outgoing, PeerAgent, Request,
-        StartRecord,
+        self, Action, Admin, AdmissionRefused, Descriptor, GrantScope, Incoming, Outgoing,
+        PeerAgent, PeerProtocol, Request, SourceBudget, StartRecord,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -186,6 +186,7 @@ async fn admin(
             {
                 return Err("invalid_link");
             }
+            let destination = link.peer.endpoint_id.clone();
             state.peers.change(|s| {
                 // Replace, not refuse: the phone has just obtained this grant from the
                 // destination, so an older link here is stale (revoked, or from a grant that
@@ -198,6 +199,7 @@ async fn admin(
                 s.outgoing.push(link);
                 Ok(())
             })?;
+            state.peers.outbound.discard(&destination);
             Ok(json!({"state":"accepted"}))
         }
         Admin::Revoke { endpoint_id } => {
@@ -273,6 +275,17 @@ pub(super) fn revoke_issuer(state: &Arc<RuntimeState>, issuer: &str) -> Result<(
 }
 
 pub(super) async fn serve(connection: Connection, state: Arc<RuntimeState>) {
+    serve_within(connection, state, peers::INBOUND_IDLE).await;
+}
+
+async fn serve_within(connection: Connection, state: Arc<RuntimeState>, idle: Duration) {
+    let Some(protocol) = PeerProtocol::negotiated(connection.alpn()) else {
+        connection.close(
+            VarInt::from_u32(CONNECTION_PROTOCOL_VIOLATION),
+            b"peer protocol violation",
+        );
+        return;
+    };
     let id = connection.remote_id();
     if state.peers.incoming(id, None).is_none() {
         connection.close(
@@ -282,7 +295,7 @@ pub(super) async fn serve(connection: Connection, state: Arc<RuntimeState>) {
         return;
     }
     let key = id.to_string();
-    {
+    let budget = {
         let _effects = state.peers.effects.lock().await;
         if state.peers.incoming(id, None).is_none() {
             connection.close(
@@ -291,44 +304,95 @@ pub(super) async fn serve(connection: Connection, state: Arc<RuntimeState>) {
             );
             return;
         }
-        let mut connections = state.peers.connections.lock();
-        if connections.contains_key(&key) || connections.len() >= peers::MAX_PEERS {
-            connection.close(VarInt::from_u32(CONNECTION_BUSY), b"peer busy");
-            return;
+        match state.peers.admit(&key, &connection, protocol) {
+            Ok(budget) => budget,
+            Err(AdmissionRefused::Busy) => {
+                connection.close(VarInt::from_u32(CONNECTION_BUSY), b"peer busy");
+                return;
+            }
         }
-        connections.insert(key.clone(), connection.clone());
-    }
-    // One finite request per connection. There are no long-lived peer subscriptions whose
-    // revocation/overflow semantics could accidentally inherit the phone's authorization.
-    if let Ok(Ok((mut send, mut recv))) =
-        timeout(Duration::from_secs(10), connection.accept_bi()).await
-    {
-        let result = timeout(DEADLINE, async {
-            let request: Request = read_request(&mut recv, Duration::from_secs(10)).await?;
-            execute(id, request, &state).await
-        })
-        .await
-        .unwrap_or(Err("timeout"));
-        let _ = agent_protocol::write_agent_frame_within(
-            &mut send,
-            &reply(result),
-            peers::MAX_REPLY_BYTES,
-        )
-        .await;
-        let _ = send.finish();
-        // Wait for the send to be acknowledged before closing the connection. This await is
-        // bounded and cancellation does not undo an already recorded effect.
-        let _ = timeout(Duration::from_secs(5), send.stopped()).await;
+    };
+    match protocol {
+        // One request per connection, as every 0.1.66 source expects.
+        PeerProtocol::SingleRequest => {
+            if let Ok(Ok((send, recv))) =
+                timeout(Duration::from_secs(10), connection.accept_bi()).await
+            {
+                answer(send, recv, id, &state).await;
+            }
+        }
+        // Each request is a finite exchange on its own stream, with the grant rechecked as for
+        // a single request. Nothing a request starts outlives its reply.
+        PeerProtocol::Streams => serve_streams(&connection, id, &budget, &state, idle).await,
     }
     // A revoke may have removed this entry; avoid removing a newly admitted connection.
-    let mut connections = state.peers.connections.lock();
-    if connections
-        .get(&key)
-        .is_some_and(|c| c.stable_id() == connection.stable_id())
-    {
-        connections.remove(&key);
-    }
+    state.peers.release(&key, &connection);
     connection.close(VarInt::from_u32(0), b"peer request complete");
+}
+
+/// Accept requests on a kept connection, each on its own stream, until it closes or idles.
+async fn serve_streams(
+    connection: &Connection,
+    id: EndpointId,
+    budget: &SourceBudget,
+    state: &Arc<RuntimeState>,
+    idle: Duration,
+) {
+    let mut requests = tokio::task::JoinSet::new();
+    loop {
+        let (send, recv) = tokio::select! {
+            biased;
+            accepted = connection.accept_bi() => match accepted {
+                Ok(streams) => streams,
+                Err(_) => break,
+            },
+            Some(_) = requests.join_next(), if !requests.is_empty() => continue,
+            // Every accepted request has been answered and acknowledged by now.
+            () = tokio::time::sleep(idle), if requests.is_empty() => {
+                connection.close(VarInt::from_u32(0), b"peer idle");
+                break;
+            }
+        };
+        // The next stream waits here for one of the source's request slots, so a source
+        // cannot queue work on this host however many streams or connections it opens.
+        let slot = tokio::select! {
+            slot = budget.requests.clone().acquire_owned() => match slot {
+                Ok(slot) => slot,
+                Err(_) => break,
+            },
+            _ = connection.closed() => break,
+        };
+        let state = state.clone();
+        requests.spawn(async move {
+            answer(send, recv, id, &state).await;
+            drop(slot);
+        });
+    }
+    // Closing does not cancel accepted requests; their recorded effects complete.
+    while requests.join_next().await.is_some() {}
+}
+
+/// Read one request, execute it and reply. The request stays in flight until the source has
+/// acknowledged the reply, so no close can discard an answer.
+async fn answer(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    id: EndpointId,
+    state: &Arc<RuntimeState>,
+) {
+    let result = timeout(DEADLINE, async {
+        let request: Request = read_request(&mut recv, Duration::from_secs(10)).await?;
+        execute(id, request, state).await
+    })
+    .await
+    .unwrap_or(Err("timeout"));
+    let _ =
+        agent_protocol::write_agent_frame_within(&mut send, &reply(result), peers::MAX_REPLY_BYTES)
+            .await;
+    let _ = send.finish();
+    // Wait for the send to be acknowledged. This await is bounded and cancellation does not
+    // undo an already recorded effect.
+    let _ = timeout(Duration::from_secs(5), send.stopped()).await;
 }
 
 async fn execute(
@@ -785,22 +849,93 @@ async fn call(
         return Err("unknown_or_ambiguous_peer");
     };
     let id: EndpointId = link.peer.endpoint_id.parse().map_err(|_| "invalid_peer")?;
-    let lane = state.peers.outbound_lane(id);
-    let _turn = lane.lock().await;
-    if !state.peers.snapshot().outgoing.contains(link) {
-        return Err("unknown_or_ambiguous_peer");
-    }
     let request = Request {
         v: 1,
         grant_id: link.grant_id.clone(),
         action,
     };
     request.validate()?;
-    let connection = timeout(Duration::from_secs(10), endpoint.connect(id, peers::ALPN))
-        .await
-        .map_err(|_| "peer_unreachable")?
-        .map_err(connect_error)?;
-    exchange(&connection, &request).await
+    // Requests on a kept connection run side by side and never wait for the lane.
+    if let Some(kept) = state.peers.outbound.reuse(id)
+        && let Sent::Answered(result) = ask(&kept.connection, &request).await
+    {
+        return result;
+    }
+    // Nothing was sent: the kept connection had closed or expired, or no stream opened.
+    let lane = state.peers.outbound_lane(id);
+    let turn = lane.lock().await;
+    if !state.peers.snapshot().outgoing.contains(link) {
+        return Err("unknown_or_ambiguous_peer");
+    }
+    // Dialing is single-flight: another request may have connected while this one waited.
+    let kept = match state.peers.outbound.reuse(id) {
+        Some(kept) => kept,
+        None => {
+            let connection = timeout(Duration::from_secs(10), dial(endpoint, id))
+                .await
+                .map_err(|_| "peer_unreachable")?
+                .map_err(connect_error)?;
+            match PeerProtocol::negotiated(connection.alpn()) {
+                Some(PeerProtocol::Streams) => state.peers.outbound.adopt(id, connection),
+                // A destination that closes after one request. Hold the lane until it has.
+                Some(PeerProtocol::SingleRequest) => return exchange(&connection, &request).await,
+                None => {
+                    connection.close(VarInt::from_u32(0), b"peer protocol unsupported");
+                    return Err("unsupported_version");
+                }
+            }
+        }
+    };
+    drop(turn);
+    match ask(&kept.connection, &request).await {
+        Sent::Answered(result) => result,
+        Sent::NotSent => Err("connection_lost"),
+    }
+}
+
+/// Offer both protocols in one handshake; the destination picks.
+async fn dial(
+    endpoint: &Endpoint,
+    id: EndpointId,
+) -> Result<Connection, iroh::endpoint::ConnectError> {
+    let connecting = endpoint
+        .connect_with_opts(
+            id,
+            PeerProtocol::Streams.alpn(),
+            iroh::endpoint::ConnectOptions::new()
+                .with_additional_alpns(vec![PeerProtocol::SingleRequest.alpn().to_vec()]),
+        )
+        .await?;
+    Ok(connecting.await?)
+}
+
+/// Whether a request left this host. Only a request that never did may be sent again.
+enum Sent {
+    NotSent,
+    Answered(Result<Value, &'static str>),
+}
+
+/// One request on its own stream of a kept connection.
+async fn ask(connection: &Connection, request: &Request) -> Sent {
+    let Ok((send, recv)) = connection.open_bi().await else {
+        return Sent::NotSent;
+    };
+    Sent::Answered(
+        match timeout(DEADLINE, send_request(send, recv, request)).await {
+            Ok(Ok(reply)) => outcome(reply, request),
+            // No reply arrived. A closed connection names the cause; once the request was written,
+            // an effect may or may not have happened.
+            Ok(Err(code)) => Err(match connection.close_reason() {
+                None => code,
+                reason => close_error(reason).unwrap_or(if request.action.has_effect() {
+                    "outcome_unknown"
+                } else {
+                    "connection_lost"
+                }),
+            }),
+            Err(_) => Err("outcome_unknown"),
+        },
+    )
 }
 
 fn connect_error(error: iroh::endpoint::ConnectError) -> &'static str {
@@ -830,43 +965,15 @@ fn close_error(error: Option<ConnectionError>) -> Option<&'static str> {
     }
 }
 
+/// The `ciao/peer/1` exchange: one request, then the destination's close.
 async fn exchange(connection: &Connection, request: &Request) -> Result<Value, &'static str> {
     let result = timeout(DEADLINE, async {
-        let (mut send, mut recv) = connection.open_bi().await.map_err(|_| "connection_lost")?;
-        agent_protocol::write_agent_frame(&mut send, request)
-            .await
-            .map_err(|_| "invalid_request")?;
-        send.finish().map_err(|_| "connection_lost")?;
-        let response: Reply = read_request(&mut recv, DEADLINE).await.map_err(|code| {
-            if code == "invalid_request" {
-                "invalid_response"
-            } else {
-                code
-            }
-        })?;
-        if response.v != 1 {
-            return Err("unsupported_version");
-        }
+        let (send, recv) = connection.open_bi().await.map_err(|_| "connection_lost")?;
+        let response = send_request(send, recv, request).await?;
         // The destination closes after it releases this endpoint's admission slot. Returning
         // on just the reply allowed the next snapshot/send to race that release.
         let _ = timeout(Duration::from_secs(5), connection.closed()).await;
-        match (response.result, response.error) {
-            (None, Some(code))
-                if code == "invalid_request"
-                    && matches!(
-                        request.action,
-                        Action::Start {
-                            agent: PeerAgent::Codex,
-                            ..
-                        }
-                    ) =>
-            {
-                Err("unsupported_peer_agent")
-            }
-            (Some(result), None) => Ok(result),
-            (None, Some(code)) => Err(remote_error(&code)),
-            _ => Err("invalid_response"),
-        }
+        outcome(response, request)
     })
     .await
     .unwrap_or(Err("outcome_unknown"));
@@ -877,6 +984,49 @@ async fn exchange(connection: &Connection, request: &Request) -> Result<Value, &
     };
     connection.close(VarInt::from_u32(0), b"peer request complete");
     result
+}
+
+/// Write one request on a fresh stream and read its reply.
+async fn send_request(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    request: &Request,
+) -> Result<Reply, &'static str> {
+    agent_protocol::write_agent_frame(&mut send, request)
+        .await
+        .map_err(|_| "invalid_request")?;
+    send.finish().map_err(|_| "connection_lost")?;
+    let response: Reply = read_request(&mut recv, DEADLINE).await.map_err(|code| {
+        if code == "invalid_request" {
+            "invalid_response"
+        } else {
+            code
+        }
+    })?;
+    if response.v != 1 {
+        return Err("unsupported_version");
+    }
+    Ok(response)
+}
+
+fn outcome(response: Reply, request: &Request) -> Result<Value, &'static str> {
+    match (response.result, response.error) {
+        (None, Some(code))
+            if code == "invalid_request"
+                && matches!(
+                    request.action,
+                    Action::Start {
+                        agent: PeerAgent::Codex,
+                        ..
+                    }
+                ) =>
+        {
+            Err("unsupported_peer_agent")
+        }
+        (Some(result), None) => Ok(result),
+        (None, Some(code)) => Err(remote_error(&code)),
+        _ => Err("invalid_response"),
+    }
 }
 
 fn remote_error(code: &str) -> &'static str {
@@ -941,11 +1091,7 @@ mod tests {
             .unwrap();
             let mut builder = Endpoint::builder(presets::N0)
                 .secret_key(identity.secret_key)
-                .alpns(vec![
-                    PAIRING_ALPN.to_vec(),
-                    HOST_ALPN.to_vec(),
-                    peers::ALPN.to_vec(),
-                ])
+                .alpns(super::super::endpoint_alpns())
                 .transport_config(host_transport_config());
             if let Some(map) = crate::relay::configured_map().unwrap() {
                 builder = builder.relay_mode(RelayMode::Custom(map));
@@ -984,6 +1130,784 @@ mod tests {
         for endpoint in endpoints {
             endpoint.close().await;
         }
+    }
+
+    async fn timed(
+        body: Value,
+        client: &Endpoint,
+        source: &Arc<RuntimeState>,
+    ) -> (f64, Result<Value, &'static str>) {
+        let began = std::time::Instant::now();
+        let result = ipc(body, client, source).await;
+        (began.elapsed().as_secs_f64() * 1000.0, result)
+    }
+
+    /// Peer latency lab (2026-11-23). It drives the source daemon's real IPC entry point against
+    /// a real destination over real Iroh on loopback, with the fake launcher. Run it inside a
+    /// network namespace whose loopback adds a fixed delay to count network round trips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "latency lab; requires CIAO_PEER_LATENCY_LAB, an output JSON path"]
+    async fn peer_latency_lab() {
+        let out = PathBuf::from(std::env::var("CIAO_PEER_LATENCY_LAB").expect("output path"));
+        let samples: usize = std::env::var("CIAO_PEER_LATENCY_SAMPLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let follow_for = Duration::from_secs(
+            std::env::var("CIAO_PEER_LATENCY_FOLLOW_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
+        );
+        // "1" stands in for a 0.1.66 destination, which only accepts ciao/peer/1.
+        let alpns = match std::env::var("CIAO_PEER_LATENCY_PROTOCOLS").as_deref() {
+            Ok("1") => vec![peers::ALPN.to_vec()],
+            _ => accepted_alpns(),
+        };
+        let pair = pair(alpns).await;
+        let Pair {
+            destination,
+            source,
+            host,
+            client,
+            ids,
+            grant,
+            ..
+        } = &pair;
+        let mut report = serde_json::Map::new();
+        let mut series = |name: &str, values: Vec<f64>| {
+            report.insert(name.into(), json!(values));
+        };
+        // Before any kept connection: the single-request exchange, step by step: handshake, request to reply, reply to close.
+        let request = req(grant, Action::Workspaces {});
+        let mut phases = [Vec::new(), Vec::new(), Vec::new()];
+        for _ in 0..samples {
+            let began = std::time::Instant::now();
+            let connection = client.connect(host.id(), peers::ALPN).await.unwrap();
+            let connected = std::time::Instant::now();
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            agent_protocol::write_agent_frame(&mut send, &request)
+                .await
+                .unwrap();
+            send.finish().unwrap();
+            let reply: Reply = read_request(&mut recv, DEADLINE).await.unwrap();
+            assert!(reply.error.is_none());
+            let answered = std::time::Instant::now();
+            let _ = timeout(Duration::from_secs(5), connection.closed()).await;
+            let closed = std::time::Instant::now();
+            for (phase, (from, to)) in phases.iter_mut().zip([
+                (began, connected),
+                (connected, answered),
+                (answered, closed),
+            ]) {
+                phase.push(to.duration_since(from).as_secs_f64() * 1000.0);
+            }
+        }
+        let [handshake, exchange, close] = phases;
+        series("v1_handshake", handshake);
+        series("v1_request_reply", exchange);
+        series("v1_reply_to_close", close);
+        let workspaces = json!({"op":"call","host":"Build","action":{"op":"workspaces"}});
+        let (first, result) = timed(workspaces.clone(), client, source).await;
+        result.unwrap();
+        series("first_workspaces", vec![first]);
+        let kept = source.peers.outbound.kept(host.id()).is_some();
+        let protocol = if kept { "ciao/peer/2" } else { "ciao/peer/1" };
+        let mut values = Vec::new();
+        for _ in 0..samples {
+            let (ms, result) = timed(workspaces.clone(), client, source).await;
+            result.unwrap();
+            values.push(ms);
+        }
+        series("workspaces", values);
+        let (ms, result) = timed(
+            json!({"op":"call","host":"Build","action":{"op":"start","request_id":"lab-start","workspace_id":ids[0]}}),
+            client,
+            source,
+        )
+        .await;
+        let started = result.unwrap();
+        series("start", vec![ms]);
+        let session = started["session_id"].as_str().unwrap().to_owned();
+        let mut bridge = register(destination, &session).await;
+        let drain = tokio::spawn(async move { while bridge.recv().await.is_some() {} });
+        let snapshot =
+            json!({"op":"call","host":"Build","action":{"op":"snapshot","session_id":session}});
+        let mut values = Vec::new();
+        for _ in 0..samples {
+            let (ms, result) = timed(snapshot.clone(), client, source).await;
+            assert_eq!(result.unwrap()["presence"], "live");
+            values.push(ms);
+        }
+        series("snapshot", values);
+        for (name, text) in [("send", json!("lab prompt")), ("interrupt", Value::Null)] {
+            let mut values = Vec::new();
+            for i in 0..samples {
+                let (ms, result) = timed(
+                    json!({"op":"send","host":"Build","session_id":session,"request_id":format!("lab-{name}-{i}"),"text":text}),
+                    client,
+                    source,
+                )
+                .await;
+                let receipt = result.unwrap();
+                assert!(receipt["state"] != "rejected", "{receipt}");
+                values.push(ms);
+            }
+            series(name, values);
+        }
+        // Follow lag: the destination changes the session at irregular times while the source
+        // follows it. Lag is the change until the source holds a snapshot that includes it.
+        let changes = Arc::new(Mutex::new(Vec::<(std::time::Instant, u64)>::new()));
+        let mutator = tokio::spawn({
+            let destination = destination.clone();
+            let session = session.clone();
+            let changes = changes.clone();
+            async move {
+                let mut i = 0_u64;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(700 + (i * 389) % 1100)).await;
+                    let mode = if i.is_multiple_of(2) {
+                        "plan"
+                    } else {
+                        "default"
+                    };
+                    destination
+                        .agent_sessions
+                        .update_bridge_permission_mode(&session, mode.into());
+                    let revision = destination
+                        .agent_sessions
+                        .snapshot(&session)
+                        .unwrap()
+                        .revision;
+                    changes.lock().push((std::time::Instant::now(), revision));
+                    i += 1;
+                }
+            }
+        });
+        let seen = follow_for_lab(client, source, &session, follow_for).await;
+        mutator.abort();
+        let changes = changes.lock().clone();
+        let lags: Vec<f64> = changes
+            .iter()
+            .filter_map(|(at, revision)| {
+                seen.iter()
+                    .find(|(_, seen)| seen >= revision)
+                    .map(|(when, _)| when.duration_since(*at).as_secs_f64() * 1000.0)
+            })
+            .collect();
+        report.insert("protocol".into(), json!(protocol));
+        report.insert("follow_snapshots".into(), json!(seen.len()));
+        report.insert("follow_changes".into(), json!(changes.len()));
+        report.insert("follow_lag".into(), json!(lags));
+        let (ms, result) = timed(
+            json!({"op":"stop","host":"Build","session_id":session,"request_id":"lab-stop"}),
+            client,
+            source,
+        )
+        .await;
+        let stopped = result.unwrap();
+        assert!(stopped["state"] != "rejected", "{stopped}");
+        report.insert("stop".into(), json!([ms]));
+        drain.abort();
+        report.insert("connections_accepted".into(), json!(pair.accepted()));
+        crate::storage::atomic_write_private(&out, &serde_json::to_vec_pretty(&report).unwrap())
+            .unwrap();
+        pair.close().await;
+    }
+
+    /// The CLI's follow loop with the lab's clock: one snapshot, then the next one second after
+    /// the reply. Returns when each snapshot arrived and its revision.
+    async fn follow_for_lab(
+        client: &Endpoint,
+        source: &Arc<RuntimeState>,
+        session: &str,
+        seconds: Duration,
+    ) -> Vec<(std::time::Instant, u64)> {
+        let until = tokio::time::Instant::now() + seconds;
+        let mut seen = Vec::new();
+        loop {
+            let value = ipc(
+                json!({"op":"call","host":"Build","action":{"op":"snapshot","session_id":session}}),
+                client,
+                source,
+            )
+            .await
+            .unwrap();
+            seen.push((
+                std::time::Instant::now(),
+                value["revision"].as_u64().unwrap(),
+            ));
+            let next = tokio::time::Instant::now() + Duration::from_secs(1);
+            if next >= until {
+                return seen;
+            }
+            tokio::time::sleep_until(next).await;
+        }
+    }
+
+    fn accepted_alpns() -> Vec<Vec<u8>> {
+        PeerProtocol::ACCEPTED.map(|p| p.alpn().to_vec()).to_vec()
+    }
+
+    async fn endpoint(
+        alpns: Vec<Vec<u8>>,
+        key: iroh::SecretKey,
+        lookup: &iroh::address_lookup::memory::MemoryLookup,
+    ) -> Endpoint {
+        Endpoint::builder(presets::N0DisableRelay)
+            .secret_key(key)
+            .alpns(alpns)
+            .address_lookup(lookup.clone())
+            .transport_config(super::super::host_transport_config())
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// Serve `host` through the daemon's dispatcher, counting the connections it accepts.
+    fn serve_counting(
+        host: &Endpoint,
+        state: &Arc<RuntimeState>,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn({
+            let (host, state, accepted) = (host.clone(), state.clone(), accepted.clone());
+            async move {
+                while let Some(incoming) = host.accept().await {
+                    let Ok(connection) = incoming.await else {
+                        continue;
+                    };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(super::super::handle_authenticated_connection(
+                        connection,
+                        state.clone(),
+                    ));
+                }
+            }
+        });
+        accepted
+    }
+
+    /// A source and a destination on real Iroh over loopback, linked as "Build".
+    struct Pair {
+        _homes: (TempDir, TempDir),
+        destination: Arc<RuntimeState>,
+        source: Arc<RuntimeState>,
+        host: Endpoint,
+        client: Endpoint,
+        client_key: iroh::SecretKey,
+        lookup: iroh::address_lookup::memory::MemoryLookup,
+        ids: Vec<String>,
+        grant: String,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn pair(alpns: Vec<Vec<u8>>) -> Pair {
+        let (home, mut destination, _, ids, grant) = fixture().await;
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let host = endpoint(alpns, iroh::SecretKey::generate(), &lookup).await;
+        let client_key = iroh::SecretKey::generate();
+        let client = endpoint(Vec::new(), client_key.clone(), &lookup).await;
+        lookup.add_endpoint_info(host.addr());
+        Arc::get_mut(&mut destination).unwrap().host_endpoint_id = host.id();
+        destination
+            .peers
+            .change(|s| {
+                s.incoming[0].peer.endpoint_id = client.id().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let source_home = tempfile::tempdir().unwrap();
+        let source =
+            super::super::tests::test_state(client.id(), &source_home.path().join("paired.json"));
+        source
+            .peers
+            .change(|s| {
+                s.outgoing.push(Outgoing {
+                    peer: Descriptor {
+                        endpoint_id: host.id().to_string(),
+                        name: "Build".into(),
+                    },
+                    grant_id: grant.clone(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let accepted = serve_counting(&host, &destination);
+        Pair {
+            _homes: (home, source_home),
+            destination,
+            source,
+            host,
+            client,
+            client_key,
+            lookup,
+            ids,
+            grant,
+            accepted,
+        }
+    }
+
+    impl Pair {
+        async fn call(&self, action: Value) -> Result<Value, &'static str> {
+            self.local(json!({"op":"call","host":"Build","action":action}))
+                .await
+        }
+
+        async fn local(&self, body: Value) -> Result<Value, &'static str> {
+            ipc(body, &self.client, &self.source).await
+        }
+
+        fn spawn_call(
+            &self,
+            action: Value,
+        ) -> tokio::task::JoinHandle<Result<Value, &'static str>> {
+            let (client, source) = (self.client.clone(), self.source.clone());
+            tokio::spawn(async move {
+                ipc(
+                    json!({"op":"call","host":"Build","action":action}),
+                    &client,
+                    &source,
+                )
+                .await
+            })
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+
+        async fn start_live(&self, request_id: &str) -> (String, tokio::task::JoinHandle<()>) {
+            let started = self
+                .call(json!({"op":"start","request_id":request_id,"workspace_id":self.ids[0]}))
+                .await
+                .unwrap();
+            let session = started["session_id"].as_str().unwrap().to_owned();
+            let mut bridge = register(&self.destination, &session).await;
+            let drain = tokio::spawn(async move { while bridge.recv().await.is_some() {} });
+            (session, drain)
+        }
+
+        async fn close(self) {
+            self.client.close().await;
+            self.host.close().await;
+        }
+    }
+
+    async fn until(condition: impl Fn() -> bool) {
+        timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("condition within five seconds");
+    }
+
+    #[tokio::test]
+    async fn peer_streams_carry_every_operation_on_one_kept_connection() {
+        let pair = pair(accepted_alpns()).await;
+        let listed = pair.call(json!({"op":"workspaces"})).await.unwrap();
+        assert_eq!(listed["workspaces"].as_array().unwrap().len(), 2);
+        let kept = pair.source.peers.outbound.kept(pair.host.id()).unwrap();
+        assert_eq!(kept.alpn(), peers::ALPN_STREAMS);
+        let (session, drain) = pair.start_live("one").await;
+        let snapshot = json!({"op":"snapshot","session_id":session});
+        assert_eq!(
+            pair.call(snapshot.clone()).await.unwrap()["presence"],
+            "live"
+        );
+        for (id, text) in [("prompt", json!("hello")), ("interrupt", Value::Null)] {
+            let receipt = pair
+                .local(json!({"op":"send","host":"Build","session_id":session,"request_id":id,"text":text}))
+                .await
+                .unwrap();
+            assert_ne!(receipt["state"], "rejected", "{receipt}");
+        }
+        // Requests on a kept connection do not take turns. With the destination's effects gate
+        // held, three run on it at once instead of queueing behind the source's lane.
+        let budget = pair.destination.peers.connections.lock()[&pair.client.id().to_string()]
+            .budget
+            .clone();
+        let gate = pair.destination.peers.effects.lock().await;
+        let calls: Vec<_> = (0..3).map(|_| pair.spawn_call(snapshot.clone())).collect();
+        until(|| budget.requests.available_permits() == peers::MAX_SOURCE_REQUESTS - 3).await;
+        drop(gate);
+        for call in calls {
+            assert_eq!(call.await.unwrap().unwrap()["presence"], "live");
+        }
+        let stopped = pair
+            .local(json!({"op":"stop","host":"Build","session_id":session,"request_id":"stop"}))
+            .await
+            .unwrap();
+        assert_ne!(stopped["state"], "rejected", "{stopped}");
+        assert_eq!(pair.accepted(), 1, "one connection carried every request");
+        let still = pair.source.peers.outbound.kept(pair.host.id()).unwrap();
+        assert_eq!(still.stable_id(), kept.stable_id());
+        drain.abort();
+        pair.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_new_source_takes_turns_with_a_single_request_destination() {
+        // A destination that only speaks ciao/peer/1 stands in for 0.1.66.
+        let pair = pair(vec![peers::ALPN.to_vec()]).await;
+        pair.call(json!({"op":"workspaces"})).await.unwrap();
+        assert!(pair.source.peers.outbound.kept(pair.host.id()).is_none());
+        let (session, drain) = pair.start_live("one").await;
+        let snapshot = json!({"op":"snapshot","session_id":session});
+        pair.call(snapshot.clone()).await.unwrap();
+        let receipt = pair
+            .local(json!({"op":"send","host":"Build","session_id":session,"request_id":"prompt","text":"hello"}))
+            .await
+            .unwrap();
+        assert_ne!(receipt["state"], "rejected", "{receipt}");
+        assert_eq!(
+            pair.accepted(),
+            5,
+            "one connection per request, send making two"
+        );
+        // Concurrent calls still take turns: one holds the lane while it is admitted, and none
+        // is refused as busy.
+        let gate = pair.destination.peers.effects.lock().await;
+        let calls: Vec<_> = (0..3).map(|_| pair.spawn_call(snapshot.clone())).collect();
+        until(|| pair.accepted() == 6).await;
+        assert!(
+            pair.source
+                .peers
+                .outbound_lane(pair.host.id())
+                .try_lock()
+                .is_err()
+        );
+        drop(gate);
+        for call in calls {
+            assert_eq!(call.await.unwrap().unwrap()["presence"], "live");
+        }
+        assert_eq!(pair.accepted(), 8);
+        assert!(pair.source.peers.outbound.kept(pair.host.id()).is_none());
+        drain.abort();
+        pair.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_single_request_source_still_gets_one_request_per_connection() {
+        let pair = pair(accepted_alpns()).await;
+        // A 0.1.66 source offers only ciao/peer/1 and waits for the destination to close.
+        for _ in 0..3 {
+            let connection = pair
+                .client
+                .connect(pair.host.id(), peers::ALPN)
+                .await
+                .unwrap();
+            assert_eq!(connection.alpn(), peers::ALPN);
+            let began = std::time::Instant::now();
+            let listed = exchange(&connection, &req(&pair.grant, Action::Workspaces {}))
+                .await
+                .unwrap();
+            assert_eq!(listed["workspaces"].as_array().unwrap().len(), 2);
+            assert!(connection.close_reason().is_some());
+            assert!(
+                began.elapsed() < Duration::from_secs(4),
+                "the destination closed after one request instead of making the source time out"
+            );
+        }
+        assert_eq!(pair.accepted(), 3);
+        pair.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_source_dials_again_only_when_no_request_byte_left() {
+        let pair = pair(accepted_alpns()).await;
+        pair.call(json!({"op":"workspaces"})).await.unwrap();
+        let kept = pair.source.peers.outbound.kept(pair.host.id()).unwrap();
+        // The destination drops the connection between requests. Nothing was sent on it, so
+        // the next request dials again and runs once.
+        pair.destination.peers.close(&pair.client.id().to_string());
+        timeout(Duration::from_secs(3), kept.closed())
+            .await
+            .unwrap();
+        let started = pair
+            .call(json!({"op":"start","request_id":"after","workspace_id":pair.ids[0]}))
+            .await
+            .unwrap();
+        assert_eq!(started["state"], "accepted", "{started}");
+        assert_eq!(pair.accepted(), 2);
+        let claims = pair.destination.peers.snapshot().starts;
+        assert_eq!(claims.iter().filter(|r| r.request_id == "after").count(), 1);
+
+        // A destination that reads each request and then drops the connection unanswered.
+        let host = endpoint(
+            vec![peers::ALPN_STREAMS.to_vec()],
+            iroh::SecretKey::generate(),
+            &pair.lookup,
+        )
+        .await;
+        pair.lookup.add_endpoint_info(host.addr());
+        let (connections, requests) = (
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        tokio::spawn({
+            let (host, connections, requests) =
+                (host.clone(), connections.clone(), requests.clone());
+            async move {
+                while let Some(incoming) = host.accept().await {
+                    let connection = incoming.await.unwrap();
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    let (_send, mut recv) = connection.accept_bi().await.unwrap();
+                    let _: Request = read_request(&mut recv, Duration::from_secs(5))
+                        .await
+                        .unwrap();
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    connection.close(VarInt::from_u32(0), b"gone");
+                }
+            }
+        });
+        pair.source
+            .peers
+            .change(|s| {
+                s.outgoing.push(Outgoing {
+                    peer: Descriptor {
+                        endpoint_id: host.id().to_string(),
+                        name: "Dropper".into(),
+                    },
+                    grant_id: "dropper-grant".into(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let dropper =
+            |action: Value| pair.local(json!({"op":"call","host":"Dropper","action":action}));
+        assert_eq!(
+            dropper(json!({"op":"start","request_id":"lost","workspace_id":"w"}))
+                .await
+                .unwrap_err(),
+            "outcome_unknown"
+        );
+        assert_eq!(
+            dropper(json!({"op":"snapshot","session_id":"s"}))
+                .await
+                .unwrap_err(),
+            "connection_lost"
+        );
+        // Each written request reached the destination once; neither was sent again.
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        host.close().await;
+        pair.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_streams_supersede_the_same_source_and_single_requests_stay_busy() {
+        let pair = pair(accepted_alpns()).await;
+        pair.call(json!({"op":"workspaces"})).await.unwrap();
+        let first = pair.source.peers.outbound.kept(pair.host.id()).unwrap();
+        let key = pair.client.id().to_string();
+        let budget = pair.destination.peers.connections.lock()[&key]
+            .budget
+            .requests
+            .clone();
+        // The same source key on a fresh endpoint, as after the source daemon restarts while
+        // the destination still holds its old connection.
+        let restarted = endpoint(Vec::new(), pair.client_key.clone(), &pair.lookup).await;
+        let second = restarted
+            .connect(pair.host.id(), peers::ALPN_STREAMS)
+            .await
+            .unwrap();
+        let superseded = timeout(Duration::from_secs(3), first.closed())
+            .await
+            .unwrap();
+        assert!(
+            matches!(superseded, ConnectionError::ApplicationClosed(close)
+            if close.error_code == VarInt::from_u32(CONNECTION_SUPERSEDED))
+        );
+        match ask(&second, &req(&pair.grant, Action::Workspaces {})).await {
+            Sent::Answered(Ok(listed)) => {
+                assert_eq!(listed["workspaces"].as_array().unwrap().len(), 2)
+            }
+            _ => panic!("the superseding connection serves requests"),
+        }
+        let held = pair.destination.peers.connections.lock()[&key]
+            .budget
+            .requests
+            .clone();
+        assert!(
+            Arc::ptr_eq(&held, &budget),
+            "a reconnect inherits the budget"
+        );
+        // ciao/peer/1 keeps 0.1.66 admission: busy while the endpoint holds a connection.
+        let legacy = restarted
+            .connect(pair.host.id(), peers::ALPN)
+            .await
+            .unwrap();
+        assert_eq!(
+            exchange(&legacy, &req(&pair.grant, Action::Workspaces {}))
+                .await
+                .unwrap_err(),
+            "peer_busy"
+        );
+        restarted.close().await;
+        pair.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_two_way_pair_keeps_admitted_and_kept_connections_apart() {
+        let (home_a, mut a, _, _, grant_a) = fixture().await;
+        let (home_b, mut b, _, _, grant_b) = fixture().await;
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let ea = endpoint(accepted_alpns(), iroh::SecretKey::generate(), &lookup).await;
+        let eb = endpoint(accepted_alpns(), iroh::SecretKey::generate(), &lookup).await;
+        lookup.add_endpoint_info(ea.addr());
+        lookup.add_endpoint_info(eb.addr());
+        for (state, me, other, name, grant) in [
+            (&mut a, &ea, &eb, "B", &grant_b),
+            (&mut b, &eb, &ea, "A", &grant_a),
+        ] {
+            Arc::get_mut(state).unwrap().host_endpoint_id = me.id();
+            state
+                .peers
+                .change(|s| {
+                    s.incoming[0].peer.endpoint_id = other.id().to_string();
+                    s.outgoing.push(Outgoing {
+                        peer: Descriptor {
+                            endpoint_id: other.id().to_string(),
+                            name: name.into(),
+                        },
+                        grant_id: grant.clone(),
+                    });
+                    Ok(())
+                })
+                .unwrap();
+        }
+        serve_counting(&ea, &a);
+        serve_counting(&eb, &b);
+        let call = |from: &Arc<RuntimeState>, endpoint: &Endpoint, host: &str| {
+            let (from, endpoint, host) = (from.clone(), endpoint.clone(), host.to_owned());
+            async move {
+                ipc(
+                    json!({"op":"call","host":host,"action":{"op":"workspaces"}}),
+                    &endpoint,
+                    &from,
+                )
+                .await
+            }
+        };
+        call(&a, &ea, "B").await.unwrap();
+        call(&b, &eb, "A").await.unwrap();
+        let a_to_b = a.peers.outbound.kept(eb.id()).unwrap();
+        assert!(b.peers.outbound.kept(ea.id()).is_some());
+        assert!(
+            a.peers
+                .connections
+                .lock()
+                .contains_key(&eb.id().to_string())
+        );
+        assert!(
+            b.peers
+                .connections
+                .lock()
+                .contains_key(&ea.id().to_string())
+        );
+        // A revokes B. That closes B's connection into A, not A's own connection to B.
+        admin(
+            Admin::Revoke {
+                endpoint_id: eb.id().to_string(),
+            },
+            None,
+            &a,
+        )
+        .await
+        .unwrap();
+        assert!(a.peers.connections.lock().is_empty());
+        call(&a, &ea, "B").await.unwrap();
+        let kept = a.peers.outbound.kept(eb.id()).unwrap();
+        assert_eq!(kept.stable_id(), a_to_b.stable_id());
+        assert_eq!(
+            call(&b, &eb, "A").await.unwrap_err(),
+            "authorization_denied"
+        );
+        // A forgets B: its kept connection closes, and B releases it.
+        admin(
+            Admin::Forget {
+                endpoint_id: eb.id().to_string(),
+            },
+            None,
+            &a,
+        )
+        .await
+        .unwrap();
+        assert!(a.peers.outbound.kept(eb.id()).is_none());
+        timeout(Duration::from_secs(3), a_to_b.closed())
+            .await
+            .unwrap();
+        until(|| b.peers.connections.lock().is_empty()).await;
+        drop((home_a, home_b));
+        ea.close().await;
+        eb.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_destination_closes_a_kept_connection_only_when_idle() {
+        let (_home, mut state, _, _, grant) = fixture().await;
+        let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+        let host = endpoint(accepted_alpns(), iroh::SecretKey::generate(), &lookup).await;
+        let client = endpoint(Vec::new(), iroh::SecretKey::generate(), &lookup).await;
+        Arc::get_mut(&mut state).unwrap().host_endpoint_id = host.id();
+        state
+            .peers
+            .change(|s| {
+                s.incoming[0].peer.endpoint_id = client.id().to_string();
+                Ok(())
+            })
+            .unwrap();
+        let idle = Duration::from_millis(200);
+        let server = tokio::spawn({
+            let (host, state) = (host.clone(), state.clone());
+            async move {
+                for _ in 0..2 {
+                    let connection = host.accept().await.unwrap().await.unwrap();
+                    serve_within(connection, state.clone(), idle).await;
+                }
+            }
+        });
+        let list = req(&grant, Action::Workspaces {});
+        let connection = client
+            .connect(host.addr(), peers::ALPN_STREAMS)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ask(&connection, &list).await,
+            Sent::Answered(Ok(_))
+        ));
+        let answered = std::time::Instant::now();
+        let closed = timeout(Duration::from_secs(5), connection.closed())
+            .await
+            .unwrap();
+        assert!(answered.elapsed() >= idle);
+        assert!(matches!(closed, ConnectionError::ApplicationClosed(close)
+            if close.error_code == VarInt::from_u32(0) && &close.reason[..] == b"peer idle"));
+        // A request in flight keeps the connection open past the idle period.
+        let connection = client
+            .connect(host.addr(), peers::ALPN_STREAMS)
+            .await
+            .unwrap();
+        until(|| !state.peers.connections.lock().is_empty()).await;
+        let gate = state.peers.effects.lock().await;
+        let pending = tokio::spawn({
+            let (connection, list) = (connection.clone(), list.clone());
+            async move { matches!(ask(&connection, &list).await, Sent::Answered(Ok(_))) }
+        });
+        tokio::time::sleep(idle * 3).await;
+        assert!(connection.close_reason().is_none());
+        drop(gate);
+        assert!(pending.await.unwrap());
+        timeout(Duration::from_secs(5), connection.closed())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(state.peers.connections.lock().is_empty());
+        client.close().await;
+        host.close().await;
     }
 
     async fn fixture() -> (TempDir, Arc<RuntimeState>, EndpointId, Vec<String>, String) {
