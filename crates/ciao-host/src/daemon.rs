@@ -2383,7 +2383,10 @@ async fn ready_phase_rpc(
                 }
                 Ok(guard) => {
                     let capture_began = Instant::now();
-                    let v4 = request.method == crate::host_protocol::METHOD_WORKSPACE_SNAPSHOT_V4;
+                    let include_folders =
+                        request.method == crate::host_protocol::METHOD_WORKSPACE_SNAPSHOT_V5;
+                    let v4 = include_folders
+                        || request.method == crate::host_protocol::METHOD_WORKSPACE_SNAPSHOT_V4;
                     let v3 = v4 || request.method == METHOD_WORKSPACE_SNAPSHOT_V3;
                     let agents = request
                         .params
@@ -2400,6 +2403,7 @@ async fn ready_phase_rpc(
                                 crate::orca::snapshot(
                                     &state.workspace.orca_profile,
                                     request.params.tabs,
+                                    include_folders,
                                     Some(&state.paths.orca_pairing_file()),
                                 )
                                 .await,
@@ -4569,7 +4573,7 @@ fn herdr_viewer_child(
     agent_plan: Option<&crate::agent_route::AgentTerminalPlan>,
 ) -> bool {
     if let Some(plan) = agent_plan {
-        return plan.provider() == crate::host_protocol::ProviderKind::Herdr;
+        return plan.is_herdr_tui();
     }
     open.validated_target()
         .is_ok_and(|target| target.provider() == Some(crate::host_protocol::ProviderKind::Herdr))
@@ -4600,6 +4604,22 @@ fn spawn_terminal_child(
                     program.clone(),
                     args.clone(),
                 ))
+            }
+            crate::agent_route::AgentTerminalPlan::Orca(proof) => {
+                let profile = state.workspace.orca_profile.clone();
+                let credentials = state.paths.orca_pairing_file();
+                let proof = proof.clone();
+                let size = open.dimensions;
+                tokio::spawn(async move {
+                    crate::orca::session::OrcaSession::attach_agent(
+                        profile,
+                        credentials,
+                        &proof,
+                        size,
+                    )
+                    .await
+                    .map(crate::terminal_session::TerminalSession::Orca)
+                })
             }
             crate::agent_route::AgentTerminalPlan::Core { session, tab } => {
                 tokio::spawn(crate::terminal_session::TerminalSession::attach_core(

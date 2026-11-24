@@ -1,6 +1,7 @@
 //! Orca's authenticated local catalog. Runtime handles, paths, and credentials stay on this host.
 mod channel;
 pub mod manage;
+pub(crate) mod route;
 pub(crate) mod session;
 
 use std::{
@@ -60,6 +61,8 @@ pub enum OrcaSnapshot {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Repository {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folder: bool,
     pub id: String,
     pub name: String,
     pub worktrees: Vec<Worktree>,
@@ -284,7 +287,7 @@ impl Runtime {
     }
 }
 
-async fn read_pairing_file(path: &Path) -> Option<Vec<u8>> {
+async fn read_private_file(path: &Path) -> Option<Vec<u8>> {
     let f = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -304,7 +307,7 @@ async fn read_pairing_file(path: &Path) -> Option<Vec<u8>> {
 }
 
 async fn paired(runtime: &Runtime, path: Option<&Path>) -> Option<()> {
-    let bytes = read_pairing_file(path?).await?;
+    let bytes = read_private_file(path?).await?;
     let pairing = serde_json::from_slice(&bytes).ok()?;
     timeout(
         Duration::from_millis(900),
@@ -319,6 +322,7 @@ async fn paired(runtime: &Runtime, path: Option<&Path>) -> Option<()> {
 pub(crate) async fn snapshot(
     profile: &Path,
     tabs: bool,
+    include_folders: bool,
     credentials: Option<&Path>,
 ) -> OrcaSnapshot {
     timeout(Duration::from_secs(3), async {
@@ -343,7 +347,7 @@ pub(crate) async fn snapshot(
             rt.query("worktree.list", json!({"limit": MAX_ROWS})),
             terminals
         );
-        let mut result = catalog(&repos?, &worktrees?, &terminals?)?;
+        let mut result = catalog(&repos?, &worktrees?, &terminals?, include_folders)?;
         if let OrcaSnapshot::Available {
             can_attach,
             can_remove_worktrees,
@@ -368,17 +372,52 @@ fn name(row: &Value, key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.into())
 }
 
-fn local_git_repo(row: &Value) -> bool {
-    row["kind"] == "git"
+fn local_project(row: &Value) -> bool {
+    (row["kind"] == "git" || row["kind"] == "folder")
         && row["connectionId"].is_null()
         && (row["hostId"].is_null() || row["hostId"] == "local")
         && (row["executionHostId"].is_null() || row["executionHostId"] == "local")
 }
-fn local_workspace(row: &Value) -> bool {
-    row["hostId"] == "local" && row["identity"]["executionHostId"] == "local"
+/// Orca 1.4.273 identifies a folder context directly on its local workspace row.
+fn workspace_instance(row: &Value, folder: bool) -> Option<&str> {
+    if row["hostId"] != "local"
+        || !row["connectionId"].is_null()
+        || !(row["executionHostId"].is_null() || row["executionHostId"] == "local")
+    {
+        return None;
+    }
+    let id = if row.get("identity").is_some() {
+        if row["identity"]["executionHostId"] != "local" {
+            return None;
+        }
+        let id = row["identity"]["instanceId"].as_str()?;
+        if row["instanceId"].as_str().is_some_and(|flat| flat != id) {
+            return None;
+        }
+        id
+    } else if folder {
+        row["instanceId"].as_str()?
+    } else {
+        return None;
+    };
+    uuid(id).then_some(id)
 }
 
-fn catalog(repos: &Value, worktrees: &Value, terminals: &Value) -> Option<OrcaSnapshot> {
+fn project_folder(repos: &Value, repo: &str) -> Option<bool> {
+    let mut rows = repos["repos"]
+        .as_array()?
+        .iter()
+        .filter(|r| r["id"] == repo);
+    let row = rows.next()?;
+    (rows.next().is_none() && local_project(row)).then(|| row["kind"] == "folder")
+}
+
+fn catalog(
+    repos: &Value,
+    worktrees: &Value,
+    terminals: &Value,
+    include_folders: bool,
+) -> Option<OrcaSnapshot> {
     let repo_rows = repos["repos"].as_array()?;
     let wt_rows = worktrees["worktrees"].as_array()?;
     let pane_rows = terminals["terminals"].as_array()?;
@@ -393,13 +432,15 @@ fn catalog(repos: &Value, worktrees: &Value, terminals: &Value) -> Option<OrcaSn
         let Some(id) = row["id"].as_str().filter(|id| uuid(id)) else {
             continue;
         };
-        if !local_git_repo(row) {
+        let folder = row["kind"] == "folder";
+        if !local_project(row) || (folder && !include_folders) {
             continue;
         }
         if index.insert(id, repositories.len()).is_some() {
             return None;
         }
         repositories.push(Repository {
+            folder,
             id: id.into(),
             name: name(row, "displayName", "Repository"),
             worktrees: vec![],
@@ -407,13 +448,11 @@ fn catalog(repos: &Value, worktrees: &Value, terminals: &Value) -> Option<OrcaSn
     }
     let mut paths = BTreeMap::new();
     for row in wt_rows.iter().take(MAX_ROWS) {
-        if !local_workspace(row) {
-            continue;
-        }
-        let Some(id) = row["identity"]["instanceId"].as_str().filter(|id| uuid(id)) else {
+        let Some(&r) = row["repoId"].as_str().and_then(|k| index.get(k)) else {
             continue;
         };
-        let Some(&r) = row["repoId"].as_str().and_then(|k| index.get(k)) else {
+        let folder = repositories[r].folder;
+        let Some(id) = workspace_instance(row, folder) else {
             continue;
         };
         let Some(key) = row["id"].as_str() else {
@@ -427,7 +466,7 @@ fn catalog(repos: &Value, worktrees: &Value, terminals: &Value) -> Option<OrcaSn
             id: id.into(),
             name: name(row, "displayName", "Worktree"),
             tabs: vec![],
-            removable: row["isMainWorktree"] == false,
+            removable: !folder && row["isMainWorktree"] == false,
         });
     }
     for row in pane_rows.iter().take(MAX_ROWS) {
@@ -554,6 +593,41 @@ mod tests {
     }
 
     #[test]
+    fn folder_catalog_is_negotiated_and_keeps_git_operations_disabled() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../protocol/fixtures/phase9/orca-folder-v5.json"
+        ))
+        .unwrap();
+        let result = &fixture["response"]["result"]["providers"]["orca"];
+        let expected = &result["repositories"][0];
+        let workspace = &expected["worktrees"][0];
+        let repos =
+            json!({"repos":[{"id":expected["id"],"kind":"folder","displayName":expected["name"]}]});
+        let worktrees = json!({"worktrees":[{"id":"folder:private","repoId":expected["id"],"hostId":"local","instanceId":workspace["id"],"displayName":workspace["name"],"isMainWorktree":false}]});
+        let tab = &workspace["tabs"][0];
+        let terminals: Vec<_> = tab["panes"].as_array().unwrap().iter().map(|p| json!({"worktreeId":"folder:private","tabId":tab["id"],"leafId":p["key"].as_str().unwrap().split_once(':').unwrap().1,"executionHostId":"local","connected":true,"title":tab["name"],"paneTitle":p["name"]})).collect();
+        let panes = json!({"terminals":terminals});
+        let snapshot = |w: &Value, folders| {
+            serde_json::to_value(catalog(&repos, w, &panes, folders).unwrap()).unwrap()
+        };
+        assert_eq!(snapshot(&worktrees, true)["repositories"][0], *expected);
+        assert_eq!(snapshot(&worktrees, false)["repositories"], json!([]));
+        let mut foreign = worktrees.clone();
+        foreign["worktrees"][0]["executionHostId"] = json!("ssh:other");
+        assert_eq!(
+            snapshot(&foreign, true)["repositories"][0]["worktrees"],
+            json!([])
+        );
+        let mut conflicting = worktrees;
+        conflicting["worktrees"][0]["identity"] =
+            json!({"executionHostId":"remote","instanceId":workspace["id"]});
+        assert_eq!(
+            snapshot(&conflicting, true)["repositories"][0]["worktrees"],
+            json!([])
+        );
+    }
+
+    #[test]
     fn catalog_requires_local_identity_at_each_join() {
         let repo = "00000000-0000-4000-8000-000000000001";
         let id = "00000000-0000-4000-8000-000000000002";
@@ -567,7 +641,8 @@ mod tests {
         let mut unknown = entry.clone();
         unknown.as_object_mut().unwrap().remove("executionHostId");
         let terminals = json!({"terminals":[foreign, unknown, entry]});
-        let snap = serde_json::to_value(catalog(&repos, &worktrees, &terminals).unwrap()).unwrap();
+        let snap =
+            serde_json::to_value(catalog(&repos, &worktrees, &terminals, false).unwrap()).unwrap();
         assert_eq!(
             snap["repositories"][0]["worktrees"][0]["tabs"][0]["panes"]
                 .as_array()
@@ -583,7 +658,8 @@ mod tests {
         );
         let mut remote = worktrees;
         remote["worktrees"][0]["identity"]["executionHostId"] = json!("ssh:other");
-        let snap = serde_json::to_value(catalog(&repos, &remote, &terminals).unwrap()).unwrap();
+        let snap =
+            serde_json::to_value(catalog(&repos, &remote, &terminals, false).unwrap()).unwrap();
         assert_eq!(snap["repositories"][0]["worktrees"], json!([]));
     }
 
@@ -594,7 +670,8 @@ mod tests {
         let dir = PathBuf::from(
             std::env::var_os("CIAO_TEST_ORCA_PROFILE").expect("disposable Orca profile"),
         );
-        let OrcaSnapshot::Available { repositories, .. } = snapshot(&dir, true, None).await else {
+        let OrcaSnapshot::Available { repositories, .. } = snapshot(&dir, true, true, None).await
+        else {
             panic!("catalog unavailable")
         };
         let pane = repositories

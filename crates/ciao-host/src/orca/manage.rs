@@ -161,13 +161,14 @@ async fn prepare(rt: &Runtime, request: &Request) -> Result<Prepared, Failure> {
         } => (repo, Some(workspace)),
     };
     let repos = repos.ok_or(Unavailable)?;
-    let mut candidates = repos["repos"]
-        .as_array()
-        .ok_or(Unavailable)?
-        .iter()
-        .filter(|row| row["id"] == repo.as_str() && super::local_git_repo(row));
-    if candidates.next().is_none() || candidates.next().is_some() {
-        return Err(Stale);
+    let folder = super::project_folder(&repos, repo).ok_or(Stale)?;
+    if folder
+        && matches!(
+            request.params,
+            Action::CreateWorktree { .. } | Action::RemoveWorktree { .. }
+        )
+    {
+        return Err(Refused);
     }
     if let Action::CreateWorktree { name, .. } = &request.params {
         return Ok(Prepared {
@@ -190,8 +191,7 @@ async fn prepare(rt: &Runtime, request: &Request) -> Result<Prepared, Failure> {
         .ok_or(Unavailable)?
         .iter()
         .filter(|w| {
-            super::local_workspace(w)
-                && w["identity"]["instanceId"] == workspace.as_str()
+            super::workspace_instance(w, folder) == Some(workspace.as_str())
                 && w["repoId"] == repo.as_str()
         });
     let w = matches.next().ok_or(Stale)?;
@@ -365,7 +365,8 @@ mod tests {
             .unwrap()
             .iter()
             .find(|r| {
-                super::super::local_git_repo(r)
+                super::super::local_project(r)
+                    && r["kind"] == "git"
                     && r["path"].as_str().is_some_and(|path| {
                         Path::new(path).canonicalize().ok().as_ref() == Some(&checkout)
                     })

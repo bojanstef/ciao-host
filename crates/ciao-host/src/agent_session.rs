@@ -471,7 +471,8 @@ impl AgentSessionSupervisor {
             })),
             metadata: Arc::new(Mutex::new(metadata)),
             registration_gate: Arc::new(AsyncMutex::new(())),
-            routes: TerminalRouteResolver::new(workspace),
+            routes: TerminalRouteResolver::new(workspace)
+                .with_orca_pairing(path.with_file_name(crate::storage::ORCA_PAIRING_FILE)),
             whereabouts: Whereabouts::default(),
         })
     }

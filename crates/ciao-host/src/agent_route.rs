@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use serde_json::Value;
 use tokio::time::timeout;
 
@@ -43,6 +44,7 @@ impl RouteContinuity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentRouteProof {
+    Orca(crate::orca::route::Proof),
     Tmux {
         binary: PathBuf,
         bridge_pid: u32,
@@ -79,7 +81,7 @@ pub(crate) enum AgentRouteProof {
 impl AgentRouteProof {
     pub(crate) const fn continuity(&self) -> RouteContinuity {
         match self {
-            Self::Tmux { .. } => RouteContinuity::ExactLive,
+            Self::Tmux { .. } | Self::Orca(_) => RouteContinuity::ExactLive,
             Self::HerdrWorkspace { .. } | Self::HerdrCore { .. } => RouteContinuity::WorkspaceOnly,
         }
     }
@@ -93,6 +95,7 @@ impl AgentRouteProof {
     /// from the tab list, and the caller must leave that tab unannotated rather than guess.
     pub(crate) fn tab_key(&self) -> Option<(ProviderKind, String, String)> {
         match self {
+            Self::Orca(_) => None, // Orca panes live in the separate Orca catalog.
             Self::HerdrCore {
                 session_name,
                 tab_id,
@@ -120,6 +123,7 @@ impl AgentRouteProof {
 
 #[derive(Debug, Clone)]
 pub(crate) enum AgentTerminalPlan {
+    Orca(crate::orca::route::Proof),
     Command {
         program: PathBuf,
         args: Vec<OsString>,
@@ -131,22 +135,34 @@ pub(crate) enum AgentTerminalPlan {
     },
 }
 impl AgentTerminalPlan {
-    pub(crate) fn provider(&self) -> ProviderKind {
-        match self {
-            Self::Command { provider, .. } => *provider,
-            Self::Core { .. } => ProviderKind::HerdrCore,
-        }
+    pub(crate) fn is_herdr_tui(&self) -> bool {
+        matches!(
+            self,
+            Self::Command {
+                provider: ProviderKind::Herdr,
+                ..
+            }
+        )
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalRouteResolver {
     workspace: WorkspaceConfig,
+    orca_pairing: Option<PathBuf>,
 }
 
 impl TerminalRouteResolver {
     pub(crate) fn new(workspace: WorkspaceConfig) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            orca_pairing: None,
+        }
+    }
+
+    pub(crate) fn with_orca_pairing(mut self, path: PathBuf) -> Self {
+        self.orca_pairing = Some(path);
+        self
     }
 
     /// The tab's own name, so an alert can say which of four conversations in one project
@@ -162,6 +178,7 @@ impl TerminalRouteResolver {
     /// provider call an hour in the worst case and not worth a cache that could go stale.
     pub(crate) async fn tab_label(&self, proof: &AgentRouteProof) -> Option<String> {
         match proof {
+            AgentRouteProof::Orca(p) => p.label(&self.workspace.orca_profile).await,
             AgentRouteProof::HerdrCore {
                 session_name,
                 tab_id,
@@ -225,7 +242,7 @@ impl TerminalRouteResolver {
     }
 
     /// Resolves only from the authenticated local bridge PID. tmux wins when providers are
-    /// nested because it is the only physically qualified exact-live route in this phase.
+    /// nested so a conversation inside tmux opens its selected tmux pane.
     pub(crate) async fn resolve(&self, bridge_pid: u32) -> Option<AgentRouteProof> {
         if bridge_pid == 0 || !process::exists(bridge_pid) {
             return None;
@@ -234,22 +251,28 @@ impl TerminalRouteResolver {
             if let Some(proof) = self.resolve_tmux(bridge_pid).await {
                 return Some(proof);
             }
-            // These equally limited workspace routes have independent providers. A stale
-            // Core socket must not consume the legacy Herdr probe's entire request budget.
-            let legacy = self.resolve_herdr_workspace(bridge_pid);
-            let core = self.resolve_core(bridge_pid);
-            tokio::pin!(legacy, core);
-            tokio::select! {
-                biased;
-                proof = &mut legacy => match proof {
-                    Some(proof) => Some(proof),
-                    None => core.await,
-                },
-                proof = &mut core => match proof {
-                    Some(proof) => Some(proof),
-                    None => legacy.await,
-                },
+            // Each backend has its own I/O. A slow or unavailable one must not conceal
+            // a proven route from another backend inside the shared deadline.
+            let orca = async {
+                crate::orca::route::Proof::find(
+                    &self.workspace.orca_profile,
+                    self.orca_pairing.as_deref()?,
+                    bridge_pid,
+                )
+                .await
+                .map(AgentRouteProof::Orca)
+            };
+            let mut candidates = FuturesUnordered::from_iter([
+                self.resolve_herdr_workspace(bridge_pid).boxed(),
+                self.resolve_core(bridge_pid).boxed(),
+                orca.boxed(),
+            ]);
+            while let Some(route) = candidates.next().await {
+                if route.is_some() {
+                    return route;
+                }
             }
+            None
         })
         .await
         .ok()
@@ -259,6 +282,10 @@ impl TerminalRouteResolver {
     pub(crate) async fn revalidate(&self, proof: &AgentRouteProof) -> bool {
         timeout(ROUTE_RESOLUTION_TIMEOUT, async {
             match proof {
+                AgentRouteProof::Orca(p) => match self.orca_pairing.as_deref() {
+                    Some(pairing) => p.current(&self.workspace.orca_profile, pairing).await,
+                    None => false,
+                },
                 AgentRouteProof::HerdrCore {
                     bridge_pid,
                     session_name,
@@ -328,6 +355,7 @@ impl TerminalRouteResolver {
             return None;
         }
         match proof {
+            AgentRouteProof::Orca(p) => Some(AgentTerminalPlan::Orca(p.clone())),
             AgentRouteProof::HerdrCore {
                 session_name,
                 tab_id,

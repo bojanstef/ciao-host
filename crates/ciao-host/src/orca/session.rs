@@ -38,13 +38,18 @@ pub(super) async fn resolve(rt: &Runtime, workspace: &str, pane: &str) -> Option
     if !uuid(workspace) || !valid_pane(pane) {
         return None;
     }
-    let list = rt
-        .query("worktree.list", json!({"limit":super::MAX_ROWS}))
-        .await?;
+    let (worktrees, repos) = tokio::join!(
+        rt.query("worktree.list", json!({"limit":super::MAX_ROWS})),
+        rt.query("repo.list", json!({}))
+    );
+    let list = worktrees?;
+    let repos = repos?;
     let mut matches = list["worktrees"].as_array()?.iter().filter(|w| {
-        w["identity"]["instanceId"] == workspace
-            && w["identity"]["executionHostId"] == "local"
-            && w["hostId"] == "local"
+        w["repoId"]
+            .as_str()
+            .and_then(|repo| super::project_folder(&repos, repo))
+            .and_then(|folder| super::workspace_instance(w, folder))
+            == Some(workspace)
     });
     let worktree = matches.next()?["id"].as_str()?;
     if matches.next().is_some() {
@@ -89,7 +94,11 @@ pub(crate) async fn pair(paths: &CiaoPaths) -> anyhow::Result<()> {
     let mut text = String::new();
     std::io::stdin().lock().take(16_385).read_line(&mut text)?;
     anyhow::ensure!(text.len() <= 16_384, "Orca pairing link is too long");
-    let pair = Pairing::decode(&text)?;
+    pair_link(paths, &text).await
+}
+
+pub(super) async fn pair_link(paths: &CiaoPaths, link: &str) -> anyhow::Result<()> {
+    let pair = Pairing::decode(link)?;
     let rt = Runtime::discover(&super::profile(&paths.home))
         .await
         .ok_or_else(|| anyhow::anyhow!("Orca is unavailable on this host"))?;
@@ -166,10 +175,14 @@ impl Viewer {
         workspace: &str,
         pane: &str,
         size: Dimensions,
+        proof: Option<&super::route::Proof>,
     ) -> Option<(Self, String)> {
         let rt = Runtime::discover(profile).await?;
         let t = resolve(&rt, workspace, pane).await?;
-        let bytes = crate::orca::read_pairing_file(credentials).await?;
+        if proof.is_some_and(|p| !p.matches(&rt, &t)) {
+            return None;
+        }
+        let bytes = crate::orca::read_private_file(credentials).await?;
         let mut channel = Channel::connect(&rt, serde_json::from_slice(&bytes).ok()?)
             .await
             .ok()?;
@@ -310,9 +323,37 @@ impl OrcaSession {
         pane: String,
         size: Dimensions,
     ) -> Result<Self, PtyError> {
+        Self::open(&profile, &credentials, &workspace, &pane, size, None).await
+    }
+
+    pub(crate) async fn attach_agent(
+        profile: PathBuf,
+        credentials: PathBuf,
+        proof: &super::route::Proof,
+        size: Dimensions,
+    ) -> Result<Self, PtyError> {
+        Self::open(
+            &profile,
+            &credentials,
+            &proof.workspace,
+            &proof.pane,
+            size,
+            Some(proof),
+        )
+        .await
+    }
+
+    async fn open(
+        profile: &Path,
+        credentials: &Path,
+        workspace: &str,
+        pane: &str,
+        size: Dimensions,
+        proof: Option<&super::route::Proof>,
+    ) -> Result<Self, PtyError> {
         let (mut viewer, initial) = timeout(
             Duration::from_secs(6),
-            Viewer::open(&profile, &credentials, &workspace, &pane, size),
+            Viewer::open(profile, credentials, workspace, pane, size, proof),
         )
         .await
         .ok()

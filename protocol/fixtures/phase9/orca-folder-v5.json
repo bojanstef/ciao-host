@@ -1,0 +1,91 @@
+{
+  "request": {
+    "v": 1,
+    "type": "request",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "method": "workspace.snapshot.v5",
+    "params": {
+      "tabs": true
+    }
+  },
+  "response": {
+    "v": 1,
+    "type": "response",
+    "request_id": "AAECAwQFBgcICQoLDA0ODw",
+    "result": {
+      "v": 1,
+      "providers": {
+        "tmux": {
+          "state": "available",
+          "version": "3.7b",
+          "sessions": []
+        },
+        "herdr": {
+          "state": "available",
+          "version": "0.9.0",
+          "sessions": [
+            {
+              "name": "default",
+              "running": true,
+              "is_default": true
+            }
+          ]
+        },
+        "herdr_core": {
+          "state": "not_installed"
+        },
+        "orca": {
+          "state": "available",
+          "truncated": false,
+          "repositories": [
+            {
+              "id": "00000000-0000-4000-8000-000000000001",
+              "name": "Folder project",
+              "worktrees": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000002",
+                  "name": "Folder project",
+                  "tabs": [
+                    {
+                      "id": "00000000-0000-4000-8000-000000000003",
+                      "name": "Shell",
+                      "panes": [
+                        {
+                          "key": "00000000-0000-4000-8000-000000000003:00000000-0000-4000-8000-000000000004",
+                          "name": "Twin"
+                        },
+                        {
+                          "key": "00000000-0000-4000-8000-000000000003:00000000-0000-4000-8000-000000000005",
+                          "name": "Twin"
+                        }
+                      ]
+                    }
+                  ],
+                  "removable": false
+                }
+              ],
+              "folder": true
+            }
+          ],
+          "can_attach": true,
+          "can_remove_worktrees": true
+        }
+      },
+      "omitted_sessions": 0,
+      "agent_integrations": [
+        {
+          "agent": "claude",
+          "state": "missing"
+        },
+        {
+          "agent": "codex",
+          "state": "needs_approval"
+        },
+        {
+          "agent": "pi",
+          "state": "outdated"
+        }
+      ]
+    }
+  }
+}

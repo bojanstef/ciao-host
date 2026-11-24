@@ -162,6 +162,7 @@ pub const PROVIDER_STATE_ERROR: &str = "error";
 /// Spec 029: the newest workspace snapshot, `v2`'s result plus `agent_integrations`. The older
 /// methods never carry that field, because the apps that ask them decode results strictly.
 pub const METHOD_WORKSPACE_SNAPSHOT_V4: &str = "workspace.snapshot.v4";
+pub const METHOD_WORKSPACE_SNAPSHOT_V5: &str = "workspace.snapshot.v5";
 pub const METHOD_WORKSPACE_SNAPSHOT_V3: &str = "workspace.snapshot.v3";
 /// Spec 029 §2 bounds: one entry per agent the host detects, and short `[a-z_]` tokens.
 pub const MAX_AGENT_INTEGRATION_ENTRIES: usize = 8;
@@ -965,6 +966,7 @@ impl WorkspaceSnapshotRequest {
                 | "workspace.snapshot.v2"
                 | METHOD_WORKSPACE_SNAPSHOT_V3
                 | METHOD_WORKSPACE_SNAPSHOT_V4
+                | METHOD_WORKSPACE_SNAPSHOT_V5
         ) {
             return Err(HostProtocolError::UnsupportedMethod);
         }
@@ -2046,7 +2048,8 @@ pub fn decode_rpc_request(body: &[u8]) -> Result<RpcRequest, HostProtocolError> 
         "workspace.snapshot"
         | "workspace.snapshot.v2"
         | METHOD_WORKSPACE_SNAPSHOT_V3
-        | METHOD_WORKSPACE_SNAPSHOT_V4 => {
+        | METHOD_WORKSPACE_SNAPSHOT_V4
+        | METHOD_WORKSPACE_SNAPSHOT_V5 => {
             let request: WorkspaceSnapshotRequest =
                 serde_json::from_slice(body).map_err(|_| HostProtocolError::MalformedJson)?;
             request.validate()?;

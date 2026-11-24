@@ -62,9 +62,11 @@ pub struct CiaoPaths {
     pub service_file: PathBuf,
 }
 
+pub(crate) const ORCA_PAIRING_FILE: &str = "orca-pairing.json";
+
 impl CiaoPaths {
     pub(crate) fn orca_pairing_file(&self) -> PathBuf {
-        self.state_dir.join("orca-pairing.json")
+        self.state_dir.join(ORCA_PAIRING_FILE)
     }
 
     pub fn discover() -> Result<Self> {

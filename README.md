@@ -38,7 +38,7 @@ The host is free software, **MIT OR Apache-2.0**. In the app, pairing, watching,
 
 ## Orca terminals
 
-On a host running Orca, a Ciao app that negotiates `workspace.snapshot.v4` can browse local Git repositories, worktrees, tabs and split panes. The host reads Orca’s private runtime metadata from the usual per-user profile or an absolute `ORCA_USER_DATA_PATH` set for the Ciao daemon. Discovery and management use the authenticated local Unix socket.
+On a host running Orca, Ciao lists local Git projects and ordinary folder projects under **Hosts → Orca workspaces** and in **New Session**. Expand the workspace and tab to open a split pane. Git projects also offer worktree creation and removal. The app negotiates `workspace.snapshot.v5` for folder support and falls back to v4 for Git projects on older hosts. The host reads Orca’s private runtime metadata from the usual per-user profile or an absolute `ORCA_USER_DATA_PATH` set for the Ciao daemon. Discovery and management use the authenticated local Unix socket.
 
 To enable live terminal viewing, create a dedicated **runtime access link** in Orca for this Ciao host. The Orca CLI generates this kind of link with `orca pair`. Orca controls its own listener settings when it creates a link. On macOS, copy the link and run the following command.
 
@@ -47,6 +47,8 @@ pbpaste | ciao orca-pair
 ```
 
 On Linux, pipe the link from your clipboard utility or redirect a private file into `ciao orca-pair`. The command verifies the local Orca runtime and stores the credential in the Ciao user state directory with mode `0600`. Revoke this client in Orca to stop live access. A Ciao host reset also removes its local copy. The iPhone uses its existing Ciao pairing.
+
+For an attached Claude Code, Codex or Pi conversation, **Show terminal** in the conversation header opens its live pane when Ciao can verify the process there. This works even when a shell started in a folder project and changed directories. Ciao uses the paired runtime and Orca 1.4.273’s local PTY daemon inventory (protocol 62) to match the process to the pane. The one-time host pairing enables both entry points.
 
 Live viewing uses Orca’s encrypted WebSocket on loopback. Detaching closes the viewer and keeps the shell running. Closing a tab ends its processes. Removing a worktree runs Orca’s archive hooks, honors dirty-checkout refusals and keeps the Git branch. The removal action requires Orca’s explicit branch-retention capability.
 
