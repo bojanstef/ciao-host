@@ -66,10 +66,18 @@ path. If a connection fails after a request was sent, the command reports `outco
 A newly spawned worker may briefly answer `session_unavailable` until it registers; inspect
 its snapshot before sending. A canonical command receipt distinguishes submission from
 application. Tool approvals and questions are answered by the person through Ciao, not by
-these peer commands. `follow` prints the canonical snapshot as one JSON line, then a new line
-soon after each change (at most four a second) and at least one a second while nothing changes,
-for the specified interval. Against a computer on Ciao 0.1.66 or earlier it polls once a second
-instead. An unavailable connection is reported as an error, not as a stopped agent.
+these peer commands. For the specified interval, `follow` prints the canonical snapshot as one
+JSON line when it first reads it, and again only when it changes (soon after the change, at most
+four a second). After each second with no change it prints a small heartbeat line instead:
+
+```json
+{"type":"heartbeat","session_id":"<session-id>","snapshot_epoch":3,"process_generation":2,"revision":41}
+```
+
+A heartbeat names the snapshot already printed and carries no conversation content. Snapshot
+lines have no `type` field. The output is the same against a computer on Ciao 0.1.66 or earlier,
+which this side polls once a second. An unavailable connection is reported as an error, never as
+a heartbeat or a stopped agent.
 
 Retry a lost start reply with the **same request ID, workspace and agent**. A recorded outcome is
 returned; an interrupted launch claim returns `outcome_unknown` and is never blindly launched

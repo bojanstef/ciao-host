@@ -1461,8 +1461,8 @@ mod tests {
         pair.close().await;
     }
 
-    /// The CLI's follow loop with the lab's clock. Returns when each snapshot arrived and its
-    /// revision.
+    /// The CLI's follow loop with the lab's clock. Returns when each snapshot line arrived and
+    /// its revision; heartbeats are left out.
     async fn follow_for_lab(
         client: &Endpoint,
         source: &Arc<RuntimeState>,
@@ -1476,12 +1476,15 @@ mod tests {
                 source,
                 session,
             },
+            session,
             seconds,
-            |snapshot| {
-                seen.push((
-                    std::time::Instant::now(),
-                    snapshot["revision"].as_u64().unwrap(),
-                ));
+            |line| {
+                if let crate::peer_cli::FollowLine::Snapshot(snapshot) = line {
+                    seen.push((
+                        std::time::Instant::now(),
+                        snapshot["revision"].as_u64().unwrap(),
+                    ));
+                }
                 Ok(())
             },
         )
@@ -1681,25 +1684,49 @@ mod tests {
             }
         });
         let source = crate::peer_cli::DaemonFollow::new(&socket, "Build".into(), session.clone());
+        // When each line came, whether it was a snapshot, and the revision it names.
         let mut lines = Vec::new();
-        crate::peer_cli::follow(&source, Duration::from_secs(3), |snapshot| {
-            lines.push((began.elapsed(), snapshot["revision"].as_u64().unwrap()));
+        crate::peer_cli::follow(&source, &session, Duration::from_secs(3), |line| {
+            lines.push(match line {
+                crate::peer_cli::FollowLine::Snapshot(snapshot) => (
+                    began.elapsed(),
+                    true,
+                    snapshot["revision"].as_u64().unwrap(),
+                ),
+                crate::peer_cli::FollowLine::Heartbeat(heartbeat) => {
+                    (began.elapsed(), false, heartbeat.holds.unwrap().revision)
+                }
+            });
             Ok(())
         })
         .await
         .unwrap();
         change.await.unwrap();
-        assert!(lines.len() >= 4, "{lines:?}");
-        assert!(lines[0].0 < Duration::from_secs(1));
+        assert!(
+            lines[0].0 < Duration::from_secs(1) && lines[0].1,
+            "{lines:?}"
+        );
         assert!(
             lines
                 .windows(2)
                 .all(|w| w[1].0 - w[0].0 < Duration::from_millis(1500)),
             "{lines:?}"
         );
+        // The change prints once, and heartbeats name the snapshot already printed.
+        let snapshots: Vec<_> = lines.iter().filter(|l| l.1).collect();
+        assert_eq!(snapshots.len(), 2, "{lines:?}");
+        assert!(snapshots[1].2 > snapshots[0].2);
+        assert!(lines.iter().any(|l| !l.1), "{lines:?}");
+        let mut held = 0;
+        for (_, snapshot, revision) in &lines {
+            if *snapshot {
+                held = *revision;
+            } else {
+                assert_eq!(*revision, held, "{lines:?}");
+            }
+        }
         // Polling once a second would see the 1.1 s change at about 2 s.
-        let seen = lines.iter().find(|l| l.1 > lines[0].1).unwrap();
-        assert!(seen.0 < Duration::from_millis(1800), "{lines:?}");
+        assert!(snapshots[1].0 < Duration::from_millis(1800), "{lines:?}");
         server.abort();
         drain.abort();
         pair.close().await;
