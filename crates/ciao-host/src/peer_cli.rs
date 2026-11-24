@@ -93,10 +93,20 @@ pub(crate) async fn follow(
 }
 
 /// The local daemon, which reaches the destination.
-struct DaemonFollow<'a> {
+pub(crate) struct DaemonFollow<'a> {
     socket: &'a Path,
     host: String,
     session: String,
+}
+
+impl<'a> DaemonFollow<'a> {
+    pub(crate) fn new(socket: &'a Path, host: String, session: String) -> Self {
+        Self {
+            socket,
+            host,
+            session,
+        }
+    }
 }
 
 impl FollowSource for DaemonFollow<'_> {
@@ -300,11 +310,7 @@ pub(crate) async fn run(command: Command, socket: &Path) -> Result<()> {
             session,
             seconds,
         } => {
-            let source = DaemonFollow {
-                socket,
-                host,
-                session,
-            };
+            let source = DaemonFollow::new(socket, host, session);
             return follow(&source, Duration::from_secs(seconds), |snapshot| {
                 println!("{}", serde_json::to_string(snapshot)?);
                 Ok(())

@@ -1658,6 +1658,53 @@ mod tests {
         pair.close().await;
     }
 
+    #[tokio::test]
+    async fn peer_cli_follow_reads_changes_through_the_local_daemon_socket() {
+        let pair = pair(accepted_alpns()).await;
+        let (session, drain) = pair.start_live("one").await;
+        let run_dir = tempfile::tempdir().unwrap();
+        let socket = run_dir.path().join("ciao.sock");
+        let listener = super::super::bind_local_socket(&socket).await.unwrap();
+        let server = tokio::spawn(super::super::serve_ipc(
+            listener,
+            pair.client.clone(),
+            pair.source.clone(),
+        ));
+        let began = std::time::Instant::now();
+        let change = tokio::spawn({
+            let (destination, session) = (pair.destination.clone(), session.clone());
+            async move {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                destination
+                    .agent_sessions
+                    .update_bridge_permission_mode(&session, "plan".into());
+            }
+        });
+        let source = crate::peer_cli::DaemonFollow::new(&socket, "Build".into(), session.clone());
+        let mut lines = Vec::new();
+        crate::peer_cli::follow(&source, Duration::from_secs(3), |snapshot| {
+            lines.push((began.elapsed(), snapshot["revision"].as_u64().unwrap()));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        change.await.unwrap();
+        assert!(lines.len() >= 4, "{lines:?}");
+        assert!(lines[0].0 < Duration::from_secs(1));
+        assert!(
+            lines
+                .windows(2)
+                .all(|w| w[1].0 - w[0].0 < Duration::from_millis(1500)),
+            "{lines:?}"
+        );
+        // Polling once a second would see the 1.1 s change at about 2 s.
+        let seen = lines.iter().find(|l| l.1 > lines[0].1).unwrap();
+        assert!(seen.0 < Duration::from_millis(1800), "{lines:?}");
+        server.abort();
+        drain.abort();
+        pair.close().await;
+    }
+
     /// The CLI's follow loop, reading through the source daemon's IPC handler in process.
     struct LabFollow<'a> {
         client: &'a Endpoint,
