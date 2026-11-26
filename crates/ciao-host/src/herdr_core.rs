@@ -31,11 +31,11 @@ use crate::{
     drift,
     host_protocol::herdr_management::valid_space_id,
     host_protocol::{
-        CoreTabPlacement, Dimensions, HOST_PENDING_INPUT_BYTES, HOST_PENDING_OUTPUT_BYTES,
-        MAX_DATA_PAYLOAD, MAX_SESSIONS_PER_PROVIDER, MAX_TABS_PER_SESSION, valid_herdr_core_tab_id,
-        valid_session_name,
+        CoreTabPlacement, Dimensions, HOST_PENDING_OUTPUT_BYTES, MAX_SESSIONS_PER_PROVIDER,
+        MAX_TABS_PER_SESSION, valid_herdr_core_tab_id, valid_session_name,
     },
     pty::{CleanupReason, PtyError, PtyExit, QueueHighWaterMarks},
+    terminal_input::{InputChunk, InputQueue},
     terminal_tabs::CreationFailure,
     workspace::{PaneFacts, sanitize_tab_label},
 };
@@ -743,11 +743,6 @@ fn rpc_result_bounded(
     value.get("result").cloned().ok_or(CoreError::Invalid)
 }
 
-struct CoreInput {
-    bytes: Vec<u8>,
-    _permit: OwnedSemaphorePermit,
-}
-
 #[derive(Default)]
 struct ConsumedCredit {
     bytes: AtomicUsize,
@@ -777,14 +772,12 @@ impl Drop for CoreOutput {
 
 pub(crate) struct CoreSession {
     terminal_id: String,
-    input: Option<mpsc::Sender<CoreInput>>,
-    input_bytes: Arc<Semaphore>,
+    input: InputQueue,
     output: mpsc::Receiver<CoreOutput>,
     resize: watch::Sender<Dimensions>,
     exit: watch::Receiver<Option<Result<PtyExit, PtyError>>>,
     read_task: JoinHandle<()>,
     write_task: JoinHandle<()>,
-    high_input: Arc<AtomicUsize>,
     high_output: Arc<AtomicUsize>,
 }
 
@@ -890,14 +883,12 @@ impl CoreSession {
             .ok_or(PtyError::OpenFailed)?;
         let buffered = stream.buffer().to_vec();
         let (read, write) = stream.into_inner().into_split();
-        let (input_tx, input_rx) = mpsc::channel(HOST_PENDING_INPUT_BYTES / MAX_DATA_PAYLOAD);
+        let (input, input_rx) = InputQueue::new();
         let (output_tx, output_rx) = mpsc::channel(HOST_PENDING_OUTPUT_BYTES / STREAM_CHUNK_BYTES);
         let consumed = Arc::new(ConsumedCredit::default());
         let write_credit = consumed.clone();
-        let input_bytes = Arc::new(Semaphore::new(HOST_PENDING_INPUT_BYTES));
         let (resize_tx, resize_rx) = watch::channel(dimensions);
         let (exit_tx, exit_rx) = watch::channel(None);
-        let high_input = Arc::new(AtomicUsize::new(0));
         let high_output = Arc::new(AtomicUsize::new(0));
         let write_exit = exit_tx.clone();
         let write_task = tokio::spawn(async move {
@@ -916,14 +907,12 @@ impl CoreSession {
         });
         Ok(Self {
             terminal_id: crate::protocol::base64url(&rand::random::<[u8; 16]>()),
-            input: Some(input_tx),
-            input_bytes,
+            input,
             output: output_rx,
             resize: resize_tx,
             exit: exit_rx,
             read_task,
             write_task,
-            high_input,
             high_output,
         })
     }
@@ -937,28 +926,12 @@ impl CoreSession {
     pub(crate) async fn next_output(&mut self) -> Option<CoreOutput> {
         self.output.recv().await
     }
+    #[cfg(test)]
     pub(crate) async fn send_input(&self, bytes: Vec<u8>) -> Result<(), PtyError> {
-        if bytes.is_empty() || bytes.len() > MAX_DATA_PAYLOAD {
-            return Err(PtyError::InvalidInput);
-        }
-        let sender = self.input.as_ref().ok_or(PtyError::InputClosed)?;
-        let permit = self
-            .input_bytes
-            .clone()
-            .acquire_many_owned(bytes.len() as u32)
-            .await
-            .map_err(|_| PtyError::InputClosed)?;
-        self.high_input.fetch_max(
-            HOST_PENDING_INPUT_BYTES - self.input_bytes.available_permits(),
-            Ordering::Relaxed,
-        );
-        sender
-            .send(CoreInput {
-                bytes,
-                _permit: permit,
-            })
-            .await
-            .map_err(|_| PtyError::InputClosed)
+        self.input.send(bytes).await
+    }
+    pub(crate) fn input(&self) -> &InputQueue {
+        &self.input
     }
     pub(crate) fn request_resize(&self, dimensions: Dimensions) -> Result<(), PtyError> {
         self.resize
@@ -967,12 +940,12 @@ impl CoreSession {
     }
     pub(crate) fn queue_high_water_marks(&self) -> QueueHighWaterMarks {
         QueueHighWaterMarks {
-            input_bytes: self.high_input.load(Ordering::Relaxed),
+            input_bytes: self.input.high_water(),
             output_bytes: self.high_output.load(Ordering::Relaxed),
         }
     }
     pub(crate) async fn cleanup(&mut self, _reason: CleanupReason) -> Result<(), PtyError> {
-        self.input.take();
+        self.input.close();
         self.read_task.abort();
         self.write_task.abort();
         let _ = (&mut self.read_task).await;
@@ -995,14 +968,14 @@ impl Drop for CoreSession {
 async fn write_loop(
     mut write: OwnedWriteHalf,
     channel: u32,
-    mut input: mpsc::Receiver<CoreInput>,
+    mut input: mpsc::Receiver<InputChunk>,
     credit: Arc<ConsumedCredit>,
     mut resize: watch::Receiver<Dimensions>,
 ) -> std::io::Result<()> {
     loop {
         tokio::select! {
             command = input.recv() => match command {
-                Some(chunk) => write_frame(&mut write, channel, DATA, &chunk.bytes).await?,
+                Some(chunk) => write_frame(&mut write, channel, DATA, chunk.bytes()).await?,
                 None => return Ok(()),
             },
             _ = credit.wake.notified() => {

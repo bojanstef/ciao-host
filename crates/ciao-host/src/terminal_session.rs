@@ -12,6 +12,7 @@ use crate::{
         CleanupReason, PtyError, PtyExit, PtyExitWatcher, PtyOutput, PtySession,
         QueueHighWaterMarks,
     },
+    terminal_input::InputQueue,
 };
 
 pub(crate) enum TerminalSession {
@@ -108,11 +109,11 @@ impl TerminalSession {
             Self::Orca(session) => session.next_output().await.map(TerminalOutput::Orca),
         }
     }
-    pub(crate) async fn send_input(&self, bytes: Vec<u8>) -> Result<(), PtyError> {
+    pub(crate) fn input(&self) -> &InputQueue {
         match self {
-            Self::Pty(session) => session.send_input(bytes).await,
-            Self::Core(session) => session.send_input(bytes).await,
-            Self::Orca(session) => session.send_input(bytes).await,
+            Self::Pty(session) => session.input(),
+            Self::Core(session) => session.input(),
+            Self::Orca(session) => session.input(),
         }
     }
     pub(crate) fn request_resize(&self, size: Dimensions) -> Result<(), PtyError> {

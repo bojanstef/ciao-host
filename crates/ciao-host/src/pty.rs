@@ -25,12 +25,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::host_protocol::{
-    Dimensions, HOST_PENDING_INPUT_BYTES, HOST_PENDING_OUTPUT_BYTES, MAX_DATA_PAYLOAD,
-};
+use crate::host_protocol::{Dimensions, HOST_PENDING_OUTPUT_BYTES};
+use crate::terminal_input::InputQueue;
 
 const PTY_READ_BYTES: usize = 16 * 1024;
-const INPUT_ITEMS: usize = HOST_PENDING_INPUT_BYTES / MAX_DATA_PAYLOAD;
 const OUTPUT_ITEMS: usize = HOST_PENDING_OUTPUT_BYTES / PTY_READ_BYTES;
 const RESIZE_MIN_INTERVAL: Duration = Duration::from_millis(50);
 const SIGNAL_WAIT: Duration = Duration::from_secs(1);
@@ -112,11 +110,6 @@ impl PtyExitWatcher {
     }
 }
 
-struct InputChunk {
-    bytes: Vec<u8>,
-    _permit: OwnedSemaphorePermit,
-}
-
 enum MasterCommand {
     Resize(Dimensions, oneshot::Sender<Result<(), PtyError>>),
     Close(oneshot::Sender<()>),
@@ -184,8 +177,7 @@ pub(crate) struct PtySession {
     /// reported as finished.
     tty: Arc<StdMutex<Option<File>>>,
     tty_name: Option<PathBuf>,
-    input_sender: Option<mpsc::Sender<InputChunk>>,
-    input_semaphore: Arc<Semaphore>,
+    input: InputQueue,
     output_receiver: mpsc::Receiver<PtyOutput>,
     output_semaphore: Arc<Semaphore>,
     resize_sender: Option<watch::Sender<Dimensions>>,
@@ -193,7 +185,6 @@ pub(crate) struct PtySession {
     exit_receiver: watch::Receiver<Option<Result<PtyExit, PtyError>>>,
     killer: Arc<StdMutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
     cancelled: Arc<AtomicBool>,
-    input_high_water: Arc<AtomicUsize>,
     output_high_water: Arc<AtomicUsize>,
     writer_task: Option<JoinHandle<()>>,
     reader_task: Option<JoinHandle<()>>,
@@ -250,19 +241,17 @@ impl PtySession {
         } = spawned;
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let input_semaphore = Arc::new(Semaphore::new(HOST_PENDING_INPUT_BYTES));
         let output_semaphore = Arc::new(Semaphore::new(HOST_PENDING_OUTPUT_BYTES));
-        let input_high_water = Arc::new(AtomicUsize::new(0));
         let output_high_water = Arc::new(AtomicUsize::new(0));
 
-        let (input_sender, mut input_receiver) = mpsc::channel::<InputChunk>(INPUT_ITEMS);
+        let (input, mut input_receiver) = InputQueue::new();
         let writer_cancelled = cancelled.clone();
         let writer_task = tokio::task::spawn_blocking(move || {
             while let Some(chunk) = input_receiver.blocking_recv() {
                 if writer_cancelled.load(Ordering::Acquire) {
                     break;
                 }
-                if writer.write_all(&chunk.bytes).is_err() || writer.flush().is_err() {
+                if writer.write_all(chunk.bytes()).is_err() || writer.flush().is_err() {
                     break;
                 }
             }
@@ -391,8 +380,7 @@ impl PtySession {
             shell_session_id,
             tty,
             tty_name,
-            input_sender: Some(input_sender),
-            input_semaphore,
+            input,
             output_receiver,
             output_semaphore,
             resize_sender: Some(resize_sender),
@@ -400,7 +388,6 @@ impl PtySession {
             exit_receiver,
             killer: Arc::new(StdMutex::new(killer)),
             cancelled,
-            input_high_water,
             output_high_water,
             writer_task: Some(writer_task),
             reader_task: Some(reader_task),
@@ -444,29 +431,13 @@ impl PtySession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn send_input(&self, bytes: Vec<u8>) -> Result<(), PtyError> {
-        if bytes.is_empty() || bytes.len() > MAX_DATA_PAYLOAD {
-            return Err(PtyError::InvalidInput);
-        }
-        let sender = self.input_sender.as_ref().ok_or(PtyError::InputClosed)?;
-        let count = u32::try_from(bytes.len()).map_err(|_| PtyError::InvalidInput)?;
-        let permit = self
-            .input_semaphore
-            .clone()
-            .acquire_many_owned(count)
-            .await
-            .map_err(|_| PtyError::InputClosed)?;
-        update_high_water(
-            &self.input_high_water,
-            HOST_PENDING_INPUT_BYTES - self.input_semaphore.available_permits(),
-        );
-        sender
-            .send(InputChunk {
-                bytes,
-                _permit: permit,
-            })
-            .await
-            .map_err(|_| PtyError::InputClosed)
+        self.input.send(bytes).await
+    }
+
+    pub(crate) fn input(&self) -> &InputQueue {
+        &self.input
     }
 
     pub(crate) async fn next_output(&mut self) -> Option<PtyOutput> {
@@ -494,7 +465,7 @@ impl PtySession {
 
     pub(crate) fn queue_high_water_marks(&self) -> QueueHighWaterMarks {
         QueueHighWaterMarks {
-            input_bytes: self.input_high_water.load(Ordering::Relaxed),
+            input_bytes: self.input.high_water(),
             output_bytes: self.output_high_water.load(Ordering::Relaxed),
         }
     }
@@ -571,8 +542,7 @@ impl PtySession {
 
     async fn stop_accepting_and_close_handles(&mut self) {
         self.cancelled.store(true, Ordering::Release);
-        self.input_sender.take();
-        self.input_semaphore.close();
+        self.input.close();
         self.resize_sender.take();
         if let Some(task) = self.resize_task.take() {
             task.abort();
@@ -628,8 +598,7 @@ impl Drop for PtySession {
             return;
         }
         self.cancelled.store(true, Ordering::Release);
-        self.input_sender.take();
-        self.input_semaphore.close();
+        self.input.close();
         self.output_receiver.close();
         self.output_semaphore.close();
         self.resize_sender.take();
@@ -1048,7 +1017,7 @@ mod tests {
         let output = collect_output(&mut session).await;
         assert!(output.windows(6).any(|window| window == b"abcdef"));
         let marks = session.queue_high_water_marks();
-        assert!(marks.input_bytes <= HOST_PENDING_INPUT_BYTES);
+        assert!(marks.input_bytes <= crate::host_protocol::HOST_PENDING_INPUT_BYTES);
         assert!(marks.output_bytes <= HOST_PENDING_OUTPUT_BYTES);
         assert_eq!(session.finish_normal().await.unwrap(), PtyExit::Exited(0));
     }

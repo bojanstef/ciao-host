@@ -5,11 +5,10 @@ use super::{
     uuid,
 };
 use crate::{
-    host_protocol::{
-        Dimensions, HOST_PENDING_INPUT_BYTES, HOST_PENDING_OUTPUT_BYTES, MAX_DATA_PAYLOAD,
-    },
+    host_protocol::{Dimensions, HOST_PENDING_OUTPUT_BYTES, MAX_DATA_PAYLOAD},
     pty::{PtyError, PtyExit, QueueHighWaterMarks},
     storage::CiaoPaths,
+    terminal_input::{InputChunk, InputQueue},
 };
 use serde_json::{Value, json};
 use std::{
@@ -141,10 +140,6 @@ impl Drop for QueuedBytes {
         self.size.bytes.fetch_sub(self.count, Ordering::Relaxed);
     }
 }
-enum Input {
-    Bytes(QueuedBytes),
-    Flush(oneshot::Sender<()>),
-}
 #[derive(PartialEq)]
 enum PendingOperation {
     Write,
@@ -152,13 +147,12 @@ enum PendingOperation {
 }
 pub(crate) struct OrcaSession {
     pub(crate) id: String,
-    input: mpsc::Sender<Input>,
+    input: InputQueue,
     resize: watch::Sender<Dimensions>,
     output: mpsc::Receiver<QueuedBytes>,
     pub(crate) exit: watch::Receiver<Option<Result<PtyExit, PtyError>>>,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
-    high_input: Arc<QueueSize>,
     high_output: Arc<QueueSize>,
 }
 struct Viewer {
@@ -241,7 +235,7 @@ impl Viewer {
         &mut self,
         initial: String,
         tx: mpsc::Sender<QueuedBytes>,
-        mut input: mpsc::Receiver<Input>,
+        mut input: mpsc::Receiver<InputChunk>,
         mut dimensions: watch::Receiver<Dimensions>,
         peak: Arc<QueueSize>,
     ) -> Result<PtyExit, PtyError> {
@@ -255,11 +249,10 @@ impl Viewer {
                     return Err(PtyError::InputClosed);
                 }
                 msg = input.recv(), if pending.is_none() => {
-                    match msg {
-                        Some(Input::Bytes(bytes)) => utf8.extend(bytes.take()),
-                        Some(Input::Flush(done)) => { let _ = done.send(()); continue; }
-                        None => return Err(PtyError::InputClosed),
-                    }
+                    // The queue closes only when Ciao releases this viewer, after every accepted
+                    // write was answered.
+                    let Some(chunk) = msg else { return Ok(PtyExit::Closed) };
+                    utf8.extend_from_slice(chunk.bytes());
                     // A UTF-8 scalar may straddle Ciao data frames. Orca accepts UTF-8 text.
                     let n = match std::str::from_utf8(&utf8) {
                         Ok(_) => utf8.len(),
@@ -359,7 +352,7 @@ impl OrcaSession {
         .ok()
         .flatten()
         .ok_or(PtyError::SessionUnavailable)?;
-        let (inputs, input) = mpsc::channel(HOST_PENDING_INPUT_BYTES / MAX_DATA_PAYLOAD);
+        let (inputs, input) = InputQueue::new();
         let (outputs, output) = mpsc::channel(HOST_PENDING_OUTPUT_BYTES / MAX_DATA_PAYLOAD);
         let (resize, dimensions) = watch::channel(size);
         let (exit_tx, exit) = watch::channel(None);
@@ -391,20 +384,15 @@ impl OrcaSession {
             exit,
             stop: Some(stop_tx),
             task,
-            high_input: Arc::default(),
             high_output,
         })
     }
+    #[cfg(test)]
     pub(crate) async fn send_input(&self, bytes: Vec<u8>) -> Result<(), PtyError> {
-        if bytes.is_empty() || bytes.len() > MAX_DATA_PAYLOAD {
-            return Err(PtyError::InvalidInput);
-        }
-        let slot = self
-            .input
-            .try_reserve()
-            .map_err(|_| PtyError::InputClosed)?;
-        slot.send(Input::Bytes(QueuedBytes::new(bytes, &self.high_input)));
-        Ok(())
+        self.input.send(bytes).await
+    }
+    pub(crate) fn input(&self) -> &InputQueue {
+        &self.input
     }
     pub(crate) async fn next_output(&mut self) -> Option<Vec<u8>> {
         self.output.recv().await.map(QueuedBytes::take)
@@ -414,19 +402,21 @@ impl OrcaSession {
     }
     pub(crate) fn high_water(&self) -> QueueHighWaterMarks {
         QueueHighWaterMarks {
-            input_bytes: self.high_input.peak.load(Ordering::Relaxed),
+            input_bytes: self.input.high_water(),
             output_bytes: self.high_output.peak.load(Ordering::Relaxed),
         }
     }
     pub(crate) async fn cleanup(&mut self) -> Result<(), PtyError> {
-        // Complete accepted input before dropping this viewer. A failed or overloaded runtime
-        // must never keep a closed Ciao connection alive indefinitely.
-        let (flush, done) = oneshot::channel();
-        let _ = timeout(Duration::from_secs(1), async {
-            self.input.send(Input::Flush(flush)).await.ok()?;
-            done.await.ok()
-        })
-        .await;
+        // Complete accepted input before dropping this viewer: closing the queue lets the viewer
+        // answer what it holds and then end. A failed or overloaded runtime must never keep a
+        // closed Ciao connection alive indefinitely.
+        self.input.close();
+        if timeout(Duration::from_secs(1), &mut self.task)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -442,6 +432,61 @@ impl OrcaSession {
 impl Drop for OrcaSession {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+impl OrcaSession {
+    /// A session driven by a scripted viewer instead of an Orca runtime.
+    fn scripted<F>(
+        viewer: impl FnOnce(mpsc::Receiver<InputChunk>, mpsc::Sender<QueuedBytes>, Arc<QueueSize>) -> F,
+    ) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (input, pending) = InputQueue::new();
+        let (resize, _) = watch::channel(Dimensions {
+            cols: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        let (outputs, output) = mpsc::channel(HOST_PENDING_OUTPUT_BYTES / MAX_DATA_PAYLOAD);
+        let (_, exit) = watch::channel(None);
+        let high_output = Arc::new(QueueSize::default());
+        let task = tokio::spawn(viewer(pending, outputs, high_output.clone()));
+        Self {
+            id: String::new(),
+            input,
+            resize,
+            output,
+            exit,
+            stop: None,
+            task,
+            high_output,
+        }
+    }
+
+    /// A session whose viewer has not taken any input yet, as during one Orca round trip.
+    fn stalled() -> (Self, ()) {
+        let session = Self::scripted(|input, output, _| async move {
+            let _held = (input, output);
+            std::future::pending::<()>().await
+        });
+        (session, ())
+    }
+
+    /// A viewer that must forward `bytes` of output before it reads any input, as a real
+    /// viewer does when output precedes the answer to a pending write.
+    pub(crate) fn output_before_input(bytes: usize) -> Self {
+        Self::scripted(move |mut input, output, peak| async move {
+            if Viewer::forward(&"x".repeat(bytes), &output, &peak)
+                .await
+                .is_ok()
+            {
+                while input.recv().await.is_some() {}
+            }
+        })
     }
 }
 
@@ -480,6 +525,57 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {needle}"));
     }
+    /// The phone sends one frame per scrolled line or key. A burst arriving within one
+    /// Orca round trip is a few bytes, far below the input byte bound, and must queue.
+    #[tokio::test]
+    async fn burst_of_small_frames_queues_while_the_viewer_is_busy() {
+        let (session, _viewer) = OrcaSession::stalled();
+        for frame in 0..8 {
+            assert_eq!(
+                session.send_input(b"\x1b[A".to_vec()).await,
+                Ok(()),
+                "frame {frame} was refused while 3-byte frames were pending"
+            );
+        }
+        assert_eq!(session.high_water().input_bytes, 24);
+    }
+
+    /// The phone sends one frame per scrolled line. Before the byte-bounded queue, the fifth
+    /// frame of a burst failed while Orca answered the first, and the terminal was closed.
+    #[tokio::test]
+    #[ignore = "writes to an explicitly selected disposable Orca test pane"]
+    async fn live_burst_of_small_frames_reaches_the_pane_in_order() {
+        let size = Dimensions {
+            cols: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut view = open(size).await;
+        let marker = format!("burst-{}", std::process::id());
+        view.send_input(format!("printf '%s-ready\\n' {marker}; cat -v\r").into_bytes())
+            .await
+            .unwrap();
+        until(&mut view, &format!("{marker}-ready")).await;
+        for _ in 0..8 {
+            view.send_input(b"\x1b[A".to_vec()).await.unwrap();
+        }
+        for letter in b'a'..=b'x' {
+            view.send_input(vec![letter]).await.unwrap();
+        }
+        until(
+            &mut view,
+            &format!("{}abcdefghijklmnopqrstuvwx", "^[[A".repeat(8)),
+        )
+        .await;
+        assert!(
+            view.exit.borrow().is_none(),
+            "the viewer ended during the burst"
+        );
+        view.send_input(vec![3]).await.unwrap();
+        view.cleanup().await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "writes to an explicitly selected disposable Orca test pane"]
     async fn live_paired_stream() {

@@ -50,8 +50,8 @@ use crate::{
         LiveActivityRegisterResponse, MAX_FORWARD_STREAMS, MAX_INCOMING_BIDI_STREAMS,
         MAX_INCOMING_UNI_STREAMS, MAX_NORMAL_CONNECTIONS, MAX_NORMAL_CONNECTIONS_PER_ENDPOINT,
         MAX_PENDING_HANDSHAKES, METHOD_WORKSPACE_SNAPSHOT_V3, NotificationsRegisterResponse,
-        RpcErrorResponse, RpcRequest, STREAM_BACKPRESSURE, STREAM_FORWARD_LIMIT, STREAM_INTERNAL,
-        STREAM_MALFORMED, STREAM_PTY_FAILURE, STREAM_TERMINAL_LIMIT, STREAM_UNEXPECTED, StreamKind,
+        RpcErrorResponse, RpcRequest, STREAM_FORWARD_LIMIT, STREAM_INTERNAL, STREAM_MALFORMED,
+        STREAM_PTY_FAILURE, STREAM_TERMINAL_LIMIT, STREAM_UNEXPECTED, StreamKind,
         TerminalCommandsResponse, TerminalError, TerminalExit, TerminalFrame, TerminalOpen,
         TerminalOpened, WorkspaceSnapshotResponse, decode_rpc_request,
         encode_snapshot_response_bounded, encode_terminal_commands_response_bounded, read_rpc_body,
@@ -4259,43 +4259,67 @@ async fn bridge_terminal(
                         // Spec 025: the only evidence that a prompt was typed on a device rather
                         // than at this machine's own keyboard.
                         whereabouts.note_device_input();
-                        let input = tokio::select! {
-                            result = session.send_input(bytes) => result,
-                            _ = connection.closed() => {
-                                cleanup_terminal(
-                                    session,
-                                    tmux_detach_binary,
-                                    CleanupReason::ConnectionLost,
-                                )
-                                .await;
-                                return Ok(());
-                            }
-                            changed = shutdown.changed() => {
-                                if changed.is_ok() && *shutdown.borrow() {
-                                    connection.close(
-                                        VarInt::from_u32(crate::host_protocol::CONNECTION_SERVER_SHUTDOWN),
-                                        b"daemon shutdown",
-                                    );
+                        // Input waits for room in the byte-bounded queue; output keeps flowing
+                        // meanwhile (see `input_room_or_output`).
+                        let room = session.input().reserve(bytes.len());
+                        tokio::pin!(room);
+                        let permit = loop {
+                            let step = tokio::select! {
+                                step = input_room_or_output(session, room.as_mut(), output_finished) => step,
+                                _ = connection.closed() => {
                                     cleanup_terminal(
                                         session,
                                         tmux_detach_binary,
-                                        CleanupReason::ServerShutdown,
+                                        CleanupReason::ConnectionLost,
                                     )
                                     .await;
                                     return Ok(());
                                 }
-                                Err(PtyError::InputClosed)
+                                changed = shutdown.changed() => {
+                                    if changed.is_ok() && *shutdown.borrow() {
+                                        connection.close(
+                                            VarInt::from_u32(crate::host_protocol::CONNECTION_SERVER_SHUTDOWN),
+                                            b"daemon shutdown",
+                                        );
+                                        cleanup_terminal(
+                                            session,
+                                            tmux_detach_binary,
+                                            CleanupReason::ServerShutdown,
+                                        )
+                                        .await;
+                                        return Ok(());
+                                    }
+                                    InputStep::Room(Err(PtyError::InputClosed))
+                                }
+                            };
+                            match step {
+                                InputStep::Room(permit) => break permit,
+                                InputStep::Output(Some(output)) => {
+                                    if write_terminal_frame(
+                                        send,
+                                        &TerminalFrame::Output(output.bytes().to_vec()),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        cleanup_terminal(
+                                            session,
+                                            tmux_detach_binary,
+                                            CleanupReason::BridgeFailure,
+                                        )
+                                        .await;
+                                        return Ok(());
+                                    }
+                                }
+                                InputStep::Output(None) => output_finished = true,
                             }
                         };
-                        if input.is_err() {
-                            send_terminal_error(
-                                send,
-                                Some(terminal_id),
-                                "backpressure",
-                                "The terminal input bridge could not keep up.",
-                            )
-                            .await;
-                            finish_terminal_error(send, recv, STREAM_BACKPRESSURE).await;
+                        if let Err(error) =
+                            permit.and_then(|permit| session.input().push(bytes, permit))
+                        {
+                            let (code, message, reset) = terminal_input_error(error);
+                            send_terminal_error(send, Some(terminal_id), code, message).await;
+                            finish_terminal_error(send, recv, reset).await;
                             cleanup_terminal(
                                 session,
                                 tmux_detach_binary,
@@ -4362,15 +4386,19 @@ async fn bridge_terminal(
                 process_exit = Some(exit);
                 let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
             }
-            Event::Process(Err(_)) => {
-                send_terminal_error(
-                    send,
-                    Some(terminal_id),
-                    "internal_error",
-                    "The Mac could not observe the shell exit.",
-                )
-                .await;
-                finish_terminal_error(send, recv, STREAM_INTERNAL).await;
+            Event::Process(Err(error)) => {
+                // A backend whose input path ended reports it here when no input was waiting.
+                let (code, message, reset) = if error == PtyError::InputClosed {
+                    terminal_input_error(error)
+                } else {
+                    (
+                        "internal_error",
+                        "The Mac could not observe the shell exit.",
+                        STREAM_INTERNAL,
+                    )
+                };
+                send_terminal_error(send, Some(terminal_id), code, message).await;
+                finish_terminal_error(send, recv, reset).await;
                 cleanup_terminal(session, tmux_detach_binary, CleanupReason::BridgeFailure).await;
                 return Ok(());
             }
@@ -4387,6 +4415,51 @@ async fn bridge_terminal(
                 return Ok(());
             }
         }
+    }
+}
+
+enum InputStep {
+    Room(Result<crate::terminal_input::InputPermit, PtyError>),
+    Output(Option<crate::terminal_session::TerminalOutput>),
+}
+
+/// Waits for input room or the next output, whichever comes first. The bridge forwards output
+/// while input waits: an Orca viewer answers a write only after it forwards the output queued
+/// ahead of the answer, so waiting for room without draining output would wedge both ways.
+async fn input_room_or_output(
+    session: &mut crate::terminal_session::TerminalSession,
+    room: std::pin::Pin<
+        &mut impl std::future::Future<Output = Result<crate::terminal_input::InputPermit, PtyError>>,
+    >,
+    output_finished: bool,
+) -> InputStep {
+    tokio::select! {
+        permit = room => InputStep::Room(permit),
+        output = session.next_output(), if !output_finished => InputStep::Output(output),
+    }
+}
+
+/// The one mapping from a refused input frame to the error the phone shows. Input waits for
+/// room, so a refusal is never backpressure: the frame was invalid or the input path is gone.
+fn terminal_input_error(error: PtyError) -> (&'static str, &'static str, u32) {
+    match error {
+        PtyError::InvalidInput => (
+            "malformed_request",
+            "The terminal input frame is invalid.",
+            STREAM_MALFORMED,
+        ),
+        PtyError::InputClosed
+        | PtyError::ShellUnavailable
+        | PtyError::OpenFailed
+        | PtyError::SpawnFailed
+        | PtyError::SessionUnavailable
+        | PtyError::ResizeFailed
+        | PtyError::WaitFailed
+        | PtyError::CleanupFailed => (
+            "input_closed",
+            "The terminal stopped accepting input.",
+            STREAM_PTY_FAILURE,
+        ),
     }
 }
 
@@ -5096,6 +5169,61 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    /// A viewer that forwards output ahead of answering input must not wedge a bridge whose
+    /// input queue is full: the bridge keeps forwarding output while the next frame waits.
+    #[tokio::test]
+    async fn input_waiting_for_room_keeps_output_flowing() {
+        use super::*;
+        use crate::host_protocol::{
+            HOST_PENDING_INPUT_BYTES, HOST_PENDING_OUTPUT_BYTES, MAX_DATA_PAYLOAD,
+        };
+        let mut session = crate::terminal_session::TerminalSession::Orca(
+            crate::orca::session::OrcaSession::output_before_input(2 * HOST_PENDING_OUTPUT_BYTES),
+        );
+        for _ in 0..HOST_PENDING_INPUT_BYTES / MAX_DATA_PAYLOAD {
+            let permit = session.input().reserve(MAX_DATA_PAYLOAD).await.unwrap();
+            session
+                .input()
+                .push(vec![b'p'; MAX_DATA_PAYLOAD], permit)
+                .unwrap();
+        }
+        let bytes = b"\x1b[A".to_vec();
+        let room = session.input().reserve(bytes.len());
+        tokio::pin!(room);
+        let mut forwarded = 0;
+        let mut output_finished = false;
+        let permit = timeout(Duration::from_secs(10), async {
+            loop {
+                match input_room_or_output(&mut session, room.as_mut(), output_finished).await {
+                    InputStep::Room(permit) => break permit,
+                    InputStep::Output(Some(output)) => forwarded += output.bytes().len(),
+                    InputStep::Output(None) => output_finished = true,
+                }
+            }
+        })
+        .await
+        .expect("input waited behind output nobody forwarded");
+        session.input().push(bytes, permit.unwrap()).unwrap();
+        assert!(forwarded >= HOST_PENDING_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn refused_input_is_never_reported_as_backpressure() {
+        use super::*;
+        assert_eq!(
+            terminal_input_error(PtyError::InputClosed),
+            (
+                "input_closed",
+                "The terminal stopped accepting input.",
+                STREAM_PTY_FAILURE
+            )
+        );
+        assert_eq!(
+            terminal_input_error(PtyError::InvalidInput).0,
+            "malformed_request"
+        );
+    }
+
     #[tokio::test]
     async fn daemon_ownership_survives_socket_replacement() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
