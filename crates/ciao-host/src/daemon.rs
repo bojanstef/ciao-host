@@ -43,10 +43,11 @@ use crate::{
     claude_managed_integration::refresh_installed_managed_worker,
     host_info,
     host_protocol::{
-        CONNECTION_AUTHORIZATION_DENIED, CONNECTION_BUSY, CONNECTION_PROTOCOL_VIOLATION,
-        CONNECTION_SUPERSEDED, HOST_ALPN, HOST_CONNECTION_RECEIVE_WINDOW, HOST_OPERATION_TIMEOUT,
-        HOST_PROTOCOL_VERSION, HOST_SEND_WINDOW, HOST_STREAM_RECEIVE_WINDOW, HostHelloRequest,
-        HostHelloResponse, HostInfoResponse, HostInfoResult, HostProtocolError, HostReceiveState,
+        CLIENT_CLOSE_TIMEOUT, CONNECTION_AUTHORIZATION_DENIED, CONNECTION_BUSY,
+        CONNECTION_PROTOCOL_VIOLATION, CONNECTION_SUPERSEDED, HOST_ALPN,
+        HOST_CONNECTION_RECEIVE_WINDOW, HOST_OPERATION_TIMEOUT, HOST_PROTOCOL_VERSION,
+        HOST_SEND_WINDOW, HOST_STREAM_RECEIVE_WINDOW, HostHelloRequest, HostHelloResponse,
+        HostInfoResponse, HostInfoResult, HostProtocolError, HostReceiveState,
         LiveActivityRegisterResponse, MAX_FORWARD_STREAMS, MAX_INCOMING_BIDI_STREAMS,
         MAX_INCOMING_UNI_STREAMS, MAX_NORMAL_CONNECTIONS, MAX_NORMAL_CONNECTIONS_PER_ENDPOINT,
         MAX_PENDING_HANDSHAKES, METHOD_WORKSPACE_SNAPSHOT_V3, NotificationsRegisterResponse,
@@ -1986,21 +1987,26 @@ async fn handle_host_session(
 
     // Phase B — RPC, Agent Session, and terminal streams have independent tasks/flow control.
     // The app owns at most one subscription; bounded one-shot Agent requests may coexist. One
-    // terminal can be active per connection. The terminal
-    // ending retains the accepted Phase 1 behavior of ending this disposable connection; an Agent
-    // screen reconnects and starts from a complete snapshot.
+    // terminal can be active per connection. A terminal or a subscription ends its own streams,
+    // never the connection: the connection-lifetime decision (ADR 015) retired the disposable
+    // connection that ended with its terminal. The connection lives until the app closes it, the
+    // idle timeout expires or the daemon shuts down, and meanwhile keeps serving RPCs and later
+    // terminals. An app that still hangs up after a terminal ends is served as before.
     let snapshot_busy = Arc::new(tokio::sync::Mutex::new(()));
-    let terminal_active = Arc::new(AtomicBool::new(false));
+    // The one-terminal slot. A new terminal waits a bounded time for it rather than being
+    // refused outright, because the app releases a terminal and opens the next on the same
+    // connection while the host is still cleaning the first one up: tmux detach retries, the
+    // PTY grace period and the wait for the Exit frame's acknowledgement take seconds.
+    let terminal_slot = Arc::new(tokio::sync::Semaphore::new(1));
     let upload_gate = crate::uploads::UploadGate::default();
     let forward_gate = Arc::new(tokio::sync::Semaphore::new(MAX_FORWARD_STREAMS));
-    let (terminal_done_sender, mut terminal_done_receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut stream_tasks: JoinSet<()> = JoinSet::new();
     let mut shutdown = state.shutdown.subscribe();
-    let result = loop {
+    loop {
         tokio::select! {
             accepted = connection.accept_bi() => {
                 let Ok((mut send, mut recv)) = accepted else {
-                    break Ok(());
+                    break;
                 };
                 state.decoded_host_prefaces.fetch_add(1, Ordering::Relaxed);
                 let kind = match read_stream_preface_with_timeout(
@@ -2042,7 +2048,7 @@ async fn handle_host_session(
                         stream_tasks.spawn(async move {
                             // An operation's own failure is logged where its name is known;
                             // what reaches here failed before one was accepted.
-                            if let Err(error) = handle_agent_stream(
+                            match handle_agent_stream(
                                 &connection,
                                 &mut send,
                                 &mut recv,
@@ -2051,18 +2057,27 @@ async fn handle_host_session(
                             )
                             .await
                             {
-                                tracing::debug!(
-                                    category = agent_stream_error_category(&error),
-                                    "agent stream ended before an operation was accepted"
-                                );
+                                // Ended here, not left to `Drop`: the connection outlives the
+                                // stream, and a read the phone parked on it must return.
+                                Ok(()) => end_stream(&mut send, &mut recv),
+                                Err(error) => {
+                                    tracing::debug!(
+                                        category = agent_stream_error_category(&error),
+                                        "agent stream ended before an operation was accepted"
+                                    );
+                                    reset_stream(
+                                        &mut send,
+                                        &mut recv,
+                                        agent_stream_error_reset_code(&error),
+                                    );
+                                }
                             }
                         });
                     }
                     StreamKind::Upload => {
-                        // One active upload per connection (Spec 007 §3.5), gated with the
-                        // same swap idiom as the terminal singleton below — but the loser is
-                        // told `busy` in-protocol on its own stream rather than bare-reset,
-                        // because the frozen upload format names that outcome.
+                        // One active upload per connection (Spec 007 §3.5). The loser is told
+                        // `busy` in-protocol on its own stream rather than bare-reset, because
+                        // the frozen upload format names that outcome.
                         let Some(lease) = upload_gate.try_acquire() else {
                             stream_tasks.spawn(async move {
                                 let _ = crate::uploads::send_put_error(
@@ -2112,15 +2127,18 @@ async fn handle_host_session(
                         });
                     }
                     StreamKind::Terminal => {
-                        if terminal_active.swap(true, Ordering::AcqRel) {
-                            reset_stream(&mut send, &mut recv, STREAM_TERMINAL_LIMIT);
-                            continue;
-                        }
                         let state = state.clone();
                         let connection = connection.clone();
-                        let done = terminal_done_sender.clone();
-                        let active = terminal_active.clone();
+                        let slot = terminal_slot.clone();
                         stream_tasks.spawn(async move {
+                            // Held for the terminal's whole life, cleanup included, and released
+                            // only after the handler has returned its PTY lease.
+                            let Ok(Ok(_slot)) =
+                                timeout(CLIENT_CLOSE_TIMEOUT, slot.acquire_owned()).await
+                            else {
+                                reset_stream(&mut send, &mut recv, STREAM_TERMINAL_LIMIT);
+                                return;
+                            };
                             let result = handle_terminal_stream(
                                 &connection,
                                 &mut send,
@@ -2129,13 +2147,20 @@ async fn handle_host_session(
                                 state,
                             )
                             .await;
-                            active.store(false, Ordering::Release);
-                            let _ = done.send(result);
+                            match result {
+                                Ok(()) => end_stream(&mut send, &mut recv),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        category = host_error_category(&error),
+                                        "terminal stream ended"
+                                    );
+                                    reset_stream(&mut send, &mut recv, STREAM_INTERNAL);
+                                }
+                            }
                         });
                     }
                 }
             }
-            Some(result) = terminal_done_receiver.recv() => break result,
             Some(_) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {}
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
@@ -2144,13 +2169,13 @@ async fn handle_host_session(
                         b"daemon shutdown",
                     );
                 }
-                break Ok(());
+                break;
             }
         }
-    };
+    }
     stream_tasks.abort_all();
     while stream_tasks.join_next().await.is_some() {}
-    result
+    Ok(())
 }
 
 enum HelloPhaseOutcome {
@@ -3103,8 +3128,19 @@ async fn handle_agent_stream(
             category = agent_stream_error_category(&error),
             "agent stream operation ended with an error"
         );
+        // Ended here, not left to `Drop`: the connection outlives a failed subscription, and a
+        // read the phone parked on it must return.
+        reset_stream(send, recv, agent_stream_error_reset_code(&error));
     }
     Ok(())
+}
+
+/// The reset code for an agent stream that failed: the protocol error's own code when there is
+/// one, and an internal error for anything else (a write to a broken stream, a timeout).
+fn agent_stream_error_reset_code(error: &anyhow::Error) -> u32 {
+    error
+        .downcast_ref::<crate::agent_protocol::AgentProtocolError>()
+        .map_or(STREAM_INTERNAL, agent_stream_reset_code)
 }
 
 /// A category for an agent-stream failure that names no content, path, or peer.
@@ -3677,6 +3713,8 @@ async fn serve_agent_operation(
                         let body = match incoming {
                             Ok(body) => body,
                             Err(crate::agent_protocol::AgentProtocolError::Truncated) => break,
+                            // Reset with this error's code where the operation's failure is
+                            // logged, in `handle_agent_stream`.
                             Err(error) => return Err(error.into()),
                         };
                         let frame: AgentClientFrame = decode_agent_body(&body)?;
@@ -4824,6 +4862,16 @@ fn valid_rpc_request_id(body: &[u8]) -> Option<String> {
     crate::host_protocol::validate_request_id(&request_id)
         .is_ok()
         .then_some(request_id)
+}
+
+/// The orderly end of a stream whose handler returned: finish the send half and stop the
+/// receive half, explicitly rather than by `Drop`, because the connection outlives the stream.
+/// A half the handler already finished, reset or stopped reports `ClosedStream`, which changes
+/// nothing — in particular a finished stream is never reset here, which could discard a final
+/// frame the peer has not acknowledged yet.
+fn end_stream(send: &mut iroh::endpoint::SendStream, recv: &mut iroh::endpoint::RecvStream) {
+    let _ = send.finish();
+    let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
 }
 
 fn reset_stream(
@@ -6254,12 +6302,21 @@ mod tests {
             }
         }
 
+        // A terminal ends its streams, not the connection: once the host's terminal handler has
+        // unwound, the device is still active and the same connection still answers.
+        wait_for_terminal_handlers(&state).await;
+        assert_eq!(state.active.lock().device_count(), 1);
+        assert_host_info_answers(&connection).await;
+        assert!(connection.close_reason().is_none());
+
+        // An app that still hangs up after its terminal ends is served as it always was.
+        connection.close(0_u32.into(), b"test complete");
         timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(state.active.lock().device_count(), 0);
-        assert_eq!(state.decoded_host_prefaces.load(Ordering::Relaxed), 2);
+        assert_eq!(state.decoded_host_prefaces.load(Ordering::Relaxed), 3);
         client.close().await;
         host.close().await;
     }
@@ -7996,6 +8053,7 @@ mod tests {
         assert_eq!(exit.kind, "exited");
         assert_eq!(exit.code, Some(0));
 
+        connection.close(0_u32.into(), b"test complete");
         timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
@@ -8115,11 +8173,462 @@ mod tests {
             "pre-focus must run first and neither argv may drift"
         );
 
+        connection.close(0_u32.into(), b"test complete");
         timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
             .unwrap();
         client.close().await;
         host.close().await;
+    }
+
+    /// A paired client on a real host connection handler, already past `host.hello`. The temp
+    /// directory is held so the state's files outlive the test body.
+    struct PairedHost {
+        _temp: tempfile::TempDir,
+        host: Endpoint,
+        client: Endpoint,
+        state: Arc<RuntimeState>,
+        server: tokio::task::JoinHandle<()>,
+        connection: Connection,
+    }
+
+    impl PairedHost {
+        async fn start(workspace: WorkspaceConfig) -> Self {
+            let temp = tempdir().unwrap();
+            let host_secret = iroh::SecretKey::generate();
+            let host_id = host_secret.public();
+            let installation_secret = iroh::SecretKey::generate();
+            let installation_id = installation_secret.public();
+            let host = Endpoint::builder(presets::N0DisableRelay)
+                .secret_key(host_secret)
+                .alpns(vec![HOST_ALPN.to_vec()])
+                .transport_config(host_transport_config())
+                .bind()
+                .await
+                .unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .secret_key(installation_secret)
+                .bind()
+                .await
+                .unwrap();
+            let state = test_state_with_workspace(
+                host_id,
+                &temp.path().join("paired-devices.json"),
+                workspace,
+            );
+            state
+                .paired_devices
+                .lock()
+                .upsert(installation_id, 1, &[4; 32], &[0x5a; 32])
+                .unwrap();
+            let server = tokio::spawn({
+                let host = host.clone();
+                let state = state.clone();
+                async move {
+                    let incoming = host.accept().await.unwrap();
+                    let connection = incoming.await.unwrap();
+                    handle_authenticated_connection(connection, state).await;
+                }
+            });
+            let connection = client.connect(host.addr(), HOST_ALPN).await.unwrap();
+            let hello = HostHelloRequest {
+                v: 1,
+                message_type: "request".into(),
+                request_id: "AAECAwQFBgcICQoLDA0ODw".into(),
+                method: "host.hello".into(),
+                params: crate::host_protocol::HostHelloParams {
+                    min_protocol: 1,
+                    max_protocol: 1,
+                },
+            };
+            let body = open_rpc_stream(&connection, &encode_rpc(&hello).unwrap()).await;
+            assert!(matches!(
+                decode_rpc_response(&body).unwrap(),
+                RpcResponse::Hello(_)
+            ));
+            Self {
+                _temp: temp,
+                host,
+                client,
+                state,
+                server,
+                connection,
+            }
+        }
+
+        /// The way an app that still hangs up ends: it closes, and the handler unwinds.
+        async fn hang_up(self) {
+            self.connection.close(0_u32.into(), b"test complete");
+            timeout(Duration::from_secs(5), self.server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(self.state.active_ptys.lock().total, 0);
+            assert_eq!(self.state.active.lock().device_count(), 0);
+            self.client.close().await;
+            self.host.close().await;
+        }
+    }
+
+    async fn open_terminal(
+        connection: &Connection,
+        target: &str,
+        session: &str,
+    ) -> (
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+        Result<TerminalFrame, HostProtocolError>,
+    ) {
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_stream_preface(&mut send, StreamKind::Terminal)
+            .await
+            .unwrap();
+        write_terminal_frame(
+            &mut send,
+            &TerminalFrame::Open(TerminalOpen {
+                v: 1,
+                target: target.into(),
+                session: Some(session.into()),
+                tab: None,
+                dimensions: Dimensions {
+                    cols: 80,
+                    rows: 24,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        let first = timeout(Duration::from_secs(10), read_terminal_frame(&mut recv))
+            .await
+            .expect("the host never answered the terminal open");
+        (send, recv, first)
+    }
+
+    /// Reads terminal frames until the output so far contains `marker`.
+    async fn read_terminal_until(recv: &mut iroh::endpoint::RecvStream, marker: &str) {
+        let mut output = Vec::new();
+        timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&output).contains(marker) {
+                match read_terminal_frame(recv).await.unwrap() {
+                    TerminalFrame::Output(bytes) => output.extend_from_slice(&bytes),
+                    other => panic!("unexpected terminal frame before {marker}: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{marker} never arrived"));
+    }
+
+    async fn read_terminal_exit(recv: &mut iroh::endpoint::RecvStream) -> TerminalExit {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match read_terminal_frame(recv).await.unwrap() {
+                    TerminalFrame::Output(_) => {}
+                    TerminalFrame::Exit(exit) => return exit,
+                    other => panic!("unexpected terminal frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the terminal never exited")
+    }
+
+    /// The host-side anchor every keep-alive test needs: a terminal's PTY lease is released
+    /// only when its handler returns, so the connection's fate after a terminal is decided by
+    /// the time this returns. Asserting on the connection any earlier would pass on a host that
+    /// still hangs up, because that host answers anything sent in the gap.
+    async fn wait_for_terminal_handlers(state: &RuntimeState) {
+        timeout(Duration::from_secs(10), async {
+            while state.active_ptys.lock().total != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a terminal handler never released its PTY lease");
+    }
+
+    async fn assert_host_info_answers(connection: &Connection) {
+        let request = encode_rpc(&crate::host_protocol::HostInfoRequest::new(
+            "AAECAwQFBgcICQoLDA0ODw".into(),
+        ))
+        .unwrap();
+        let body = timeout(
+            Duration::from_secs(2),
+            open_rpc_stream(connection, &request),
+        )
+        .await
+        .expect("host.info was not answered on the same connection");
+        let response: HostInfoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.message_type, "response");
+    }
+
+    /// How a client read that was parked on one stream ended.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ParkedReadEnd {
+        Finished,
+        Reset(VarInt),
+    }
+
+    /// Reads until the stream ends. A connection-level error panics: ending a stream must never
+    /// be how the client learns that its stream ended.
+    async fn parked_read_end(mut recv: iroh::endpoint::RecvStream) -> ParkedReadEnd {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match recv.read(&mut buffer).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return ParkedReadEnd::Finished,
+                Err(iroh::endpoint::ReadError::Reset(code)) => return ParkedReadEnd::Reset(code),
+                Err(other) => panic!("the stream ended with a connection error: {other:?}"),
+            }
+        }
+    }
+
+    /// Parks a read on `recv` in its own task and lets it reach its first await.
+    async fn park_read(recv: iroh::endpoint::RecvStream) -> tokio::task::JoinHandle<ParkedReadEnd> {
+        let parked = tokio::spawn(parked_read_end(recv));
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        parked
+    }
+
+    /// A terminal's lifetime is its stream. Its exit finishes that stream, and the connection
+    /// it rode on goes on serving RPCs and the next terminal.
+    #[tokio::test]
+    async fn a_terminal_that_exits_leaves_its_connection_serving() {
+        let stub_dir = tempdir().unwrap();
+        write_stub(stub_dir.path(), "herdr", "printf 'stub-ran\\n'; exit 0");
+        let paired = PairedHost::start(WorkspaceConfig::with_binary_dirs(vec![
+            stub_dir.path().to_owned(),
+        ]))
+        .await;
+
+        let (_send, mut recv, opened) =
+            open_terminal(&paired.connection, "herdr.attach", "default").await;
+        assert!(matches!(opened, Ok(TerminalFrame::Opened(_))), "{opened:?}");
+        assert_eq!(read_terminal_exit(&mut recv).await.kind, "exited");
+        let rest = timeout(Duration::from_secs(1), recv.read_to_end(64))
+            .await
+            .expect("the exited terminal's stream was never finished")
+            .expect("the exited terminal's stream ended other than by FIN");
+        assert!(rest.is_empty());
+
+        wait_for_terminal_handlers(&paired.state).await;
+        assert_host_info_answers(&paired.connection).await;
+        let (_second_send, mut second_recv, second) =
+            open_terminal(&paired.connection, "herdr.attach", "default").await;
+        assert!(
+            matches!(second, Ok(TerminalFrame::Opened(_))),
+            "the next terminal on the same connection was refused: {second:?}"
+        );
+        assert_eq!(read_terminal_exit(&mut second_recv).await.kind, "exited");
+        assert!(paired.connection.close_reason().is_none());
+        paired.hang_up().await;
+    }
+
+    /// The phone releases a terminal by resetting its send half. The host must end its own
+    /// half of that stream, so a read the phone has parked there returns, and leave the
+    /// connection alone. The error kind is the assertion: a host that hangs up also ends the
+    /// parked read, with a connection error instead.
+    #[tokio::test]
+    async fn a_reset_terminal_stream_ends_the_host_half_without_closing_the_connection() {
+        let stub_dir = tempdir().unwrap();
+        write_stub(
+            stub_dir.path(),
+            "herdr",
+            "printf 'READY\\n'; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done",
+        );
+        let paired = PairedHost::start(WorkspaceConfig::with_binary_dirs(vec![
+            stub_dir.path().to_owned(),
+        ]))
+        .await;
+
+        let (mut send, mut recv, opened) =
+            open_terminal(&paired.connection, "herdr.attach", "default").await;
+        assert!(matches!(opened, Ok(TerminalFrame::Opened(_))), "{opened:?}");
+        read_terminal_until(&mut recv, "READY").await;
+        let parked = park_read(recv).await;
+        send.reset(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED))
+            .unwrap();
+        let ended = timeout(Duration::from_secs(1), parked)
+            .await
+            .expect("the parked read never returned")
+            .unwrap();
+        assert!(
+            matches!(ended, ParkedReadEnd::Reset(_) | ParkedReadEnd::Finished),
+            "{ended:?}"
+        );
+
+        wait_for_terminal_handlers(&paired.state).await;
+        assert!(paired.connection.close_reason().is_none());
+        assert_host_info_answers(&paired.connection).await;
+        paired.hang_up().await;
+    }
+
+    /// One terminal per connection still holds, but a phone that releases terminal 1 and opens
+    /// terminal 2 at once waits for the slot instead of being refused while terminal 1's
+    /// cleanup runs. The stub ignores HUP and TERM, so that cleanup runs its whole grace period.
+    #[tokio::test]
+    async fn a_terminal_opened_while_the_last_is_cleaning_up_waits_for_the_slot() {
+        let stub_dir = tempdir().unwrap();
+        // Only the attach lingers; the detach and any other provider call answer at once, so
+        // the wait below is the PTY grace period and nothing else. Bounded so that a failed
+        // run cannot leave a process behind for long.
+        write_stub(
+            stub_dir.path(),
+            "tmux",
+            "case \"$*\" in *attach-session*) ;; *) exit 0 ;; esac\n\
+             trap '' HUP TERM\n\
+             printf 'TRAPPED\\n'\n\
+             i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done",
+        );
+        let paired = PairedHost::start(WorkspaceConfig::with_binary_dirs(vec![
+            stub_dir.path().to_owned(),
+        ]))
+        .await;
+
+        let (mut first_send, mut first_recv, opened) =
+            open_terminal(&paired.connection, "tmux.attach", "slot").await;
+        assert!(matches!(opened, Ok(TerminalFrame::Opened(_))), "{opened:?}");
+        read_terminal_until(&mut first_recv, "TRAPPED").await;
+
+        let code = VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED);
+        first_send.reset(code).unwrap();
+        first_recv.stop(code).unwrap();
+        let released = Instant::now();
+        let (mut second_send, mut second_recv, second) =
+            open_terminal(&paired.connection, "tmux.attach", "slot").await;
+        assert!(
+            matches!(second, Ok(TerminalFrame::Opened(_))),
+            "a terminal opened during the last one's cleanup was refused: {second:?}"
+        );
+        // Positive control: the grace period really ran, so the open really overlapped it.
+        assert!(
+            released.elapsed() >= Duration::from_secs(1),
+            "terminal 1's cleanup was too quick to overlap the open; this test is vacuous"
+        );
+
+        read_terminal_until(&mut second_recv, "TRAPPED").await;
+        write_terminal_frame(&mut second_send, &TerminalFrame::Close)
+            .await
+            .unwrap();
+        assert_eq!(read_terminal_exit(&mut second_recv).await.kind, "closed");
+        wait_for_terminal_handlers(&paired.state).await;
+        assert!(paired.connection.close_reason().is_none());
+        paired.hang_up().await;
+    }
+
+    /// An Agent subscription whose phone resets it must end the host's half explicitly, not by
+    /// whatever `Drop` happens to do, so the phone's parked read returns and the connection
+    /// stays up for the next subscription.
+    #[tokio::test]
+    async fn a_reset_subscription_ends_the_host_half() {
+        use crate::agent_protocol::{AgentStreamOpen, CAPABILITY_AGENT_SESSION_V1};
+
+        let paired = PairedHost::start(WorkspaceConfig::for_home(std::path::Path::new(
+            "/nonexistent-test-home",
+        )))
+        .await;
+        let (daemon_bridge, mut adapter_bridge) = UnixStream::pair().unwrap();
+        let bridge_task = tokio::spawn({
+            let state = paired.state.clone();
+            async move { handle_agent_bridge(daemon_bridge, state).await }
+        });
+        write_agent_frame(
+            &mut adapter_bridge,
+            &serde_json::json!({
+                "v": 1,
+                "type": "register",
+                "adapter": "pi",
+                "adapter_version": crate::pi_adapter::PINNED_PI_VERSION,
+                "mode": "tui",
+                "session_id": "fixture-upstream-session",
+                "process_nonce": "0123456789abcdef0123456789abcdef",
+                "process_id": std::process::id(),
+                "workspace_display": "Fixture workspace",
+                "commands": {
+                    "prompt": true,
+                    "steer": true,
+                    "follow_up": true,
+                    "interrupt": true
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let registered: serde_json::Value =
+            decode_agent_body(&read_agent_frame(&mut adapter_bridge).await.unwrap()).unwrap();
+        assert_eq!(registered["type"], "registered");
+        let session_id = registered["session_id"].as_str().unwrap().to_owned();
+        for frame in [
+            serde_json::json!({"v": 1, "type": "snapshot_start"}),
+            serde_json::json!({"v": 1, "type": "snapshot_end"}),
+        ] {
+            write_agent_frame(&mut adapter_bridge, &frame)
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            while paired.state.agent_sessions.snapshot(&session_id).is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the adapter's snapshot never landed");
+
+        let (mut send, mut recv) = paired.connection.open_bi().await.unwrap();
+        write_stream_preface(&mut send, StreamKind::Agent)
+            .await
+            .unwrap();
+        write_agent_frame(
+            &mut send,
+            &AgentStreamOpen {
+                v: 1,
+                message_type: "agent_stream_open".into(),
+                client_instance_id: "0123456789abcdef0123456789abcdef".into(),
+                operation: "agent.session.subscribe".into(),
+                capabilities: vec![CAPABILITY_AGENT_SESSION_V1.into()],
+                session_id: Some(session_id.clone()),
+                before_sequence: None,
+                page_limit: None,
+                workspace_id: None,
+                lifecycle_command_id: None,
+                expected_generation: None,
+                entry_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_agent_server(&mut recv).await,
+            AgentServerFrame::StreamAccepted { .. }
+        ));
+        assert!(matches!(
+            read_agent_server(&mut recv).await,
+            AgentServerFrame::SessionSnapshot { .. }
+        ));
+
+        let parked = park_read(recv).await;
+        send.reset(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED))
+            .unwrap();
+        let ended = timeout(Duration::from_secs(1), parked)
+            .await
+            .expect("the parked subscription read never returned")
+            .unwrap();
+        // The reset is the host's own, with the code for the error it read: proof that the
+        // half was ended on purpose rather than finished by `Drop` on the way out.
+        assert_eq!(
+            ended,
+            ParkedReadEnd::Reset(VarInt::from_u32(STREAM_INTERNAL))
+        );
+        assert!(paired.connection.close_reason().is_none());
+        assert_host_info_answers(&paired.connection).await;
+
+        drop(adapter_bridge);
+        let _ = timeout(Duration::from_secs(3), bridge_task).await;
+        paired.hang_up().await;
     }
 }
