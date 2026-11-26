@@ -59,8 +59,10 @@ pub(crate) enum RouteCheck {
 }
 
 impl RouteCheck {
-    /// tmux and herdr workspace checks are local list commands that report only a match, so
-    /// within the deadline their `false` is an answer.
+    /// tmux and herdr workspace checks report only whether everything matched. A `false`
+    /// inside the deadline is treated as an answer, though a failed `ps` or an empty listing
+    /// also yields it. Those providers can still flap under load; Orca and Herdr Core cannot,
+    /// except where Core's `descends_from` hits the same `ps` failure.
     const fn answered(current: bool) -> Self {
         if current {
             Self::Current

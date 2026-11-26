@@ -3349,6 +3349,10 @@ impl AgentSessionSupervisor {
                 RouteCheck::Disproved => {
                     // Re-resolve now rather than publish `unavailable` and wait for recovery:
                     // an Orca relaunch disproves every held proof while every pane lives on.
+                    // Unlike `refresh_route_for`, this does not recheck a shared Codex binding
+                    // around the resolve. `revalidate_shared_with` checked it earlier in this
+                    // same sweep, and the commit is fenced on the binding captured before the
+                    // inspection.
                     match resolve(fence.process_id).await {
                         Some(proof) => self.replace_route_if_current(&route_id, &fence, proof),
                         None => self.downgrade_if_current(&route_id, &fence, "route_invalidated"),
@@ -3448,8 +3452,9 @@ impl AgentSessionSupervisor {
     /// thing that lets a terminal attached from the Hosts tab offer the controls a terminal
     /// opened at an agent route already offers.
     ///
-    /// Read off `routes`, which holds a record only while the route is live — `revalidate_live_
-    /// routes` removes an invalidated one — so a stale pane cannot be advertised as an agent's.
+    /// Read off `routes`, which `revalidate_live_routes` clears of a disproved route at once and
+    /// of an unanswered one after `ROUTE_UNANSWERED_WINDOW`. So a pane can stay annotated for
+    /// that window while its provider cannot answer. Opening it still requires fresh proof.
     /// A pane the proof cannot name a tab for is simply absent; the tab lists unannotated.
     pub(crate) fn agent_tabs(&self) -> AgentTabIndex {
         self.inner
