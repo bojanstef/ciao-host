@@ -14,6 +14,11 @@ const CONFIGURATION = JSON.parse(fs.readFileSync(
 	path.join(import.meta.dir, "../../../protocol/fixtures/phase5/destination-configuration-v1.json"), "utf8",
 ));
 const SESSION_ID = "0123456789abcdef0123456789abcdef";
+// The worker's exit code for a vendor that ended the session before it was handed a prompt.
+// Like 1 (bridge gone) and 2 (launch refused), it is what the daemon's reaper sees. A fake whose
+// script runs out before any prompt is exactly that vendor, so a test that waits for the worker
+// to finish such a script sees this code rather than 0.
+const VENDOR_ENDED_UNPROMPTED_EXIT = 3;
 
 const resources: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -248,6 +253,14 @@ export function query(config) {
 				}
 			}
 			for (const message of SCRIPT) {
+				// The real SDK throws once the CLI it spawned exits nonzero, after the result.
+				if (message.fake_throw) throw new Error(message.fake_throw);
+				// Holds the stream until the worker has handed the SDK a prompt, so a test can
+				// end the session after one rather than racing the command it sent.
+				if (message.fake_await_prompt) {
+					while (journal.promptContexts.length === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+					continue;
+				}
                 if (message.hook_event_name) {
                     for (const matcher of config.options.hooks[message.hook_event_name] ?? []) {
                         for (const hook of matcher.hooks) await hook(message);
@@ -439,7 +452,7 @@ test("future_shaped_input_permission_mode_is_tallied_without_inventing_session_s
 	const { frames, child } = await startWorker([
 		{ type: "system", subtype: "init", permissionMode: "future-mode" },
 	]);
-	expect(await child.exited).toBe(0);
+	expect(await child.exited).toBe(VENDOR_ENDED_UNPROMPTED_EXIT);
 	expect(frames.filter((frame) => frame.type === "permission_mode")).toEqual([]);
 	expect(frames.filter((frame) => frame.type === "drift_note").map((frame) => [frame.surface, frame.name]))
 		.toContainEqual(["sdk_init", "permissionMode"]);
@@ -502,7 +515,7 @@ test.each([
 	fs.writeFileSync(path.join(root, ".claude.json"), content!);
 	const { journal, frames, child } = await startWorker([], undefined, undefined, undefined,
 		{ CLAUDE_CONFIG_DIR: root });
-	expect(await child.exited).toBe(0);
+	expect(await child.exited).toBe(VENDOR_ENDED_UNPROMPTED_EXIT);
 	expect(journal().options).not.toBeNull();
 	expect(Object.hasOwn(journal().options.extraArgs, "chrome")).toBe(false);
 	const notes = frames.filter((frame) => frame.type === "drift_note" && frame.surface === "configuration");
@@ -872,7 +885,7 @@ test("the worker observes child identities across the parent result without forw
 		{ hook_event_name: "PostToolUse", agent_id: "private-child" },
 		{ hook_event_name: "SubagentStop", agent_id: "private-child", last_assistant_message: "private-child-output" },
 	]);
-	expect(await child.exited).toBe(0);
+	expect(await child.exited).toBe(VENDOR_ENDED_UNPROMPTED_EXIT);
 	const states = frames.filter(f => f.type === "child_activity" || f.type === "turn");
 	const report = (f: Record<string, unknown>) => f.report as { state: string; ids: string[] } | undefined;
 	expect(states.map(f => report(f)?.state ?? f.state)).toEqual(["started", "completed", "waiting", "progress", "finished"]);
@@ -2229,6 +2242,45 @@ test.each(WORKER_RUNTIMES)(
 		expect(await child.exited).toBe(0);
 	},
 );
+
+// A takeover on a Linux host resumed a terminal's conversation, and the vendor answered with a
+// result and ended its process before the phone had sent anything. The worker treated that as an
+// ordinary end and exited 0, so the session read as one somebody stopped — and every Resume did
+// the same thing again with nothing saying why. Both shapes the vendor can end in are covered:
+// the error result followed by the SDK's throw, and a stream that simply runs out.
+const VENDOR_ENDINGS = [
+	["throws after its error result", [
+		{ type: "result", subtype: "error_during_execution", is_error: true },
+		{ fake_throw: "Claude Code process exited with code 1" },
+	]],
+	["runs out after its result", [{ type: "result", subtype: "error_during_execution", is_error: true }]],
+] as const;
+test.each(WORKER_RUNTIMES.flatMap(([name, runtime]) =>
+	VENDOR_ENDINGS.map(([ending, script]) => [ending, name, runtime, script] as const)))(
+	"a vendor that ends the session before its first prompt %s is a failed start under %s",
+	async (_, __, runtime, script) => {
+		const { child, frames } = await startWorker(
+			[...script], undefined, undefined, undefined, undefined, false, { runtime },
+		);
+		expect(await child.exited).toBe(VENDOR_ENDED_UNPROMPTED_EXIT);
+		// The bridge still ends cleanly, so the only thing that changes is what the host records.
+		expect(frames.at(-1)?.type).toBe("session_end");
+	},
+);
+
+// The grounded interrupt teardown stays an ordinary end: once the worker has handed the vendor a
+// prompt, a turn ending in an error result and a nonzero CLI exit is how the pinned SDK stops.
+test.each(WORKER_RUNTIMES)("a vendor that ends the session after a prompt keeps the clean teardown under %s", async (_, runtime) => {
+	const { child, frames, send } = await startWorker([
+		{ fake_await_prompt: true },
+		{ type: "result", subtype: "error_during_execution", is_error: true },
+		{ fake_throw: "Claude Code process exited with code 1" },
+	], undefined, undefined, undefined, undefined, false, { runtime });
+	await eventually(() => frames.some((frame) => frame.type === "snapshot_end"));
+	send({ v: 1, type: "command", command_id: "command-interrupted", kind: "prompt", text: "Stop me." });
+	expect(await child.exited).toBe(0);
+	expect(frames.at(-1)?.type).toBe("session_end");
+});
 
 // A full peer close must also exit nonzero: error-only handling used to leave an invisible
 // worker that could neither receive commands nor re-register with its consumed spawn token.

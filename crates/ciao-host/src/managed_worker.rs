@@ -339,21 +339,44 @@ impl WorkerTable {
 
     /// Reaps workers that exited on their own. Returns the sessions whose
     /// worker is gone so the directory can record a truthful stored reason.
-    pub(crate) fn reap(&self) -> Vec<(String, bool)> {
+    pub(crate) fn reap(&self) -> Vec<(String, WorkerExit)> {
         let mut workers = self.workers.lock();
         let mut exited = Vec::new();
         workers.retain(|session_id, worker| match worker.child.try_wait() {
             Ok(Some(status)) => {
-                exited.push((session_id.clone(), !status.success()));
+                exited.push((
+                    session_id.clone(),
+                    WorkerExit {
+                        code: status.code(),
+                    },
+                ));
                 false
             }
             Ok(None) => true,
             Err(_) => {
-                exited.push((session_id.clone(), true));
+                exited.push((session_id.clone(), WorkerExit { code: None }));
                 false
             }
         });
         exited
+    }
+}
+
+/// How a worker that exited on its own ended, as the reaper saw it.
+///
+/// The code is the worker's only categorical account of why it ended, because its output is
+/// discarded on purpose. `worker.mjs` owns the meanings: 0 is an ordinary end, 1 its bridge went
+/// away, 2 its launch was refused, and 3 the vendor ended the session before the worker had
+/// handed it a prompt — a start or resume the vendor refused. `None` is a signal, or a wait that
+/// failed, and counts as a crash like every other nonzero code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerExit {
+    pub(crate) code: Option<i32>,
+}
+
+impl WorkerExit {
+    pub(crate) fn crashed(self) -> bool {
+        self.code != Some(0)
     }
 }
 
@@ -622,7 +645,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(exited, vec![("configuration-fixture".into(), false)]);
+        assert_eq!(
+            exited,
+            vec![("configuration-fixture".into(), WorkerExit { code: Some(0) })]
+        );
+        assert!(!exited[0].1.crashed());
         let capture = std::fs::read_to_string(workspace.path().join("launch.txt")).unwrap();
         assert_eq!(
             capture.lines().collect::<Vec<_>>(),
@@ -639,17 +666,17 @@ mod tests {
     #[tokio::test]
     async fn spawn_tokens_are_single_use_and_workers_are_reaped() {
         let home = tempdir().unwrap();
-        let entrypoint = home.path().join("worker.mjs");
-        // A script that exits nonzero stands in for a crashed SDK worker; it is
-        // run through `env false` so the test needs no Node install.
-        std::fs::write(&entrypoint, "process.exit(3)").unwrap();
+        let entrypoint = home.path().join("worker.sh");
+        // A shell script exiting with the worker's failed-start code stands in for a worker
+        // whose vendor refused to resume; run through `/bin/sh` so the test needs no Node.
+        std::fs::write(&entrypoint, "exit 3").unwrap();
         let runtime = ManagedRuntime {
             sdk_prefix: home.path().to_owned(),
             worker_entrypoint: entrypoint,
             cli_path: home.path().join("claude"),
             cli_version: PINNED_MANAGED_CLI_VERSION.into(),
             sdk_version: PINNED_CLAUDE_SDK_VERSION.into(),
-            node_path: PathBuf::from("/usr/bin/env"),
+            node_path: PathBuf::from("/bin/sh"),
             tool_path: "/usr/bin:/bin".into(),
         };
         let table = WorkerTable::default();
@@ -684,7 +711,13 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(exited, vec![("session-a".to_owned(), true)]);
+        // The code itself survives the reap: it is the only categorical account of why a worker
+        // ended that reaches the daemon's log (the worker's own output is discarded).
+        assert_eq!(
+            exited,
+            vec![("session-a".to_owned(), WorkerExit { code: Some(3) })]
+        );
+        assert!(exited[0].1.crashed());
         // The entry is gone, so a second reap reports nothing and a stale token
         // can no longer bind.
         assert!(table.reap().is_empty());

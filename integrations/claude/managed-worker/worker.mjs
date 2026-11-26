@@ -778,6 +778,10 @@ const input = (() => {
 	};
 })();
 
+/// How many prompts this worker has handed the SDK. The input stream never closes before
+/// `shutdown`, so a vendor stream that ends while this is still zero ended without being asked
+/// anything: the CLI refused to start or to resume, which is a failed start and not a stop.
+let promptsHanded = 0;
 // command_id -> the uuid streamed for it, so the SDK's replay echo is the
 // delivery acknowledgement (grounded: requires --replay-user-messages).
 const promptsAwaitingReplay = new Map();
@@ -1346,6 +1350,7 @@ function activeCatalogueRow() {
 function handleCommand(frame) {
 	const commandID = frame.command_id;
 	if (frame.kind === "prompt") {
+		promptsHanded += 1;
 		const uuid = crypto.randomUUID();
 		promptsAwaitingReplay.set(uuid, commandID);
 		whereaboutsPending.push(
@@ -1471,14 +1476,27 @@ function handleCommand(frame) {
 
 const heartbeat = setInterval(() => writeFrame({ type: "heartbeat" }), HEARTBEAT_MS);
 
-function shutdown(reasonCode) {
+/// The exit code for a vendor that ended before `promptsHanded` moved off zero. Nonzero, so the daemon's reaper stores the session as a
+/// crash rather than as one somebody stopped; distinct from 1 (the bridge went away) and 2 (the
+/// launch was refused), so the daemon's log names which of the three happened. Nothing else about
+/// the vendor's answer leaves this process: its error text can name paths and session IDs.
+const VENDOR_ENDED_UNPROMPTED_EXIT = 3;
+
+function shutdown(reasonCode, exitCode = 0) {
 	clearInterval(heartbeat);
 	writeFrame({ type: "session_end" });
 	input.close();
 	socket.end();
 	// A reason code is categorical; never log prompt or model content.
 	process.stderr.write(`ciao-managed-worker: ${reasonCode}\n`);
-	process.exit(0);
+	process.exit(exitCode);
+}
+
+/// The vendor ended the stream on its own. Before any prompt that is a start that failed; after
+/// one it is the grounded teardown an interrupted or errored turn ends in.
+function vendorEnded(reasonCode) {
+	if (promptsHanded === 0) shutdown("vendor_ended_unprompted", VENDOR_ENDED_UNPROMPTED_EXIT);
+	shutdown(reasonCode);
 }
 
 const TYPED = new Set(["system", "user", "assistant", "result", "stream_event"]);
@@ -1696,9 +1714,9 @@ try {
 			turnCompleted();
 		}
 	}
-	shutdown("stream_complete");
+	vendorEnded("stream_complete");
 } catch {
 	// Grounded: the CLI exits nonzero after an interrupted or errored turn and
 	// the SDK surfaces it as a throw even when the result was delivered.
-	shutdown("stream_ended");
+	vendorEnded("stream_ended");
 }

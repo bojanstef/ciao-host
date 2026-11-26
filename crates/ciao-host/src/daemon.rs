@@ -1086,9 +1086,20 @@ async fn monitor_agent_routes(state: Arc<RuntimeState>) {
                     });
                 }
                 // A worker that exited on its own becomes a truthful stored
-                // session; a nonzero exit is reported as a crash.
-                for (session_id, crashed) in state.managed_workers.reap() {
-                    state.managed_sessions.record_worker_exit(&session_id, crashed);
+                // session; a nonzero exit is reported as a crash. The code is logged because it
+                // is the only account of why that reaches this log: a takeover whose vendor
+                // refused to resume used to leave nothing here at all.
+                for (session_id, exit) in state.managed_workers.reap() {
+                    if exit.crashed() {
+                        tracing::warn!(
+                            session = %session_id,
+                            code = ?exit.code,
+                            "managed worker exited unexpectedly"
+                        );
+                    } else {
+                        tracing::info!(session = %session_id, "managed worker exited");
+                    }
+                    state.managed_sessions.record_worker_exit(&session_id, exit.crashed());
                 }
                 // ADR 004 §5: exactly one owner per conversation. A terminal that resumed a
                 // conversation Ciao is running is the second one, and the person is sitting at
