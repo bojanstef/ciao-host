@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "description": "The managed worker's exit codes and the categorical cause each one names. worker.mjs exits with them, and the daemon's reaper logs the cause. Names only, never the vendor's text.",
+  "exits": [
+    { "code": 0, "cause": "ended", "crash": false },
+    { "code": 1, "cause": "bridge_closed", "crash": true, "note": "also Node's own code for an uncaught exception" },
+    { "code": 2, "cause": "launch_refused", "crash": true },
+    { "code": 3, "cause": "vendor_ended_unprompted", "crash": true },
+    { "code": 4, "cause": "resume_refused", "crash": true, "vendor_prefix": "Failed to resume session" },
+    { "code": 5, "cause": "resume_not_found", "crash": true, "vendor_prefix": "No conversation found with session ID" }
+  ]
+}

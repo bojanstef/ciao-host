@@ -14,11 +14,15 @@ const CONFIGURATION = JSON.parse(fs.readFileSync(
 	path.join(import.meta.dir, "../../../protocol/fixtures/phase5/destination-configuration-v1.json"), "utf8",
 ));
 const SESSION_ID = "0123456789abcdef0123456789abcdef";
-// The worker's exit code for a vendor that ended the session before it was handed a prompt.
-// Like 1 (bridge gone) and 2 (launch refused), it is what the daemon's reaper sees. A fake whose
-// script runs out before any prompt is exactly that vendor, so a test that waits for the worker
-// to finish such a script sees this code rather than 0.
-const VENDOR_ENDED_UNPROMPTED_EXIT = 3;
+// The worker's exit codes, from the fixture the daemon's reaper reads too.
+const EXITS: Array<{ code: number; cause: string; vendor_prefix?: string }> = JSON.parse(fs.readFileSync(
+	path.join(import.meta.dir, "../../../protocol/fixtures/phase5/managed-worker-exit-v1.json"), "utf8",
+)).exits;
+const exitFor = (cause: string) => EXITS.find((exit) => exit.cause === cause)!;
+// A vendor that ended the session before the worker handed it a prompt. A fake whose script runs
+// out before any prompt is exactly that vendor, so a test that waits for the worker to finish
+// such a script sees this code rather than 0.
+const VENDOR_ENDED_UNPROMPTED_EXIT = exitFor("vendor_ended_unprompted").code;
 
 const resources: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -2248,21 +2252,41 @@ test.each(WORKER_RUNTIMES)(
 // ordinary end and exited 0, so the session read as one somebody stopped — and every Resume did
 // the same thing again with nothing saying why. Both shapes the vendor can end in are covered:
 // the error result followed by the SDK's throw, and a stream that simply runs out.
+// What the pinned CLI said when it refused the Code Mode takeover, grounded 2026-11-26.
+const CODE_MODE_REFUSAL = "Failed to resume session: This session was started in Code Mode (experimental), "
+	+ "which isn't available because for now it only works in the interactive terminal, so it can't be resumed "
+	+ "here. Resume it in the terminal: CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1 claude --resume private-session-id";
 const VENDOR_ENDINGS = [
-	["throws after its error result", [
+	["throws after its error result", "vendor_ended_unprompted", [
 		{ type: "result", subtype: "error_during_execution", is_error: true },
 		{ fake_throw: "Claude Code process exited with code 1" },
 	]],
-	["runs out after its result", [{ type: "result", subtype: "error_during_execution", is_error: true }]],
+	["runs out after its result", "vendor_ended_unprompted", [{ type: "result", subtype: "error_during_execution", is_error: true }]],
+	// The vendor's reason arrives in the result's errors, or only in the stderr tail the SDK puts
+	// on the error it throws; either names the failure.
+	["refuses the resume in its result", "resume_refused", [
+		{ type: "result", subtype: "error_during_execution", is_error: true, errors: [CODE_MODE_REFUSAL] },
+		{ fake_throw: "Claude Code process exited with code 1" },
+	]],
+	["refuses the resume on stderr", "resume_refused", [
+		{ type: "result", subtype: "error_during_execution", is_error: true },
+		{ fake_throw: `Claude Code process exited with code 1\n${CODE_MODE_REFUSAL}` },
+	]],
+	["cannot find the conversation", "resume_not_found", [
+		{ fake_throw: "Claude Code process exited with code 1\nNo conversation found with session ID: private-session-id" },
+	]],
 ] as const;
 test.each(WORKER_RUNTIMES.flatMap(([name, runtime]) =>
-	VENDOR_ENDINGS.map(([ending, script]) => [ending, name, runtime, script] as const)))(
+	VENDOR_ENDINGS.map(([ending, cause, script]) => [ending, name, runtime, cause, script] as const)))(
 	"a vendor that ends the session before its first prompt %s is a failed start under %s",
-	async (_, __, runtime, script) => {
+	async (_, __, runtime, cause, script) => {
 		const { child, frames } = await startWorker(
 			[...script], undefined, undefined, undefined, undefined, false, { runtime },
 		);
-		expect(await child.exited).toBe(VENDOR_ENDED_UNPROMPTED_EXIT);
+		expect(await child.exited).toBe(exitFor(cause).code);
+		// Names only: none of the vendor's words leave the worker.
+		expect(JSON.stringify(frames)).not.toContain("private-session-id");
+		expect(JSON.stringify(frames)).not.toContain("Code Mode");
 		// The bridge still ends cleanly, so the only thing that changes is what the host records.
 		expect(frames.at(-1)?.type).toBe("session_end");
 	},

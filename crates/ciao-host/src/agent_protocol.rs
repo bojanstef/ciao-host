@@ -673,6 +673,13 @@ pub struct AgentSessionDescriptor {
     /// hosts, so only presence grants the verb.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takeover: Option<String>,
+    /// Why a row that would otherwise offer a takeover does not: a reason code, the same one the
+    /// refused lifecycle request would carry (today only `code_mode_terminal_only`, a Claude
+    /// conversation in Code Mode, which only its own terminal can resume). Never beside a
+    /// `takeover`. Additive like it: absent from older hosts, and an older app simply shows no
+    /// offer, which is the truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeover_refusal: Option<String>,
     /// Present only while this row's vendor runs ahead of the host's grounding (Spec 017
     /// §4.5). Same additive contract as `takeover`: absent from older hosts, and only
     /// presence renders the line.
@@ -719,6 +726,12 @@ impl AgentSessionDescriptor {
         if let Some(takeover) = &self.takeover {
             valid_token(takeover)?;
             if self.topology != "attached" {
+                return Err(AgentProtocolError::InvalidValue);
+            }
+        }
+        if let Some(refusal) = &self.takeover_refusal {
+            valid_token(refusal)?;
+            if self.topology != "attached" || self.takeover.is_some() {
                 return Err(AgentProtocolError::InvalidValue);
             }
         }

@@ -603,6 +603,7 @@ pub(crate) fn unheld_descriptor(
         managed_session_id: None,
         // The whole point of the row: nobody holds this thread, so the daemon can.
         takeover: Some("pickup".into()),
+        takeover_refusal: None,
         revision: 1,
         updated_at: row.updated_at,
     }

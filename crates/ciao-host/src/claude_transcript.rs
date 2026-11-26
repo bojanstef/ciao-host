@@ -11,7 +11,7 @@
 
 use std::{
     env, fs,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -120,6 +120,85 @@ fn recent_model_in(projects: &Path, vendor_session_id: &str) -> Option<String> {
             }
             Some(model.to_owned())
         })
+}
+
+/// Whether `vendor_session_id`'s conversation is in Claude Code's experimental Code Mode,
+/// which Claude refuses to resume anywhere but its interactive terminal.
+///
+/// Grounded 2026-11-26 against the pinned CLI (2.1.326) and real 2.1.332 transcripts. The
+/// terminal records the mode as a bare `{"type":"repl-mode","replMode":<bool>}` record from the
+/// first lines of a conversation, repeated through it, newest wins (`currentSessionCodeMode`).
+/// A resume where Code Mode is unavailable — every headless SDK launch, so every managed worker
+/// — refuses a conversation whose newest record says `true` with "Failed to resume session:
+/// This session was started in Code Mode (experimental)…", after Ciao has already ended the
+/// terminal. Managed transcripts carry no such record.
+///
+/// The whole file is read, unlike the tail readers above. This answers whether taking over
+/// would destroy the terminal for nothing, it runs once per takeover or resume, and a marker
+/// the tail missed would answer wrongly. Only marker-sized lines are ever held.
+pub(crate) fn code_mode(vendor_session_id: &str) -> bool {
+    claude_projects_dir().is_some_and(|projects| code_mode_in(&projects, vendor_session_id))
+}
+
+/// The marker record is under a hundred bytes; anything longer is consumed without being held.
+const MAX_MARKER_LINE_BYTES: u64 = 4096;
+
+fn code_mode_in(projects: &Path, vendor_session_id: &str) -> bool {
+    let Some(path) = transcript_path(projects, vendor_session_id) else {
+        return false;
+    };
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut code_mode = false;
+    loop {
+        line.clear();
+        match (&mut reader)
+            .take(MAX_MARKER_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.last() != Some(&b'\n') && line.len() as u64 == MAX_MARKER_LINE_BYTES {
+            if reader.skip_until(b'\n').is_err() {
+                break;
+            }
+            continue;
+        }
+        if let Some(on) = repl_mode_record(&line) {
+            code_mode = on;
+        }
+    }
+    code_mode
+}
+
+/// The value of a `repl-mode` line, or `None` for any other line.
+fn repl_mode_record(line: &[u8]) -> Option<bool> {
+    if !line
+        .windows(b"repl-mode".len())
+        .any(|window| window == b"repl-mode")
+    {
+        return None;
+    }
+    repl_mode_value(&serde_json::from_slice(line).ok()?)
+}
+
+/// The value a `repl-mode` record states, or `None` for any other record. The one reading of
+/// the marker: the whole-file check above and the history reader both use it.
+pub(crate) fn repl_mode_value(record: &Value) -> Option<bool> {
+    if record.get("type").and_then(Value::as_str) != Some("repl-mode") {
+        return None;
+    }
+    let value = record.get("replMode").and_then(Value::as_bool);
+    if value.is_none() {
+        // Spec 017: the marker's shape changed under us. Read as "not recorded", which keeps
+        // today's behaviour, and tally it so the change is visible.
+        crate::drift::note("claude", "transcript", "invalid", "replMode", None);
+    }
+    value
 }
 
 /// Where `vendor_session_id`'s transcript lives, when Claude has one on disk.
@@ -318,6 +397,53 @@ mod tests {
         let mut file = fs::File::create(project.join(format!("{session}.jsonl"))).unwrap();
         file.write_all(body.as_bytes()).unwrap();
         projects.to_path_buf()
+    }
+
+    /// The marker as Claude Code 2.1.332 writes it into a terminal conversation: a bare
+    /// `repl-mode` record near the start, repeated through the file, and newest wins.
+    #[test]
+    fn a_conversation_in_code_mode_is_known_from_its_newest_repl_mode_record() {
+        let root = tempfile::tempdir().unwrap();
+        let record = |on: bool| format!(r#"{{"type":"repl-mode","replMode":{on}}}"#);
+        let projects = write_transcript(
+            root.path(),
+            "code-mode",
+            &[
+                r#"{"type":"permission-mode","permissionMode":"bypassPermissions"}"#.to_owned(),
+                record(true),
+                // Far more than the tail other readers scan, so a marker only at the start of a
+                // long conversation is still found.
+                format!(
+                    r#"{{"type":"user","message":{{"role":"user","content":"{}"}}}}"#,
+                    "x".repeat(2 * MAX_TRANSCRIPT_TAIL_BYTES as usize)
+                ),
+            ]
+            .join("\n"),
+        );
+        assert!(code_mode_in(&projects, "code-mode"));
+
+        let root = tempfile::tempdir().unwrap();
+        let projects = write_transcript(
+            root.path(),
+            "left-code-mode",
+            &[record(true), record(false)].join("\n"),
+        );
+        assert!(!code_mode_in(&projects, "left-code-mode"), "newest wins");
+
+        // A conversation that never recorded the mode — every managed transcript, and every
+        // terminal one from before Code Mode — is not in it.
+        let root = tempfile::tempdir().unwrap();
+        let projects = write_transcript(root.path(), "plain", &transcript());
+        assert!(!code_mode_in(&projects, "plain"));
+        assert!(!code_mode_in(&projects, "missing"));
+        // The record's own value is read, never a mention of it inside someone's message.
+        let root = tempfile::tempdir().unwrap();
+        let projects = write_transcript(
+            root.path(),
+            "quoted",
+            r#"{"type":"user","message":{"role":"user","content":"{\"type\":\"repl-mode\",\"replMode\":true}"}}"#,
+        );
+        assert!(!code_mode_in(&projects, "quoted"));
     }
 
     #[test]

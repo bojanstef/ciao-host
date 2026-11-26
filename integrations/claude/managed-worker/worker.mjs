@@ -1476,11 +1476,28 @@ function handleCommand(frame) {
 
 const heartbeat = setInterval(() => writeFrame({ type: "heartbeat" }), HEARTBEAT_MS);
 
-/// The exit code for a vendor that ended before `promptsHanded` moved off zero. Nonzero, so the daemon's reaper stores the session as a
-/// crash rather than as one somebody stopped; distinct from 1 (the bridge went away) and 2 (the
-/// launch was refused), so the daemon's log names which of the three happened. Nothing else about
-/// the vendor's answer leaves this process: its error text can name paths and session IDs.
+/// Exit codes for a vendor that ended before `promptsHanded` moved off zero: a failed start.
+/// Nonzero, so the daemon's reaper stores the session as a crash rather than as one somebody
+/// stopped, and distinct, so its log names the cause. The codes and their causes are the
+/// shared fixture `protocol/fixtures/phase5/managed-worker-exit-v1.json`, which the daemon reads
+/// too. The vendor's own words never leave this process: they can name paths and session IDs.
 const VENDOR_ENDED_UNPROMPTED_EXIT = 3;
+/// The CLI's own prefixes for its two resume failures (its constants in 2.1.326). A resume the
+/// CLI refuses — a Code Mode conversation, outside the interactive terminal — and one it cannot
+/// find. Matched, never forwarded; anything else stays the generic failed start.
+const VENDOR_START_FAILURES = [
+	["No conversation found with session ID", 5],
+	["Failed to resume session", 4],
+];
+/// The vendor's words about a failed start, held only until they are classified.
+const startFailureWords = [];
+
+function failedStartExit() {
+	for (const [prefix, code] of VENDOR_START_FAILURES) {
+		if (startFailureWords.some((words) => words.includes(prefix))) return code;
+	}
+	return VENDOR_ENDED_UNPROMPTED_EXIT;
+}
 
 function shutdown(reasonCode, exitCode = 0) {
 	clearInterval(heartbeat);
@@ -1495,7 +1512,7 @@ function shutdown(reasonCode, exitCode = 0) {
 /// The vendor ended the stream on its own. Before any prompt that is a start that failed; after
 /// one it is the grounded teardown an interrupted or errored turn ends in.
 function vendorEnded(reasonCode) {
-	if (promptsHanded === 0) shutdown("vendor_ended_unprompted", VENDOR_ENDED_UNPROMPTED_EXIT);
+	if (promptsHanded === 0) shutdown("vendor_ended_unprompted", failedStartExit());
 	shutdown(reasonCode);
 }
 
@@ -1706,6 +1723,9 @@ try {
 			continue;
 		}
 		if (message.type === "result") {
+			if (promptsHanded === 0 && Array.isArray(message.errors)) {
+				for (const words of message.errors) if (typeof words === "string") startFailureWords.push(words);
+			}
 			// Every prompt still awaiting a replay after a turn ended is ambiguous.
 			for (const [uuid, commandID] of promptsAwaitingReplay) {
 				promptsAwaitingReplay.delete(uuid);
@@ -1715,8 +1735,10 @@ try {
 		}
 	}
 	vendorEnded("stream_complete");
-} catch {
+} catch (error) {
 	// Grounded: the CLI exits nonzero after an interrupted or errored turn and
-	// the SDK surfaces it as a throw even when the result was delivered.
+	// the SDK surfaces it as a throw even when the result was delivered. Its message carries
+	// the tail of the CLI's stderr, which is where a refused resume says why.
+	if (promptsHanded === 0) startFailureWords.push(String(error?.message ?? ""));
 	vendorEnded("stream_ended");
 }

@@ -389,6 +389,10 @@ struct LiveSession {
     proof_revision: u64,
     process_id: u32,
     terminal_binding: Option<crate::codex_terminal_status::TerminalBinding>,
+    /// The conversation is in Claude Code's experimental Code Mode, as its transcript last
+    /// said (`note_code_mode`). Only Claude's own terminal resumes one, so the row withholds
+    /// its takeover. A property of the conversation, so a new process for it inherits it.
+    code_mode: bool,
     /// Required at-use evidence belongs to live authority, never solely to an evictable
     /// recovery candidate. Only an actual hook may replace it with hook authority.
     derived_admission: Option<crate::codex_terminal_status::DerivedAdmission>,
@@ -1250,7 +1254,9 @@ impl AgentSessionSupervisor {
             let mut history = Vec::new();
             let mut next_sequence = 1;
             let mut whereabouts = Announced::default();
+            let mut code_mode = false;
             if let Some(mut previous) = inner.sessions.remove(&session_id) {
+                code_mode = previous.code_mode;
                 // What the agent was told belongs to the conversation, not the process: a resumed
                 // Claude carries its old notes in its history, so a new process inherits them.
                 whereabouts = std::mem::take(&mut previous.whereabouts);
@@ -1276,6 +1282,7 @@ impl AgentSessionSupervisor {
                 proof_revision: 0,
                 process_id: registration.process_id,
                 terminal_binding: registration.terminal_binding,
+                code_mode,
                 derived_admission: None,
                 compatible: registration.compatible,
                 offered_commands: registration.capabilities.commands,
@@ -1342,6 +1349,16 @@ impl AgentSessionSupervisor {
 
     /// The model the adapter says is answering. Same contract as the mode above: reported, not
     /// requested, and idempotent so a worker restating it costs no revision.
+    /// Records whether the conversation is in Claude Code's Code Mode, as its transcript says.
+    ///
+    /// Deliberately not a snapshot delta: what changes is the directory row's takeover offer,
+    /// which the phone re-reads with the list, not the open conversation's state.
+    pub(crate) fn note_code_mode(&self, session_id: &str, code_mode: bool) {
+        if let Some(session) = self.inner.lock().sessions.get_mut(session_id) {
+            session.code_mode = code_mode;
+        }
+    }
+
     pub(crate) fn update_bridge_model(&self, session_id: &str, model: String) {
         let mut inner = self.inner.lock();
         let Some(session) = inner.sessions.get_mut(session_id) else {
@@ -4537,6 +4554,13 @@ fn drift_note_for(registration: &NormalizedRegistration) -> Option<DriftNote> {
 mod directory_preview;
 
 fn descriptor_for(session: &LiveSession) -> (AgentSessionDescriptor, RecentPrompt) {
+    let takeover = session
+        .terminal_binding
+        .is_none()
+        .then(|| takeover_verb(&session.snapshot.topology, &session.snapshot.adapter.family))
+        .flatten();
+    // Only a promotion resumes through the managed CLI, which is what refuses Code Mode.
+    let code_mode_refused = session.code_mode && takeover == Some("promote");
     let turn = session.visible_turn();
     let context_preview = directory_preview::for_session(session, &turn);
     let descriptor = AgentSessionDescriptor {
@@ -4557,14 +4581,9 @@ fn descriptor_for(session: &LiveSession) -> (AgentSessionDescriptor, RecentPromp
         recent_prompt: None,
         // Filled in by the caller, which is the only place that can see both directories.
         managed_session_id: None,
-        takeover: session
-            .terminal_binding
-            .is_none()
-            .then(|| {
-                takeover_verb(&session.snapshot.topology, &session.snapshot.adapter.family)
-                    .map(str::to_owned)
-            })
-            .flatten(),
+        takeover: takeover.filter(|_| !code_mode_refused).map(str::to_owned),
+        takeover_refusal: code_mode_refused
+            .then(|| crate::managed_session::CODE_MODE_TERMINAL_ONLY.to_owned()),
         drift: session.snapshot.drift.clone(),
         revision: session.snapshot.revision,
         updated_at: session.updated_at,
@@ -6374,6 +6393,39 @@ mod tests {
         assert!(plan.is_none());
         assert!(s.session_for_route(&route).is_none());
         assert_eq!(withdrawn_frames(&mut updates), 1);
+    }
+
+    /// A terminal conversation in Claude Code's experimental Code Mode cannot be taken over: the
+    /// managed CLI refuses to resume it. Once its transcript has said so, the row stops offering
+    /// a takeover that would end the terminal for nothing, and says why instead.
+    #[test]
+    fn a_code_mode_claude_row_withholds_its_takeover_and_says_why() {
+        let temp = tempdir().unwrap();
+        let supervisor = supervisor(&temp.path().join("metadata.json"));
+        let mut registration = observer_registration("code-mode-claude");
+        registration.adapter_family = "Claude".into();
+        let registered = supervisor.register_new(registration.clone(), None).unwrap();
+        let row = || supervisor.list().sessions[0].clone();
+        assert_eq!(row().takeover.as_deref(), Some("promote"));
+        assert_eq!(row().takeover_refusal, None);
+
+        supervisor.note_code_mode(&registered.session_id, true);
+        assert_eq!(row().takeover, None);
+        assert_eq!(
+            row().takeover_refusal.as_deref(),
+            Some(crate::managed_session::CODE_MODE_TERMINAL_ONLY)
+        );
+        row().validate().unwrap();
+
+        // The mode belongs to the conversation, not the process: a new process registering the
+        // same conversation keeps it until a transcript read says otherwise.
+        let mut next = registration.clone();
+        next.process_nonce = "code-mode-claude-next".into();
+        supervisor.register_new(next, None).unwrap();
+        assert_eq!(row().takeover, None);
+        supervisor.note_code_mode(&registered.session_id, false);
+        assert_eq!(row().takeover.as_deref(), Some("promote"));
+        assert_eq!(row().takeover_refusal, None);
     }
 
     fn install_fixture_route(

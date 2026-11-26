@@ -365,10 +365,10 @@ impl WorkerTable {
 /// How a worker that exited on its own ended, as the reaper saw it.
 ///
 /// The code is the worker's only categorical account of why it ended, because its output is
-/// discarded on purpose. `worker.mjs` owns the meanings: 0 is an ordinary end, 1 its bridge went
-/// away, 2 its launch was refused, and 3 the vendor ended the session before the worker had
-/// handed it a prompt — a start or resume the vendor refused. `None` is a signal, or a wait that
-/// failed, and counts as a crash like every other nonzero code.
+/// discarded on purpose. What each code means is the shared fixture
+/// `protocol/fixtures/phase5/managed-worker-exit-v1.json`, which `worker.mjs`'s tests and this
+/// file's both hold their side to. `None` is a signal, or a wait that failed, and counts as a
+/// crash like every other nonzero code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerExit {
     pub(crate) code: Option<i32>,
@@ -377,6 +377,20 @@ pub(crate) struct WorkerExit {
 impl WorkerExit {
     pub(crate) fn crashed(self) -> bool {
         self.code != Some(0)
+    }
+
+    /// The categorical cause the worker meant by its code, for the daemon's log.
+    pub(crate) fn cause(self) -> &'static str {
+        match self.code {
+            Some(0) => "ended",
+            Some(1) => "bridge_closed",
+            Some(2) => "launch_refused",
+            Some(3) => "vendor_ended_unprompted",
+            Some(4) => "resume_refused",
+            Some(5) => "resume_not_found",
+            Some(_) => "unknown",
+            None => "signal",
+        }
     }
 }
 
@@ -661,6 +675,34 @@ mod tests {
                 "saved-model"
             ]
         );
+    }
+
+    /// The worker and the reaper read one table of exit codes, so a cause the worker names is a
+    /// cause the daemon's log names, and the crash verdict the store records agrees with it.
+    #[test]
+    fn every_worker_exit_code_names_the_cause_the_worker_meant() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/fixtures/phase5/managed-worker-exit-v1.json"
+        ))
+        .unwrap();
+        let exits = fixture["exits"].as_array().unwrap();
+        assert!(!exits.is_empty());
+        for exit in exits {
+            let code = i32::try_from(exit["code"].as_i64().unwrap()).unwrap();
+            let worker_exit = WorkerExit { code: Some(code) };
+            assert_eq!(
+                worker_exit.cause(),
+                exit["cause"].as_str().unwrap(),
+                "{code}"
+            );
+            assert_eq!(
+                worker_exit.crashed(),
+                exit["crash"].as_bool().unwrap(),
+                "{code}"
+            );
+        }
+        assert_eq!(WorkerExit { code: Some(99) }.cause(), "unknown");
+        assert_eq!(WorkerExit { code: None }.cause(), "signal");
     }
 
     #[tokio::test]

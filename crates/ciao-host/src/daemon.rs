@@ -1094,6 +1094,7 @@ async fn monitor_agent_routes(state: Arc<RuntimeState>) {
                         tracing::warn!(
                             session = %session_id,
                             code = ?exit.code,
+                            cause = exit.cause(),
                             "managed worker exited unexpectedly"
                         );
                     } else {
@@ -5812,7 +5813,7 @@ mod tests {
             agent_managed
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
-            ManagedLauncher::Fake(crate::managed_session::fake::FakeLauncher::default()),
+            ManagedLauncher::Fake(Box::default()),
         )
         .unwrap();
         let paired_devices = Arc::new(Mutex::new(PairedDeviceStore::load(paired_path).unwrap()));

@@ -565,6 +565,12 @@
     },
     {
       "v": 1,
+      "command_id": "lifecycle-promote-code-mode",
+      "state": "refused",
+      "reason_code": "code_mode_terminal_only"
+    },
+    {
+      "v": 1,
       "command_id": "lifecycle-resume-unknown",
       "state": "refused",
       "reason_code": "unknown_session"

@@ -88,6 +88,9 @@ const METADATA_RECORD_TYPES: &[&str] = &[
     "progress",
     "queue-operation",
     "relocated",
+    // Code Mode's marker. Read for its value (`claude_transcript::repl_mode_value`), never
+    // mapped as conversation.
+    "repl-mode",
     "summary",
     "system",
     "worktree-state",
@@ -126,6 +129,9 @@ pub(crate) struct TranscriptHistory {
     /// Attached scheme: the run a `Stop` names (`claude_hook::run_id` of the prompt ID), mapped
     /// to the source of the prompt that opened it — where that turn starts in `entries`.
     turn_prompts: HashMap<String, String>,
+    /// Whether the conversation is in Code Mode, from the newest marker this read saw. `None`
+    /// when the read held no marker, which says nothing either way.
+    pub(crate) code_mode: Option<bool>,
 }
 
 impl TranscriptHistory {
@@ -193,6 +199,10 @@ pub(crate) fn spawn_backfill(
         };
         let count = history.entries.len();
         let complete = history.complete;
+        // Before the backfill, whose revision is what tells the phone the row changed.
+        if let Some(code_mode) = history.code_mode {
+            sessions.note_code_mode(&session_id, code_mode);
+        }
         match sessions.backfill_bridge_history(
             &session_id,
             Some(process_generation),
@@ -229,6 +239,10 @@ pub(crate) fn spawn_turn_reconcile(
         let Ok(Some(history)) = read else {
             return;
         };
+        // Code Mode can be switched inside a conversation; each turn's read says where it is now.
+        if let Some(code_mode) = history.code_mode {
+            sessions.note_code_mode(&session_id, code_mode);
+        }
         let (entries, from_turn_start) = history.into_turn(run_id.as_deref());
         if let Err(error) = sessions.reconcile_bridge_turn(
             &session_id,
@@ -423,6 +437,7 @@ struct HistoryMapper {
     turn_prompts: HashMap<String, String>,
     messages: usize,
     truncated: bool,
+    code_mode: Option<bool>,
 }
 
 impl HistoryMapper {
@@ -439,10 +454,14 @@ impl HistoryMapper {
             turn_prompts: HashMap::new(),
             messages: 0,
             truncated: false,
+            code_mode: None,
         }
     }
 
     fn push_record(&mut self, record: &Value) {
+        if let Some(code_mode) = crate::claude_transcript::repl_mode_value(record) {
+            self.code_mode = Some(code_mode);
+        }
         if !conversation_record(record) {
             return;
         }
@@ -724,6 +743,7 @@ impl HistoryMapper {
             entries,
             complete: !self.truncated,
             turn_prompts: self.turn_prompts,
+            code_mode: self.code_mode,
         }
     }
 }
@@ -1211,6 +1231,35 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Code Mode's marker (grounded 2026-11-26, see `claude_transcript::code_mode`) is metadata
+    /// this build now reads: the newest record is what a read reports, and it is no longer
+    /// tallied as an unknown record.
+    #[test]
+    fn a_read_reports_the_newest_code_mode_marker_and_no_longer_tallies_it() {
+        let marker = |on: bool| serde_json::json!({"type": "repl-mode", "replMode": on});
+        let prompt = serde_json::json!({"type": "user", "uuid": "c-1",
+            "timestamp": "2023-11-14T22:13:20Z", "message": {"content": "hello"}});
+        let mapped = map_records(
+            &[marker(false), prompt.clone(), marker(true)],
+            SourceScheme::Attached,
+            1,
+        );
+        assert_eq!(mapped.code_mode, Some(true));
+        assert_eq!(mapped.entries.len(), 1);
+        assert_eq!(
+            map_records(&[prompt], SourceScheme::Attached, 1).code_mode,
+            None,
+            "a read without the marker says nothing about the mode"
+        );
+        let ledger = crate::drift::snapshot();
+        assert!(!ledger.vendors.get("claude").is_some_and(|claude| {
+            claude
+                .signatures
+                .iter()
+                .any(|note| note.name == "repl-mode")
+        }));
     }
 
     /// Spec 017 §4.2: shapes this build does not know are tallied by name and tolerated — a

@@ -1232,7 +1232,7 @@ mod tests {
             Arc::get_mut(&mut state).unwrap().managed_sessions = ManagedSessionDirectory::load(
                 &paths.agent_managed_file,
                 &home,
-                ManagedLauncher::Fake(crate::managed_session::fake::FakeLauncher::default()),
+                ManagedLauncher::Fake(Box::default()),
             )
             .unwrap();
             let mut builder = Endpoint::builder(presets::N0)

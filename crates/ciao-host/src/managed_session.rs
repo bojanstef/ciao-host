@@ -89,7 +89,7 @@ pub(crate) struct LaunchSpec {
 pub(crate) enum ManagedLauncher {
     Worker(Box<WorkerLauncher>),
     #[cfg(test)]
-    Fake(fake::FakeLauncher),
+    Fake(Box<fake::FakeLauncher>),
 }
 
 /// Owns the pinned-pair resolution and the supervised worker table.
@@ -234,6 +234,23 @@ impl ManagedLauncher {
         }
     }
 
+    /// Whether only Claude's own terminal can continue this conversation (Code Mode), which
+    /// a managed worker cannot: its CLI refuses the resume. Read from Claude's transcript.
+    async fn terminal_only(&self, vendor_session_id: &str) -> bool {
+        match self {
+            Self::Worker(_) => {
+                let vendor_session_id = vendor_session_id.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    crate::claude_transcript::code_mode(&vendor_session_id)
+                })
+                .await
+                .unwrap_or(false)
+            }
+            #[cfg(test)]
+            Self::Fake(fake) => fake.terminal_only(vendor_session_id),
+        }
+    }
+
     async fn handback(
         &self,
         workspace: &str,
@@ -259,6 +276,11 @@ impl ManagedLauncher {
         }
     }
 }
+
+/// The refusal for a conversation in Claude Code's experimental Code Mode, which Claude resumes
+/// only in its own interactive terminal (`claude_transcript::code_mode`). Shared by takeover,
+/// resume and the attached row that withholds its takeover offer, so the phone reads one reason.
+pub(crate) const CODE_MODE_TERMINAL_ONLY: &str = "code_mode_terminal_only";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedSessionDirectory {
@@ -724,9 +746,12 @@ impl ManagedSessionDirectory {
         if !path.is_absolute() || !path.is_dir() {
             return Some("unknown_workspace");
         }
-        // Both remaining checks ask who else holds this conversation. A takeover with nothing to
+        // The remaining checks ask about the conversation itself. A takeover with nothing to
         // resume has no conversation to contend over, so there is no one to collide with.
         if let Some(vendor_session_id) = target.vendor_session_id.as_deref() {
+            if self.launcher.terminal_only(vendor_session_id).await {
+                return Some(CODE_MODE_TERMINAL_ONLY);
+            }
             if self.store.lock().records.iter().any(|record| {
                 record.vendor_session_id.as_deref() == Some(vendor_session_id)
                     && record.presence == "live"
@@ -771,6 +796,9 @@ impl ManagedSessionDirectory {
         // Both ownership checks are about a conversation. A takeover with none to resume starts
         // one, and a conversation that does not exist yet cannot be held by anyone.
         if let Some(vendor_session_id) = target.vendor_session_id.as_deref() {
+            if self.launcher.terminal_only(vendor_session_id).await {
+                return self.refuse(command_id, CODE_MODE_TERMINAL_ONLY);
+            }
             // Ciao may already hold this vendor session from an earlier promotion; adopting it
             // twice would be the same silent fork the terminal check exists to prevent.
             if self.store.lock().records.iter().any(|record| {
@@ -1041,6 +1069,13 @@ impl ManagedSessionDirectory {
                     .flatten(),
             )
         };
+        // Before anything is ended: a conversation only Claude's terminal can resume would cost
+        // the handback terminal and then fail in the worker anyway.
+        if let Some(vendor_session) = vendor_session.as_deref()
+            && self.launcher.terminal_only(vendor_session).await
+        {
+            return self.refuse(command_id, CODE_MODE_TERMINAL_ONLY);
+        }
         // Ends the terminal Ciao opened before the probe below looks for owners, or the Claude
         // inside it would be read as a foreign owner and refuse the take-back. Ordered this way
         // on purpose: evict the holder Ciao is responsible for, then let the probe rule on
@@ -1245,6 +1280,7 @@ fn stored_descriptor(
             terminal_continuity: terminal_continuity.into(),
         },
         takeover: None,
+        takeover_refusal: None,
         workspace_display: record.workspace_label.clone(),
         // A managed session has no terminal — except a released one, which now has exactly
         // one. `resumable_session` and not `exact_live`: the terminal holds a Claude that
@@ -1609,6 +1645,8 @@ pub(crate) mod fake {
         pub(crate) handback_fails: Mutex<bool>,
         /// Handback terminals a take-back ended, in order.
         pub(crate) closed_handbacks: Mutex<Vec<String>>,
+        /// Vendor sessions whose transcript says Code Mode, which only the terminal resumes.
+        pub(crate) terminal_only: Mutex<HashSet<String>>,
     }
 
     impl FakeLauncher {
@@ -1633,6 +1671,13 @@ pub(crate) mod fake {
             _ignoring: Option<u32>,
         ) -> bool {
             self.foreign_owned
+                .lock()
+                .unwrap()
+                .contains(vendor_session_id)
+        }
+
+        pub(crate) fn terminal_only(&self, vendor_session_id: &str) -> bool {
+            self.terminal_only
                 .lock()
                 .unwrap()
                 .contains(vendor_session_id)
@@ -1665,7 +1710,7 @@ mod tests {
         ManagedSessionDirectory::load(
             path,
             path.parent().unwrap_or_else(|| Path::new(".")),
-            ManagedLauncher::Fake(fake::FakeLauncher::default()),
+            ManagedLauncher::Fake(Box::default()),
         )
         .unwrap()
     }
@@ -2089,6 +2134,65 @@ mod tests {
             ..target.clone()
         };
         assert_eq!(directory.promotion_preflight(&fresh).await, None);
+    }
+
+    /// A conversation in Claude Code's experimental Code Mode can only continue in the terminal:
+    /// the managed CLI refuses to resume it. A takeover used to find that out after it had
+    /// already ended the owner's terminal, and every Resume after it spawned a worker that died
+    /// in under a second. Both are now refused before anything is touched or launched.
+    #[tokio::test]
+    async fn a_code_mode_conversation_is_refused_before_anything_is_ended_or_launched() {
+        let home = tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let directory = directory(&home.path().join("agent-managed.json"));
+        let target = PromotionTarget {
+            vendor_session_id: Some("vendor-code-mode".into()),
+            workspace_path: workspace.to_string_lossy().into_owned(),
+            process_id: 0,
+        };
+        fake(&directory)
+            .terminal_only
+            .lock()
+            .unwrap()
+            .insert("vendor-code-mode".into());
+        assert_eq!(
+            directory.promotion_preflight(&target).await,
+            Some("code_mode_terminal_only")
+        );
+        let promoted = directory
+            .managed_promote(&target, "cmd-code-mode", &|_| {
+                panic!("a refused takeover inherits nothing")
+            })
+            .await;
+        assert_eq!(promoted.state, "refused");
+        assert_eq!(
+            promoted.reason_code.as_deref(),
+            Some("code_mode_terminal_only")
+        );
+        assert!(directory.summaries().is_empty(), "no worker was launched");
+
+        // A stored chat whose conversation is in Code Mode — one a takeover promoted before this
+        // check existed — is refused the same way, and its handback terminal is left alone.
+        fake(&directory).terminal_only.lock().unwrap().clear();
+        let started = directory
+            .managed_start_at_path(&workspace, "cmd-start")
+            .await;
+        let session_id = started.session_id.unwrap();
+        directory.record_vendor_session(&session_id, "vendor-code-mode");
+        directory.managed_stop(&session_id, 1, "cmd-stop").await;
+        fake(&directory)
+            .terminal_only
+            .lock()
+            .unwrap()
+            .insert("vendor-code-mode".into());
+        let resumed = directory.managed_resume(&session_id, "cmd-resume").await;
+        assert_eq!(
+            resumed.reason_code.as_deref(),
+            Some("code_mode_terminal_only")
+        );
+        assert_eq!(directory.summaries()[0].presence, "stored");
+        assert!(fake(&directory).closed_handbacks.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
