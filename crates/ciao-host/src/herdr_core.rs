@@ -276,14 +276,25 @@ pub(crate) async fn terminal(
     session: &str,
     tab: &str,
 ) -> Option<CoreTerminal> {
+    terminal_answer(config, session, tab).await.ok().flatten()
+}
+
+/// Core's answer for one tab, keeping "Core did not answer" (`Err`: no socket, a timeout, an
+/// unreadable reply) apart from "Core answered without that tab" (`Ok(None)`). A route check
+/// must not read the first as the pane being gone.
+pub(crate) async fn terminal_answer(
+    config: &CoreConfig,
+    session: &str,
+    tab: &str,
+) -> Result<Option<CoreTerminal>, CoreError> {
     if !valid_herdr_core_tab_id(tab) {
-        return None;
+        return Ok(None);
     }
-    let (listing, _) = listing(config, session).await.ok()?;
-    listing
+    let (listing, _) = listing(config, session).await?;
+    Ok(listing
         .terminals
         .into_iter()
-        .find(|terminal| terminal.tab == tab)
+        .find(|terminal| terminal.tab == tab))
 }
 
 /// Create on the verified existing Core only. No argv means Core's configured shell.
@@ -2001,7 +2012,7 @@ mod tests {
             assert!(resolver.revalidate(&proof).await);
             assert!(matches!(
                 resolver.terminal_plan(&proof).await,
-                Some(crate::agent_route::AgentTerminalPlan::Core { .. })
+                Ok(crate::agent_route::AgentTerminalPlan::Core { .. })
             ));
 
             let mut first_viewer =

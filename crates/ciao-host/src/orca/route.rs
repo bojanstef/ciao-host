@@ -2,7 +2,7 @@
 //! incarnations. Orca's local PTY daemon supplies their shell PIDs. All viewer traffic
 //! still uses the separately paired runtime connection.
 use super::{MAX_ROWS, RESPONSE_LIMIT, Runtime, project_folder, session, workspace_instance};
-use crate::process;
+use crate::{agent_route::RouteCheck, process};
 use nix::unistd::Uid;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -86,8 +86,26 @@ impl Proof {
         .then_some(proof)
     }
 
-    pub(crate) async fn current(&self, profile: &Path, pairing: &Path) -> bool {
-        Self::find(profile, pairing, self.process).await.as_ref() == Some(self)
+    /// `find` folds every miss into `None`, and most of its misses are Orca not answering:
+    /// the runtime relaunching, the paired handshake or a query outrunning its deadline. Only
+    /// facts that cannot change back disprove the route: the agent exiting, the pairing being
+    /// removed, or Orca answering with a different pane or runtime.
+    pub(crate) const fn process(&self) -> u32 {
+        self.process
+    }
+
+    pub(crate) async fn check(&self, profile: &Path, pairing: &Path) -> RouteCheck {
+        match fs::try_exists(pairing).await {
+            Ok(true) => {}
+            Ok(false) => return RouteCheck::Disproved,
+            Err(_) => return RouteCheck::Unanswered,
+        }
+        match Self::find(profile, pairing, self.process).await {
+            Some(fresh) if fresh == *self => RouteCheck::Current,
+            Some(_) => RouteCheck::Disproved,
+            None if !process::exists(self.process) => RouteCheck::Disproved,
+            None => RouteCheck::Unanswered,
+        }
     }
 
     pub(super) fn matches(&self, rt: &Runtime, terminal: &Value) -> bool {
@@ -238,12 +256,61 @@ async fn inventory(profile: &Path) -> Option<Vec<Pty>> {
 mod tests {
     use super::*;
     use crate::{
-        agent_route::{AgentRouteProof, AgentTerminalPlan, TerminalRouteResolver},
+        agent_route::{AgentRouteProof, AgentTerminalPlan, RouteCheck, TerminalRouteResolver},
         host_protocol::Dimensions,
         storage::CiaoPaths,
         workspace::WorkspaceConfig,
     };
     use std::time::Duration;
+
+    fn fixture_proof(process: u32) -> Proof {
+        let id = "11111111-1111-4111-8111-111111111111";
+        Proof {
+            workspace: id.into(),
+            pane: format!("{id}:{id}"),
+            runtime: id.into(),
+            handle: "term_fixture".into(),
+            pty: "fixture-pty".into(),
+            incarnation: id.into(),
+            process,
+            process_generation: "fixture".into(),
+            shell: process,
+            shell_generation: "fixture".into(),
+        }
+    }
+
+    // A relaunching or starved Orca cannot answer for a pane that is still live. That is not
+    // evidence the pane is gone; an exited agent or a removed pairing is.
+    #[tokio::test]
+    async fn orca_check_separates_no_answer_from_disproof() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pairing = dir.path().join("orca-pairing.json");
+        std::fs::write(&pairing, "{}").unwrap();
+        std::fs::set_permissions(&pairing, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut workspace = WorkspaceConfig::with_binary_dirs(vec![]);
+        workspace.orca_profile = profile;
+        let resolver = TerminalRouteResolver::new(workspace).with_orca_pairing(pairing.clone());
+        let live = AgentRouteProof::Orca(fixture_proof(std::process::id()));
+        assert_eq!(resolver.check(&live).await, RouteCheck::Unanswered);
+        assert!(
+            !resolver.revalidate(&live).await,
+            "an open still needs proof"
+        );
+
+        // Above every pid_max, so no process can hold it. Spawning a real child to reap would
+        // briefly share this test process's descriptors and races the daemon-lock tests.
+        let gone = u32::try_from(i32::MAX).unwrap();
+        assert!(!process::exists(gone));
+        let dead = AgentRouteProof::Orca(fixture_proof(gone));
+        assert_eq!(resolver.check(&dead).await, RouteCheck::Disproved);
+
+        std::fs::remove_file(&pairing).unwrap();
+        assert_eq!(resolver.check(&live).await, RouteCheck::Disproved);
+    }
 
     #[tokio::test]
     #[ignore = "requires an isolated paired Orca profile and two disposable folder terminals running cat"]
@@ -304,7 +371,7 @@ mod tests {
             .is_err()
         );
         assert!(resolver.resolve(std::process::id()).await.is_none());
-        let Some(AgentTerminalPlan::Orca(plan)) = resolver
+        let Ok(AgentTerminalPlan::Orca(plan)) = resolver
             .terminal_plan(&AgentRouteProof::Orca(a.clone()))
             .await
         else {

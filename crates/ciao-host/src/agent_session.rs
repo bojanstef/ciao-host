@@ -9,7 +9,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,7 +35,8 @@ use crate::{
         fit_entry_alone, fit_entry_to_frame, fit_snapshot_to_frame, valid_opaque_id, valid_token,
     },
     agent_route::{
-        AgentRouteProof, AgentSighting, AgentTerminalPlan, RouteContinuity, TerminalRouteResolver,
+        AgentRouteProof, AgentSighting, AgentTerminalPlan, RouteCheck, RouteContinuity,
+        TerminalRouteResolver,
     },
     host_protocol::AgentTabIndex,
     notify::NotificationFacts,
@@ -69,6 +70,14 @@ const TURN_CLAIM_EXPIRY_SECONDS: u64 = 15 * 60;
 /// `unknown` until the adapters speak again. Capped because a long-lived daemon ends thousands of
 /// sessions and only the handful still selected on someone's Lock Screen ever matter.
 const MAX_ENDED_VERDICTS: usize = 256;
+/// How long a held route survives checks that get no answer before it is withdrawn.
+///
+/// Measured on the owner's Mac (2026-11-26): while the machine was busy, every check of a live
+/// Orca pane slowed to 3–7 s against a 5 s deadline, then got no answer at all for 57–60 s,
+/// twice, before answering `Current` again with the pane unchanged. An Orca relaunch costs
+/// about 10 s. Two minutes covers both with margin and still bounds a stale advertisement.
+/// Opening a terminal never relies on this: it requires a `Current` answer of its own.
+const ROUTE_UNANSWERED_WINDOW: Duration = Duration::from_secs(120);
 
 /// What a vendor notification kind is allowed to do to the turn. The alert is delivered for
 /// every kind regardless; this only decides the state claim.
@@ -269,6 +278,9 @@ struct SupervisorInner {
     ended: HashMap<String, u64>,
     /// Bounded, no-authority evidence survives selection invalidation/session erasure.
     shared_recovery: HashMap<String, SharedRecoveryCandidate>,
+    /// When each held route's checks stopped getting answers, keyed by route ID. Present only
+    /// while a route is inside its unanswered window; a `Current` answer removes it.
+    unanswered_routes: HashMap<String, Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -468,6 +480,7 @@ impl AgentSessionSupervisor {
                 carried_history: HashMap::new(),
                 ended: HashMap::new(),
                 shared_recovery: HashMap::new(),
+                unanswered_routes: HashMap::new(),
             })),
             metadata: Arc::new(Mutex::new(metadata)),
             registration_gate: Arc::new(AsyncMutex::new(())),
@@ -2895,6 +2908,24 @@ impl AgentSessionSupervisor {
         expected_session: &str,
         expected_generation: u64,
     ) -> Option<PendingAgentTerminal> {
+        self.terminal_plan_with(route_id, expected_session, expected_generation, |proof| {
+            let routes = self.routes.clone();
+            async move { routes.terminal_plan(&proof).await }
+        })
+        .await
+    }
+
+    async fn terminal_plan_with<P, Fut>(
+        &self,
+        route_id: &str,
+        expected_session: &str,
+        expected_generation: u64,
+        plan: P,
+    ) -> Option<PendingAgentTerminal>
+    where
+        P: FnOnce(AgentRouteProof) -> Fut,
+        Fut: std::future::Future<Output = Result<AgentTerminalPlan, RouteCheck>>,
+    {
         if valid_opaque_id(route_id).is_err() {
             return None;
         }
@@ -2916,7 +2947,7 @@ impl AgentSessionSupervisor {
         if !self.route_record_is_current(route_id, &record) {
             return None;
         }
-        let plan = self.routes.terminal_plan(&record.proof).await;
+        let plan = plan(record.proof.clone()).await;
         if !self.revalidate_terminal_binding(&record.session_id).await
             || !self.route_record_is_current(route_id, &record)
             || !self
@@ -2928,10 +2959,12 @@ impl AgentSessionSupervisor {
         {
             return None;
         }
-        if plan.is_none() {
+        // An open is refused unless proven current right now, but only a disproof revokes:
+        // an open that could not get an answer leaves the route for the sweep to settle.
+        if matches!(plan, Err(RouteCheck::Disproved)) {
             self.downgrade_if_current(route_id, &fence, "route_invalidated");
         }
-        plan.map(|plan| PendingAgentTerminal {
+        plan.ok().map(|plan| PendingAgentTerminal {
             plan,
             route_id: route_id.into(),
             record,
@@ -3260,17 +3293,25 @@ impl AgentSessionSupervisor {
     }
 
     async fn revalidate_provider_routes(&self) {
-        self.revalidate_providers_with(|proof| {
-            let routes = self.routes.clone();
-            async move { routes.revalidate(&proof).await }
-        })
+        self.revalidate_providers_with(
+            |proof| {
+                let routes = self.routes.clone();
+                async move { routes.check(&proof).await }
+            },
+            |process_id| {
+                let routes = self.routes.clone();
+                async move { routes.resolve(process_id).await }
+            },
+        )
         .await;
     }
 
-    async fn revalidate_providers_with<F, Fut>(&self, mut inspect: F)
+    async fn revalidate_providers_with<F, Fut, R, RFut>(&self, mut inspect: F, mut resolve: R)
     where
         F: FnMut(AgentRouteProof) -> Fut,
-        Fut: std::future::Future<Output = bool> + Send + 'static,
+        Fut: std::future::Future<Output = RouteCheck> + Send + 'static,
+        R: FnMut(u32) -> RFut,
+        RFut: std::future::Future<Output = Option<AgentRouteProof>>,
     {
         let records: Vec<_> = {
             let inner = self.inner.lock();
@@ -3290,15 +3331,38 @@ impl AgentSessionSupervisor {
         for (route_id, record, fence) in records {
             let inspection = inspect(record.proof);
             checks.spawn(async move {
-                let valid = inspection.await;
-                (route_id, fence, valid)
+                let verdict = inspection.await;
+                (route_id, fence, verdict)
             });
         }
-        while let Some(Ok((route_id, fence, valid))) = checks.join_next().await {
-            if !valid {
-                self.downgrade_if_current(&route_id, &fence, "route_invalidated");
+        while let Some(Ok((route_id, fence, verdict))) = checks.join_next().await {
+            match verdict {
+                RouteCheck::Current => {
+                    self.inner.lock().unanswered_routes.remove(&route_id);
+                }
+                RouteCheck::Unanswered => {
+                    if self.unanswered_window_open(&route_id, &fence) {
+                        continue;
+                    }
+                    self.downgrade_if_current(&route_id, &fence, "route_unanswered");
+                }
+                RouteCheck::Disproved => {
+                    // Re-resolve now rather than publish `unavailable` and wait for recovery:
+                    // an Orca relaunch disproves every held proof while every pane lives on.
+                    match resolve(fence.process_id).await {
+                        Some(proof) => self.replace_route_if_current(&route_id, &fence, proof),
+                        None => self.downgrade_if_current(&route_id, &fence, "route_invalidated"),
+                    }
+                }
             }
         }
+        let mut inner = self.inner.lock();
+        let SupervisorInner {
+            routes,
+            unanswered_routes,
+            ..
+        } = &mut *inner;
+        unanswered_routes.retain(|route_id, _| routes.contains_key(route_id));
     }
 
     /// Retries sessions that are live but hold no route. Resolution is attempted exactly once,
@@ -3407,7 +3471,7 @@ impl AgentSessionSupervisor {
     }
 
     async fn refresh_route_for(&self, session_id: &str, expected: Option<&SessionFence>) {
-        let route_fence = {
+        let captured = {
             let inner = self.inner.lock();
             inner
                 .sessions
@@ -3417,9 +3481,9 @@ impl AgentSessionSupervisor {
                 // daemon's own vendor child, and its None verdict must not rewrite the grant
                 // — one adopted-and-unavailable row makes phones reject the whole list.
                 .filter(|session| session.adapter_active && session.snapshot.topology != "adopted")
-                .map(SessionFence::capture)
+                .map(|session| (SessionFence::capture(session), session.route_id.clone()))
         };
-        let Some(route_fence) = route_fence else {
+        let Some((route_fence, expected_route)) = captured else {
             return;
         };
         if expected.is_some_and(|expected| *expected != route_fence)
@@ -3432,13 +3496,18 @@ impl AgentSessionSupervisor {
         if !self.revalidate_terminal_binding(session_id).await {
             return;
         }
-        self.commit_route_refresh(session_id, &route_fence, proof);
+        self.commit_route_refresh(session_id, &route_fence, expected_route.as_deref(), proof);
     }
 
+    /// Commits one resolution as the session's route. `expected_route` is the route the
+    /// resolution set out to replace: a slower resolution that finishes after another one
+    /// committed must not overwrite it, and above all a late miss must not revoke a route
+    /// minted after it started.
     fn commit_route_refresh(
         &self,
         session_id: &str,
         route_fence: &SessionFence,
+        expected_route: Option<&str>,
         proof: Option<AgentRouteProof>,
     ) {
         let process_id = route_fence.process_id;
@@ -3447,11 +3516,11 @@ impl AgentSessionSupervisor {
             None => "none",
         };
         let mut inner = self.inner.lock();
-        if !inner
-            .sessions
-            .get(session_id)
-            .is_some_and(|session| session.adapter_active && route_fence.matches(session))
-        {
+        if !inner.sessions.get(session_id).is_some_and(|session| {
+            session.adapter_active
+                && route_fence.matches(session)
+                && session.route_id.as_deref() == expected_route
+        }) {
             return;
         }
         let old_route = inner
@@ -3460,6 +3529,7 @@ impl AgentSessionSupervisor {
             .and_then(|session| session.route_id.take());
         if let Some(old_route) = old_route {
             inner.routes.remove(&old_route);
+            inner.unanswered_routes.remove(&old_route);
         }
         let Some(session) = inner.sessions.get_mut(session_id) else {
             return;
@@ -3545,6 +3615,49 @@ impl AgentSessionSupervisor {
         );
     }
 
+    /// Whether a route whose check got no answer is still inside its window, opening the
+    /// window on the first such check.
+    fn unanswered_window_open(&self, route_id: &str, fence: &SessionFence) -> bool {
+        let mut inner = self.inner.lock();
+        let held = inner
+            .sessions
+            .get(&fence.registered.session_id)
+            .is_some_and(|session| {
+                session.route_id.as_deref() == Some(route_id) && fence.matches(session)
+            });
+        if !held {
+            return true; // Superseded meanwhile; nothing of this route's left to withdraw.
+        }
+        let now = Instant::now();
+        let since = *inner
+            .unanswered_routes
+            .entry(route_id.to_owned())
+            .or_insert_with(|| {
+                tracing::debug!(
+                    session = %fence.registered.session_id,
+                    "agent route check unanswered"
+                );
+                now
+            });
+        now.duration_since(since) < ROUTE_UNANSWERED_WINDOW
+    }
+
+    /// Swaps a disproved route for a freshly proven one in a single delta, so subscribers never
+    /// see the session without a route while its pane is still there.
+    fn replace_route_if_current(
+        &self,
+        route_id: &str,
+        fence: &SessionFence,
+        proof: AgentRouteProof,
+    ) {
+        self.commit_route_refresh(
+            &fence.registered.session_id,
+            fence,
+            Some(route_id),
+            Some(proof),
+        );
+    }
+
     fn downgrade_if_current(&self, route_id: &str, fence: &SessionFence, reason: &str) {
         let session_id = &fence.registered.session_id;
         let mut inner = self.inner.lock();
@@ -3554,6 +3667,10 @@ impl AgentSessionSupervisor {
         if !current {
             return;
         }
+        // Withdrawal used to be silent: only the later recovery logged, so a loss could not be
+        // told from a route that never resolved.
+        tracing::info!(session = %session_id, reason, "agent route withdrawn");
+        inner.unanswered_routes.remove(route_id);
         inner.routes.remove(route_id);
         if let Some(session) = inner.sessions.get_mut(session_id) {
             session.route_id = None;
@@ -5745,11 +5862,13 @@ mod tests {
             let (release, withheld) = tokio::sync::oneshot::channel();
             let pending_s = s.clone();
             let pending_row = row.clone();
+            let pending_old = s.inner.lock().sessions[&first.session_id].route_id.clone();
             let pending = tokio::spawn(async move {
                 let proof = withheld.await.unwrap();
                 pending_s.commit_route_refresh(
                     &pending_row.registered.session_id,
                     &pending_row.fence,
+                    pending_old.as_deref(),
                     proof,
                 );
             });
@@ -5782,7 +5901,13 @@ mod tests {
             }
             // Ordered production handoff begins provider work with this successor. A fresh
             // positive is immediate, without weakening the fence or waiting 15 ticks.
-            s.commit_route_refresh(&first.session_id, &current.fence, Some(proof));
+            let held = s.inner.lock().sessions[&first.session_id].route_id.clone();
+            s.commit_route_refresh(
+                &first.session_id,
+                &current.fence,
+                held.as_deref(),
+                Some(proof),
+            );
             assert!(
                 s.snapshot(&first.session_id)
                     .unwrap()
@@ -5811,8 +5936,14 @@ mod tests {
                 let (release, withheld) = tokio::sync::oneshot::channel();
                 let pending_s = s.clone();
                 let id = registered.session_id.clone();
+                let pending_old = old.clone();
                 let pending = tokio::spawn(async move {
-                    pending_s.commit_route_refresh(&id, &fence, withheld.await.unwrap());
+                    pending_s.commit_route_refresh(
+                        &id,
+                        &fence,
+                        Some(&pending_old),
+                        withheld.await.unwrap(),
+                    );
                 });
                 {
                     let mut inner = s.inner.lock();
@@ -5828,7 +5959,7 @@ mod tests {
                 assert!(s.session_for_route(&old).is_some());
                 let current =
                     SessionFence::capture(&s.inner.lock().sessions[&registered.session_id]);
-                s.commit_route_refresh(&registered.session_id, &current, Some(proof));
+                s.commit_route_refresh(&registered.session_id, &current, Some(&old), Some(proof));
                 assert!(s.session_for_route(&old).is_none());
             }
         }
@@ -6029,6 +6160,215 @@ mod tests {
             supervisor.list().sessions[0].takeover.as_deref(),
             Some("pickup")
         );
+    }
+
+    /// How many times a subscriber has been told the session's terminal route is gone.
+    fn withdrawn_frames(updates: &mut broadcast::Receiver<AgentServerFrame>) -> usize {
+        let mut count = 0;
+        while let Ok(frame) = updates.try_recv() {
+            if let AgentServerFrame::SessionDelta { delta, .. } = frame {
+                count += delta
+                    .changes
+                    .iter()
+                    .filter(|change| {
+                        matches!(
+                            change,
+                            AgentDeltaChange::TerminalFallback { terminal_fallback }
+                                if terminal_fallback.continuity == "unavailable"
+                        )
+                    })
+                    .count();
+            }
+        }
+        count
+    }
+
+    /// A live attached observer holding an exact route, with a subscriber watching it.
+    fn held_route() -> (
+        tempfile::TempDir,
+        AgentSessionSupervisor,
+        RegisteredAgentSession,
+        String,
+        broadcast::Receiver<AgentServerFrame>,
+    ) {
+        let tmp = tempdir().unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let registered = s
+            .register_new(observer_registration("held-route"), None)
+            .unwrap();
+        let route = install_fixture_route(&s, &registered);
+        let updates = s.inner.lock().sessions[&registered.session_id]
+            .updates
+            .subscribe();
+        (tmp, s, registered, route, updates)
+    }
+
+    fn replacement_proof(s: &AgentSessionSupervisor, session_id: &str) -> AgentRouteProof {
+        let pid = s.inner.lock().sessions[session_id].process_id;
+        AgentRouteProof::HerdrCore {
+            bridge_pid: pid,
+            session_name: "fixture".into(),
+            tab_id: "replacement-tab".into(),
+            terminal_pid: pid,
+        }
+    }
+
+    // The owner's bug: a live Orca agent's route flapped to `unavailable` whenever a check
+    // could not get an answer in time, and Home then opened the transcript.
+    #[tokio::test]
+    async fn unanswered_check_keeps_a_live_route_without_an_unavailable_frame() {
+        let (_tmp, s, registered, route, mut updates) = held_route();
+        for _ in 0..3 {
+            s.revalidate_providers_with(|_| async { RouteCheck::Unanswered }, |_| async { None })
+                .await;
+        }
+        assert_eq!(
+            withdrawn_frames(&mut updates),
+            0,
+            "a check with no answer told the phone the route was gone"
+        );
+        assert!(s.session_for_route(&route).is_some());
+        assert_eq!(
+            s.snapshot(&registered.session_id)
+                .unwrap()
+                .terminal_fallback
+                .continuity,
+            "exact_live"
+        );
+    }
+
+    #[tokio::test]
+    async fn unanswered_route_is_withdrawn_once_its_window_closes() {
+        let (_tmp, s, _registered, route, mut updates) = held_route();
+        s.revalidate_providers_with(|_| async { RouteCheck::Unanswered }, |_| async { None })
+            .await;
+        assert!(s.session_for_route(&route).is_some());
+        s.inner.lock().unanswered_routes.insert(
+            route.clone(),
+            Instant::now().checked_sub(ROUTE_UNANSWERED_WINDOW).unwrap(),
+        );
+        s.revalidate_providers_with(|_| async { RouteCheck::Unanswered }, |_| async { None })
+            .await;
+        assert!(
+            s.session_for_route(&route).is_none(),
+            "a route nobody can vouch for outlived its window"
+        );
+        assert_eq!(withdrawn_frames(&mut updates), 1);
+        assert!(s.inner.lock().unanswered_routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_answer_closes_the_unanswered_window() {
+        let (_tmp, s, _registered, route, _updates) = held_route();
+        s.revalidate_providers_with(|_| async { RouteCheck::Unanswered }, |_| async { None })
+            .await;
+        s.revalidate_providers_with(|_| async { RouteCheck::Current }, |_| async { None })
+            .await;
+        assert!(s.session_for_route(&route).is_some());
+        assert!(
+            s.inner.lock().unanswered_routes.is_empty(),
+            "a later answer must restart the window, not inherit the old one"
+        );
+    }
+
+    // An Orca relaunch changes the runtime ID, so the held proof can never match again while
+    // the pane itself lives on. Re-resolving at once replaces it without a gap.
+    #[tokio::test]
+    async fn disproved_route_is_replaced_in_place_without_an_unavailable_frame() {
+        let (_tmp, s, registered, route, mut updates) = held_route();
+        let replacement = replacement_proof(&s, &registered.session_id);
+        let minted = replacement.clone();
+        s.revalidate_providers_with(
+            |_| async { RouteCheck::Disproved },
+            move |_| {
+                let minted = minted.clone();
+                async move { Some(minted) }
+            },
+        )
+        .await;
+        assert_eq!(withdrawn_frames(&mut updates), 0);
+        assert!(s.session_for_route(&route).is_none());
+        let fresh = s
+            .snapshot(&registered.session_id)
+            .unwrap()
+            .terminal_fallback
+            .route_id
+            .expect("the replacement route is advertised");
+        assert_ne!(fresh, route);
+        assert_eq!(s.inner.lock().routes[&fresh].proof, replacement);
+    }
+
+    #[tokio::test]
+    async fn disproved_route_with_no_replacement_is_withdrawn_in_the_same_sweep() {
+        let (_tmp, s, registered, route, mut updates) = held_route();
+        s.revalidate_providers_with(|_| async { RouteCheck::Disproved }, |_| async { None })
+            .await;
+        assert!(s.session_for_route(&route).is_none());
+        assert_eq!(withdrawn_frames(&mut updates), 1);
+        assert_eq!(
+            s.snapshot(&registered.session_id)
+                .unwrap()
+                .terminal_fallback
+                .availability_reason
+                .as_deref(),
+            Some("route_invalidated")
+        );
+    }
+
+    // Registration, hook re-registration and recovery each start a resolution. Under load the
+    // slowest can finish last with a miss; it must not revoke the route another one minted.
+    #[tokio::test]
+    async fn a_late_miss_cannot_revoke_a_route_minted_after_it_started() {
+        let tmp = tempdir().unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let registered = s
+            .register_new(observer_registration("late-miss"), None)
+            .unwrap();
+        let started = SessionFence::capture(&s.inner.lock().sessions[&registered.session_id]);
+        let minted = install_fixture_route(&s, &registered);
+        s.commit_route_refresh(&registered.session_id, &started, None, None);
+        assert!(
+            s.session_for_route(&minted).is_some(),
+            "a resolution that started before the route existed revoked it"
+        );
+        let replacement = replacement_proof(&s, &registered.session_id);
+        s.commit_route_refresh(&registered.session_id, &started, None, Some(replacement));
+        assert!(
+            s.session_for_route(&minted).is_some(),
+            "a late resolution rotated the route under the phone"
+        );
+    }
+
+    #[tokio::test]
+    async fn unanswered_open_refuses_without_revoking_the_route() {
+        let (_tmp, s, registered, route, mut updates) = held_route();
+        let plan = s
+            .terminal_plan_with(
+                &route,
+                &registered.session_id,
+                registered.process_generation,
+                |_| async { Err(RouteCheck::Unanswered) },
+            )
+            .await;
+        assert!(plan.is_none(), "an open must be proven current right now");
+        assert!(s.session_for_route(&route).is_some());
+        assert_eq!(withdrawn_frames(&mut updates), 0);
+    }
+
+    #[tokio::test]
+    async fn disproved_open_revokes_the_route() {
+        let (_tmp, s, registered, route, mut updates) = held_route();
+        let plan = s
+            .terminal_plan_with(
+                &route,
+                &registered.session_id,
+                registered.process_generation,
+                |_| async { Err(RouteCheck::Disproved) },
+            )
+            .await;
+        assert!(plan.is_none());
+        assert!(s.session_for_route(&route).is_none());
+        assert_eq!(withdrawn_frames(&mut updates), 1);
     }
 
     fn install_fixture_route(
@@ -7107,14 +7447,17 @@ int main(int argc,char **argv) {
             let task = tokio::spawn(async move {
                 let mut channels = Some((started_tx, release_rx));
                 task_s
-                    .revalidate_providers_with(|_| {
-                        let (started, release) = channels.take().unwrap();
-                        async move {
-                            started.send(()).unwrap();
-                            release.await.unwrap();
-                            false
-                        }
-                    })
+                    .revalidate_providers_with(
+                        |_| {
+                            let (started, release) = channels.take().unwrap();
+                            async move {
+                                started.send(()).unwrap();
+                                release.await.unwrap();
+                                RouteCheck::Disproved
+                            }
+                        },
+                        |_| async { None },
+                    )
                     .await;
             });
             started_rx.await.unwrap();

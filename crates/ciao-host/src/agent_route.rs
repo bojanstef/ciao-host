@@ -42,6 +42,34 @@ impl RouteContinuity {
     }
 }
 
+/// What one check of a held route learned about it.
+///
+/// A check that could not get an answer is not evidence the pane is gone. Under load or while
+/// Orca relaunches, a provider can take longer than the deadline to answer for a pane that is
+/// still live, and revoking on that alone made a live agent's route flap. The background sweep
+/// treats the two failures differently; opening a terminal still requires `Current`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteCheck {
+    /// The provider answered and the pane is the one the proof names.
+    Current,
+    /// The provider answered, or the process is gone: this proof can never be current again.
+    Disproved,
+    /// No complete answer arrived in time. The pane may still be live.
+    Unanswered,
+}
+
+impl RouteCheck {
+    /// tmux and herdr workspace checks are local list commands that report only a match, so
+    /// within the deadline their `false` is an answer.
+    const fn answered(current: bool) -> Self {
+        if current {
+            Self::Current
+        } else {
+            Self::Disproved
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentRouteProof {
     Orca(crate::orca::route::Proof),
@@ -79,6 +107,16 @@ pub(crate) enum AgentRouteProof {
 }
 
 impl AgentRouteProof {
+    /// The registered agent process this route was proven for.
+    pub(crate) const fn bridge_pid(&self) -> u32 {
+        match self {
+            Self::Orca(p) => p.process(),
+            Self::Tmux { bridge_pid, .. }
+            | Self::HerdrWorkspace { bridge_pid, .. }
+            | Self::HerdrCore { bridge_pid, .. } => *bridge_pid,
+        }
+    }
+
     pub(crate) const fn continuity(&self) -> RouteContinuity {
         match self {
             Self::Tmux { .. } | Self::Orca(_) => RouteContinuity::ExactLive,
@@ -279,12 +317,22 @@ impl TerminalRouteResolver {
         .flatten()
     }
 
+    /// Strict: only a route proven current right now may be opened.
     pub(crate) async fn revalidate(&self, proof: &AgentRouteProof) -> bool {
+        self.check(proof).await == RouteCheck::Current
+    }
+
+    /// One bounded check of a held route. The deadline expiring is `Unanswered`, never
+    /// `Disproved`; only the provider's own answer or the process exiting disproves a route.
+    pub(crate) async fn check(&self, proof: &AgentRouteProof) -> RouteCheck {
+        if !process::exists(proof.bridge_pid()) {
+            return RouteCheck::Disproved;
+        }
         timeout(ROUTE_RESOLUTION_TIMEOUT, async {
             match proof {
                 AgentRouteProof::Orca(p) => match self.orca_pairing.as_deref() {
-                    Some(pairing) => p.current(&self.workspace.orca_profile, pairing).await,
-                    None => false,
+                    Some(pairing) => p.check(&self.workspace.orca_profile, pairing).await,
+                    None => RouteCheck::Disproved,
                 },
                 AgentRouteProof::HerdrCore {
                     bridge_pid,
@@ -292,15 +340,17 @@ impl TerminalRouteResolver {
                     tab_id,
                     terminal_pid,
                 } => {
-                    let Some(terminal) =
-                        crate::herdr_core::terminal(&self.workspace.core, session_name, tab_id)
-                            .await
-                    else {
-                        return false;
-                    };
-                    terminal.pid == Some(*terminal_pid)
-                        && process::exists(*bridge_pid)
-                        && process::descends_from(*bridge_pid, *terminal_pid).await
+                    let core = &self.workspace.core;
+                    match crate::herdr_core::terminal_answer(core, session_name, tab_id).await {
+                        Err(_) => RouteCheck::Unanswered,
+                        Ok(Some(terminal))
+                            if terminal.pid == Some(*terminal_pid)
+                                && process::descends_from(*bridge_pid, *terminal_pid).await =>
+                        {
+                            RouteCheck::Current
+                        }
+                        Ok(_) => RouteCheck::Disproved,
+                    }
                 }
                 AgentRouteProof::Tmux {
                     binary,
@@ -312,9 +362,8 @@ impl TerminalRouteResolver {
                     pane_tty,
                     // `session_name` is deliberately not compared: see the field's own note.
                     ..
-                } => {
-                    process::exists(*bridge_pid)
-                        && process_tty(*bridge_pid).await.as_deref() == Some(pane_tty)
+                } => RouteCheck::answered(
+                    process_tty(*bridge_pid).await.as_deref() == Some(pane_tty)
                         && process::descends_from(*bridge_pid, *pane_pid).await
                         && list_tmux_panes(binary).await.iter().any(|pane| {
                             pane.session_id == *session_id
@@ -322,8 +371,8 @@ impl TerminalRouteResolver {
                                 && pane.pane_id == *pane_id
                                 && pane.pane_pid == *pane_pid
                                 && pane.pane_tty == *pane_tty
-                        })
-                }
+                        }),
+                ),
                 AgentRouteProof::HerdrWorkspace {
                     binary,
                     bridge_pid,
@@ -331,39 +380,38 @@ impl TerminalRouteResolver {
                     pane_id,
                     terminal_id,
                     ..
-                } => {
-                    process::exists(*bridge_pid)
-                        && herdr_process_matches(
-                            binary,
-                            session_name,
-                            pane_id,
-                            terminal_id,
-                            *bridge_pid,
-                        )
-                        .await
-                }
+                } => RouteCheck::answered(
+                    herdr_process_matches(binary, session_name, pane_id, terminal_id, *bridge_pid)
+                        .await,
+                ),
             }
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or(RouteCheck::Unanswered)
     }
 
     /// Revalidates immediately, then performs only the fixed focus operation needed for an exact
     /// route. A stale route never degrades silently to a session-level target.
-    pub(crate) async fn terminal_plan(&self, proof: &AgentRouteProof) -> Option<AgentTerminalPlan> {
-        if !self.revalidate(proof).await {
-            return None;
+    /// A refused plan carries the check's verdict, so an open that could not get an answer
+    /// refuses without revoking a route that may still be live.
+    pub(crate) async fn terminal_plan(
+        &self,
+        proof: &AgentRouteProof,
+    ) -> Result<AgentTerminalPlan, RouteCheck> {
+        match self.check(proof).await {
+            RouteCheck::Current => {}
+            verdict => return Err(verdict),
         }
-        match proof {
-            AgentRouteProof::Orca(p) => Some(AgentTerminalPlan::Orca(p.clone())),
+        Ok(match proof {
+            AgentRouteProof::Orca(p) => AgentTerminalPlan::Orca(p.clone()),
             AgentRouteProof::HerdrCore {
                 session_name,
                 tab_id,
                 ..
-            } => Some(AgentTerminalPlan::Core {
+            } => AgentTerminalPlan::Core {
                 session: session_name.clone(),
                 tab: tab_id.clone(),
-            }),
+            },
             AgentRouteProof::Tmux {
                 binary,
                 session_id,
@@ -378,14 +426,18 @@ impl TerminalRouteResolver {
                     && run_bounded(binary, &["select-pane", "-t", pane_id])
                         .await
                         .is_ok_and(|output| output.status_success);
-                if !selected_pane || !self.revalidate(proof).await {
-                    return None;
+                if !selected_pane {
+                    return Err(RouteCheck::Disproved);
                 }
-                Some(AgentTerminalPlan::Command {
+                match self.check(proof).await {
+                    RouteCheck::Current => {}
+                    verdict => return Err(verdict),
+                }
+                AgentTerminalPlan::Command {
                     program: binary.clone(),
                     args: vec!["attach-session".into(), "-t".into(), session_id.into()],
                     provider: ProviderKind::Tmux,
-                })
+                }
             }
             AgentRouteProof::HerdrWorkspace {
                 binary,
@@ -401,13 +453,13 @@ impl TerminalRouteResolver {
                 if let Some(tab_id) = tab_id {
                     focus_tab(&self.workspace, ProviderKind::Herdr, session_name, tab_id).await;
                 }
-                Some(AgentTerminalPlan::Command {
+                AgentTerminalPlan::Command {
                     program: binary.clone(),
                     args: vec!["session".into(), "attach".into(), session_name.into()],
                     provider: ProviderKind::Herdr,
-                })
+                }
             }
-        }
+        })
     }
 
     async fn resolve_tmux(&self, bridge_pid: u32) -> Option<AgentRouteProof> {
@@ -1058,6 +1110,30 @@ esac
         assert_eq!(proof.continuity(), RouteContinuity::WorkspaceOnly);
     }
 
+    // A busy Mac made the owner's herdr-core route flap exactly like the Orca one: Core not
+    // answering read as the tab being gone. Only a dead agent disproves without an answer.
+    #[tokio::test]
+    async fn core_check_separates_no_answer_from_disproof() {
+        let temp = tempdir().unwrap();
+        let mut workspace = WorkspaceConfig::with_binary_dirs(vec![]);
+        workspace.core = crate::herdr_core::CoreConfig::at(temp.path().join("no-core"));
+        let resolver = TerminalRouteResolver::new(workspace);
+        let proof = |bridge_pid| AgentRouteProof::HerdrCore {
+            bridge_pid,
+            session_name: "default".into(),
+            tab_id: "11111111111111111111111111111111:t1".into(),
+            terminal_pid: bridge_pid,
+        };
+        let live = proof(std::process::id());
+        assert_eq!(resolver.check(&live).await, RouteCheck::Unanswered);
+        assert!(
+            !resolver.revalidate(&live).await,
+            "an open still needs proof"
+        );
+        let gone = u32::try_from(i32::MAX).unwrap();
+        assert_eq!(resolver.check(&proof(gone)).await, RouteCheck::Disproved);
+    }
+
     #[tokio::test]
     async fn terminal_plan_uses_only_fixed_tmux_argv_and_rejects_stale_proof() {
         let temp = tempdir().unwrap();
@@ -1086,7 +1162,7 @@ esac
         };
         // The current test process is not actually on the fabricated TTY, so revalidation fails
         // before either focus command can run.
-        assert!(resolver.terminal_plan(&stale).await.is_none());
+        assert!(resolver.terminal_plan(&stale).await.is_err());
         let contents = fs::read_to_string(log).unwrap_or_default();
         assert!(!contents.contains("select-window"));
         assert!(!contents.contains("select-pane"));
