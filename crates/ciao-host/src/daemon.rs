@@ -5326,6 +5326,34 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    /// Ending the owner's terminal is not reversible, so every takeover path — the phone's
+    /// `agent.managed.promote` and the CLI's `ciao agent promote` — asks the preflight between
+    /// finding the target and asking the terminal to exit. That is where a Code Mode
+    /// conversation, which Claude will not resume outside its terminal, is refused. A source
+    /// count rather than a behaviour test: a new path that skipped the preflight would pass any
+    /// behaviour test written for the old ones. The needles are split so this test is not one.
+    #[test]
+    fn every_takeover_asks_the_preflight_before_ending_the_terminal() {
+        let source = include_str!("daemon.rs");
+        let exit = concat!("request_exit(", "target.process_id)");
+        let preflight = concat!("promotion_preflight(", "&target)");
+        let target = concat!("promotion_target(", "");
+        let exits: Vec<usize> = source.match_indices(exit).map(|(at, _)| at).collect();
+        assert_eq!(exits.len(), 2, "one exit per takeover path: phone and CLI");
+        for at in exits {
+            let before = &source[..at];
+            let asked = before
+                .rfind(preflight)
+                .expect("a preflight before every exit");
+            let found = before.rfind(target).expect("a target before every exit");
+            assert!(found < asked, "the preflight follows the target it checks");
+            assert!(
+                !source[asked..at].contains(target),
+                "no other takeover path sits between this preflight and the exit"
+            );
+        }
+    }
+
     /// `bridge_terminal` over a real local connection, with a scripted Orca runtime behind the
     /// real viewer. Assertions are on what the phone reads from the terminal stream.
     mod bridge {
