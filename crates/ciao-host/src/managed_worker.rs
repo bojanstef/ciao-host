@@ -436,7 +436,7 @@ pub(crate) async fn foreign_owner_evidence(vendor_session_id: &str, ignoring: Op
         return false;
     }
     let Ok(output) = Command::new("/bin/ps")
-        .args(["-axo", "pid=,command="])
+        .args(["-axww", "-o", "pid=,command="])
         .output()
         .await
     else {

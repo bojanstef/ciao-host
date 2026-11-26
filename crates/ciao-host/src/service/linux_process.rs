@@ -26,21 +26,46 @@ enum Listener {
     Agent,
 }
 
+fn parse_unix_table_line(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    // Kernel `unix_seq_show` prints the inode column with `%5lu`, which inserts leading spaces
+    // for inodes < 10000. Consume runs of spaces between the 7 fixed columns while keeping spaces
+    // inside the trailing socket pathname intact.
+    let mut rest = line;
+    let mut columns = [&b""[..]; 7];
+    for slot in &mut columns {
+        while rest.first() == Some(&b' ') {
+            rest = &rest[1..];
+        }
+        let end = rest.iter().position(|b| *b == b' ')?;
+        *slot = &rest[..end];
+        rest = &rest[end..];
+    }
+    while rest.first() == Some(&b' ') {
+        rest = &rest[1..];
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    if columns[3] == b"00010000" && columns[4] == b"0001" && columns[5] == b"01" {
+        Some((columns[6], rest))
+    } else {
+        None
+    }
+}
+
 fn listener_inodes(paths: &CiaoPaths) -> Result<HashMap<Vec<u8>, Listener>> {
     let table = fs::read("/proc/net/unix").context("inspect Unix listeners")?;
     let mut inodes = HashMap::new();
     for line in table.split(|b| *b == b'\n') {
-        // Kernel columns use single spaces. The remaining path may itself contain spaces.
-        let fields: Vec<_> = line.splitn(8, |b| *b == b' ').collect();
-        if let [_, _, _, b"00010000", b"0001", b"01", inode, path] = fields.as_slice() {
-            let kind = if *path == paths.socket_file.as_os_str().as_bytes() {
+        if let Some((inode, path)) = parse_unix_table_line(line) {
+            let kind = if path == paths.socket_file.as_os_str().as_bytes() {
                 Listener::Control
-            } else if *path == paths.agent_socket_file.as_os_str().as_bytes() {
+            } else if path == paths.agent_socket_file.as_os_str().as_bytes() {
                 Listener::Agent
             } else {
                 continue;
             };
-            inodes.insert([b"socket:[", *inode, b"]"].concat(), kind);
+            inodes.insert([b"socket:[", inode, b"]"].concat(), kind);
         }
     }
     Ok(inodes)

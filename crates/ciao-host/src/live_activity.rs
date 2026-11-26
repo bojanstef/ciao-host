@@ -103,15 +103,22 @@ impl LiveActivityOverview {
                             &descriptor.adapter_family,
                             MAX_LIVE_ACTIVITY_ADAPTER_CHARACTERS,
                         ),
-                        workspace: bounded_utf8(
-                            &descriptor.workspace_display,
-                            MAX_LIVE_ACTIVITY_DISPLAY_BYTES,
-                        ),
+                        workspace: {
+                            let label = bounded_utf8(
+                                &descriptor.workspace_display,
+                                MAX_LIVE_ACTIVITY_DISPLAY_BYTES,
+                            );
+                            if label.is_empty() {
+                                "Workspace".to_owned()
+                            } else {
+                                label
+                            }
+                        },
                         prompt: descriptor
                             .recent_prompt
                             .as_deref()
-                            .filter(|prompt| !prompt.is_empty())
-                            .map(|prompt| bounded_utf8(prompt, MAX_LIVE_ACTIVITY_DISPLAY_BYTES)),
+                            .map(|prompt| bounded_utf8(prompt, MAX_LIVE_ACTIVITY_DISPLAY_BYTES))
+                            .filter(|prompt| !prompt.is_empty()),
                     }),
                 },
             );
@@ -167,14 +174,37 @@ pub(crate) fn bounded_ascii_token(value: &str, bytes: usize) -> String {
     value.bytes().take(bytes).map(char::from).collect()
 }
 
+fn is_forbidden_display_scalar(character: char) -> bool {
+    let scalar = character as u32;
+    (0x0000..=0x001f).contains(&scalar)
+        || (0x007f..=0x009f).contains(&scalar)
+        || scalar == 0x2028
+        || scalar == 0x2029
+        || (0x202a..=0x202e).contains(&scalar)
+        || (0x2066..=0x2069).contains(&scalar)
+}
+
 pub(crate) fn bounded_utf8(value: &str, bytes: usize) -> String {
-    if value.len() <= bytes {
-        return value.to_owned();
+    let sanitized: String = value
+        .chars()
+        .filter_map(|character| {
+            if character == '\t' {
+                Some(' ')
+            } else if is_forbidden_display_scalar(character) {
+                None
+            } else {
+                Some(character)
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim();
+    if trimmed.len() <= bytes {
+        return trimmed.to_owned();
     }
     let marker = '…';
     let content_bytes = bytes.saturating_sub(marker.len_utf8());
     let mut result = String::new();
-    for character in value.chars() {
+    for character in trimmed.chars() {
         if result.len().saturating_add(character.len_utf8()) > content_bytes {
             break;
         }
@@ -435,7 +465,7 @@ mod tests {
             "ciao"
         );
 
-        for absent in [None, Some(String::new())] {
+        for absent in [None, Some(String::new()), Some("\t\u{202e}\n".into())] {
             let mut empty = descriptor.clone();
             empty.recent_prompt = absent;
             let overview = LiveActivityOverview::project(vec![empty], Vec::new(), &HashSet::new());
@@ -450,6 +480,15 @@ mod tests {
                     .is_none()
             );
         }
+
+        // Tabs become spaces and C0/C1/bidi controls are stripped so iOS never rejects the seal.
+        assert_eq!(
+            bounded_utf8(
+                "fix\tbug\u{202e}\u{0007}\nnow",
+                MAX_LIVE_ACTIVITY_DISPLAY_BYTES
+            ),
+            "fix bugnow"
+        );
     }
 
     /// The canonical Spec 005 descriptor, which is also the one the phone's own tests read.

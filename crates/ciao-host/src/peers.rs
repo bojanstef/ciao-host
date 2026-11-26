@@ -124,7 +124,7 @@ pub(crate) enum FollowMode {
 #[derive(Debug)]
 pub(crate) struct Admitted {
     pub connection: iroh::endpoint::Connection,
-    pub budget: SourceBudget,
+    pub budget: std::sync::Arc<SourceBudget>,
 }
 
 /// Why a destination refused to admit a connection.
@@ -531,6 +531,9 @@ pub(crate) struct Peers {
     /// Serializes policy changes with async effects. A successful revoke fences all later effects.
     pub effects: tokio::sync::Mutex<()>,
     lanes: Mutex<std::collections::HashMap<EndpointId, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Per-source budgets kept alive while any admitted connection or in-flight request still
+    /// holds a permit, so supersede-then-close-reconnect cannot mint a fresh budget.
+    budgets: Mutex<std::collections::HashMap<String, std::sync::Weak<SourceBudget>>>,
     /// Source connections this host admitted as a destination, by source endpoint ID.
     pub connections: Mutex<std::collections::HashMap<String, Admitted>>,
     /// Connections this host keeps to its destinations as a source.
@@ -595,6 +598,7 @@ impl Peers {
             store: Mutex::new(store),
             effects: tokio::sync::Mutex::new(()),
             lanes: Mutex::default(),
+            budgets: Mutex::default(),
             connections: Mutex::new(Default::default()),
             outbound: OutboundConnections::default(),
         })
@@ -697,8 +701,9 @@ impl Peers {
         endpoint: &str,
         connection: &iroh::endpoint::Connection,
         protocol: PeerProtocol,
-    ) -> Result<SourceBudget, AdmissionRefused> {
+    ) -> Result<std::sync::Arc<SourceBudget>, AdmissionRefused> {
         let mut connections = self.connections.lock();
+        let mut budgets = self.budgets.lock();
         let budget = match connections.get(endpoint) {
             Some(_) if protocol == PeerProtocol::SingleRequest => {
                 return Err(AdmissionRefused::Busy);
@@ -711,7 +716,16 @@ impl Peers {
                 older.budget.clone()
             }
             None if connections.len() >= MAX_PEERS => return Err(AdmissionRefused::Busy),
-            None => SourceBudget::new(),
+            None => {
+                if let Some(live) = budgets.get(endpoint).and_then(std::sync::Weak::upgrade) {
+                    live
+                } else {
+                    budgets.retain(|_, weak| weak.strong_count() > 0);
+                    let fresh = std::sync::Arc::new(SourceBudget::new());
+                    budgets.insert(endpoint.into(), std::sync::Arc::downgrade(&fresh));
+                    fresh
+                }
+            }
         };
         connections.insert(
             endpoint.into(),

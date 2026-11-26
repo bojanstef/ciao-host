@@ -135,7 +135,7 @@ fn cron_field(path: &Path, what: &str) -> Result<String> {
     };
     if text
         .bytes()
-        .any(|byte| matches!(byte, b'%' | b'"' | b'\\' | b'\n'))
+        .any(|byte| matches!(byte, b'%' | b'"' | b'\\' | b'\n' | b'\r' | b'$' | b'`'))
     {
         bail!("{what} contains characters unsupported in a crontab entry");
     }
@@ -813,13 +813,23 @@ fn start_cron_daemon(paths: &CiaoPaths, executable: &Path) -> Result<i32> {
         .append(true)
         .open(&paths.stderr_log)
         .with_context(|| format!("open {}", paths.stderr_log.display()))?;
-    let child = Command::new(executable)
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(executable);
+    command
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().context("clone the daemon log handle")?)
-        .stderr(log)
-        .spawn()
-        .context("start the Ciao daemon")?;
+        .stderr(log);
+    // Detach into a new session and process group so Ctrl-C (SIGINT) during the setup/pair QR
+    // wait or SSH disconnect (SIGHUP) does not kill the cron-started daemon.
+    // SAFETY: `setsid` is async-signal-safe per POSIX.1-2008 and allocates nothing.
+    unsafe {
+        command.pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    }
+    let child = command.spawn().context("start the Ciao daemon")?;
     Ok(i32::try_from(child.id())?)
 }
 

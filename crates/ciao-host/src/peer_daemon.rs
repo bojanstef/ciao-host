@@ -334,7 +334,7 @@ async fn serve_within(connection: Connection, state: Arc<RuntimeState>, idle: Du
 async fn serve_streams(
     connection: &Connection,
     id: EndpointId,
-    budget: &SourceBudget,
+    budget: &std::sync::Arc<SourceBudget>,
     state: &Arc<RuntimeState>,
     idle: Duration,
 ) {
@@ -342,11 +342,13 @@ async fn serve_streams(
     loop {
         let (send, recv) = tokio::select! {
             biased;
+            // Reap finished request handles before accepting new streams so sustained pipelining
+            // never starves cleanup and leaks JoinSet entries.
+            Some(_) = requests.join_next(), if !requests.is_empty() => continue,
             accepted = connection.accept_bi() => match accepted {
                 Ok(streams) => streams,
                 Err(_) => break,
             },
-            Some(_) = requests.join_next(), if !requests.is_empty() => continue,
             // Every accepted request has been answered and acknowledged by now.
             () = tokio::time::sleep(idle), if requests.is_empty() => {
                 connection.close(VarInt::from_u32(0), b"peer idle");
@@ -362,10 +364,15 @@ async fn serve_streams(
             },
             _ = connection.closed() => break,
         };
-        let (state, watches) = (state.clone(), budget.watches.clone());
+        let (state, watches, keep_budget) = (
+            state.clone(),
+            budget.watches.clone(),
+            std::sync::Arc::clone(budget),
+        );
         requests.spawn(async move {
             answer(send, recv, id, &state, Some(&watches)).await;
             drop(slot);
+            drop(keep_budget);
         });
     }
     // Closing does not cancel accepted requests; their recorded effects complete.
@@ -1017,6 +1024,12 @@ async fn call_negotiated(
                 .await
                 .map_err(|_| "peer_unreachable")?
                 .map_err(connect_error)?;
+            // Re-check after dialing so an Admin::Forget / Remember racing dial() cannot adopt a
+            // kept connection to a forgotten or rotated peer link.
+            if !state.peers.snapshot().outgoing.contains(link) {
+                connection.close(VarInt::from_u32(0), b"peer forgotten");
+                return Err("unknown_or_ambiguous_peer");
+            }
             match PeerProtocol::negotiated(connection.alpn()) {
                 Some(PeerProtocol::Streams) => state.peers.outbound.adopt(id, connection),
                 // A destination that closes after one request. Hold the lane until it has.
@@ -1035,7 +1048,9 @@ async fn call_negotiated(
     drop(turn);
     match ask(&kept.connection, &request(PeerProtocol::Streams)).await {
         Sent::Answered(result) => streams(result),
-        Sent::NotSent => Err("connection_lost"),
+        Sent::NotSent => {
+            Err(close_error(kept.connection.close_reason()).unwrap_or("connection_lost"))
+        }
     }
 }
 
@@ -1500,8 +1515,7 @@ mod tests {
         }
 
         fn budget(&self) -> SourceBudget {
-            self.destination.peers.connections.lock()[&self.client.id().to_string()]
-                .budget
+            (*self.destination.peers.connections.lock()[&self.client.id().to_string()].budget)
                 .clone()
         }
     }

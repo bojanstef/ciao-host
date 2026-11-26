@@ -209,6 +209,23 @@ struct LiveActivityDeliveryState {
     /// writes nothing, so a slow retry can neither deliver an older state after a newer one nor
     /// rewind the newer delivery's bookkeeping (audit B4).
     generation: u64,
+    /// Tracks the currently running delivery task for this endpoint so the 1s sweep does not
+    /// supersede an in-flight POST or retry backoff for the same state (or while retries are
+    /// already failing).
+    in_flight: Option<InFlightLiveActivity>,
+}
+
+/// How long an in-flight delivery may suppress duplicate sweeps before being considered wedged
+/// (covers 3 curl attempts + 2s + 8s retry sleeps with ample headroom).
+const LIVE_ACTIVITY_IN_FLIGHT_STALE_SECONDS: u64 = 120;
+
+#[derive(Debug, Clone)]
+struct InFlightLiveActivity {
+    generation: u64,
+    ticket_fingerprint: [u8; 32],
+    semantic_rows: Vec<LiveActivitySemanticRow>,
+    started_at: u64,
+    failing: bool,
 }
 
 /// The payload a device is known to hold, kept to suppress unchanged re-sends and to carry each
@@ -393,6 +410,18 @@ fn prepare_live_activity_job(
         return None;
     }
     let delivery = live_activity_delivery(host, target, overview, state.delivered.as_ref(), now)?;
+    let ticket_fingerprint = live_activity_ticket_fingerprint(&delivery.ticket);
+    let rows = semantic_rows(&delivery.payload);
+    if let Some(active) = &state.in_flight
+        && now.saturating_sub(active.started_at) < LIVE_ACTIVITY_IN_FLIGHT_STALE_SECONDS
+    {
+        let same_payload =
+            active.ticket_fingerprint == ticket_fingerprint && active.semantic_rows == rows;
+        let same_ticket_failing = active.failing && active.ticket_fingerprint == ticket_fingerprint;
+        if same_payload || same_ticket_failing {
+            return None;
+        }
+    }
     // Logged before the seal, because a payload that fails to prepare is itself an answer. The
     // sweep runs once a second, so the absence of this line says the host decided there was
     // nothing to send — which is indistinguishable from a successful push in a log that only
@@ -418,6 +447,7 @@ fn prepare_live_activity_job(
             state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             state.next_attempt_at =
                 now.saturating_add(live_activity_retry_delay(state.consecutive_failures));
+            state.in_flight = None;
             tracing::warn!(
                 step,
                 failures = state.consecutive_failures,
@@ -429,6 +459,13 @@ fn prepare_live_activity_job(
     state.generation = state.generation.wrapping_add(1);
     let timestamp = now.max(state.last_timestamp.saturating_add(1));
     state.last_timestamp = timestamp;
+    state.in_flight = Some(InFlightLiveActivity {
+        generation: state.generation,
+        ticket_fingerprint,
+        semantic_rows: rows.clone(),
+        started_at: now,
+        failing: false,
+    });
     Some(LiveActivityJob {
         endpoint_id: delivery.endpoint_id,
         ticket: delivery.ticket.clone(),
@@ -437,8 +474,8 @@ fn prepare_live_activity_job(
         stale_at: timestamp.saturating_add(LIVE_ACTIVITY_STALE_SECONDS),
         generation: state.generation,
         delivered: DeliveredLiveActivity {
-            ticket_fingerprint: live_activity_ticket_fingerprint(&delivery.ticket),
-            semantic_rows: semantic_rows(&delivery.payload),
+            ticket_fingerprint,
+            semantic_rows: rows,
             payload: delivery.payload,
             at: now,
         },
@@ -516,7 +553,14 @@ fn live_activity_delivery(
         key: target.key,
         payload: LiveActivityPayload {
             v: 1,
-            host: bounded_utf8(host, MAX_LIVE_ACTIVITY_DISPLAY_BYTES),
+            host: {
+                let label = bounded_utf8(host, MAX_LIVE_ACTIVITY_DISPLAY_BYTES);
+                if label.is_empty() {
+                    "Host".to_owned()
+                } else {
+                    label
+                }
+            },
             updated_at: now,
             sessions: rows,
         },
@@ -745,10 +789,20 @@ impl NotifierInner {
                 }
             }
             if let Some(backoff) = ATTEMPT_BACKOFF.get(attempt) {
+                self.mark_live_activity_in_flight_failing(&job);
                 tokio::time::sleep(Duration::from_secs(*backoff)).await;
             }
         }
         self.record_live_activity_failure(&job);
+    }
+
+    fn mark_live_activity_in_flight_failing(&self, job: &LiveActivityJob) {
+        if let Some(state) = self.live_activities.lock().get_mut(&job.endpoint_id)
+            && let Some(active) = state.in_flight.as_mut()
+            && active.generation == job.generation
+        {
+            active.failing = true;
+        }
     }
 
     fn live_activity_generation_is_current(&self, endpoint_id: &str, generation: u64) -> bool {
@@ -767,6 +821,7 @@ impl NotifierInner {
             state.delivered = Some(job.delivered.clone());
             state.consecutive_failures = 0;
             state.next_attempt_at = 0;
+            state.in_flight = None;
         }
     }
 
@@ -780,6 +835,7 @@ impl NotifierInner {
             state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             let delay = live_activity_retry_delay(state.consecutive_failures);
             state.next_attempt_at = job.timestamp.saturating_add(delay);
+            state.in_flight = None;
             tracing::debug!(
                 failures = state.consecutive_failures,
                 delay,
@@ -795,11 +851,32 @@ impl NotifierInner {
     fn record_live_activity_refusal(&self, job: &LiveActivityJob, detail: &str) {
         match classify_live_activity_refusal(detail) {
             LiveActivityRefusal::TokenDead => {
-                tracing::warn!("live activity token is dead; clearing the registration");
-                if let Ok(endpoint) = validate_endpoint_id(&job.endpoint_id) {
-                    let _ = self.devices.lock().clear_live_activity(endpoint);
+                if !self.live_activity_generation_is_current(&job.endpoint_id, job.generation) {
+                    return;
                 }
-                self.live_activities.lock().remove(&job.endpoint_id);
+                let cleared = validate_endpoint_id(&job.endpoint_id)
+                    .ok()
+                    .and_then(|endpoint| {
+                        self.devices
+                            .lock()
+                            .clear_live_activity_if_ticket(endpoint, &job.ticket)
+                            .ok()
+                    })
+                    .unwrap_or(false);
+                if cleared {
+                    tracing::warn!("live activity token is dead; clearing the registration");
+                    let mut deliveries = self.live_activities.lock();
+                    if deliveries
+                        .get(&job.endpoint_id)
+                        .is_some_and(|state| state.generation == job.generation)
+                    {
+                        deliveries.remove(&job.endpoint_id);
+                    }
+                } else if let Some(state) = self.live_activities.lock().get_mut(&job.endpoint_id)
+                    && state.generation == job.generation
+                {
+                    state.in_flight = None;
+                }
             }
             refusal => {
                 match refusal {
@@ -818,6 +895,7 @@ impl NotifierInner {
                     state.next_attempt_at = job
                         .timestamp
                         .saturating_add(LIVE_ACTIVITY_MAX_RETRY_SECONDS);
+                    state.in_flight = None;
                 }
             }
         }
@@ -1484,6 +1562,7 @@ mod tests {
                 next_attempt_at: 0,
                 last_timestamp: 100,
                 generation: 1,
+                in_flight: None,
             },
         );
 
@@ -1934,12 +2013,57 @@ mod tests {
             state.next_attempt_at = 0;
         }
 
-        // The activity itself is gone: the registration goes with it, and the bookkeeping too.
+        // The activity itself is gone: a stale generation or old ticket must NOT wipe a rotated
+        // registration, while the current matching ticket clears it cleanly.
+        let mut stale_ticket_job = job(1);
+        stale_ticket_job.ticket = "x".repeat(140);
+        notifier
+            .inner
+            .record_live_activity_refusal(&stale_ticket_job, "bad_token");
+        assert!(
+            !devices.lock().live_activity_targets().is_empty(),
+            "a delayed bad_token for an older ticket must not clear a rotated registration"
+        );
+
         notifier
             .inner
             .record_live_activity_refusal(&job(1), "bad_token");
         assert!(devices.lock().live_activity_targets().is_empty());
         assert!(notifier.inner.live_activities.lock().is_empty());
+    }
+
+    #[test]
+    fn in_flight_live_activity_is_not_superseded_by_the_1s_sweep_for_identical_state() {
+        let target = LiveActivityTarget {
+            endpoint_id: "a".repeat(64),
+            ticket: "T".repeat(140),
+            key: [7; 32],
+            selections: vec![crate::storage::LiveActivitySelection {
+                session_id: "session-1".into(),
+                adapter: "Claude".into(),
+                workspace: "ciao".into(),
+            }],
+        };
+        let overview = LiveActivityOverview::default();
+        let mut state = LiveActivityDeliveryState::default();
+        let first =
+            prepare_live_activity_job("Studio Mac", target.clone(), &overview, &mut state, 100)
+                .expect("initial job");
+        // Next 1s sweep for the exact same state while first is still in flight must not supersede.
+        assert!(
+            prepare_live_activity_job("Studio Mac", target.clone(), &overview, &mut state, 101)
+                .is_none()
+        );
+        assert_eq!(state.generation, first.generation);
+        // Once the in-flight job is marked failing (retrying), even a semantic row change must let
+        // it finish and engage exponential backoff instead of looping at 1 req/s.
+        state.in_flight.as_mut().unwrap().failing = true;
+        let mut changed_target = target;
+        changed_target.selections[0].session_id = "session-2".into();
+        assert!(
+            prepare_live_activity_job("Studio Mac", changed_target, &overview, &mut state, 102)
+                .is_none()
+        );
     }
 
     /// The canonical Spec 005 descriptor, which is also the one the phone's own tests read.

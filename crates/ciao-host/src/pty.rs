@@ -602,16 +602,32 @@ impl Drop for PtySession {
             return;
         }
         self.cancelled.store(true, Ordering::Release);
+        let groups = self.owned_groups();
+        if self.viewer_cleanup {
+            // Preserve the viewer_cleanup invariant even on task abort: kill the viewer before
+            // closing handles or hanging up stdin so it cannot inject phantom keystrokes.
+            signal_groups(&groups, Signal::SIGKILL);
+            if let Ok(mut killer) = self.killer.lock() {
+                let _ = killer.kill();
+            }
+        }
         self.input.close();
         self.output_receiver.close();
         self.output_semaphore.close();
         self.resize_sender.take();
+        if let Some(task) = self.resize_task.take() {
+            task.abort();
+        }
+        if !self.viewer_cleanup {
+            signal_groups(&groups, Signal::SIGHUP);
+        }
         if let Some(sender) = self.master_sender.take() {
             let (acknowledgement, _) = oneshot::channel();
             let _ = sender.try_send(MasterCommand::Close(acknowledgement));
         }
-        signal_groups(&self.owned_groups(), Signal::SIGHUP);
-        if let Ok(mut killer) = self.killer.lock() {
+        if !self.viewer_cleanup
+            && let Ok(mut killer) = self.killer.lock()
+        {
             let _ = killer.kill();
         }
     }

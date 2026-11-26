@@ -634,11 +634,15 @@ impl UploadStore {
                     "The Mac upload storage is full.",
                 ));
             };
-            if fs::remove_file(&entry.path).is_err() {
-                return Err(UploadFailure::new(
-                    UploadErrorCode::Io,
-                    "The Mac could not make room in its upload storage.",
-                ));
+            match fs::remove_file(&entry.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(UploadFailure::new(
+                        UploadErrorCode::Io,
+                        "The Mac could not make room in its upload storage.",
+                    ));
+                }
             }
             total = total.saturating_sub(entry.len);
         }
@@ -659,10 +663,14 @@ impl UploadStore {
             if !metadata.is_file() {
                 continue;
             }
-            let partial = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.ends_with(".partial"));
+            // Partial files are `{16-hex}.partial`; completed files are `{16-hex}-{sanitized}`.
+            // Match the exact partial shape so a completed upload named `foo.partial` is counted
+            // toward the quota and kept for the completed TTL instead of misclassified as partial.
+            let partial = entry.file_name().to_str().is_some_and(|name| {
+                name.strip_suffix(".partial").is_some_and(|stem| {
+                    stem.len() == 16 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            });
             let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
             entries.push(SweepEntry {
                 path: entry.path(),
@@ -1830,5 +1838,21 @@ mod tests {
             Err(HostProtocolError::Truncated | HostProtocolError::Io(_))
         ));
         assert!(dir_names(store.root.as_path()).is_empty());
+    }
+
+    #[test]
+    fn completed_file_ending_in_partial_is_not_misclassified_as_in_flight_partial() {
+        let temp = tempdir().unwrap();
+        let store = store_in(&temp);
+        fs::create_dir_all(&store.root).unwrap();
+        let completed = store.root.join("0123456789abcdef-backup.partial");
+        let in_flight = store.root.join("fedcba9876543210.partial");
+        fs::write(&completed, b"done").unwrap();
+        fs::write(&in_flight, b"wip").unwrap();
+        let entries = store.scan().unwrap();
+        let completed_entry = entries.iter().find(|e| e.path == completed).unwrap();
+        let partial_entry = entries.iter().find(|e| e.path == in_flight).unwrap();
+        assert!(!completed_entry.partial);
+        assert!(partial_entry.partial);
     }
 }

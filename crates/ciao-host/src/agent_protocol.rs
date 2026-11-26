@@ -18,6 +18,9 @@ pub const CAPABILITY_AGENT_SESSION_MANAGED_V1: &str = "agent.session.managed.v1"
 /// adopt one, which degrades quietly instead of breaking.
 pub const CAPABILITY_AGENT_SESSION_ADOPTED_V1: &str = "agent.session.adopted.v1";
 pub const CAPABILITY_TERMINAL_AGENT_ROUTE: &str = "terminal.agent_route.v1";
+/// Shared by takeover, resume, agent discovery, and the worker when this destination cannot run
+/// headless Code Mode.
+pub const CODE_MODE_TERMINAL_ONLY: &str = "code_mode_terminal_only";
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024;
 /// The local agent bridge's frame bound — the same-user Unix socket adapters register on, never
 /// the phone's stream. It is split from [`MAX_AGENT_FRAME_BYTES`] so an adapter can hand over a

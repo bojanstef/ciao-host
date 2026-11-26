@@ -406,30 +406,45 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 Some(running(required_string(object, "turn_id")?)),
             ),
             // Codex has no streaming display hook, so this is the whole of the assistant's
-            // answer and it arrives once, at the end of the turn it closes.
+            // answer and it arrives once, at the end of the turn it closes. Interrupted and
+            // tool-only turns may omit or empty `last_assistant_message`; still deliver the
+            // Completed turn transition so the session does not strand in Running for 15 minutes.
             "Stop" => {
                 let turn_id = required_string(object, "turn_id")?;
-                let (text, truncation) = bounded_text(
-                    required_string(object, "last_assistant_message")?,
-                    MAX_RETAINED_TEXT_BYTES,
-                );
-                (
-                    CodexHookEventFrame::UpsertEntry {
-                        v: CODEX_HOOK_PROTOCOL_VERSION,
-                        entry: Box::new(WireTimelineEntry {
-                            source_id: opaque_digest("message", turn_id),
-                            source_revision: 1,
-                            timestamp,
-                            state: "complete".into(),
-                            kind: "assistant_message".into(),
-                            body: TimelineBody::Text { text },
-                            truncation,
-                        }),
-                    },
-                    Some(TurnState::Completed {
-                        run_id: Some(run_id(turn_id)),
-                    }),
-                )
+                let completed = TurnState::Completed {
+                    run_id: Some(run_id(turn_id)),
+                };
+                match object
+                    .get("last_assistant_message")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    Some(raw_message) => {
+                        let (text, truncation) = bounded_text(raw_message, MAX_RETAINED_TEXT_BYTES);
+                        (
+                            CodexHookEventFrame::UpsertEntry {
+                                v: CODEX_HOOK_PROTOCOL_VERSION,
+                                entry: Box::new(WireTimelineEntry {
+                                    source_id: opaque_digest("message", turn_id),
+                                    source_revision: 1,
+                                    timestamp,
+                                    state: "complete".into(),
+                                    kind: "assistant_message".into(),
+                                    body: TimelineBody::Text { text },
+                                    truncation,
+                                }),
+                            },
+                            Some(completed),
+                        )
+                    }
+                    None => (
+                        CodexHookEventFrame::Turn {
+                            v: CODEX_HOOK_PROTOCOL_VERSION,
+                            turn: completed,
+                        },
+                        None,
+                    ),
+                }
             }
             // The one hook that says "needs you" (ADR 005). Codex names no reason of its own
             // here, so the categorical kind is the reason: it is a permission gate.
@@ -451,7 +466,7 @@ fn map_hook_input(value: &Value, facts: &HookRuntimeFacts) -> Result<Option<Hook
                 CodexHookEventFrame::SessionEnd {
                     v: CODEX_HOOK_PROTOCOL_VERSION,
                 },
-                Some(TurnState::Idle),
+                None,
             ),
             name if IGNORED_HOOK_EVENTS.contains(&name) => return Ok(None),
             // Accounting only: a dispatch would register and clobber the observed turn.
@@ -889,17 +904,18 @@ pub(crate) mod tests {
             payload["tool_response"] = json!("hello");
             let turn_id = payload["turn_id"].as_str().unwrap();
             let expected = match event {
-                "SessionStart" | "SessionEnd" => TurnState::Idle,
-                "Stop" => TurnState::Completed {
+                "SessionStart" => Some(TurnState::Idle),
+                "SessionEnd" => None,
+                "Stop" => Some(TurnState::Completed {
                     run_id: Some(run_id(turn_id)),
-                },
-                "PermissionRequest" => TurnState::AwaitingInteraction {
+                }),
+                "PermissionRequest" => Some(TurnState::AwaitingInteraction {
                     run_id: Some(run_id(turn_id)),
-                },
-                _ => running(turn_id),
+                }),
+                _ => Some(running(turn_id)),
             };
             let dispatch = map_hook_input(&payload, &facts()).unwrap().unwrap();
-            assert_eq!(dispatch.turn, Some(expected), "{event}");
+            assert_eq!(dispatch.turn, expected, "{event}");
         }
         // Candidate metadata does not authorize admission or even novelty tallying: a minor past
         // the pin registers a heartbeat and says nothing else, whatever event it names.
@@ -1098,7 +1114,19 @@ pub(crate) mod tests {
     fn a_malformed_payload_is_refused_rather_than_guessed() {
         // Every turn-scoped event needs its turn ID; a missing one is not a turn of `None`.
         assert!(map_hook_input(&common("UserPromptSubmit"), &facts()).is_err());
-        assert!(map_hook_input(&turn(common("Stop")), &facts()).is_err());
+        assert!(map_hook_input(&common("Stop"), &facts()).is_err());
+        // Interrupted and tool-only turns omit `last_assistant_message` and still close via Stop.
+        let stop_without_text = map_hook_input(&turn(common("Stop")), &facts())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stop_without_text.event,
+            CodexHookEventFrame::Turn {
+                turn: TurnState::Completed { .. },
+                ..
+            }
+        ));
+        assert_eq!(stop_without_text.turn, None);
         let mut no_workspace = turn(common("Stop"));
         no_workspace["cwd"] = json!("");
         no_workspace["last_assistant_message"] = json!("Done.");

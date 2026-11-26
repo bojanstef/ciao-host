@@ -714,8 +714,22 @@ pub(crate) async fn handle_agent_bridge(
                 } else {
                     None
                 };
-                let outbound = selected.codec.command_frame(command.command, whereabouts)
-                    .map_err(|_| anyhow!("agent command mapping failed"))?;
+                let command_id = command.command.command_id.clone();
+                let outbound = match selected.codec.command_frame(command.command, whereabouts) {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        // Reject the single unmappable command cleanly rather than returning `?`
+                        // out of the loop and bypassing `bridge_disconnected` cleanup.
+                        sessions.record_bridge_receipt(
+                            &registered.session_id,
+                            &command_id,
+                            "rejected",
+                            None,
+                            Some("unsupported_command"),
+                        );
+                        continue;
+                    }
+                };
                 if let Err(error) = write_agent_frame(&mut stream, &outbound).await {
                     break Err(anyhow!(error));
                 }

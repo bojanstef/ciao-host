@@ -424,6 +424,15 @@ impl NormalConnectionLease {
             }
             handles.insert(token, connection.clone());
         }
+        // Re-check allowlist *after* registering in `host_connections` so an `Unpair` running
+        // between `handle_host_connection`'s initial allowlist check and `handles.insert` cannot
+        // miss this connection (either `Unpair` ran first and this check rejects, or it runs
+        // afterwards and closes this handle).
+        if !state.paired_devices.lock().contains(endpoint_id) {
+            state.host_connections.lock().remove(&token);
+            state.normal_connections.lock().remove(&endpoint, token);
+            return None;
+        }
         if !evicted.is_empty() {
             tracing::info!(
                 remote = %short_endpoint_id(endpoint_id),
@@ -1067,11 +1076,15 @@ async fn monitor_agent_routes(state: Arc<RuntimeState>) {
                 if shared_recovery.is_empty() {
                     let state = state.clone();
                     shared_recovery.spawn(async move {
-                        if let Ok(paths) = CiaoPaths::discover() {
-                            let _ = tokio::time::timeout(Duration::from_secs(90),
-                                crate::agent_bridge::recover_shared_status(&state.agent_sessions,
-                                    &state.codex_adoptions, &paths)).await;
-                        }
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(90),
+                            crate::agent_bridge::recover_shared_status(
+                                &state.agent_sessions,
+                                &state.codex_adoptions,
+                                &state.paths,
+                            ),
+                        )
+                        .await;
                     });
                 }
                 state.agent_sessions.sweep_dead_sessions();
@@ -2021,29 +2034,32 @@ async fn handle_host_session(
                     break;
                 };
                 state.decoded_host_prefaces.fetch_add(1, Ordering::Relaxed);
-                let kind = match read_stream_preface_with_timeout(
-                    &mut recv,
-                    crate::host_protocol::STREAM_PREFACE_TIMEOUT,
-                )
-                .await
-                {
-                    Ok(kind) => kind,
-                    Err(error) => {
-                        reset_stream(&mut send, &mut recv, host_stream_reset_code(&error));
-                        continue;
-                    }
-                };
-                match kind {
-                    StreamKind::Peers => {
-                        let state = state.clone();
-                        stream_tasks.spawn(async move {
+                let state = state.clone();
+                let connection = connection.clone();
+                let snapshot_busy = snapshot_busy.clone();
+                let terminal_slot = terminal_slot.clone();
+                let upload_gate = upload_gate.clone();
+                let forward_gate = forward_gate.clone();
+                // Read the stream preface inside the stream's own task so one stalled stream
+                // cannot head-of-line block accept_bi or shutdown for up to STREAM_PREFACE_TIMEOUT.
+                stream_tasks.spawn(async move {
+                    let kind = match read_stream_preface_with_timeout(
+                        &mut recv,
+                        crate::host_protocol::STREAM_PREFACE_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(kind) => kind,
+                        Err(error) => {
+                            reset_stream(&mut send, &mut recv, host_stream_reset_code(&error));
+                            return;
+                        }
+                    };
+                    match kind {
+                        StreamKind::Peers => {
                             peer::admin_stream(&mut send, &mut recv, remote_id, &state).await;
-                        });
-                    }
-                    StreamKind::Rpc => {
-                        let state = state.clone();
-                        let snapshot_busy = snapshot_busy.clone();
-                        stream_tasks.spawn(async move {
+                        }
+                        StreamKind::Rpc => {
                             let _ = ready_phase_rpc(
                                 &mut send,
                                 &mut recv,
@@ -2052,12 +2068,8 @@ async fn handle_host_session(
                                 &snapshot_busy,
                             )
                             .await;
-                        });
-                    }
-                    StreamKind::Agent => {
-                        let state = state.clone();
-                        let connection = connection.clone();
-                        stream_tasks.spawn(async move {
+                        }
+                        StreamKind::Agent => {
                             // An operation's own failure is logged where its name is known;
                             // what reaches here failed before one was accepted.
                             match handle_agent_stream(
@@ -2084,14 +2096,12 @@ async fn handle_host_session(
                                     );
                                 }
                             }
-                        });
-                    }
-                    StreamKind::Upload => {
-                        // One active upload per connection (Spec 007 §3.5). The loser is told
-                        // `busy` in-protocol on its own stream rather than bare-reset, because
-                        // the frozen upload format names that outcome.
-                        let Some(lease) = upload_gate.try_acquire() else {
-                            stream_tasks.spawn(async move {
+                        }
+                        StreamKind::Upload => {
+                            // One active upload per connection (Spec 007 §3.5). The loser is told
+                            // `busy` in-protocol on its own stream rather than bare-reset, because
+                            // the frozen upload format names that outcome.
+                            let Some(_lease) = upload_gate.try_acquire() else {
                                 let _ = crate::uploads::send_put_error(
                                     &mut send,
                                     crate::uploads::UploadErrorCode::Busy,
@@ -2099,35 +2109,28 @@ async fn handle_host_session(
                                 )
                                 .await;
                                 finish_upload_stream(&mut send, &mut recv).await;
-                            });
-                            continue;
-                        };
-                        let state = state.clone();
-                        stream_tasks.spawn(async move {
-                            let _lease = lease;
+                                return;
+                            };
                             handle_upload_stream(&mut send, &mut recv, remote_id, state).await;
-                        });
-                    }
-                    StreamKind::Download => {
-                        // No gate and no lease: a preview is bounded at 16 MiB, streams from a
-                        // 16 KiB buffer, and QUIC already caps this connection at 8 concurrent
-                        // bidi streams. A counter on top of that limit would guard nothing.
-                        let state = state.clone();
-                        stream_tasks.spawn(async move {
+                        }
+                        StreamKind::Download => {
+                            // No gate and no lease: a preview is bounded at 16 MiB, streams from a
+                            // 16 KiB buffer, and QUIC already caps this connection at 8 concurrent
+                            // bidi streams. A counter on top of that limit would guard nothing.
                             handle_download_stream(&mut send, &mut recv, remote_id, state).await;
-                        });
-                    }
-                    StreamKind::Forward => {
-                        // Spec-less by design (see `crate::forward`): the pairing is the trust
-                        // boundary, so the only thing enforced here is the stream count. The
-                        // permit is held for the life of the copy, and a browser over quota is
-                        // told so rather than left waiting on a QUIC credit the terminal needs.
-                        let Ok(permit) = forward_gate.clone().try_acquire_owned() else {
-                            reset_stream(&mut send, &mut recv, STREAM_FORWARD_LIMIT);
-                            continue;
-                        };
-                        stream_tasks.spawn(async move {
-                            let _permit = permit;
+                        }
+                        StreamKind::Forward => {
+                            // Recheck the paired allowlist like every other stream kind so a
+                            // revoked device cannot open new loopback forwards on a surviving
+                            // connection.
+                            if !state.paired_devices.lock().contains(remote_id) {
+                                reset_stream(&mut send, &mut recv, STREAM_UNEXPECTED);
+                                return;
+                            }
+                            let Ok(_permit) = forward_gate.try_acquire_owned() else {
+                                reset_stream(&mut send, &mut recv, STREAM_FORWARD_LIMIT);
+                                return;
+                            };
                             if let Err(error) = crate::forward::forward(&mut send, &mut recv).await
                             {
                                 // Ordinary: the dev server was not running, or the browser hung
@@ -2136,17 +2139,12 @@ async fn handle_host_session(
                                 tracing::debug!(%error, "forward stream ended");
                                 reset_stream(&mut send, &mut recv, STREAM_INTERNAL);
                             }
-                        });
-                    }
-                    StreamKind::Terminal => {
-                        let state = state.clone();
-                        let connection = connection.clone();
-                        let slot = terminal_slot.clone();
-                        stream_tasks.spawn(async move {
+                        }
+                        StreamKind::Terminal => {
                             // Held for the terminal's whole life, cleanup included, and released
                             // only after the handler has returned its PTY lease.
                             let Ok(Ok(_slot)) =
-                                timeout(CLIENT_CLOSE_TIMEOUT, slot.acquire_owned()).await
+                                timeout(CLIENT_CLOSE_TIMEOUT, terminal_slot.acquire_owned()).await
                             else {
                                 reset_stream(&mut send, &mut recv, STREAM_TERMINAL_LIMIT);
                                 return;
@@ -2169,9 +2167,9 @@ async fn handle_host_session(
                                     reset_stream(&mut send, &mut recv, STREAM_INTERNAL);
                                 }
                             }
-                        });
+                        }
                     }
-                }
+                });
             }
             Some(_) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {}
             changed = shutdown.changed() => {
@@ -2185,6 +2183,13 @@ async fn handle_host_session(
             }
         }
     }
+    // Give active stream tasks (especially terminal bridges observing the closed connection or
+    // shutdown watch) a bounded window to complete their orderly cleanup (tmux detach, herdr
+    // viewer_cleanup, PTY signal escalation, Orca flush) before aborting any stragglers.
+    let _ = timeout(Duration::from_secs(6), async {
+        while stream_tasks.join_next().await.is_some() {}
+    })
+    .await;
     stream_tasks.abort_all();
     while stream_tasks.join_next().await.is_some() {}
     Ok(())
@@ -2215,6 +2220,16 @@ async fn hello_phase_rpc(
     match decode_rpc_request(&body) {
         Ok(RpcRequest::Hello(request)) => {
             require_finished_request(send, recv, Some(request.request_id.clone())).await?;
+            if !state.paired_devices.lock().contains(remote_id) {
+                send_rpc_error_code(
+                    send,
+                    Some(request.request_id),
+                    "authorization_denied",
+                    "This installation is no longer authorized.",
+                )
+                .await;
+                return Err(anyhow!("host hello rejected revoked device"));
+            }
             send_host_hello(send, &request, remote_id, state.host_endpoint_id).await?;
             let _ = send.finish();
             Ok(HelloPhaseOutcome::HelloDone)
@@ -2499,7 +2514,7 @@ async fn ready_phase_rpc(
                 return Ok(());
             }
             static MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-            let Ok(_guard) = MUTATION.try_lock() else {
+            let Ok(guard) = MUTATION.try_lock() else {
                 send_rpc_error_code(
                     send,
                     Some(request.request_id),
@@ -2509,7 +2524,10 @@ async fn ready_phase_rpc(
                 .await;
                 return Ok(());
             };
-            match crate::orca::manage::execute(&state.workspace.orca_profile, &request).await {
+            let outcome =
+                crate::orca::manage::execute(&state.workspace.orca_profile, &request).await;
+            drop(guard);
+            match outcome {
                 Ok(result) => {
                     write_rpc(send,&serde_json::json!({"v":1,"type":"response","request_id":request.request_id,"result":result})).await?;
                     finish_rpc_send(send).await;

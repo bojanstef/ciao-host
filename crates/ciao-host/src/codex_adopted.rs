@@ -540,7 +540,11 @@ fn unheld_rows(listed: &Value) -> Vec<UnheldThread> {
                         .max(1)
                     })
                     .unwrap_or_else(unix_now),
-                cli_version: row["cliVersion"].as_str().unwrap_or("unknown").to_owned(),
+                cli_version: row["cliVersion"]
+                    .as_str()
+                    .filter(|version| crate::agent_protocol::valid_token(version).is_ok())
+                    .unwrap_or("unknown")
+                    .to_owned(),
             })
         })
         .collect()
@@ -555,8 +559,7 @@ pub(crate) fn unheld_descriptor(
     let workspace_display = row
         .cwd
         .as_deref()
-        .and_then(|cwd| Path::new(cwd).file_name())
-        .map(|name| name.to_string_lossy().into_owned())
+        .map(crate::agent_adapter::workspace_display)
         .unwrap_or_else(|| "Codex".to_owned());
     crate::agent_protocol::AgentSessionDescriptor {
         v: crate::agent_protocol::AGENT_PROTOCOL_VERSION,
@@ -714,6 +717,10 @@ pub(crate) fn unheld_snapshot_for_wire(
         let (history, boundary) = crate::agent_session::history_coverage(false);
         history.clone_into(&mut snapshot.capabilities.history);
         snapshot.timeline_window.history_boundary = boundary;
+        // Re-fit after adding the longer `live_tail` + `history_boundary` fields so the wire
+        // frame stays within MAX_AGENT_FRAME_BYTES; setting `has_older = false` only shrinks it.
+        snapshot = crate::agent_protocol::fit_snapshot_to_frame(snapshot);
+        snapshot.timeline_window.has_older = false;
     }
     snapshot
 }
@@ -1453,6 +1460,13 @@ async fn on_notification(
             let run_id = turn["id"].as_str().map(codex_run_id);
             let status = turn["status"].as_str().unwrap_or("completed");
             tracking.vendor_turn_id = None;
+            // Clear any unresolved approval cards belonging to the ended turn so
+            // `LiveSession::visible_turn()` does not stay pinned at `AwaitingInteraction`.
+            let orphaned: Vec<String> = tracking.approvals.drain().map(|(id, _)| id).collect();
+            for interaction_id in orphaned {
+                let _ =
+                    supervisor.resolve_bridge_interaction(session, &interaction_id, "cancelled");
+            }
             let state = match status {
                 "interrupted" => TurnState::Interrupted { run_id },
                 "failed" => TurnState::Failed {
@@ -1687,9 +1701,10 @@ async fn on_server_request(
                 return;
             }
             let item_id = params["itemId"].as_str().unwrap_or_default();
+            let approval_seed = format!("{item_id}:{id}");
             let interaction_id = format!(
                 "codex.approval.{}",
-                keyed_digest(CODEX_ADOPTED_DOMAIN, "approval", item_id)
+                keyed_digest(CODEX_ADOPTED_DOMAIN, "approval", &approval_seed)
             );
             let body = if method.starts_with("item/commandExecution") {
                 bounded_preview(params.get("command"), MAX_TOOL_INPUT_PREVIEW_BYTES)

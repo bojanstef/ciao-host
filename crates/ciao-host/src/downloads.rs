@@ -623,10 +623,17 @@ where
         return send_git_diff(send, cwd, open.base.as_deref(), GIT_REVIEW_PREP_TIMEOUT).await;
     }
 
-    let target = if open.kind.as_deref() == Some(GET_KIND_GIT_FILE) {
-        resolve_git_file(&open.path, cwd).await
-    } else {
-        resolve_target(&open.path, cwd, home)
+    let target = match open.kind.as_deref() {
+        Some(GET_KIND_GIT_FILE) => resolve_git_file(&open.path, cwd).await,
+        None => resolve_target(&open.path, cwd, home),
+        Some(_) => {
+            return send_get_error(
+                send,
+                DownloadErrorCode::Invalid,
+                "That preview request is invalid.",
+            )
+            .await;
+        }
     };
     let path = match target {
         Ok(path) => path,

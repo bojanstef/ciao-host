@@ -116,12 +116,17 @@ impl Proof {
     }
 
     pub(crate) async fn label(&self, profile: &Path) -> Option<String> {
-        let rt = Runtime::discover(profile).await?;
-        let terminal = session::resolve(&rt, &self.workspace, &self.pane).await?;
-        if !self.matches(&rt, &terminal) {
-            return None;
-        }
-        crate::workspace::sanitize_tab_label(terminal["title"].as_str()?)
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let rt = Runtime::discover(profile).await?;
+            let terminal = session::resolve(&rt, &self.workspace, &self.pane).await?;
+            if !self.matches(&rt, &terminal) {
+                return None;
+            }
+            crate::workspace::sanitize_tab_label(terminal["title"].as_str()?)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 }
 

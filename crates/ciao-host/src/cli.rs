@@ -14,10 +14,9 @@ use crate::{
     daemon,
     identity::{create_or_load_identity, load_identity},
     install::{
-        ProgressLine, Spinner, decode_sha256_hex, fetch_archive, fetch_release_file,
-        parse_manifest, read_verified_archive, refuse_if_active_work, restore_previous,
-        signature_path, stable_binary_path, stage_and_swap, swap_with_previous,
-        valid_release_version,
+        ProgressLine, Spinner, decode_sha256_hex, fetch_archive, parse_manifest,
+        read_verified_archive, refuse_if_active_work, restore_previous, signature_path,
+        stable_binary_path, stage_and_swap, swap_with_previous, valid_release_version,
     },
     ipc,
     ipc::{
@@ -1027,10 +1026,23 @@ async fn update_command(paths: &CiaoPaths, release_base: Option<String>) -> Resu
     let manifest_path = paths
         .state_dir
         .join(format!(".ciao-manifest.{}.json", std::process::id()));
-    let manifest = match fetch_release_file(&base, RELEASE_MANIFEST_FILE, &manifest_path, None) {
-        Ok(()) => std::fs::read(&manifest_path)
+    let manifest = match crate::install::fetch_release_file_bounded(
+        &base,
+        RELEASE_MANIFEST_FILE,
+        &manifest_path,
+        None,
+        crate::install::MAX_MANIFEST_BYTES,
+    ) {
+        Ok(()) => std::fs::File::open(&manifest_path)
             .context("read downloaded release manifest")
-            .and_then(|bytes| parse_manifest(&bytes)),
+            .and_then(|file| {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                file.take(crate::install::MAX_MANIFEST_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .context("read downloaded release manifest")?;
+                parse_manifest(&bytes)
+            }),
         Err(error) => Err(error),
     };
     let _ = std::fs::remove_file(&manifest_path);
@@ -1294,6 +1306,7 @@ fn reset_identity_files(paths: &CiaoPaths) -> Result<()> {
         &paths.credentials_file,
         &paths.paired_devices_file,
         &paths.agent_metadata_file,
+        &paths.agent_managed_file,
         &paths.config_file,
         &paths.socket_file,
         &paths.agent_socket_file,

@@ -644,7 +644,7 @@ fn valid_provider_id(value: &str) -> bool {
 }
 
 fn valid_tty(value: &str) -> bool {
-    value.starts_with("/dev/tty")
+    (value.starts_with("/dev/tty") || value.starts_with("/dev/pts/"))
         && value.len() <= MAX_OPAQUE_ID_BYTES
         && value
             .bytes()
@@ -1194,6 +1194,9 @@ esac
         assert_eq!(panes.len(), 1, "fake structured pane must parse");
         assert_eq!(panes[0].pane_tty, tty);
         assert_eq!(panes[0].pane_pid, pid);
+        assert!(valid_tty("/dev/pts/4"));
+        assert!(valid_tty("/dev/ttys003"));
+        assert!(!valid_tty("/tmp/pts/4"));
         let resolver = TerminalRouteResolver::new(WorkspaceConfig::with_binary_dirs(vec![
             temp.path().to_owned(),
         ]));

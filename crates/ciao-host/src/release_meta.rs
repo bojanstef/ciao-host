@@ -170,11 +170,19 @@ fn resolve_locked(state: &mut State) {
     }
 }
 
+fn read_bounded_meta(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_META_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= MAX_META_BYTES).then_some(bytes)
+}
+
 /// Loads the last fetched meta at daemon start, so an answer already given survives restarts
 /// without a fetch.
 pub(crate) fn load_cached(run_dir: &Path) {
     let path = run_dir.join(META_CACHE_FILE);
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Some(bytes) = read_bounded_meta(&path) else {
         return;
     };
     if let Some(meta) = parse_meta(&bytes) {
@@ -208,26 +216,46 @@ pub(crate) async fn poll_loop(paths: crate::storage::CiaoPaths, release_base: St
             continue;
         }
         lock().last_poll = now;
-        let dest = paths.run_dir.join(META_CACHE_FILE);
+        let cache = paths.run_dir.join(META_CACHE_FILE);
+        let staged = paths
+            .run_dir
+            .join(format!(".{META_CACHE_FILE}.{}.tmp", std::process::id()));
+        let staged_for_fetch = staged.clone();
         let base = release_base.clone();
         let fetched = tokio::task::spawn_blocking(move || {
-            crate::install::fetch_release_file(&base, REMOTE_META_FILE, &dest, None)
+            crate::install::fetch_release_file_bounded(
+                &base,
+                REMOTE_META_FILE,
+                &staged_for_fetch,
+                None,
+                MAX_META_BYTES,
+            )
         })
         .await;
         match fetched {
             Ok(Ok(())) => {
-                let bytes = std::fs::read(paths.run_dir.join(META_CACHE_FILE)).unwrap_or_default();
-                match parse_meta(&bytes) {
+                let parsed = read_bounded_meta(&staged).and_then(|bytes| parse_meta(&bytes));
+                match parsed {
                     Some(meta) => {
+                        let _ = std::fs::rename(&staged, &cache);
                         let host = meta.host.clone();
                         apply_meta(meta);
                         tracing::info!(release = %host, "release meta fetched while drifting");
                     }
-                    None => tracing::debug!("release meta was unreadable; ignored"),
+                    None => {
+                        let _ = std::fs::remove_file(&staged);
+                        tracing::debug!("release meta was unreadable; ignored");
+                    }
                 }
             }
-            Ok(Err(error)) => tracing::debug!(error = %error, "release meta fetch failed"),
-            Err(error) => tracing::debug!(error = %error, "release meta fetch task failed"),
+            Ok(Err(error)) => {
+                let _ = std::fs::remove_file(&staged);
+                tracing::debug!(error = %error, "release meta fetch failed");
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&staged);
+                tracing::debug!(error = %error, "release meta fetch task failed");
+            }
         }
     }
 }

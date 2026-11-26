@@ -1011,7 +1011,12 @@ async fn write_loop(
             },
             _ = credit.wake.notified() => {
                 let bytes = credit.bytes.swap(0, Ordering::AcqRel) as u32;
-                if bytes != 0 { write_frame(&mut write, channel, CREDIT, &bytes.to_le_bytes()).await?; }
+                if bytes != 0 && write_frame(&mut write, channel, CREDIT, &bytes.to_le_bytes()).await.is_err() {
+                    // Draining final output after a clean CLOSE commonly wakes CREDIT against a
+                    // closing peer socket; let read_loop deliver the authoritative CLOSE or EOF
+                    // verdict instead of racing ahead with a broken-socket error.
+                    return Ok(());
+                }
             },
             changed = resize.changed() => {
                 if changed.is_err() { return Ok(()); }

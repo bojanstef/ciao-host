@@ -570,9 +570,10 @@ pub fn fetch_archive(
     let archive = archive_file_name(version, target);
     fetch_release_file(release_base, &archive, dest, expected_bytes)?;
     let signature = signature_file_name(&archive);
-    fetch_release_file(release_base, &signature, &signature_path(dest), None).with_context(|| {
-        format!("{signature} is missing from the release; Ciao installs only signed releases")
-    })
+    fetch_release_file_bounded(release_base, &signature, &signature_path(dest), None, 4096)
+        .with_context(|| {
+            format!("{signature} is missing from the release; Ciao installs only signed releases")
+        })
 }
 
 /// Downloads one named file from an explicitly supplied HTTPS release base. Same bounds and
@@ -584,6 +585,22 @@ pub fn fetch_release_file(
     file_name: &str,
     dest: &Path,
     expected_bytes: Option<u64>,
+) -> Result<()> {
+    fetch_release_file_bounded(
+        release_base,
+        file_name,
+        dest,
+        expected_bytes,
+        MAX_ARCHIVE_BYTES,
+    )
+}
+
+pub fn fetch_release_file_bounded(
+    release_base: &str,
+    file_name: &str,
+    dest: &Path,
+    expected_bytes: Option<u64>,
+    max_bytes: u64,
 ) -> Result<()> {
     if !release_base.starts_with("https://")
         || release_base
@@ -608,7 +625,7 @@ pub fn fetch_release_file(
             "--max-time",
             &DOWNLOAD_MAX_SECONDS.to_string(),
             "--max-filesize",
-            &MAX_ARCHIVE_BYTES.to_string(),
+            &max_bytes.to_string(),
             "--output",
         ])
         .arg(dest)

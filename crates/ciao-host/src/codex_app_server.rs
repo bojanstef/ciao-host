@@ -481,9 +481,17 @@ async fn read_loop(
             }
         } else if events.send(event).await.is_err() {
             // The supervisor hung up; nothing left to deliver to.
+            if let Ok(mut waiters) = pending.lock() {
+                waiters.clear();
+            }
             return;
         }
     };
+    // Drop every pending oneshot::Sender so in-flight request() callers wake immediately with a
+    // closed-connection error instead of waiting the full 30-second STANDING_REQUEST_TIMEOUT.
+    if let Ok(mut waiters) = pending.lock() {
+        waiters.clear();
+    }
     let _ = events.send(AppServerEvent::Closed { reason }).await;
 }
 

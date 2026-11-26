@@ -602,6 +602,28 @@ impl PairedDeviceStore {
             .map(|_| ())
     }
 
+    /// Clears a device's Live Activity registration only if its current ticket still matches the
+    /// one that was refused as dead, so a delayed 400 cannot wipe a newly rotated registration.
+    pub fn clear_live_activity_if_ticket(
+        &mut self,
+        endpoint_id: EndpointId,
+        ticket: &str,
+    ) -> Result<bool> {
+        let key = endpoint_id.to_string();
+        let matches = self.devices.iter().any(|device| {
+            device.endpoint_id == key
+                && device
+                    .live_activity
+                    .as_ref()
+                    .is_some_and(|registration| registration.ticket == ticket)
+        });
+        if !matches {
+            return Ok(false);
+        }
+        self.clear_live_activity(endpoint_id)?;
+        Ok(true)
+    }
+
     /// Every current ActivityKit target with the pairing key needed to seal its state. A device
     /// paired before ADR 005 cannot create a registration in the first place.
     pub fn live_activity_targets(&self) -> Vec<LiveActivityTarget> {

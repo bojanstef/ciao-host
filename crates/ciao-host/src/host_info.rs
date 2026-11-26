@@ -184,10 +184,22 @@ fn hostname_file(path: &Path) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn linux_distribution() -> (Option<String>, Option<String>) {
-    let id = parse_assignment_file(Path::new("/etc/os-release"), "ID")
+    // Freedesktop `os-release(5)`: `/etc/os-release` is commonly a symlink to
+    // `../usr/lib/os-release` on Debian, Ubuntu, Fedora, Arch, and RHEL. Try it first, then fall
+    // back to `/usr/lib/os-release` (following symlinks only for the standard system paths).
+    let path = [
+        Path::new("/etc/os-release"),
+        Path::new("/usr/lib/os-release"),
+    ]
+    .into_iter()
+    .find(|candidate| fs::metadata(candidate).is_ok_and(|meta| meta.is_file()));
+    let Some(path) = path else {
+        return (None, None);
+    };
+    let id = parse_assignment_file_following_system_symlink(path, "ID")
         .map(|value| value.to_ascii_lowercase())
         .filter(|value| valid_host_metadata_token(value));
-    let version = parse_assignment_file(Path::new("/etc/os-release"), "VERSION_ID")
+    let version = parse_assignment_file_following_system_symlink(path, "VERSION_ID")
         .map(|value| value.to_ascii_lowercase())
         .filter(|value| valid_host_metadata_token(value));
     (id, version)
@@ -195,7 +207,16 @@ fn linux_distribution() -> (Option<String>, Option<String>) {
 
 #[cfg(any(target_os = "linux", test))]
 fn parse_assignment_file(path: &Path, key: &str) -> Option<String> {
-    let text = read_bounded_text(path)?;
+    parse_assignment_text(&read_bounded_text(path)?, key)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_assignment_file_following_system_symlink(path: &Path, key: &str) -> Option<String> {
+    parse_assignment_text(&read_bounded_system_text(path)?, key)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_assignment_text(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
         let Some((candidate, raw)) = line.split_once('=') else {
             continue;
@@ -233,6 +254,19 @@ fn read_bounded_text(path: &Path) -> Option<String> {
     {
         return None;
     }
+    read_bounded_open_file(path)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_bounded_system_text(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > LOCAL_METADATA_FILE_CAP {
+        return None;
+    }
+    read_bounded_open_file(path)
+}
+
+fn read_bounded_open_file(path: &Path) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut reader: Take<File> = file.take(LOCAL_METADATA_FILE_CAP + 1);
     let mut bytes = Vec::new();
@@ -316,6 +350,24 @@ mod tests {
         );
         fs::write(&path, "not-a-machine-id\n").unwrap();
         assert!(machine_id_file(&path).is_none());
+    }
+
+    #[test]
+    fn system_os_release_follows_symlink() {
+        let temp = tempdir().unwrap();
+        let real = temp.path().join("usr-lib-os-release");
+        let link = temp.path().join("etc-os-release");
+        fs::write(&real, "ID=\"ubuntu\"\nVERSION_ID=\"24.04\"\n").unwrap();
+        symlink(&real, &link).unwrap();
+        assert!(parse_assignment_file(&link, "ID").is_none());
+        assert_eq!(
+            parse_assignment_file_following_system_symlink(&link, "ID").as_deref(),
+            Some("ubuntu")
+        );
+        assert_eq!(
+            parse_assignment_file_following_system_symlink(&link, "VERSION_ID").as_deref(),
+            Some("24.04")
+        );
     }
 
     #[test]

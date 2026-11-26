@@ -537,6 +537,9 @@ pub(crate) async fn descends_from(mut pid: u32, ancestor: u32) -> bool {
 }
 
 pub(crate) fn exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     i32::try_from(pid)
         .ok()
         .is_some_and(|pid| kill(Pid::from_raw(pid), None).is_ok())
@@ -555,6 +558,9 @@ pub(crate) fn exists(pid: u32) -> bool {
 ///
 /// Bounded: this runs inside a lifecycle request a phone is waiting on.
 pub(crate) async fn request_exit(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
     let Ok(raw) = i32::try_from(pid) else {
         return false;
     };
@@ -1091,5 +1097,12 @@ mod tests {
         // The bound is the caller's, and a fingerprint that does not fit is refused rather than
         // truncated into something two processes could share.
         assert!(start_fingerprint(own, 1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_and_init_pids_are_never_treated_as_live_or_signalled() {
+        assert!(!exists(0));
+        assert!(!request_exit(0).await);
+        assert!(!request_exit(1).await);
     }
 }

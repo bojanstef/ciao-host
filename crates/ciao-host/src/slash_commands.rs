@@ -427,6 +427,10 @@ async fn probe(runtime: &ManagedRuntime, cwd: &Path, source: &str) -> Vec<SlashC
             Vec::new()
         }
         Err(_) => {
+            // Kill and drop the hung child before draining stderr so its write end closes
+            // immediately instead of stalling for the full stderr drain timeout.
+            let _ = child.start_kill();
+            drop(child);
             let detail = drained(draining, &collected).await;
             tracing::warn!(
                 seconds = PROBE_TIMEOUT.as_secs(),

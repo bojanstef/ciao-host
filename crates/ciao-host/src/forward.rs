@@ -13,10 +13,24 @@
 //! would be a UI affordance dressed as a boundary, and the boundary is the pairing.
 
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+const FORWARD_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn connect_loopback(port: u16) -> io::Result<TcpStream> {
+    match TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await {
+        Ok(stream) => Ok(stream),
+        Err(v4_err) => TcpStream::connect((Ipv6Addr::LOCALHOST, port))
+            .await
+            .map_err(|_| v4_err),
+    }
+}
 
 /// The port the app named, big-endian. Port 0 means "any port" to `bind` and nothing at all to
 /// `connect`, so it is refused here rather than turned into a confusing connect error.
@@ -45,8 +59,12 @@ where
     S: AsyncWrite + Unpin + Send,
     R: AsyncRead + Unpin + Send,
 {
-    let port = read_forward_open(recv).await?;
-    let upstream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+    let port = timeout(FORWARD_OPEN_TIMEOUT, read_forward_open(recv))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "forward stream open timed out"))??;
+    let upstream = timeout(FORWARD_CONNECT_TIMEOUT, connect_loopback(port))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "loopback connect timed out"))??;
     // Every byte here has already paid a relay round trip. Nagle would add another one to each
     // small write, and there is no bandwidth on this path worth buying with it.
     upstream.set_nodelay(true)?;
@@ -126,5 +144,33 @@ mod tests {
 
         let error = forward(&mut host_send, &mut host_recv).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn ipv6_only_loopback_listener_is_reached_via_fallback() {
+        let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ipv6");
+            socket.write_all(b"ok").await.unwrap();
+        });
+
+        let (mut app_write, mut host_recv) = duplex(64);
+        let (mut host_send, mut app_read) = duplex(64);
+        let forwarding = tokio::spawn(async move { forward(&mut host_send, &mut host_recv).await });
+
+        app_write.write_all(&port.to_be_bytes()).await.unwrap();
+        app_write.write_all(b"ipv6").await.unwrap();
+        let mut reply = [0_u8; 2];
+        app_read.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ok");
+        app_write.shutdown().await.unwrap();
+        upstream.await.unwrap();
+        forwarding.await.unwrap().unwrap();
     }
 }

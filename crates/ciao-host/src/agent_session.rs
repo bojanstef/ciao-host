@@ -1586,10 +1586,13 @@ impl AgentSessionSupervisor {
             history = combined;
         }
         session.history = history;
-        fence_rewritten_history(&self.metadata, session, &held)?;
         // The adapter's word on whether its snapshot was whole, and the host's own bound either
-        // way: evicting the start withdraws `full` whatever the adapter said.
-        let cut_by_bound = enforce_history_bound(session);
+        // way: evicting the start withdraws `full` whatever the adapter said. Run bound eviction
+        // *before* `fence_rewritten_history` so an interior eviction (when index 0 stays streaming)
+        // bumps `snapshot_epoch`.
+        let eviction = enforce_history_bound(session);
+        fence_rewritten_history(&self.metadata, session, &held)?;
+        let cut_by_bound = eviction.any;
         match history_complete {
             Some(complete) => {
                 set_history_coverage(session, complete && !cut_by_bound);
@@ -1825,8 +1828,9 @@ impl AgentSessionSupervisor {
         };
         let before = held_sequences(session);
         let rewritten = apply_reconcile_plan(session, &plan, &authority);
+        let eviction = enforce_history_bound(session);
+        let cut_by_bound = eviction.any;
         let fenced = fence_rewritten_history(&self.metadata, session, &before)?;
-        let cut_by_bound = enforce_history_bound(session);
         let coverage_changed = match mode {
             ReconcileMode::Backfill { complete } => {
                 set_history_coverage(session, complete && !cut_by_bound)
@@ -1877,15 +1881,29 @@ impl AgentSessionSupervisor {
             session.history.push(canonical.clone());
             session.history.sort_by_key(|candidate| candidate.sequence);
         }
-        let start_evicted = enforce_history_bound(session);
+        let eviction = enforce_history_bound(session);
         let base_revision = session.snapshot.revision;
         bump_revision(session);
+        if eviction.interior {
+            if eviction.any {
+                set_history_coverage(session, false);
+            }
+            bump_snapshot_epoch(&self.metadata, session)?;
+            refresh_snapshot_window(session);
+            let _ = clear_hook_attention(session);
+            let _ = session.updates.send(AgentServerFrame::ResyncRequired {
+                v: AGENT_PROTOCOL_VERSION,
+                session_id: session.snapshot.session_id.clone(),
+                reason_code: "history_reconciled".into(),
+            });
+            return Ok(());
+        }
         refresh_snapshot_window(session);
         let attention = clear_hook_attention(session);
         let _ = session
             .updates
             .send(entry_delta(session, base_revision, &canonical, attention));
-        publish_evicted_start(session, start_evicted);
+        publish_evicted_start(session, eviction.any);
         Ok(())
     }
 
@@ -2138,15 +2156,29 @@ impl AgentSessionSupervisor {
             session.history.push(canonical.clone());
             session.history.sort_by_key(|entry| entry.sequence);
         }
-        let start_evicted = enforce_history_bound(session);
+        let eviction = enforce_history_bound(session);
         let base_revision = session.snapshot.revision;
         bump_revision(session);
+        if eviction.interior {
+            if eviction.any {
+                set_history_coverage(session, false);
+            }
+            bump_snapshot_epoch(&self.metadata, session)?;
+            refresh_snapshot_window(session);
+            let _ = clear_hook_attention(session);
+            let _ = session.updates.send(AgentServerFrame::ResyncRequired {
+                v: AGENT_PROTOCOL_VERSION,
+                session_id: session.snapshot.session_id.clone(),
+                reason_code: "history_reconciled".into(),
+            });
+            return Ok(());
+        }
         refresh_snapshot_window(session);
         let attention = clear_hook_attention(session);
         let _ = session
             .updates
             .send(entry_delta(session, base_revision, &canonical, attention));
-        publish_evicted_start(session, start_evicted);
+        publish_evicted_start(session, eviction.any);
         Ok(())
     }
 
@@ -2293,7 +2325,7 @@ impl AgentSessionSupervisor {
                 {
                     descriptor.takeover = None;
                     descriptor.takeover_refusal =
-                        Some(crate::managed_session::CODE_MODE_TERMINAL_ONLY.into());
+                        Some(crate::agent_protocol::CODE_MODE_TERMINAL_ONLY.into());
                 }
                 descriptor.recent_prompt = prompt.resolve(&read_prompt);
                 descriptor
@@ -2800,6 +2832,28 @@ impl AgentSessionSupervisor {
         Some(receipt)
     }
 
+    fn settle_in_flight_commands(&self, session: &mut LiveSession, reason_code: &str) {
+        let in_flight: Vec<_> = session.in_flight_commands.drain().collect();
+        for command_id in in_flight {
+            let receipt = CommandReceipt {
+                command_id,
+                session_id: session.snapshot.session_id.clone(),
+                process_generation: session.snapshot.process_generation,
+                snapshot_epoch: session.snapshot.snapshot_epoch,
+                state: "outcome_unknown".into(),
+                updated_at: unix_now(),
+                reason_code: Some(reason_code.into()),
+                application_evidence: None,
+            };
+            if self
+                .persist_and_publish_receipt(session, receipt.clone())
+                .is_err()
+            {
+                self.publish_receipt(session, receipt);
+            }
+        }
+    }
+
     pub(crate) fn bridge_disconnected(
         &self,
         session_id: &str,
@@ -2814,6 +2868,7 @@ impl AgentSessionSupervisor {
             return;
         }
         if process_exited {
+            self.settle_in_flight_commands(session, "bridge_disconnected");
             if let Some(route_id) = session.route_id.take() {
                 inner.routes.remove(&route_id);
             }
@@ -2823,33 +2878,27 @@ impl AgentSessionSupervisor {
         }
         session.bridge_sender = None;
         session.adapter_active = false;
-        let in_flight: Vec<_> = session.in_flight_commands.drain().collect();
-        for command_id in in_flight {
-            let receipt = CommandReceipt {
-                command_id,
-                session_id: session_id.to_owned(),
-                process_generation: session.snapshot.process_generation,
-                snapshot_epoch: session.snapshot.snapshot_epoch,
-                state: "outcome_unknown".into(),
-                updated_at: unix_now(),
-                reason_code: Some("bridge_disconnected".into()),
-                application_evidence: None,
-            };
-            if self
-                .persist_and_publish_receipt(session, receipt.clone())
-                .is_err()
-            {
-                self.publish_receipt(session, receipt);
-            }
-        }
-        if session.snapshot.topology == "adopted" {
+        self.settle_in_flight_commands(session, "bridge_disconnected");
+        let topology_changed = session.snapshot.topology == "adopted";
+        if topology_changed {
             // An abrupt bridge loss ends the hold as surely as a clean release; the record
             // left behind takes the attached shape, mirroring end_adopted_session, so the
-            // adopted-implies-resumable invariant never sees a downgraded row.
+            // adopted-implies-resumable invariant never sees a downgraded row. Because
+            // SessionDelta cannot mutate `topology`, bump the epoch and request a resync.
             session.snapshot.topology = "attached".into();
-            session.snapshot.pending_interactions.clear();
         }
-        downgrade_session(session, "bridge_disconnected");
+        let cleared_interactions: Vec<String> = session
+            .snapshot
+            .pending_interactions
+            .drain(..)
+            .map(|interaction| interaction.interaction_id)
+            .collect();
+        if topology_changed {
+            let _ = bump_snapshot_epoch(&self.metadata, session);
+            downgrade_session_requiring_resync(session, "bridge_disconnected");
+        } else {
+            downgrade_session_clearing(session, "bridge_disconnected", cleared_interactions);
+        }
     }
 
     pub(crate) fn end_observed_session(&self, session_id: &str, process_generation: u64) {
@@ -2919,10 +2968,12 @@ impl AgentSessionSupervisor {
             }
             session.bridge_sender = None;
             session.adapter_active = false;
+            self.settle_in_flight_commands(session, reason);
             let route_id = session.route_id.take();
             session.snapshot.topology = "attached".into();
             session.snapshot.pending_interactions.clear();
-            downgrade_session(session, reason);
+            let _ = bump_snapshot_epoch(&self.metadata, session);
+            downgrade_session_requiring_resync(session, reason);
             route_id
         };
         if let Some(route_id) = route_id {
@@ -3228,7 +3279,8 @@ impl AgentSessionSupervisor {
             .map(|(id, _)| id.clone())
             .collect();
         for id in dead {
-            if let Some(old) = inner.sessions.remove(&id) {
+            if let Some(mut old) = inner.sessions.remove(&id) {
+                self.settle_in_flight_commands(&mut old, "process_exited");
                 if let Some(route_id) = old.route_id {
                     inner.routes.remove(&route_id);
                 }
@@ -4332,6 +4384,22 @@ fn held_sequences(session: &LiveSession) -> HashMap<String, u64> {
 /// Dropping only the oldest entries is the shape bound eviction already has, and a client
 /// tolerates it the same way; dropping one from the middle leaves the client a row the host no
 /// longer has, which is a rewrite like any other.
+fn bump_snapshot_epoch(
+    metadata: &Mutex<AgentMetadataStore>,
+    session: &mut LiveSession,
+) -> Result<()> {
+    let previous = session.snapshot.snapshot_epoch;
+    let epoch = std::iter::repeat_with(nonzero_random_u64)
+        .find(|candidate| *candidate != previous)
+        .unwrap_or(previous.wrapping_add(1).max(1));
+    session.snapshot.snapshot_epoch = epoch;
+    session.snapshot.latest_command_receipts.clear();
+    metadata
+        .lock()
+        .update_epoch(&session.snapshot.session_id, epoch)?;
+    Ok(())
+}
+
 fn fence_rewritten_history(
     metadata: &Mutex<AgentMetadataStore>,
     session: &mut LiveSession,
@@ -4354,15 +4422,7 @@ fn fence_rewritten_history(
     if !renumbered && !removed_from_the_middle {
         return Ok(false);
     }
-    let previous = session.snapshot.snapshot_epoch;
-    let epoch = std::iter::repeat_with(nonzero_random_u64)
-        .find(|candidate| *candidate != previous)
-        .unwrap_or(previous.wrapping_add(1).max(1));
-    session.snapshot.snapshot_epoch = epoch;
-    session.snapshot.latest_command_receipts.clear();
-    metadata
-        .lock()
-        .update_epoch(&session.snapshot.session_id, epoch)?;
+    bump_snapshot_epoch(metadata, session)?;
     Ok(true)
 }
 
@@ -4378,17 +4438,23 @@ fn truncate_utf8(value: &mut String, maximum_bytes: usize) -> bool {
     true
 }
 
-/// Evicts to the host bound. Returns whether anything went — which is always the oldest end, so
-/// the session no longer holds its conversation's start.
-fn enforce_history_bound(session: &mut LiveSession) -> bool {
+#[derive(Debug, Clone, Copy, Default)]
+struct HistoryEviction {
+    any: bool,
+    interior: bool,
+}
+
+/// Evicts to the host bound. Tracks whether anything went and whether an interior entry had to be
+/// removed (e.g. because index 0 remained `"streaming"`), which requires fencing the epoch.
+fn enforce_history_bound(session: &mut LiveSession) -> HistoryEviction {
     let mut bytes: usize = session
         .history
         .iter()
         .map(TimelineEntry::decoded_bytes)
         .sum();
-    let mut evicted = false;
+    let mut result = HistoryEviction::default();
     while bytes > MAX_HOST_TIMELINE_BYTES || session.history.len() > MAX_HOST_TIMELINE_ENTRIES {
-        evicted = true;
+        result.any = true;
         let index = session
             .history
             .iter()
@@ -4397,13 +4463,16 @@ fn enforce_history_bound(session: &mut LiveSession) -> bool {
             // records. If no complete item exists, evict the oldest item and force subscribers
             // through the normal bounded window/resync path rather than exceed the hard cap.
             .unwrap_or(0);
+        if index > 0 {
+            result.interior = true;
+        }
         let removed = session.history.remove(index);
         bytes = bytes.saturating_sub(removed.decoded_bytes());
         session
             .source_entries
             .retain(|_, mapping| mapping.entry_id != removed.entry_id);
     }
-    evicted
+    result
 }
 
 fn refresh_snapshot_window(session: &mut LiveSession) {
@@ -4772,8 +4841,7 @@ fn bump_revision(session: &mut LiveSession) {
     session.updated_at = unix_now();
 }
 
-fn downgrade_session(session: &mut LiveSession, reason: &str) {
-    let base_revision = session.snapshot.revision;
+fn apply_downgrade_fields(session: &mut LiveSession, reason: &str) {
     bump_revision(session);
     // Whatever run was open belonged to the adapter that just went away. Nothing may hand it
     // back afterwards.
@@ -4797,6 +4865,47 @@ fn downgrade_session(session: &mut LiveSession, reason: &str) {
         handback_session: None,
         resume_command: None,
     };
+}
+
+fn downgrade_session_requiring_resync(session: &mut LiveSession, reason: &str) {
+    apply_downgrade_fields(session, reason);
+    let _ = session.updates.send(AgentServerFrame::ResyncRequired {
+        v: AGENT_PROTOCOL_VERSION,
+        session_id: session.snapshot.session_id.clone(),
+        reason_code: reason.into(),
+    });
+}
+
+fn downgrade_session(session: &mut LiveSession, reason: &str) {
+    downgrade_session_clearing(session, reason, Vec::new());
+}
+
+fn downgrade_session_clearing(
+    session: &mut LiveSession,
+    reason: &str,
+    cleared_interactions: Vec<String>,
+) {
+    let base_revision = session.snapshot.revision;
+    apply_downgrade_fields(session, reason);
+    let mut changes = Vec::with_capacity(4 + cleared_interactions.len());
+    for interaction_id in cleared_interactions {
+        changes.push(AgentDeltaChange::RemoveInteraction {
+            interaction_id,
+            resolution: "cancelled".into(),
+        });
+    }
+    changes.push(AgentDeltaChange::Observation {
+        observation: session.snapshot.observation.clone(),
+    });
+    changes.push(AgentDeltaChange::TerminalFallback {
+        terminal_fallback: session.snapshot.terminal_fallback.clone(),
+    });
+    changes.push(AgentDeltaChange::Capabilities {
+        capabilities: session.snapshot.capabilities.clone(),
+    });
+    changes.push(AgentDeltaChange::Turn {
+        turn: session.visible_turn(),
+    });
     let delta = AgentSessionDelta {
         v: AGENT_PROTOCOL_VERSION,
         session_id: session.snapshot.session_id.clone(),
@@ -4804,20 +4913,7 @@ fn downgrade_session(session: &mut LiveSession, reason: &str) {
         process_generation: session.snapshot.process_generation,
         base_revision,
         revision: session.snapshot.revision,
-        changes: vec![
-            AgentDeltaChange::Observation {
-                observation: session.snapshot.observation.clone(),
-            },
-            AgentDeltaChange::TerminalFallback {
-                terminal_fallback: session.snapshot.terminal_fallback.clone(),
-            },
-            AgentDeltaChange::Capabilities {
-                capabilities: session.snapshot.capabilities.clone(),
-            },
-            AgentDeltaChange::Turn {
-                turn: session.visible_turn(),
-            },
-        ],
+        changes,
     };
     let _ = session.updates.send(AgentServerFrame::SessionDelta {
         v: AGENT_PROTOCOL_VERSION,
@@ -6431,7 +6527,7 @@ mod tests {
         assert_eq!(row().takeover, None);
         assert_eq!(
             row().takeover_refusal.as_deref(),
-            Some(crate::managed_session::CODE_MODE_TERMINAL_ONLY)
+            Some(crate::agent_protocol::CODE_MODE_TERMINAL_ONLY)
         );
         row().validate().unwrap();
 

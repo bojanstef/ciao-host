@@ -291,7 +291,7 @@ impl ManagedLauncher {
 }
 
 /// Shared by takeover, resume and the worker when this destination cannot run headless Code Mode.
-pub(crate) const CODE_MODE_TERMINAL_ONLY: &str = "code_mode_terminal_only";
+pub(crate) use crate::agent_protocol::CODE_MODE_TERMINAL_ONLY;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedSessionDirectory {
@@ -305,6 +305,9 @@ pub(crate) struct ManagedSessionDirectory {
     /// daemon — and only those, so a chat someone stopped, or one an older restart left stored,
     /// stays where it was. Taken once by the startup resume.
     restart_resumable: Arc<Mutex<Vec<String>>>,
+    /// Sessions currently mid-launch, mapping to any worker exit observed by the reaper before
+    /// `start`/`resume` finishes writing `presence = "live"` into `store`.
+    launching: Arc<Mutex<HashMap<String, Option<WorkerExit>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +344,7 @@ impl ManagedSessionDirectory {
             launcher: Arc::new(launcher),
             home: home.to_owned(),
             restart_resumable: Arc::new(Mutex::new(restart_resumable)),
+            launching: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -757,6 +761,9 @@ impl ManagedSessionDirectory {
         if !path.is_absolute() || !path.is_dir() {
             return Some("unknown_workspace");
         }
+        if self.store.lock().records.len() >= MAX_MANAGED_RECORDS {
+            return Some("record_limit");
+        }
         // The remaining checks ask about the conversation itself. A takeover with nothing to
         // resume has no conversation to contend over, so there is no one to collide with.
         if let Some(vendor_session_id) = target.vendor_session_id.as_deref() {
@@ -861,6 +868,9 @@ impl ManagedSessionDirectory {
         command_id: &str,
         before_spawn: Option<&(dyn Fn(&str) + Sync)>,
     ) -> LifecycleOutcome {
+        if self.store.lock().records.len() >= MAX_MANAGED_RECORDS {
+            return self.refuse(command_id, "record_limit");
+        }
         let session_id = random_opaque_id();
         if let Some(before_spawn) = before_spawn {
             before_spawn(&session_id);
@@ -885,17 +895,24 @@ impl ManagedSessionDirectory {
             permission_mode,
             model,
         };
+        self.launching.lock().insert(session_id.clone(), None);
         match self.launcher.launch(&spec, &label).await {
             Ok(worker) => {
+                let over_limit = self.store.lock().records.len() >= MAX_MANAGED_RECORDS;
+                if over_limit {
+                    self.launching.lock().remove(&session_id);
+                    // Concurrent starts raced past the pre-launch check: stop the freshly spawned
+                    // worker so it cannot connect as an uncontrollable ghost session.
+                    self.launcher.stop(&session_id).await;
+                    return self.refuse(command_id, "record_limit");
+                }
                 let outcome = {
                     let mut store = self.store.lock();
-                    if store.records.len() >= MAX_MANAGED_RECORDS {
-                        drop(store);
-                        // A bound on the *store*, not on how many agents a person may run. It
-                        // took the live workers' reason code until 2026-08-02 and therefore
-                        // reported a limit that no longer exists.
-                        return self.refuse(command_id, "record_limit");
-                    }
+                    let early_exit = self.launching.lock().remove(&session_id).flatten();
+                    let (presence, stored_reason) = match early_exit {
+                        Some(exit) => ("stored".into(), Some(exit.stored_reason().into())),
+                        None => ("live".into(), None),
+                    };
                     let workspace_id = store.workspace_id(&path);
                     store.records.push(ManagedRecord {
                         session_id: session_id.clone(),
@@ -906,8 +923,8 @@ impl ManagedSessionDirectory {
                         adapter_family: worker.adapter_family,
                         adapter_version: worker.adapter_version,
                         process_generation: 1,
-                        presence: "live".into(),
-                        stored_reason: None,
+                        presence,
+                        stored_reason,
                         externally_owned: false,
                         handback_session: None,
                         revision: 1,
@@ -918,7 +935,10 @@ impl ManagedSessionDirectory {
                 self.persist();
                 outcome
             }
-            Err(reason) => self.refuse(command_id, reason),
+            Err(reason) => {
+                self.launching.lock().remove(&session_id);
+                self.refuse(command_id, reason)
+            }
         }
     }
 
@@ -1121,14 +1141,24 @@ impl ManagedSessionDirectory {
             permission_mode,
             model,
         };
+        self.launching.lock().insert(session_id.to_owned(), None);
         match self.launcher.launch(&spec, &workspace_label).await {
             Ok(_) => {
                 let next_generation = generation.saturating_add(1);
                 let outcome = {
                     let mut store = self.store.lock();
+                    let early_exit = self.launching.lock().remove(session_id).flatten();
                     if let Some(record) = store.record_mut(session_id) {
-                        record.presence = "live".into();
-                        record.stored_reason = None;
+                        match early_exit {
+                            Some(exit) => {
+                                record.presence = "stored".into();
+                                record.stored_reason = Some(exit.stored_reason().into());
+                            }
+                            None => {
+                                record.presence = "live".into();
+                                record.stored_reason = None;
+                            }
+                        }
                         // Ciao runs this conversation again, so the flags describing the
                         // release are stale: leaving them would refuse the *next* resume and
                         // advertise a terminal route to a session that is live here now.
@@ -1147,7 +1177,10 @@ impl ManagedSessionDirectory {
                 self.persist();
                 outcome
             }
-            Err(reason) => self.refuse(command_id, reason),
+            Err(reason) => {
+                self.launching.lock().remove(session_id);
+                self.refuse(command_id, reason)
+            }
         }
     }
 
@@ -1183,6 +1216,10 @@ impl ManagedSessionDirectory {
                 record.stored_reason = Some(exit.stored_reason().into());
                 record.revision = record.revision.saturating_add(1);
                 record.updated_at = unix_now();
+            } else if let Some(slot) = self.launching.lock().get_mut(session_id) {
+                // Worker exited before start/resume recorded `presence = "live"`; capture it so
+                // the launching path writes `"stored"` instead of stranding the record live.
+                *slot = Some(exit);
             }
         }
         self.persist();

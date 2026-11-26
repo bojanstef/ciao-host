@@ -343,7 +343,8 @@ pub(crate) async fn close_handback_session(config: &WorkspaceConfig, session: &s
     {
         for pid in listing
             .lines()
-            .filter_map(|line| line.trim().parse().ok())
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| *pid > 1)
             .take(8)
         {
             crate::process::request_exit(pid).await;

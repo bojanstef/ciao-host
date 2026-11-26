@@ -302,7 +302,11 @@ fn prune_version_caches(run_dir: &Path, preserved: &Path) -> Result<()> {
         if !valid_version_cache_name(name) || entry.path() == preserved {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path())?;
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
             || metadata.uid() != nix::unistd::Uid::effective().as_raw()
@@ -316,8 +320,25 @@ fn prune_version_caches(run_dir: &Path, preserved: &Path) -> Result<()> {
         .len()
         .saturating_sub(MAX_VERSION_CACHE_FILES.saturating_sub(1));
     for (_, path) in caches.into_iter().take(remove_count) {
-        validate_private_file(&path).context("validate stale Claude version cache")?;
-        fs::remove_file(path).context("remove stale Claude version cache")?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+        if let Err(error) = validate_private_file(&path) {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
+            return Err(error).context("validate stale Claude version cache");
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove stale Claude version cache"),
+        }
     }
     Ok(())
 }
