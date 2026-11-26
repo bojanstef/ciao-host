@@ -4317,6 +4317,7 @@ async fn bridge_terminal(
                         if let Err(error) =
                             permit.and_then(|permit| session.input().push(bytes, permit))
                         {
+                            tracing::info!(error = ?error, "terminal input refused");
                             let (code, message, reset) = terminal_input_error(error);
                             send_terminal_error(send, Some(terminal_id), code, message).await;
                             finish_terminal_error(send, recv, reset).await;
@@ -4387,6 +4388,7 @@ async fn bridge_terminal(
                 let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
             }
             Event::Process(Err(error)) => {
+                tracing::info!(error = ?error, "terminal backend failed");
                 // A backend whose input path ended reports it here when no input was waiting.
                 let (code, message, reset) = if error == PtyError::InputClosed {
                     terminal_input_error(error)

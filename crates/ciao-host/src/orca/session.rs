@@ -239,14 +239,16 @@ impl Viewer {
         mut dimensions: watch::Receiver<Dimensions>,
         peak: Arc<QueueSize>,
     ) -> Result<PtyExit, PtyError> {
-        Self::forward(&initial, &tx, &peak).await?;
+        Self::forward(&initial, &tx, &peak)
+            .await
+            .map_err(|e| ended("output_closed", e))?;
         let mut pending: Option<(String, PendingOperation)> = None;
         let mut utf8 = Vec::new();
         let mut deadline = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline), if pending.is_some() => {
-                    return Err(PtyError::InputClosed);
+                    return Err(ended("no_answer", PtyError::InputClosed));
                 }
                 msg = input.recv(), if pending.is_none() => {
                     // The queue closes only when Ciao releases this viewer, after every accepted
@@ -257,49 +259,49 @@ impl Viewer {
                     let n = match std::str::from_utf8(&utf8) {
                         Ok(_) => utf8.len(),
                         Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                        Err(_) => return Err(PtyError::InvalidInput),
+                        Err(_) => return Err(ended("invalid_utf8", PtyError::InvalidInput)),
                     };
                     if n == 0 { continue; }
-                    let text = std::str::from_utf8(&utf8[..n]).map_err(|_| PtyError::InvalidInput)?;
+                    let text = std::str::from_utf8(&utf8[..n]).map_err(|_| ended("invalid_utf8", PtyError::InvalidInput))?;
                     self.viewport = viewport(*dimensions.borrow());
                     let params = json!({
                         "terminal": self.handle, "client": self.client, "viewport": self.viewport, "text": text
                     });
-                    let id = self.channel.request("terminal.send", params).await.map_err(|_| PtyError::InputClosed)?;
+                    let id = self.channel.request("terminal.send", params).await.map_err(|_| ended("send_failed", PtyError::InputClosed))?;
                     utf8.drain(..n);
                     pending = Some((id, PendingOperation::Write));
                     deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 }
                 changed = dimensions.changed(), if pending.is_none() => {
-                    changed.map_err(|_| PtyError::ResizeFailed)?;
+                    changed.map_err(|_| ended("resize_closed", PtyError::ResizeFailed))?;
                     self.viewport = viewport(*dimensions.borrow_and_update());
                     let params = json!({
                         "terminal": self.handle, "client": self.client, "viewport": self.viewport, "claim": true
                     });
-                    let id = self.channel.request("terminal.updateViewport", params).await.map_err(|_| PtyError::ResizeFailed)?;
+                    let id = self.channel.request("terminal.updateViewport", params).await.map_err(|_| ended("resize_send_failed", PtyError::ResizeFailed))?;
                     pending = Some((id, PendingOperation::Resize));
                     deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 }
                 frame = self.channel.next() => {
-                    let frame = frame.map_err(|_| PtyError::WaitFailed)?;
-                    if frame["ok"] != true { return Err(PtyError::WaitFailed); }
+                    let frame = frame.map_err(|_| ended("channel_failed", PtyError::WaitFailed))?;
+                    if frame["ok"] != true { return Err(ended("request_failed", PtyError::WaitFailed)); }
                     let result = &frame["result"];
                     if frame["id"] == self.subscription {
                         match result["type"].as_str() {
                             Some("data") => {
-                                let chunk = result["chunk"].as_str().ok_or(PtyError::WaitFailed)?;
-                                Self::forward(chunk, &tx, &peak).await?;
+                                let chunk = result["chunk"].as_str().ok_or_else(|| ended("malformed_data", PtyError::WaitFailed))?;
+                                Self::forward(chunk, &tx, &peak).await.map_err(|e| ended("output_closed", e))?;
                             }
                             Some("end") => return Ok(PtyExit::Closed),
                             Some("fit-override-changed") => {}
-                            _ => return Err(PtyError::WaitFailed),
+                            _ => return Err(ended("unknown_event", PtyError::WaitFailed)),
                         }
                     } else {
-                        let (id, operation) = pending.take().ok_or(PtyError::WaitFailed)?;
-                        if frame["id"] != id { return Err(PtyError::WaitFailed); }
+                        let (id, operation) = pending.take().ok_or_else(|| ended("unsolicited_answer", PtyError::WaitFailed))?;
+                        if frame["id"] != id { return Err(ended("unexpected_answer", PtyError::WaitFailed)); }
                         match operation {
-                            PendingOperation::Write if result["send"]["accepted"] != true => return Err(PtyError::InputClosed),
-                            PendingOperation::Resize if result["updated"] != true => return Err(PtyError::ResizeFailed),
+                            PendingOperation::Write if result["send"]["accepted"] != true => return Err(ended("write_refused", PtyError::InputClosed)),
+                            PendingOperation::Resize if result["updated"] != true => return Err(ended("resize_refused", PtyError::ResizeFailed)),
                             _ => {}
                         }
                     }
@@ -308,6 +310,13 @@ impl Viewer {
         }
     }
 }
+/// Names the exit site, so a viewer that ends in the field explains itself in the daemon log.
+/// The site is a fixed label and the error a variant name; no terminal content is logged.
+fn ended(site: &'static str, error: PtyError) -> PtyError {
+    tracing::info!(site, error = ?error, "Orca viewer ended");
+    error
+}
+
 impl OrcaSession {
     pub(crate) async fn attach(
         profile: PathBuf,
