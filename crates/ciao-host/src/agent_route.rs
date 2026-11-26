@@ -218,7 +218,7 @@ impl TerminalRouteResolver {
     /// provider call an hour in the worst case and not worth a cache that could go stale.
     pub(crate) async fn tab_label(&self, proof: &AgentRouteProof) -> Option<String> {
         match proof {
-            AgentRouteProof::Orca(p) => p.label(&self.workspace.orca_profile).await,
+            AgentRouteProof::Orca(p) => p.label(&self.workspace.orca).await,
             AgentRouteProof::HerdrCore {
                 session_name,
                 tab_id,
@@ -295,7 +295,7 @@ impl TerminalRouteResolver {
             // a proven route from another backend inside the shared deadline.
             let orca = async {
                 crate::orca::route::Proof::find(
-                    &self.workspace.orca_profile,
+                    &self.workspace.orca,
                     self.orca_pairing.as_deref()?,
                     bridge_pid,
                 )
@@ -333,7 +333,7 @@ impl TerminalRouteResolver {
         timeout(ROUTE_RESOLUTION_TIMEOUT, async {
             match proof {
                 AgentRouteProof::Orca(p) => match self.orca_pairing.as_deref() {
-                    Some(pairing) => p.check(&self.workspace.orca_profile, pairing).await,
+                    Some(pairing) => p.check(&self.workspace.orca, pairing).await,
                     None => RouteCheck::Disproved,
                 },
                 AgentRouteProof::HerdrCore {

@@ -2453,7 +2453,7 @@ async fn ready_phase_rpc(
                         if v4 {
                             Some(
                                 crate::orca::snapshot(
-                                    &state.workspace.orca_profile,
+                                    &state.workspace.orca,
                                     request.params.tabs,
                                     include_folders,
                                     Some(&state.paths.orca_pairing_file()),
@@ -2524,8 +2524,7 @@ async fn ready_phase_rpc(
                 .await;
                 return Ok(());
             };
-            let outcome =
-                crate::orca::manage::execute(&state.workspace.orca_profile, &request).await;
+            let outcome = crate::orca::manage::execute(&state.workspace.orca, &request).await;
             drop(guard);
             match outcome {
                 Ok(result) => {
@@ -4844,19 +4843,14 @@ fn spawn_terminal_child(
                 ))
             }
             crate::agent_route::AgentTerminalPlan::Orca(proof) => {
-                let profile = state.workspace.orca_profile.clone();
+                let orca = state.workspace.orca.clone();
                 let credentials = state.paths.orca_pairing_file();
                 let proof = proof.clone();
                 let size = open.dimensions;
                 tokio::spawn(async move {
-                    crate::orca::session::OrcaSession::attach_agent(
-                        profile,
-                        credentials,
-                        &proof,
-                        size,
-                    )
-                    .await
-                    .map(crate::terminal_session::TerminalSession::Orca)
+                    crate::orca::session::OrcaSession::attach_agent(orca, credentials, &proof, size)
+                        .await
+                        .map(crate::terminal_session::TerminalSession::Orca)
                 })
             }
             crate::agent_route::AgentTerminalPlan::Core { session, tab } => {
@@ -4878,12 +4872,12 @@ fn spawn_terminal_child(
     if target == crate::host_protocol::TerminalTarget::OrcaAttach {
         let workspace = open.session.clone().ok_or_else(invalid_target_error)?;
         let pane = open.tab.clone().ok_or_else(invalid_target_error)?;
-        let profile = state.workspace.orca_profile.clone();
+        let orca = state.workspace.orca.clone();
         let credentials = state.paths.orca_pairing_file();
         let dimensions = open.dimensions;
         return Ok(tokio::spawn(async move {
             crate::orca::session::OrcaSession::attach(
-                profile,
+                orca,
                 credentials,
                 workspace,
                 pane,

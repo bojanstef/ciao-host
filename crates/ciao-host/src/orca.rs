@@ -28,21 +28,72 @@ const MAX_ROWS: usize = 128;
 const METADATA_LIMIT: u64 = 16 * 1024;
 const RESPONSE_LIMIT: u64 = 4 * 1024 * 1024;
 
-pub(crate) fn profile(home: &Path) -> PathBuf {
-    if let Some(profile) = std::env::var_os("ORCA_USER_DATA_PATH")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-    {
-        return profile;
+/// Ordered, reviewed candidate directories for local Orca runtimes.
+///
+/// An explicit absolute `ORCA_USER_DATA_PATH` (or `ORCA_USER_DATA`, used by headless `orcad`)
+/// pins discovery to that single directory for strict test and operator isolation. Otherwise,
+/// discovery checks both the platform desktop user-data directory and headless `orcad`'s
+/// `~/.orca` directory dynamically on each call, skipping missing or stale profiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrcaConfig {
+    profiles: Vec<PathBuf>,
+}
+
+impl OrcaConfig {
+    pub(crate) fn for_home(home: &Path) -> Self {
+        Self::resolve_profiles(
+            home,
+            std::env::var_os("ORCA_USER_DATA_PATH").map(PathBuf::from),
+            std::env::var_os("ORCA_USER_DATA").map(PathBuf::from),
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        )
     }
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/orca")
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".config"))
-            .join("orca")
+
+    #[cfg(test)]
+    pub(crate) fn at(profile: PathBuf) -> Self {
+        Self {
+            profiles: vec![profile],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_profiles(profiles: Vec<PathBuf>) -> Self {
+        Self { profiles }
+    }
+
+    fn resolve_profiles(
+        home: &Path,
+        user_data_path: Option<PathBuf>,
+        user_data: Option<PathBuf>,
+        xdg_config_home: Option<PathBuf>,
+    ) -> Self {
+        if let Some(explicit) = user_data_path
+            .filter(|p| p.is_absolute())
+            .or_else(|| user_data.filter(|p| p.is_absolute()))
+        {
+            return Self {
+                profiles: vec![explicit],
+            };
+        }
+        let mut profiles = Vec::with_capacity(2);
+        let desktop = if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/orca")
+        } else {
+            xdg_config_home
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| home.join(".config"))
+                .join("orca")
+        };
+        profiles.push(desktop);
+        let headless = home.join(".orca");
+        if !profiles.contains(&headless) {
+            profiles.push(headless);
+        }
+        Self { profiles }
+    }
+
+    fn profiles(&self) -> &[PathBuf] {
+        &self.profiles
     }
 }
 
@@ -187,12 +238,13 @@ struct Transport {
 }
 
 struct Runtime {
+    profile: PathBuf,
     metadata: Metadata,
     endpoint: PathBuf,
 }
 
 impl Runtime {
-    async fn discover(profile: &Path) -> Option<Self> {
+    async fn discover_in(profile: &Path) -> Option<Self> {
         let uid = Uid::effective().as_raw();
         let dir = fs::symlink_metadata(profile).await.ok()?;
         if !dir.is_dir() || dir.uid() != uid || dir.mode() & 0o022 != 0 {
@@ -239,7 +291,40 @@ impl Runtime {
         {
             return None;
         }
-        Some(Self { metadata, endpoint })
+        Some(Self {
+            profile: profile.to_path_buf(),
+            metadata,
+            endpoint,
+        })
+    }
+
+    async fn candidates(config: &OrcaConfig) -> Vec<Self> {
+        let mut found = Vec::with_capacity(config.profiles().len());
+        let mut seen = BTreeSet::new();
+        for profile in config.profiles() {
+            if let Some(rt) = Self::discover_in(profile).await
+                && seen.insert(rt.metadata.runtime_id.clone())
+            {
+                found.push(rt);
+            }
+        }
+        found
+    }
+
+    async fn discover_id(config: &OrcaConfig, runtime_id: &str) -> Option<Self> {
+        for profile in config.profiles() {
+            if let Some(rt) = Self::discover_in(profile).await
+                && rt.metadata.runtime_id == runtime_id
+            {
+                return Some(rt);
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    async fn discover(config: &OrcaConfig) -> Option<Self> {
+        Self::candidates(config).await.into_iter().next()
     }
 
     async fn query(&self, method: &str, params: Value) -> Option<Value> {
@@ -320,49 +405,75 @@ async fn paired(runtime: &Runtime, path: Option<&Path>) -> Option<()> {
 }
 
 pub(crate) async fn snapshot(
-    profile: &Path,
+    config: &OrcaConfig,
     tabs: bool,
     include_folders: bool,
     credentials: Option<&Path>,
 ) -> OrcaSnapshot {
     timeout(Duration::from_secs(3), async {
-        let rt = Runtime::discover(profile).await?;
-        let terminals = async {
-            if !tabs {
-                return Some(json!({"terminals":[]}));
+        let mut fallback = None;
+        for rt in Runtime::candidates(config).await {
+            let Some(snap) = snapshot_runtime(&rt, tabs, include_folders, credentials).await else {
+                continue;
+            };
+            if matches!(
+                snap,
+                OrcaSnapshot::Available {
+                    can_attach: true,
+                    ..
+                }
+            ) {
+                return Some(snap);
             }
-            rt.query(
-                "terminal.list",
-                json!({
-                    "limit": MAX_ROWS, "includePreview": false,
-                    "includeVisualLayouts": false, "requireFreshPtyLiveness": true
-                }),
-            )
-            .await
-        };
-        let (status, pairing, repos, worktrees, terminals) = tokio::join!(
-            rt.query("status.get", json!({})),
-            paired(&rt, credentials),
-            rt.query("repo.list", json!({})),
-            rt.query("worktree.list", json!({"limit": MAX_ROWS})),
-            terminals
-        );
-        let mut result = catalog(&repos?, &worktrees?, &terminals?, include_folders)?;
-        if let OrcaSnapshot::Available {
-            can_attach,
-            can_remove_worktrees,
-            ..
-        } = &mut result
-        {
-            *can_attach = pairing.is_some();
-            *can_remove_worktrees = status.as_ref().is_some_and(manage::can_retain);
+            if fallback.is_none() {
+                fallback = Some(snap);
+            }
         }
-        Some(result)
+        fallback
     })
     .await
     .ok()
     .flatten()
     .unwrap_or(OrcaSnapshot::Unavailable)
+}
+
+async fn snapshot_runtime(
+    rt: &Runtime,
+    tabs: bool,
+    include_folders: bool,
+    credentials: Option<&Path>,
+) -> Option<OrcaSnapshot> {
+    let terminals = async {
+        if !tabs {
+            return Some(json!({"terminals":[]}));
+        }
+        rt.query(
+            "terminal.list",
+            json!({
+                "limit": MAX_ROWS, "includePreview": false,
+                "includeVisualLayouts": false, "requireFreshPtyLiveness": true
+            }),
+        )
+        .await
+    };
+    let (status, pairing, repos, worktrees, terminals) = tokio::join!(
+        rt.query("status.get", json!({})),
+        paired(rt, credentials),
+        rt.query("repo.list", json!({})),
+        rt.query("worktree.list", json!({"limit": MAX_ROWS})),
+        terminals
+    );
+    let mut result = catalog(&repos?, &worktrees?, &terminals?, include_folders)?;
+    if let OrcaSnapshot::Available {
+        can_attach,
+        can_remove_worktrees,
+        ..
+    } = &mut result
+    {
+        *can_attach = pairing.is_some();
+        *can_remove_worktrees = status.as_ref().is_some_and(manage::can_retain);
+    }
+    Some(result)
 }
 
 fn name(row: &Value, key: &str, default: &str) -> String {
@@ -663,6 +774,154 @@ mod tests {
         assert_eq!(snap["repositories"][0]["worktrees"], json!([]));
     }
 
+    #[test]
+    fn config_resolves_overrides_and_headless_fallback() {
+        let home = Path::new("/home/tester");
+        let explicit_path = PathBuf::from("/custom/orca-path");
+        let explicit_data = PathBuf::from("/custom/orca-data");
+
+        assert_eq!(
+            OrcaConfig::resolve_profiles(
+                home,
+                Some(explicit_path.clone()),
+                Some(explicit_data.clone()),
+                None
+            )
+            .profiles(),
+            &[explicit_path]
+        );
+        assert_eq!(
+            OrcaConfig::resolve_profiles(home, None, Some(explicit_data.clone()), None).profiles(),
+            &[explicit_data]
+        );
+        // Relative env overrides fail closed to the reviewed defaults.
+        let defaults = OrcaConfig::resolve_profiles(
+            home,
+            Some(PathBuf::from("relative/path")),
+            Some(PathBuf::from("relative/data")),
+            Some(PathBuf::from("/xdg/config")),
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                defaults.profiles(),
+                &[
+                    home.join("Library/Application Support/orca"),
+                    home.join(".orca")
+                ]
+            );
+        } else {
+            assert_eq!(
+                defaults.profiles(),
+                &[PathBuf::from("/xdg/config/orca"), home.join(".orca")]
+            );
+        }
+        // When XDG_CONFIG_HOME/orca coincides with ~/.orca, keep one entry.
+        if !cfg!(target_os = "macos") {
+            let dedup =
+                OrcaConfig::resolve_profiles(home, None, None, Some(PathBuf::from("/home/tester")));
+            assert_eq!(dedup.profiles(), &[home.join("orca"), home.join(".orca")]);
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_skips_dead_primary_profile_and_discovers_headless_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let desktop = dir.path().join("desktop");
+        let headless = dir.path().join("headless");
+        for p in [&desktop, &headless] {
+            std::fs::create_dir(p).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // Stale desktop profile: valid metadata and socket file on disk, but nobody listening.
+        let dead_sock = desktop.join("o-dead.sock");
+        {
+            let _dead_listener = UnixListener::bind(&dead_sock).unwrap();
+            // Dropping the listener leaves the socket file behind with ECONNREFUSED.
+        }
+        let write_meta = |profile: &Path, runtime_id: &str, sock: &Path| {
+            let meta = json!({
+                "runtimeId": runtime_id,
+                "authToken": "tok-test",
+                "transports": [{"kind": "unix", "endpoint": sock}]
+            });
+            let path = profile.join("orca-runtime.json");
+            std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write_meta(&desktop, "11111111-1111-4111-8111-111111111111", &dead_sock);
+
+        let live_sock = headless.join("o-live.sock");
+        let listener = UnixListener::bind(&live_sock).unwrap();
+        let runtime_id = "22222222-2222-4222-8222-222222222222";
+        write_meta(&headless, runtime_id, &live_sock);
+
+        let repo_id = "00000000-0000-4000-8000-000000000001";
+        let instance_id = "00000000-0000-4000-8000-000000000002";
+        let tab_id = "00000000-0000-4000-8000-000000000003";
+        let leaf_id = "00000000-0000-4000-8000-000000000004";
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    let result = match req["method"].as_str().unwrap_or_default() {
+                        "status.get" => json!({"capabilities": []}),
+                        "repo.list" => json!({"repos": [{
+                            "id": repo_id, "kind": "folder", "displayName": "remote://~"
+                        }]}),
+                        "worktree.list" => json!({"worktrees": [{
+                            "id": "folder:home", "repoId": repo_id, "hostId": "local",
+                            "instanceId": instance_id, "displayName": "tester",
+                            "isMainWorktree": true
+                        }]}),
+                        "terminal.list" => json!({"terminals": [{
+                            "worktreeId": "folder:home", "tabId": tab_id, "leafId": leaf_id,
+                            "executionHostId": "local", "connected": true, "orphaned": false,
+                            "title": "Claude", "paneTitle": "Pane 1"
+                        }]}),
+                        _ => json!({}),
+                    };
+                    let reply = json!({
+                        "id": req["id"],
+                        "ok": true,
+                        "result": result,
+                        "_meta": {"runtimeId": runtime_id}
+                    });
+                    let mut bytes = serde_json::to_vec(&reply).unwrap();
+                    bytes.push(b'\n');
+                    let _ = write_half.write_all(&bytes).await;
+                });
+            }
+        });
+
+        let config = OrcaConfig::from_profiles(vec![desktop, headless.clone()]);
+        let snap = snapshot(&config, true, true, None).await;
+        server.abort();
+        let OrcaSnapshot::Available { repositories, .. } = snap else {
+            panic!("expected headless fallback runtime to produce an available snapshot");
+        };
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].id, repo_id);
+        assert_eq!(repositories[0].worktrees[0].id, instance_id);
+        assert_eq!(
+            repositories[0].worktrees[0].tabs[0].panes[0].key,
+            format!("{tab_id}:{leaf_id}")
+        );
+        let matched = Runtime::discover_id(&config, runtime_id).await.unwrap();
+        assert_eq!(matched.profile, headless);
+    }
+
     /// Run only against a disposable profile containing at least one connected test terminal.
     #[tokio::test]
     #[ignore = "requires a running disposable Orca runtime"]
@@ -670,7 +929,9 @@ mod tests {
         let dir = PathBuf::from(
             std::env::var_os("CIAO_TEST_ORCA_PROFILE").expect("disposable Orca profile"),
         );
-        let OrcaSnapshot::Available { repositories, .. } = snapshot(&dir, true, true, None).await
+        let config = OrcaConfig::at(dir);
+        let OrcaSnapshot::Available { repositories, .. } =
+            snapshot(&config, true, true, None).await
         else {
             panic!("catalog unavailable")
         };
@@ -681,7 +942,7 @@ mod tests {
             .flat_map(|t| &t.panes)
             .next()
             .expect("disposable profile lacks a connected local pane");
-        let rt = Runtime::discover(&dir).await.unwrap();
+        let rt = Runtime::discover(&config).await.unwrap();
         let terms = rt
             .query("terminal.list", json!({"includePreview":false}))
             .await

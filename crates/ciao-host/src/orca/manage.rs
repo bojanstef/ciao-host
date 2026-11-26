@@ -1,6 +1,6 @@
 //! Fixed, local workspace operations. Resolve provider-owned identities immediately before dispatch.
 use super::{
-    Runtime,
+    OrcaConfig, Runtime,
     session::{resolve, valid_pane},
     uuid,
 };
@@ -9,7 +9,7 @@ use crate::host_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 use tokio::time::timeout;
 
 pub const METHOD: &str = "orca.manage.v1";
@@ -241,16 +241,36 @@ async fn prepare(rt: &Runtime, request: &Request) -> Result<Prepared, Failure> {
     })
 }
 
-pub(crate) async fn execute(profile: &Path, request: &Request) -> Result<Value, Failure> {
+pub(crate) async fn execute(config: &OrcaConfig, request: &Request) -> Result<Value, Failure> {
     use Failure::*;
-    let rt = timeout(Duration::from_secs(3), Runtime::discover(profile))
+    let candidates = timeout(Duration::from_secs(3), Runtime::candidates(config))
         .await
         .ok()
-        .flatten()
-        .ok_or(Unavailable)?;
-    let p = timeout(Duration::from_secs(5), prepare(&rt, request))
-        .await
-        .map_err(|_| Unavailable)??;
+        .unwrap_or_default();
+    if candidates.is_empty() {
+        return Err(Unavailable);
+    }
+    let mut selected = None;
+    let mut last_error = Unavailable;
+    for rt in candidates {
+        match timeout(Duration::from_secs(5), prepare(&rt, request)).await {
+            Ok(Ok(prepared)) => {
+                selected = Some((rt, prepared));
+                break;
+            }
+            Ok(Err(err)) => {
+                // Keep a specific refusal (Stale/Refused/Retain) over Unavailable if a second
+                // candidate also misses.
+                if matches!(last_error, Unavailable) || !matches!(err, Unavailable) {
+                    last_error = err;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let Some((rt, p)) = selected else {
+        return Err(last_error);
+    };
     let removing = p.method == "worktree.rm";
     let budget = Duration::from_secs(if removing { 300 } else { 60 });
     let reply = timeout(budget, rt.exchange(p.method, p.params, Some(p.source)))
@@ -334,11 +354,11 @@ mod tests {
     use super::*;
     use crate::host_protocol::Dimensions;
     use crate::orca::session::OrcaSession;
-    use std::{env, path::PathBuf, process::Command};
+    use std::{env, path::Path, path::PathBuf, process::Command};
 
-    async fn apply(profile: &Path, params: Action) -> Result<Value, Failure> {
+    async fn apply(config: &OrcaConfig, params: Action) -> Result<Value, Failure> {
         execute(
-            profile,
+            config,
             &Request {
                 v: 1,
                 kind: "request".into(),
@@ -353,12 +373,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "creates and removes a checkout in an explicitly selected disposable Orca Git repository"]
     async fn live_worktree_lifecycle() {
-        let profile = PathBuf::from(env::var_os("CIAO_TEST_ORCA_PROFILE").unwrap());
+        let config = OrcaConfig::at(PathBuf::from(
+            env::var_os("CIAO_TEST_ORCA_PROFILE").unwrap(),
+        ));
         let checkout = PathBuf::from(env::var_os("CIAO_TEST_ORCA_REPO").unwrap())
             .canonicalize()
             .unwrap();
         let credentials = PathBuf::from(env::var_os("CIAO_TEST_ORCA_PAIRING").unwrap());
-        let rt = Runtime::discover(&profile).await.unwrap();
+        let rt = Runtime::discover(&config).await.unwrap();
         let rows = rt.query("repo.list", json!({})).await.unwrap();
         let repo = rows["repos"]
             .as_array()
@@ -377,7 +399,7 @@ mod tests {
             .to_owned();
         let name = format!("ciao-qa-{:08x}", rand::random::<u32>());
         apply(
-            &profile,
+            &config,
             Action::CreateWorktree {
                 repo: repo.clone(),
                 name: name.clone(),
@@ -399,10 +421,10 @@ mod tests {
             repo: repo.clone(),
             workspace: workspace.clone(),
         };
-        let first = apply(&profile, create.clone())
+        let first = apply(&config, create.clone())
             .await
             .expect("create first tab");
-        let second = apply(&profile, create).await.expect("create sibling");
+        let second = apply(&config, create).await.expect("create sibling");
         let pane = first["pane"].as_str().unwrap().to_owned();
         let sibling = second["pane"].as_str().unwrap().to_owned();
         assert_ne!(sibling, pane);
@@ -414,7 +436,7 @@ mod tests {
             pixel_height: 0,
         };
         let mut viewer = OrcaSession::attach(
-            profile.clone(),
+            config.clone(),
             credentials,
             workspace.clone(),
             pane.clone(),
@@ -440,7 +462,7 @@ mod tests {
         .expect("shell executed input");
         viewer.cleanup().await.unwrap();
         apply(
-            &profile,
+            &config,
             Action::RenameTab {
                 repo: repo.clone(),
                 workspace: workspace.clone(),
@@ -451,7 +473,7 @@ mod tests {
         .await
         .expect("rename");
         apply(
-            &profile,
+            &config,
             Action::CloseTab {
                 repo: repo.clone(),
                 workspace: workspace.clone(),
@@ -472,7 +494,7 @@ mod tests {
             resolve(&rt, &workspace, &sibling).await.unwrap()["ptyId"]
         );
         apply(
-            &profile,
+            &config,
             Action::CloseTab {
                 repo: repo.clone(),
                 workspace: workspace.clone(),
@@ -485,14 +507,12 @@ mod tests {
         std::fs::File::create_new(&dirty).unwrap();
         let remove = Action::RemoveWorktree { repo, workspace };
         assert!(matches!(
-            apply(&profile, remove.clone()).await,
+            apply(&config, remove.clone()).await,
             Err(Failure::Dirty)
         ));
         assert!(dirty.is_file());
         std::fs::remove_file(dirty).unwrap();
-        apply(&profile, remove)
-            .await
-            .expect("remove clean checkout");
+        apply(&config, remove).await.expect("remove clean checkout");
         assert!(!path.exists());
         assert!(
             Command::new("git")

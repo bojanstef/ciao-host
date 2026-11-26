@@ -1,6 +1,6 @@
 //! One viewer per Ciao terminal. Dropping the WebSocket releases Orca's viewer only.
 use super::{
-    Runtime,
+    OrcaConfig, Runtime,
     channel::{Channel, ChannelError, Pairing},
     uuid,
 };
@@ -99,16 +99,29 @@ pub(crate) async fn pair(paths: &CiaoPaths) -> anyhow::Result<()> {
 
 pub(super) async fn pair_link(paths: &CiaoPaths, link: &str) -> anyhow::Result<()> {
     let pair = Pairing::decode(link)?;
-    let rt = Runtime::discover(&super::profile(&paths.home))
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Orca is unavailable on this host"))?;
+    let candidates = Runtime::candidates(&OrcaConfig::for_home(&paths.home)).await;
+    if candidates.is_empty() {
+        anyhow::bail!("Orca is unavailable on this host");
+    }
     crate::storage::ensure_private_directory(&paths.state_dir)?;
-    let pair = timeout(Duration::from_secs(10), pair.redeem(&rt)).await??;
-    // The offer is retired by the first sign-in with the new token. Persist it first.
-    crate::storage::atomic_write_private(&paths.orca_pairing_file(), &serde_json::to_vec(&pair)?)?;
-    timeout(Duration::from_secs(6), Channel::connect(&rt, pair)).await??;
-    println!("Paired this Ciao host with the local Orca runtime.");
-    Ok(())
+    let mut last_error = None;
+    for rt in candidates {
+        match timeout(Duration::from_secs(10), pair.clone().redeem(&rt)).await {
+            Ok(Ok(redeemed)) => {
+                // The offer is retired by the first sign-in with the new token. Persist it first.
+                crate::storage::atomic_write_private(
+                    &paths.orca_pairing_file(),
+                    &serde_json::to_vec(&redeemed)?,
+                )?;
+                timeout(Duration::from_secs(6), Channel::connect(&rt, redeemed)).await??;
+                println!("Paired this Ciao host with the local Orca runtime.");
+                return Ok(());
+            }
+            Ok(Err(err)) => last_error = Some(anyhow::Error::from(err)),
+            Err(err) => last_error = Some(anyhow::Error::from(err)),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Orca is unavailable on this host")))
 }
 
 #[derive(Default)]
@@ -234,23 +247,44 @@ struct Viewer<C = Channel> {
 }
 impl Viewer {
     async fn open(
-        profile: &Path,
+        config: &OrcaConfig,
         credentials: &Path,
         workspace: &str,
         pane: &str,
         size: Dimensions,
         proof: Option<&super::route::Proof>,
     ) -> Option<(Self, String)> {
-        let rt = Runtime::discover(profile).await?;
-        let t = resolve(&rt, workspace, pane).await?;
-        if proof.is_some_and(|p| !p.matches(&rt, &t)) {
+        let bytes = crate::orca::read_private_file(credentials).await?;
+        let pairing: Pairing = serde_json::from_slice(&bytes).ok()?;
+        let runtimes = match proof {
+            Some(proof) => Runtime::discover_id(config, proof.runtime())
+                .await
+                .into_iter()
+                .collect(),
+            None => Runtime::candidates(config).await,
+        };
+        for rt in runtimes {
+            if let Some(opened) = Self::open_in(&rt, &pairing, workspace, pane, size, proof).await {
+                return Some(opened);
+            }
+        }
+        None
+    }
+
+    async fn open_in(
+        rt: &Runtime,
+        pairing: &Pairing,
+        workspace: &str,
+        pane: &str,
+        size: Dimensions,
+        proof: Option<&super::route::Proof>,
+    ) -> Option<(Self, String)> {
+        let t = resolve(rt, workspace, pane).await?;
+        if proof.is_some_and(|p| !p.matches(rt, &t)) {
             return None;
         }
-        let bytes = crate::orca::read_private_file(credentials).await?;
-        let mut channel = Channel::connect(&rt, serde_json::from_slice(&bytes).ok()?)
-            .await
-            .ok()?;
-        let current = resolve(&rt, workspace, pane).await?;
+        let mut channel = Channel::connect(rt, pairing.clone()).await.ok()?;
+        let current = resolve(rt, workspace, pane).await?;
         if current["handle"] != t["handle"]
             || current["ptyId"] != t["ptyId"]
             || current["incarnationId"] != t["incarnationId"]
@@ -435,23 +469,23 @@ async fn drive<C: ViewerChannel>(
 
 impl OrcaSession {
     pub(crate) async fn attach(
-        profile: PathBuf,
+        config: OrcaConfig,
         credentials: PathBuf,
         workspace: String,
         pane: String,
         size: Dimensions,
     ) -> Result<Self, PtyError> {
-        Self::open(&profile, &credentials, &workspace, &pane, size, None).await
+        Self::open(&config, &credentials, &workspace, &pane, size, None).await
     }
 
     pub(crate) async fn attach_agent(
-        profile: PathBuf,
+        config: OrcaConfig,
         credentials: PathBuf,
         proof: &super::route::Proof,
         size: Dimensions,
     ) -> Result<Self, PtyError> {
         Self::open(
-            &profile,
+            &config,
             &credentials,
             &proof.workspace,
             &proof.pane,
@@ -462,7 +496,7 @@ impl OrcaSession {
     }
 
     async fn open(
-        profile: &Path,
+        config: &OrcaConfig,
         credentials: &Path,
         workspace: &str,
         pane: &str,
@@ -471,7 +505,7 @@ impl OrcaSession {
     ) -> Result<Self, PtyError> {
         let (viewer, initial) = timeout(
             Duration::from_secs(6),
-            Viewer::open(profile, credentials, workspace, pane, size, proof),
+            Viewer::open(config, credentials, workspace, pane, size, proof),
         )
         .await
         .ok()
@@ -678,7 +712,7 @@ mod tests {
     }
     async fn open(size: Dimensions) -> OrcaSession {
         OrcaSession::attach(
-            setting("CIAO_TEST_ORCA_PROFILE").into(),
+            OrcaConfig::at(setting("CIAO_TEST_ORCA_PROFILE").into()),
             setting("CIAO_TEST_ORCA_PAIRING").into(),
             setting("CIAO_TEST_ORCA_WORKSPACE"),
             setting("CIAO_TEST_ORCA_PANE"),

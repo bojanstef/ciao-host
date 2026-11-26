@@ -1,7 +1,9 @@
 //! Bind a Ciao agent process to its actual Orca PTY. The runtime identifies panes and
 //! incarnations. Orca's local PTY daemon supplies their shell PIDs. All viewer traffic
 //! still uses the separately paired runtime connection.
-use super::{MAX_ROWS, RESPONSE_LIMIT, Runtime, project_folder, session, workspace_instance};
+use super::{
+    MAX_ROWS, OrcaConfig, RESPONSE_LIMIT, Runtime, project_folder, session, workspace_instance,
+};
 use crate::{agent_route::RouteCheck, process};
 use nix::unistd::Uid;
 use serde::Deserialize;
@@ -32,14 +34,22 @@ pub(crate) struct Proof {
 }
 
 impl Proof {
-    pub(crate) async fn find(profile: &Path, pairing: &Path, pid: u32) -> Option<Self> {
+    pub(crate) async fn find(config: &OrcaConfig, pairing: &Path, pid: u32) -> Option<Self> {
         if !fs::try_exists(pairing).await.ok()? {
             return None;
         }
-        let rt = Runtime::discover(profile).await?;
-        super::paired(&rt, Some(pairing)).await?;
         let generation = process::terminal_identity(pid).await?;
-        let sessions = inventory(profile).await?;
+        for rt in Runtime::candidates(config).await {
+            if let Some(proof) = Self::find_in(&rt, pairing, pid, &generation).await {
+                return Some(proof);
+            }
+        }
+        None
+    }
+
+    async fn find_in(rt: &Runtime, pairing: &Path, pid: u32, generation: &str) -> Option<Self> {
+        super::paired(rt, Some(pairing)).await?;
+        let sessions = inventory(&rt.profile).await?;
         let owner = owner(&sessions, pid).await?;
         let (listed, projects) = tokio::join!(
             rt.query("worktree.list", json!({"limit": MAX_ROWS})),
@@ -76,12 +86,12 @@ impl Proof {
             pty: owner.id.clone(),
             incarnation: owner.incarnation.clone()?,
             process: pid,
-            process_generation: generation,
+            process_generation: generation.to_owned(),
             shell: owner.pid?,
             shell_generation: process::terminal_identity(owner.pid?).await?,
         };
-        let verified = session::resolve(&rt, &proof.workspace, &proof.pane).await?;
-        (proof.matches(&rt, &verified)
+        let verified = session::resolve(rt, &proof.workspace, &proof.pane).await?;
+        (proof.matches(rt, &verified)
             && process::terminal_identity(pid).await.as_ref() == Some(&proof.process_generation))
         .then_some(proof)
     }
@@ -94,13 +104,17 @@ impl Proof {
         self.process
     }
 
-    pub(crate) async fn check(&self, profile: &Path, pairing: &Path) -> RouteCheck {
+    pub(super) fn runtime(&self) -> &str {
+        &self.runtime
+    }
+
+    pub(crate) async fn check(&self, config: &OrcaConfig, pairing: &Path) -> RouteCheck {
         match fs::try_exists(pairing).await {
             Ok(true) => {}
             Ok(false) => return RouteCheck::Disproved,
             Err(_) => return RouteCheck::Unanswered,
         }
-        match Self::find(profile, pairing, self.process).await {
+        match Self::find(config, pairing, self.process).await {
             Some(fresh) if fresh == *self => RouteCheck::Current,
             Some(_) => RouteCheck::Disproved,
             None if !process::exists(self.process) => RouteCheck::Disproved,
@@ -115,9 +129,9 @@ impl Proof {
             && terminal["incarnationId"] == self.incarnation
     }
 
-    pub(crate) async fn label(&self, profile: &Path) -> Option<String> {
+    pub(crate) async fn label(&self, config: &OrcaConfig) -> Option<String> {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let rt = Runtime::discover(profile).await?;
+            let rt = Runtime::discover_id(config, &self.runtime).await?;
             let terminal = session::resolve(&rt, &self.workspace, &self.pane).await?;
             if !self.matches(&rt, &terminal) {
                 return None;
@@ -297,7 +311,7 @@ mod tests {
         std::fs::write(&pairing, "{}").unwrap();
         std::fs::set_permissions(&pairing, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut workspace = WorkspaceConfig::with_binary_dirs(vec![]);
-        workspace.orca_profile = profile;
+        workspace.orca = OrcaConfig::at(profile);
         let resolver = TerminalRouteResolver::new(workspace).with_orca_pairing(pairing.clone());
         let live = AgentRouteProof::Orca(fixture_proof(std::process::id()));
         assert_eq!(resolver.check(&live).await, RouteCheck::Unanswered);
@@ -329,7 +343,7 @@ mod tests {
             session::pair_link(&paths, &link).await.unwrap();
         }
         let mut workspace = WorkspaceConfig::with_binary_dirs(vec![dir.clone()]);
-        workspace.orca_profile = profile.clone();
+        workspace.orca = OrcaConfig::at(profile.clone());
         let resolver =
             TerminalRouteResolver::new(workspace).with_orca_pairing(paths.orca_pairing_file());
         let pid = |n: &str| {
@@ -367,7 +381,7 @@ mod tests {
         };
         assert!(
             session::OrcaSession::attach_agent(
-                profile.clone(),
+                OrcaConfig::at(profile.clone()),
                 paths.orca_pairing_file(),
                 &stale,
                 size
@@ -382,10 +396,14 @@ mod tests {
         else {
             panic!("exact route was lost")
         };
-        let mut view =
-            session::OrcaSession::attach_agent(profile, paths.orca_pairing_file(), &plan, size)
-                .await
-                .unwrap();
+        let mut view = session::OrcaSession::attach_agent(
+            OrcaConfig::at(profile),
+            paths.orca_pairing_file(),
+            &plan,
+            size,
+        )
+        .await
+        .unwrap();
         let marker = format!(
             "ciao-folder-{}",
             crate::protocol::base64url(&rand::random::<[u8; 12]>())

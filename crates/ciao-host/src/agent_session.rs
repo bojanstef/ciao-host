@@ -3662,6 +3662,19 @@ impl AgentSessionSupervisor {
                 None,
             ),
         };
+        if route_record.is_none()
+            && session.snapshot.terminal_fallback == fallback
+            && session.snapshot.capabilities.terminal_continuity == fallback.continuity
+            && session.snapshot.capabilities.commands == commands
+        {
+            tracing::debug!(
+                session = session_id,
+                pid = process_id,
+                route = route_verdict,
+                "agent route resolve"
+            );
+            return;
+        }
         let base_revision = session.snapshot.revision;
         bump_revision(session);
         session.snapshot.terminal_fallback = fallback.clone();
@@ -6445,6 +6458,33 @@ mod tests {
                 .as_deref(),
             Some("route_invalidated")
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_missing_route_recovery_does_not_emit_noop_deltas() {
+        let tmp = tempdir().unwrap();
+        let s = supervisor(&tmp.path().join("metadata.json"));
+        let registered = s
+            .register_new(observer_registration("no-pane"), None)
+            .unwrap();
+        let mut updates = s.inner.lock().sessions[&registered.session_id]
+            .updates
+            .subscribe();
+        let fence = SessionFence::capture(&s.inner.lock().sessions[&registered.session_id]);
+        // Initial miss transitions from route_resolving -> durable_context_unavailable once.
+        s.commit_route_refresh(&registered.session_id, &fence, None, None);
+        let settled = s.snapshot(&registered.session_id).unwrap();
+        assert_eq!(
+            settled.terminal_fallback.availability_reason.as_deref(),
+            Some("durable_context_unavailable")
+        );
+        assert!(updates.try_recv().is_ok());
+
+        // Subsequent recovery misses must not churn revision or broadcast no-op deltas.
+        s.commit_route_refresh(&registered.session_id, &fence, None, None);
+        let after = s.snapshot(&registered.session_id).unwrap();
+        assert_eq!(after.revision, settled.revision);
+        assert!(updates.try_recv().is_err());
     }
 
     // Registration, hook re-registration and recovery each start a resolution. Under load the

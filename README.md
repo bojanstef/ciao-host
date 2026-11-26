@@ -38,7 +38,7 @@ The host is free software, **MIT OR Apache-2.0**. In the app, pairing, watching,
 
 ## Orca terminals
 
-On a host running Orca, Ciao lists local Git projects and ordinary folder projects under **Hosts → Orca workspaces** and in **New Session**. Expand the workspace and tab to open a split pane. Git projects also offer worktree creation and removal. The app negotiates `workspace.snapshot.v5` for folder support and falls back to v4 for Git projects on older hosts. The host reads Orca’s private runtime metadata from the usual per-user profile or an absolute `ORCA_USER_DATA_PATH` set for the Ciao daemon. Discovery and management use the authenticated local Unix socket.
+On a host running Orca, Ciao lists local Git projects and ordinary folder projects under **Hosts → Orca workspaces** and in **New Session**. Expand the workspace and tab to open a split pane. Git projects also offer worktree creation and removal. The app negotiates `workspace.snapshot.v5` for folder support and falls back to v4 for Git projects on older hosts. The host reads Orca’s private runtime metadata from the standard desktop profile, headless `orcad`’s `~/.orca` directory, or an absolute `ORCA_USER_DATA_PATH` / `ORCA_USER_DATA` override set for the Ciao daemon. Discovery and management use the authenticated local Unix socket.
 
 To enable live terminal viewing, create a dedicated **runtime access link** in Orca for this Ciao host. The Orca CLI generates this kind of link with `orca pair`. Orca controls its own listener settings when it creates a link. On macOS, copy the link and run the following command.
 
