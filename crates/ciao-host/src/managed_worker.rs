@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
 
 use crate::agent_adapter::AttachedAgentAdapter;
+use crate::claude_code_mode::LaunchMode;
 use crate::claude_managed_adapter::{PINNED_CLAUDE_SDK_VERSION, PINNED_MANAGED_CLI_VERSION};
 
 /// Spec 006 §12 worker bounds.
@@ -138,16 +139,12 @@ impl ManagedRuntime {
         {
             return Err(RuntimeIssue::UnsupportedVersion);
         }
-        let platform = current_platform_token().ok_or(RuntimeIssue::Sdk)?;
+        let (platform, cli_path) = native_cli(sdk_prefix).ok_or(RuntimeIssue::Sdk)?;
         let expected = manifest
             .platforms
             .get(platform)
             .map(|entry| entry.checksum.clone())
             .ok_or(RuntimeIssue::Sdk)?;
-        let cli_path = sdk_prefix
-            .join("node_modules")
-            .join(format!("@anthropic-ai/claude-agent-sdk-{platform}"))
-            .join("claude");
         let identity = binary_identity(&cli_path).ok_or(RuntimeIssue::Executable)?;
         let cached = {
             let guard = VERIFIED_BINARIES.lock();
@@ -200,6 +197,16 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// The SDK ships headless Code Mode only in its platform-native CLI package.
+pub(crate) fn native_cli(sdk_prefix: &Path) -> Option<(&'static str, PathBuf)> {
+    let platform = current_platform_token()?;
+    let path = sdk_prefix
+        .join("node_modules")
+        .join(format!("@anthropic-ai/claude-agent-sdk-{platform}"))
+        .join("claude");
+    Some((platform, path))
+}
+
 fn current_platform_token() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Some("darwin-arm64"),
@@ -244,6 +251,7 @@ impl WorkerTable {
         resume_vendor_session: Option<&str>,
         permission_mode: Option<&str>,
         model: Option<&str>,
+        mode: LaunchMode,
     ) -> Result<String> {
         let spawn_token = format!("{:032x}", random::<u128>());
         let mut command = Command::new(&runtime.node_path);
@@ -276,6 +284,10 @@ impl WorkerTable {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        command.env_remove("CIAO_MANAGED_CODE_MODE");
+        if mode == LaunchMode::Enable {
+            command.env("CIAO_MANAGED_CODE_MODE", "1");
+        }
         if let Some(resume) = resume_vendor_session {
             command.env("CIAO_MANAGED_RESUME_SESSION_ID", resume);
         }
@@ -375,6 +387,18 @@ pub(crate) struct WorkerExit {
 }
 
 impl WorkerExit {
+    pub(crate) const CLEAN: Self = Self { code: Some(0) };
+
+    pub(crate) fn stored_reason(self) -> &'static str {
+        match self.cause() {
+            "ended" => "stopped",
+            crate::managed_session::CODE_MODE_TERMINAL_ONLY => {
+                crate::managed_session::CODE_MODE_TERMINAL_ONLY
+            }
+            _ => "worker_crash",
+        }
+    }
+
     pub(crate) fn crashed(self) -> bool {
         self.code != Some(0)
     }
@@ -388,6 +412,7 @@ impl WorkerExit {
             Some(3) => "vendor_ended_unprompted",
             Some(4) => "resume_refused",
             Some(5) => "resume_not_found",
+            Some(6) => crate::managed_session::CODE_MODE_TERMINAL_ONLY,
             Some(_) => "unknown",
             None => "signal",
         }
@@ -625,7 +650,7 @@ mod tests {
     async fn production_launch_preserves_destination_and_resume_overrides() {
         let workspace = tempdir().unwrap();
         let entrypoint = workspace.path().join("capture.sh");
-        std::fs::write(&entrypoint, r#"printf '%s\n' "$CIAO_AGENT_CONFIGURATION" "$PWD" "$PATH" "$CIAO_MANAGED_PERMISSION_MODE" "$CIAO_MANAGED_MODEL" > launch.txt"#).unwrap();
+        std::fs::write(&entrypoint, r#"printf '%s\n' "$CIAO_AGENT_CONFIGURATION" "$PWD" "$PATH" "$CIAO_MANAGED_PERMISSION_MODE" "$CIAO_MANAGED_MODEL" "$CIAO_MANAGED_CODE_MODE" > launch.txt"#).unwrap();
         let runtime = ManagedRuntime {
             sdk_prefix: workspace.path().to_owned(),
             worker_entrypoint: entrypoint,
@@ -646,6 +671,7 @@ mod tests {
                 Some("saved-session"),
                 Some("plan"),
                 Some("saved-model"),
+                LaunchMode::Enable,
             )
             .unwrap();
         let exited = tokio::time::timeout(Duration::from_secs(5), async {
@@ -672,7 +698,8 @@ mod tests {
                 workspace.path().canonicalize().unwrap().to_str().unwrap(),
                 runtime.tool_path.as_str(),
                 "plan",
-                "saved-model"
+                "saved-model",
+                "1"
             ]
         );
     }
@@ -690,6 +717,12 @@ mod tests {
         for exit in exits {
             let code = i32::try_from(exit["code"].as_i64().unwrap()).unwrap();
             let worker_exit = WorkerExit { code: Some(code) };
+            if exit["cause"] == crate::managed_session::CODE_MODE_TERMINAL_ONLY {
+                assert_eq!(
+                    worker_exit.stored_reason(),
+                    crate::managed_session::CODE_MODE_TERMINAL_ONLY
+                );
+            }
             assert_eq!(
                 worker_exit.cause(),
                 exit["cause"].as_str().unwrap(),
@@ -732,6 +765,7 @@ mod tests {
                 None,
                 None,
                 None,
+                LaunchMode::Default,
             )
             .unwrap();
 

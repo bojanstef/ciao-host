@@ -390,8 +390,7 @@ struct LiveSession {
     process_id: u32,
     terminal_binding: Option<crate::codex_terminal_status::TerminalBinding>,
     /// The conversation is in Claude Code's experimental Code Mode, as its transcript last
-    /// said (`note_code_mode`). Only Claude's own terminal resumes one, so the row withholds
-    /// its takeover. A property of the conversation, so a new process for it inherits it.
+    /// said. The directory tests headless capability before offering promotion.
     code_mode: bool,
     /// Required at-use evidence belongs to live authority, never solely to an evictable
     /// recovery candidate. Only an actual hook may replace it with hook authority.
@@ -2253,7 +2252,11 @@ impl AgentSessionSupervisor {
         &self,
         live_vendor_owners: &std::collections::HashMap<String, String>,
     ) -> AgentSessionList {
-        self.list_with_prompt_reader(live_vendor_owners, read_transcript_prompt)
+        self.list_with_prompt_reader(live_vendor_owners, read_transcript_prompt, || {
+            crate::storage::CiaoPaths::discover().map_or(true, |paths| {
+                crate::claude_code_mode::terminal_only(&paths.managed_sdk_prefix)
+            })
+        })
     }
 
     pub(crate) fn list(&self) -> AgentSessionList {
@@ -2264,6 +2267,7 @@ impl AgentSessionSupervisor {
         &self,
         live_vendor_owners: &HashMap<String, String>,
         read_prompt: impl Fn(&str) -> Option<String>,
+        terminal_only: impl FnOnce() -> bool,
     ) -> AgentSessionList {
         // Capture each descriptor and the identity that supplied it together. Transcript I/O
         // enriches only this returned list; a later registration cannot be changed by the read.
@@ -2278,12 +2282,19 @@ impl AgentSessionSupervisor {
                     descriptor.managed_session_id =
                         live_vendor_owners.get(&session.upstream_identity).cloned();
                 }
-                (descriptor, prompt)
+                (descriptor, prompt, session.code_mode)
             })
             .collect();
+        let terminal_only = std::cell::LazyCell::new(terminal_only);
         let descriptors = rows
             .into_iter()
-            .map(|(mut descriptor, prompt)| {
+            .map(|(mut descriptor, prompt, code_mode)| {
+                if code_mode && descriptor.takeover.as_deref() == Some("promote") && *terminal_only
+                {
+                    descriptor.takeover = None;
+                    descriptor.takeover_refusal =
+                        Some(crate::managed_session::CODE_MODE_TERMINAL_ONLY.into());
+                }
                 descriptor.recent_prompt = prompt.resolve(&read_prompt);
                 descriptor
             })
@@ -4559,8 +4570,6 @@ fn descriptor_for(session: &LiveSession) -> (AgentSessionDescriptor, RecentPromp
         .is_none()
         .then(|| takeover_verb(&session.snapshot.topology, &session.snapshot.adapter.family))
         .flatten();
-    // Only a promotion resumes through the managed CLI, which is what refuses Code Mode.
-    let code_mode_refused = session.code_mode && takeover == Some("promote");
     let turn = session.visible_turn();
     let context_preview = directory_preview::for_session(session, &turn);
     let descriptor = AgentSessionDescriptor {
@@ -4581,9 +4590,8 @@ fn descriptor_for(session: &LiveSession) -> (AgentSessionDescriptor, RecentPromp
         recent_prompt: None,
         // Filled in by the caller, which is the only place that can see both directories.
         managed_session_id: None,
-        takeover: takeover.filter(|_| !code_mode_refused).map(str::to_owned),
-        takeover_refusal: code_mode_refused
-            .then(|| crate::managed_session::CODE_MODE_TERMINAL_ONLY.to_owned()),
+        takeover: takeover.map(str::to_owned),
+        takeover_refusal: None,
         drift: session.snapshot.drift.clone(),
         revision: session.snapshot.revision,
         updated_at: session.updated_at,
@@ -5271,20 +5279,24 @@ mod tests {
         registration.adapter_family = "Claude".into();
         let original_turn = registration.turn.clone();
         let registered = supervisor.register_new(registration, None).unwrap();
-        let listed = supervisor.list_with_prompt_reader(&HashMap::new(), |upstream| {
-            assert_eq!(upstream, "fixture-upstream-a");
-            assert!(
-                supervisor.inner.try_lock().is_some(),
-                "transcript I/O blocks other sessions"
-            );
-            supervisor
-                .note_bridge_turn(
-                    &registered.session_id,
-                    TurnState::Completed { run_id: None },
-                )
-                .unwrap();
-            Some("Recovered topic".into())
-        });
+        let listed = supervisor.list_with_prompt_reader(
+            &HashMap::new(),
+            |upstream| {
+                assert_eq!(upstream, "fixture-upstream-a");
+                assert!(
+                    supervisor.inner.try_lock().is_some(),
+                    "transcript I/O blocks other sessions"
+                );
+                supervisor
+                    .note_bridge_turn(
+                        &registered.session_id,
+                        TurnState::Completed { run_id: None },
+                    )
+                    .unwrap();
+                Some("Recovered topic".into())
+            },
+            || false,
+        );
         assert_eq!(listed.sessions.len(), 1);
         assert_eq!(listed.sessions[0].session_id, registered.session_id);
         assert_eq!(listed.sessions[0].turn, original_turn);
@@ -6395,9 +6407,7 @@ mod tests {
         assert_eq!(withdrawn_frames(&mut updates), 1);
     }
 
-    /// A terminal conversation in Claude Code's experimental Code Mode cannot be taken over: the
-    /// managed CLI refuses to resume it. Once its transcript has said so, the row stops offering
-    /// a takeover that would end the terminal for nothing, and says why instead.
+    /// An attached Code Mode row offers takeover only on a capable destination.
     #[test]
     fn a_code_mode_claude_row_withholds_its_takeover_and_says_why() {
         let temp = tempdir().unwrap();
@@ -6405,11 +6415,19 @@ mod tests {
         let mut registration = observer_registration("code-mode-claude");
         registration.adapter_family = "Claude".into();
         let registered = supervisor.register_new(registration.clone(), None).unwrap();
-        let row = || supervisor.list().sessions[0].clone();
+        let row = || {
+            supervisor
+                .list_with_prompt_reader(&HashMap::new(), |_| None, || true)
+                .sessions[0]
+                .clone()
+        };
         assert_eq!(row().takeover.as_deref(), Some("promote"));
         assert_eq!(row().takeover_refusal, None);
 
         supervisor.note_code_mode(&registered.session_id, true);
+        let supported = supervisor.list_with_prompt_reader(&HashMap::new(), |_| None, || false);
+        assert_eq!(supported.sessions[0].takeover.as_deref(), Some("promote"));
+        assert_eq!(supported.sessions[0].takeover_refusal, None);
         assert_eq!(row().takeover, None);
         assert_eq!(
             row().takeover_refusal.as_deref(),

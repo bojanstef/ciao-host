@@ -675,7 +675,7 @@ pub struct AgentSessionDescriptor {
     pub takeover: Option<String>,
     /// Why a row that would otherwise offer a takeover does not: a reason code, the same one the
     /// refused lifecycle request would carry (today only `code_mode_terminal_only`, a Claude
-    /// conversation in Code Mode, which only its own terminal can resume). Never beside a
+    /// Code Mode conversation this host cannot resume headless). Never beside a
     /// `takeover`. Additive like it: absent from older hosts, and an older app simply shows no
     /// offer, which is the truth.
     #[serde(default, skip_serializing_if = "Option::is_none")]

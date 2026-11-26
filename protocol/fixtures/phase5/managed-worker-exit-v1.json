@@ -7,6 +7,7 @@
     { "code": 2, "cause": "launch_refused", "crash": true },
     { "code": 3, "cause": "vendor_ended_unprompted", "crash": true },
     { "code": 4, "cause": "resume_refused", "crash": true, "vendor_prefix": "Failed to resume session" },
-    { "code": 5, "cause": "resume_not_found", "crash": true, "vendor_prefix": "No conversation found with session ID" }
+    { "code": 5, "cause": "resume_not_found", "crash": true, "vendor_prefix": "No conversation found with session ID" },
+    { "code": 6, "cause": "code_mode_terminal_only", "crash": true, "vendor_prefix": "Failed to resume session: This session was started in Code Mode (experimental)" }
   ]
 }

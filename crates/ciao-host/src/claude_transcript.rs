@@ -122,20 +122,8 @@ fn recent_model_in(projects: &Path, vendor_session_id: &str) -> Option<String> {
         })
 }
 
-/// Whether `vendor_session_id`'s conversation is in Claude Code's experimental Code Mode,
-/// which Claude refuses to resume anywhere but its interactive terminal.
-///
-/// Grounded 2026-11-26 against the pinned CLI (2.1.326) and real 2.1.332 transcripts. The
-/// terminal records the mode as a bare `{"type":"repl-mode","replMode":<bool>}` record from the
-/// first lines of a conversation, repeated through it, newest wins (`currentSessionCodeMode`).
-/// A resume where Code Mode is unavailable — every headless SDK launch, so every managed worker
-/// — refuses a conversation whose newest record says `true` with "Failed to resume session:
-/// This session was started in Code Mode (experimental)…", after Ciao has already ended the
-/// terminal. Managed transcripts carry no such record.
-///
-/// The whole file is read, unlike the tail readers above. This answers whether taking over
-/// would destroy the terminal for nothing, it runs once per takeover or resume, and a marker
-/// the tail missed would answer wrongly. Only marker-sized lines are ever held.
+/// The newest Code Mode marker governs a resume. Markers can be separated by megabytes of
+/// tool output, so scan the whole transcript while holding only marker-sized lines.
 pub(crate) fn code_mode(vendor_session_id: &str) -> bool {
     claude_projects_dir().is_some_and(|projects| code_mode_in(&projects, vendor_session_id))
 }
@@ -222,7 +210,7 @@ pub(crate) fn transcript_path(projects: &Path, vendor_session_id: &str) -> Optio
 
 /// The same two sources `claude_integration` resolves the plugin directory from, so an
 /// operator who relocated Claude's config keeps working without configuring Ciao twice.
-fn claude_config_dir() -> Option<PathBuf> {
+pub(crate) fn claude_config_dir() -> Option<PathBuf> {
     match env::var_os("CLAUDE_CONFIG_DIR") {
         Some(value) if !value.is_empty() => {
             let path = PathBuf::from(value);
@@ -430,8 +418,7 @@ mod tests {
         );
         assert!(!code_mode_in(&projects, "left-code-mode"), "newest wins");
 
-        // A conversation that never recorded the mode — every managed transcript, and every
-        // terminal one from before Code Mode — is not in it.
+        // A conversation without a marker resumes with ordinary SDK settings.
         let root = tempfile::tempdir().unwrap();
         let projects = write_transcript(root.path(), "plain", &transcript());
         assert!(!code_mode_in(&projects, "plain"));

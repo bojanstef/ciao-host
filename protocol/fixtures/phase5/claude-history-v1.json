@@ -24,7 +24,11 @@
     {"type": "user", "uuid": "u-18", "parentUuid": "u-17", "promptId": "p-03", "promptSource": "queued", "isSidechain": false, "sessionId": "synthetic-session", "message": {"role": "user", "content": "A queued follow-up sharing an earlier prompt id, with no timestamp."}}
 ,
     {"type": "assistant", "uuid": "a-19", "parentUuid": "u-18", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:36.000Z", "message": {"role": "assistant", "id": "msg-06", "content": [{"type": "text", "text": {"$repeat": ["t", 50000]}}, {"type": "tool_use", "id": "toolu-04", "name": "Write", "input": {"content": {"$repeat": ["a", 17000]}, "file_path": "big.txt"}}]}},
-    {"type": "user", "uuid": "u-20", "parentUuid": "a-19", "promptId": "p-03", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:37.000Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu-04", "content": {"$repeat": ["r", 33000]}}]}}
+    {"type": "user", "uuid": "u-20", "parentUuid": "a-19", "promptId": "p-03", "isSidechain": false, "sessionId": "synthetic-session", "timestamp": "2023-11-14T22:13:37.000Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu-04", "content": {"$repeat": ["r", 33000]}}]}},
+    {"type": "assistant", "uuid": "cm-1", "parentUuid": "u-20", "sessionId": "synthetic-session", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "REPL", "id": "script-1", "input": {"code": "6*7", "description": "Compute 6 times 7"}}]}},
+    {"type": "user", "uuid": "cm-2", "parentUuid": "cm-1", "sessionId": "synthetic-session", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "script-1", "content": "(dispatched #1)"}]}},
+    {"type": "assistant", "uuid": "cm-3", "parentUuid": "cm-2", "sessionId": "synthetic-session", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Poll", "id": "poll-1", "input": {}}]}},
+    {"type": "user", "uuid": "cm-4", "parentUuid": "cm-3", "sessionId": "synthetic-session", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "poll-1", "content": "<repl-output>\n<result>42</result>\n</repl-output>"}]}}
   ],
   "expected": [
     {

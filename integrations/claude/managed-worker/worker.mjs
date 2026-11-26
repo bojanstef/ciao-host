@@ -550,6 +550,7 @@ function unsupportedBody(reasonCode) {
 function canonicalHistory(messages, createdAt) {
 	const entries = [];
 	const bySource = new Map();
+	const foldedToolIDs = new Set();
 	let truncated = false;
 
 	const upsert = (source, timestamp, kind, body, state = "complete") => {
@@ -609,6 +610,7 @@ function canonicalHistory(messages, createdAt) {
 				for (const [blockIndex, block] of content.entries()) {
 					if (block?.type === "text") continue;
 					if (block?.type === "tool_result" && typeof block.tool_use_id === "string") {
+						if (foldedToolIDs.has(block.tool_use_id)) continue;
 						const result = textFromContent(block.content);
 						upsertTool(
 							sourceID("tool", block.tool_use_id),
@@ -670,6 +672,11 @@ function canonicalHistory(messages, createdAt) {
 		for (const [blockIndex, block] of content.entries()) {
 			if (["thinking", "redacted_thinking", "text"].includes(block?.type)) continue;
 			if (block?.type === "tool_use" && typeof block.id === "string") {
+				// Code Mode's transcript-only wrappers surround the actual tool calls.
+				if (block.name === "REPL" || block.name === "Poll") {
+					foldedToolIDs.add(block.id);
+					continue;
+				}
 				upsertTool(
 					sourceID("tool", block.id),
 					timestamp,
@@ -1059,6 +1066,9 @@ const query = sdk.query({
 		env: childEnv,
 		// Shared destination-configuration contract: use the vendor's own settings merge.
 		// Ciao supplies protocol hooks and explicit session overrides, never copied settings.
+		...(destinationConfiguration && process.env.CIAO_MANAGED_CODE_MODE === "1"
+			? { settings: { env: { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" } } }
+			: {}),
 		settingSources: destinationConfiguration ? ["user", "project", "local"] : [],
 		// The SDK otherwise supplies only a minimal tool-calling prompt, unlike the CLI.
 		...(destinationConfiguration ? { systemPrompt: { type: "preset", preset: "claude_code" } } : {}),
@@ -1376,12 +1386,16 @@ function handleCommand(frame) {
 			return;
 		}
 		query.setPermissionMode(mode).then(
-			() => {
-				permissionMode = mode;
-				receipt(commandID, "applied", "permission_mode_set");
-				// Reported after the SDK accepted it, never before: the frame is a statement
-				// about what the session is, not about what was requested.
-				writeFrame({ type: "permission_mode", mode });
+			(response) => {
+				const effective = response?.mode ?? mode;
+				if (!PERMISSION_MODES.has(effective)) {
+					receipt(commandID, "outcome_unknown", undefined, "permission_mode_failed");
+					return;
+				}
+				if (effective === mode) receipt(commandID, "applied", "permission_mode_set");
+				else receipt(commandID, "rejected", undefined, "permission_mode_failed");
+				permissionMode = effective;
+				writeFrame({ type: "permission_mode", mode: effective });
 			},
 			() => receipt(commandID, "outcome_unknown", undefined, "permission_mode_failed"),
 		);
@@ -1482,21 +1496,19 @@ const heartbeat = setInterval(() => writeFrame({ type: "heartbeat" }), HEARTBEAT
 /// shared fixture `protocol/fixtures/phase5/managed-worker-exit-v1.json`, which the daemon reads
 /// too. The vendor's own words never leave this process: they can name paths and session IDs.
 const VENDOR_ENDED_UNPROMPTED_EXIT = 3;
-/// The CLI's own prefixes for its two resume failures (its constants in 2.1.326). A resume the
-/// CLI refuses — a Code Mode conversation, outside the interactive terminal — and one it cannot
-/// find. Matched, never forwarded; anything else stays the generic failed start.
-const VENDOR_START_FAILURES = [
-	["No conversation found with session ID", 5],
-	["Failed to resume session", 4],
-];
-/// The vendor's words about a failed start, held only until they are classified.
-const startFailureWords = [];
-
-function failedStartExit() {
-	for (const [prefix, code] of VENDOR_START_FAILURES) {
-		if (startFailureWords.some((words) => words.includes(prefix))) return code;
+const CODE_MODE_REFUSED_EXIT = 6;
+// Keep only the category. The result and the SDK's final stderr tail can both carry it.
+let startFailureExit = VENDOR_ENDED_UNPROMPTED_EXIT;
+let initialized = false;
+function noteStartFailure(words) {
+	if (typeof words !== "string" || startFailureExit === CODE_MODE_REFUSED_EXIT) return;
+	if ((!initialized || promptsHanded === 0) &&
+		words.includes("Failed to resume session: This session was started in Code Mode (experimental)")) {
+		startFailureExit = CODE_MODE_REFUSED_EXIT;
+	} else if (promptsHanded === 0) {
+		if (words.includes("No conversation found with session ID")) startFailureExit = 5;
+		else if (startFailureExit === VENDOR_ENDED_UNPROMPTED_EXIT && words.includes("Failed to resume session")) startFailureExit = 4;
 	}
-	return VENDOR_ENDED_UNPROMPTED_EXIT;
 }
 
 function shutdown(reasonCode, exitCode = 0) {
@@ -1512,7 +1524,9 @@ function shutdown(reasonCode, exitCode = 0) {
 /// The vendor ended the stream on its own. Before any prompt that is a start that failed; after
 /// one it is the grounded teardown an interrupted or errored turn ends in.
 function vendorEnded(reasonCode) {
-	if (promptsHanded === 0) shutdown("vendor_ended_unprompted", failedStartExit());
+	if (promptsHanded === 0 || startFailureExit === CODE_MODE_REFUSED_EXIT) {
+		shutdown("vendor_ended_unprompted", startFailureExit);
+	}
 	shutdown(reasonCode);
 }
 
@@ -1590,6 +1604,7 @@ try {
 			continue;
 		}
 		if (message.type === "system" && message.subtype === "init") {
+			initialized = true;
 			if (PERMISSION_MODES.has(message.permissionMode)) {
 				permissionMode = message.permissionMode;
 				writeFrame({ type: "permission_mode", mode: permissionMode });
@@ -1723,8 +1738,8 @@ try {
 			continue;
 		}
 		if (message.type === "result") {
-			if (promptsHanded === 0 && Array.isArray(message.errors)) {
-				for (const words of message.errors) if (typeof words === "string") startFailureWords.push(words);
+			if (Array.isArray(message.errors)) {
+				for (const words of message.errors) noteStartFailure(words);
 			}
 			// Every prompt still awaiting a replay after a turn ended is ambiguous.
 			for (const [uuid, commandID] of promptsAwaitingReplay) {
@@ -1739,6 +1754,6 @@ try {
 	// Grounded: the CLI exits nonzero after an interrupted or errored turn and
 	// the SDK surfaces it as a throw even when the result was delivered. Its message carries
 	// the tail of the CLI's stderr, which is where a refused resume says why.
-	if (promptsHanded === 0) startFailureWords.push(String(error?.message ?? ""));
+	noteStartFailure(error?.message);
 	vendorEnded("stream_ended");
 }

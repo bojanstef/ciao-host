@@ -1100,7 +1100,7 @@ async fn monitor_agent_routes(state: Arc<RuntimeState>) {
                     } else {
                         tracing::info!(session = %session_id, "managed worker exited");
                     }
-                    state.managed_sessions.record_worker_exit(&session_id, exit.crashed());
+                    state.managed_sessions.record_worker_exit(&session_id, exit);
                 }
                 // ADR 004 §5: exactly one owner per conversation. A terminal that resumed a
                 // conversation Ciao is running is the second one, and the person is sitting at
@@ -1112,7 +1112,7 @@ async fn monitor_agent_routes(state: Arc<RuntimeState>) {
                     // Recorded here rather than left to the next reap: the record has to
                     // reach `stored` before it can be marked, and a reap arriving first
                     // would settle it as an ordinary stop and lose the reason.
-                    state.managed_sessions.record_worker_exit(&session_id, false);
+                    state.managed_sessions.record_worker_exit(&session_id, crate::managed_worker::WorkerExit::CLEAN);
                     state.managed_sessions.mark_externally_owned(&session_id);
                 }
                 refresh_live_activities(&state);

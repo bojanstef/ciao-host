@@ -557,6 +557,12 @@ impl HistoryMapper {
                 && let Some(id) = block.get("id").and_then(Value::as_str)
             {
                 let source = self.source("tool", id);
+                // Fold script dispatch and polling together with their result records.
+                // The ordinary calls made by the script have their own tool IDs.
+                if matches!(block["name"].as_str(), Some("REPL" | "Poll")) {
+                    self.evicted.insert(source);
+                    continue;
+                }
                 let name = safe_tool_name(block.get("name"));
                 let input = json_text(block.get("input"));
                 self.upsert_tool(source, timestamp, Some(name), "running", Some(input), None);

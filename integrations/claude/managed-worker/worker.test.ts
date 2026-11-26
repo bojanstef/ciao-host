@@ -134,6 +134,7 @@ export function query(config) {
 		model: config.options.model ?? null,
 		permissionMode: config.options.permissionMode ?? null,
 		settingSources: config.options.settingSources ?? null,
+		settings: config.options.settings ?? null,
 		systemPrompt: config.options.systemPrompt ?? null,
 		extraArgs: config.options.extraArgs,
 		hooks: Object.keys(config.options.hooks ?? {}),
@@ -284,7 +285,7 @@ export function query(config) {
 				controller.signal.dispatchEvent(new Event("abort"));
 			}
 		},
-		setPermissionMode() {},
+		async setPermissionMode() { return { mode: "plan" }; },
 		// Async on purpose: the real surfaces return promises and the worker chains a receipt
 		// off each one, so a synchronous fake would pass a test the real SDK would fail.
 		async setModel(model) {
@@ -388,8 +389,8 @@ async function startWorker(
 			CIAO_MANAGED_SESSION_ID: SESSION_ID,
 			CIAO_MANAGED_SPAWN_TOKEN: "fedcba9876543210fedcba9876543210",
 			CIAO_MANAGED_WORKSPACE_LABEL: "workspace",
-			CIAO_MANAGED_CLI_VERSION: "2.1.325",
-			CIAO_MANAGED_SDK_VERSION: "0.3.325",
+			CIAO_MANAGED_CLI_VERSION: "2.1.332",
+			CIAO_MANAGED_SDK_VERSION: "0.3.332",
 			[CONFIGURATION.environment_key]: CONFIGURATION.adapters["claude-managed"],
 			// Tests never consult the developer's settings or browser preference.
 			CLAUDE_CONFIG_DIR: path.join(root, "config"),
@@ -437,10 +438,28 @@ test("destination configuration loads all settings without replacing fresh-sessi
 	expect(journal().options.systemPrompt).toEqual(CONFIGURATION.claude_system_prompt);
 	expect(journal().options.permissionMode).toBeNull();
 	expect(journal().options.model).toBeNull();
+	expect(journal().options.settings).toBeNull();
 	expect(journal().options.launchPolicyLeaked).toBe(false);
 	expect(journal().options.hooks.sort()).toEqual(["Notification", "PostToolUse", "PostToolUseFailure", "PreToolUse", "SubagentStart", "SubagentStop", "UserPromptSubmit"]);
 	// Until the vendor reports its resolved mode, a default would be an invented fact.
 	expect(frames.filter((frame) => frame.type === "permission_mode")).toEqual([]);
+});
+
+test("Code Mode opt-in is an SDK flag setting", async () => {
+	const { journal } = await startWorker([], undefined, undefined, undefined,
+		{ CIAO_MANAGED_CODE_MODE: "1" }, true);
+	await eventually(() => journal().options !== null);
+	expect(journal().options.settings).toEqual({ env: { CLAUDE_CODE_EXPERIMENTAL_CODE_MODE: "1" } });
+});
+
+test("a mode change reports the effective SDK mode", async () => {
+	const { frames, send } = await startWorker([], undefined, undefined, undefined, undefined, true);
+	await eventually(() => frames.some(frame => frame.type === "snapshot_end"));
+	send({ v: 1, type: "command", kind: "set_permission_mode", command_id: "mode-differs", mode: "acceptEdits" });
+	await eventually(() => frames.some(frame => frame.type === "permission_mode" && frame.mode === "plan"));
+	expect(frames.find(frame => frame.command_id === "mode-differs")).toMatchObject({
+		state: "rejected", reason_code: "permission_mode_failed",
+	});
 });
 
 test("destination configuration preserves a resumed mode and reports the vendor's resolved mode", async () => {
@@ -1073,11 +1092,13 @@ test("the worker brackets a turn with running and completed, around the content 
 	expect(stderr).not.toContain("road");
 });
 
-test("an ordinary tool is still a permission card with two host-issued choices", async () => {
-	const { frames, send } = await startWorker([{ type: "result", subtype: "success" }], {
-		tool: "Bash",
-		input: { command: "rm -rf ~/Downloads/build" },
-	});
+test("a Code Mode inner Bash call streams normally and still requires a permission decision", async () => {
+	const input = { command: "echo probe-ok" };
+	const { frames, send } = await startWorker([
+		{ type: "assistant", message: { content: [{ type: "tool_use", id: "inner-bash", name: "Bash", input }] } },
+		{ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "inner-bash", content: "probe-ok" }] } },
+		{ type: "result", subtype: "success" },
+	], { tool: "Bash", input }, undefined, undefined, { CIAO_MANAGED_CODE_MODE: "1" });
 
 	await eventually(() => frames.some((frame) => frame.type === "upsert_interaction"));
 	const raised = frames.find((frame) => frame.type === "upsert_interaction") as Record<string, any>;
@@ -1095,7 +1116,7 @@ test("an ordinary tool is still a permission card with two host-issued choices",
 	expect(
 		raised.interaction.response_schema.choices.map((choice: { choice_id: string }) => choice.choice_id),
 	).toEqual(["allow-once", "deny"]);
-	expect(raised.interaction.body).toContain("rm -rf");
+	expect(raised.interaction.body).toContain("echo probe-ok");
 
 	// Answering it with question answers is refused rather than guessed at: the request stays
 	// pending and the phone is told, which is the failure the shapes could otherwise share.
@@ -1125,6 +1146,10 @@ test("an ordinary tool is still a permission card with two host-issued choices",
 	const applied = frames.filter((frame) => frame.type === "command_receipt").at(-1) as Record<string, any>;
 	expect(applied.state).toBe("applied");
 	expect(applied.evidence).toBe("permission_resolved");
+	await eventually(() => frames.some((frame: any) => frame.entry?.body.tool?.result_preview === "probe-ok"));
+	const calls = frames.filter((frame: any) => frame.entry?.source_id === "tool-inner-bash") as any[];
+	expect(calls.map(frame => frame.entry.body.tool.status)).toEqual(["running", "complete"]);
+	expect(calls[0].entry.body.tool.name).toBe("Bash");
 });
 
 // Suggestions are vendor proposals, not permission grants. In particular, the candidate SDK's
@@ -2257,6 +2282,11 @@ const CODE_MODE_REFUSAL = "Failed to resume session: This session was started in
 	+ "which isn't available because for now it only works in the interactive terminal, so it can't be resumed "
 	+ "here. Resume it in the terminal: CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1 claude --resume private-session-id";
 const VENDOR_ENDINGS = [
+	["needs the headless Code Mode flag", "code_mode_terminal_only", [
+		{ type: "result", subtype: "error_during_execution", is_error: true, errors: [
+			"Failed to resume session: This session was started in Code Mode (experimental), which is off in this run, so it can't be resumed. To resume it, set CLAUDE_CODE_EXPERIMENTAL_CODE_MODE to 1 in the env block of --settings (the Agent SDK's settings option).",
+		] },
+	]],
 	["throws after its error result", "vendor_ended_unprompted", [
 		{ type: "result", subtype: "error_during_execution", is_error: true },
 		{ fake_throw: "Claude Code process exited with code 1" },
@@ -2264,14 +2294,15 @@ const VENDOR_ENDINGS = [
 	["runs out after its result", "vendor_ended_unprompted", [{ type: "result", subtype: "error_during_execution", is_error: true }]],
 	// The vendor's reason arrives in the result's errors, or only in the stderr tail the SDK puts
 	// on the error it throws; either names the failure.
-	["refuses the resume in its result", "resume_refused", [
+	["refuses the resume in its result", "code_mode_terminal_only", [
 		{ type: "result", subtype: "error_during_execution", is_error: true, errors: [CODE_MODE_REFUSAL] },
 		{ fake_throw: "Claude Code process exited with code 1" },
 	]],
-	["refuses the resume on stderr", "resume_refused", [
+	["refuses the resume on stderr", "code_mode_terminal_only", [
 		{ type: "result", subtype: "error_during_execution", is_error: true },
 		{ fake_throw: `Claude Code process exited with code 1\n${CODE_MODE_REFUSAL}` },
 	]],
+	["refuses another resume", "resume_refused", [{ fake_throw: "Failed to resume session: unavailable" }]],
 	["cannot find the conversation", "resume_not_found", [
 		{ fake_throw: "Claude Code process exited with code 1\nNo conversation found with session ID: private-session-id" },
 	]],
@@ -2291,6 +2322,16 @@ test.each(WORKER_RUNTIMES.flatMap(([name, runtime]) =>
 		expect(frames.at(-1)?.type).toBe("session_end");
 	},
 );
+
+test("a queued prompt cannot disguise a Code Mode resume refusal", async () => {
+	const { child, frames, send } = await startWorker([
+		{ fake_await_prompt: true },
+		{ fake_throw: CODE_MODE_REFUSAL },
+	], undefined, undefined, undefined, { CIAO_MANAGED_RESUME_SESSION_ID: "synthetic-resume" });
+	await eventually(() => frames.some(frame => frame.type === "snapshot_end"));
+	send({ v: 1, type: "command", command_id: "early-prompt", kind: "prompt", text: "Hello" });
+	expect(await child.exited).toBe(exitFor("code_mode_terminal_only").code);
+});
 
 // The grounded interrupt teardown stays an ordinary end: once the worker has handed the vendor a
 // prompt, a turn ending in an error result and a nonzero CLI exit is how the pinned SDK stops.

@@ -749,8 +749,8 @@ fn contracts() -> [ParityContract; 4] {
             history: "live_tail",
             pending_rehydration: "none",
             reports_workspace_path: true,
-            // A row withholds it, stating `takeover_refusal: code_mode_terminal_only`, once the
-            // conversation's transcript says Code Mode: the managed CLI refuses to resume one
+            // A row withholds it, stating `takeover_refusal: code_mode_terminal_only`, when the
+            // transcript requires Code Mode and the destination cannot resume it headless
             // (grounded 2026-11-26, `claude_transcript::code_mode`). The verb itself is unchanged.
             takeover: Some("promote"),
             commands: CommandCapabilities::none(),

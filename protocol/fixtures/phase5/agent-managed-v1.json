@@ -379,6 +379,7 @@
     "stopped",
     "daemon_restart",
     "worker_crash",
+    "code_mode_terminal_only",
     "unsupported_version",
     "externally_owned"
   ],

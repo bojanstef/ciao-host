@@ -26,7 +26,8 @@ use crate::agent_protocol::{
     WorkspaceDescriptor, valid_opaque_id, valid_token,
 };
 use crate::agent_session::PromotionTarget;
-use crate::managed_worker::{ManagedRuntime, SharedWorkerTable};
+use crate::claude_code_mode::{self, Conversation, LaunchMode};
+use crate::managed_worker::{ManagedRuntime, SharedWorkerTable, WorkerExit};
 use crate::storage::{atomic_write_private, validate_private_file};
 
 const MANAGED_METADATA_VERSION: u8 = 1;
@@ -142,6 +143,16 @@ impl WorkerLauncher {
                     .map_err(|issue| issue.reason())?
             }
         };
+        let resume = spec.resume_vendor_session.clone();
+        let version = runtime.cli_version.clone();
+        let mode = tokio::task::spawn_blocking(move || {
+            claude_code_mode::launch_mode(Conversation::from_resume(resume.as_deref()), &version)
+        })
+        .await
+        .map_err(|_| "managed_worker_start_failed")?;
+        if mode == LaunchMode::TerminalOnly {
+            return Err(CODE_MODE_TERMINAL_ONLY);
+        }
         self.workers
             .spawn(
                 &runtime,
@@ -152,6 +163,7 @@ impl WorkerLauncher {
                 spec.resume_vendor_session.as_deref(),
                 spec.permission_mode.as_deref(),
                 spec.model.as_deref(),
+                mode,
             )
             .map_err(|_| "managed_worker_start_failed")?;
         Ok(LaunchedWorker {
@@ -234,17 +246,18 @@ impl ManagedLauncher {
         }
     }
 
-    /// Whether only Claude's own terminal can continue this conversation (Code Mode), which
-    /// a managed worker cannot: its CLI refuses the resume. Read from Claude's transcript.
+    /// Recheck the transcript and destination before relinquishing the current terminal.
     async fn terminal_only(&self, vendor_session_id: &str) -> bool {
         match self {
-            Self::Worker(_) => {
+            Self::Worker(launcher) => {
+                let prefix = launcher.sdk_prefix.clone();
                 let vendor_session_id = vendor_session_id.to_owned();
                 tokio::task::spawn_blocking(move || {
                     crate::claude_transcript::code_mode(&vendor_session_id)
+                        && claude_code_mode::terminal_only(&prefix)
                 })
                 .await
-                .unwrap_or(false)
+                .unwrap_or(true)
             }
             #[cfg(test)]
             Self::Fake(fake) => fake.terminal_only(vendor_session_id),
@@ -277,9 +290,7 @@ impl ManagedLauncher {
     }
 }
 
-/// The refusal for a conversation in Claude Code's experimental Code Mode, which Claude resumes
-/// only in its own interactive terminal (`claude_transcript::code_mode`). Shared by takeover,
-/// resume and the attached row that withholds its takeover offer, so the phone reads one reason.
+/// Shared by takeover, resume and the worker when this destination cannot run headless Code Mode.
 pub(crate) const CODE_MODE_TERMINAL_ONLY: &str = "code_mode_terminal_only";
 
 #[derive(Debug, Clone)]
@@ -1162,15 +1173,14 @@ impl ManagedSessionDirectory {
     /// transcript of record; the session is retained as stored and resumes only
     /// by explicit command.
     #[cfg_attr(not(test), allow(dead_code))] // the supervising launcher lands in step 6
-    pub(crate) fn record_worker_exit(&self, session_id: &str, crashed: bool) {
+    pub(crate) fn record_worker_exit(&self, session_id: &str, exit: WorkerExit) {
         {
             let mut store = self.store.lock();
             if let Some(record) = store.record_mut(session_id)
                 && record.presence == "live"
             {
                 record.presence = "stored".into();
-                record.stored_reason =
-                    Some(if crashed { "worker_crash" } else { "stopped" }.into());
+                record.stored_reason = Some(exit.stored_reason().into());
                 record.revision = record.revision.saturating_add(1);
                 record.updated_at = unix_now();
             }
@@ -1645,7 +1655,7 @@ pub(crate) mod fake {
         pub(crate) handback_fails: Mutex<bool>,
         /// Handback terminals a take-back ended, in order.
         pub(crate) closed_handbacks: Mutex<Vec<String>>,
-        /// Vendor sessions whose transcript says Code Mode, which only the terminal resumes.
+        /// Marked conversations which this test destination cannot resume headless.
         pub(crate) terminal_only: Mutex<HashSet<String>>,
     }
 
@@ -2136,10 +2146,7 @@ mod tests {
         assert_eq!(directory.promotion_preflight(&fresh).await, None);
     }
 
-    /// A conversation in Claude Code's experimental Code Mode can only continue in the terminal:
-    /// the managed CLI refuses to resume it. A takeover used to find that out after it had
-    /// already ended the owner's terminal, and every Resume after it spawned a worker that died
-    /// in under a second. Both are now refused before anything is touched or launched.
+    /// A known-incompatible resume must be refused before closing the owner’s terminal.
     #[tokio::test]
     async fn a_code_mode_conversation_is_refused_before_anything_is_ended_or_launched() {
         let home = tempdir().unwrap();
@@ -2669,7 +2676,7 @@ mod tests {
         // What the daemon does with that answer: stop the worker, settle the record, then
         // mark it. The order matters — a record only takes the mark once it is stored, so
         // marking a live one is silently dropped and the reason is lost.
-        directory.record_worker_exit(&session_id, false);
+        directory.record_worker_exit(&session_id, WorkerExit::CLEAN);
         directory.mark_externally_owned(&session_id);
         let stored = directory.stored_descriptors(&HashSet::new());
         assert_eq!(stored.len(), 1);
@@ -2733,7 +2740,7 @@ mod tests {
             .managed_start_at_path(&workspace, "cmd-start")
             .await;
         let session_id = started.session_id.unwrap();
-        directory.record_worker_exit(&session_id, true);
+        directory.record_worker_exit(&session_id, WorkerExit { code: Some(1) });
         let stored = directory.stored_descriptors(&all_recorded_handbacks(&directory));
         assert_eq!(stored[0].stored_reason.as_deref(), Some("worker_crash"));
         assert_eq!(directory.live_count(), 0);
