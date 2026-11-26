@@ -813,7 +813,6 @@ fn start_cron_daemon(paths: &CiaoPaths, executable: &Path) -> Result<i32> {
         .append(true)
         .open(&paths.stderr_log)
         .with_context(|| format!("open {}", paths.stderr_log.display()))?;
-    use std::os::unix::process::CommandExt;
     let mut command = Command::new(executable);
     command
         .arg("daemon")
@@ -822,13 +821,7 @@ fn start_cron_daemon(paths: &CiaoPaths, executable: &Path) -> Result<i32> {
         .stderr(log);
     // Detach into a new session and process group so Ctrl-C (SIGINT) during the setup/pair QR
     // wait or SSH disconnect (SIGHUP) does not kill the cron-started daemon.
-    // SAFETY: `setsid` is async-signal-safe per POSIX.1-2008 and allocates nothing.
-    unsafe {
-        command.pre_exec(|| {
-            nix::unistd::setsid().map_err(std::io::Error::from)?;
-            Ok(())
-        });
-    }
+    ciao_native_process::detach_session(&mut command);
     let child = command.spawn().context("start the Ciao daemon")?;
     Ok(i32::try_from(child.id())?)
 }

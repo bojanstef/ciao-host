@@ -12,6 +12,25 @@ mod probe_runtime;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use probe_runtime::{can_reap_probe_children, prepare_probe_helper, reset_probe_alarm};
 
+/// Configures a child `Command` to start in a new POSIX session (`setsid`) before `exec`,
+/// detaching it from the parent's controlling terminal and process group so `SIGINT`/`SIGHUP`
+/// directed at an interactive setup session cannot terminate a detached background daemon.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn detach_session(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: `setsid(2)` is async-signal-safe per POSIX.1-2008 and performs no heap allocation
+    // or locking between `fork` and `exec`.
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Shared bounds for the two platform-specific native image proof helpers.
 pub const MAX_PROBE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_PROBE_TRANSACTIONS: usize = 4;
@@ -371,5 +390,28 @@ mod tests {
             native_identity(pid).is_none(),
             "a reaped PID has no kernel identity"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn detach_session_makes_child_its_own_session_leader() {
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as nix::libc::pid_t;
+        // SAFETY: `getsid` reads only kernel process metadata for the live child and self.
+        let child_sid = unsafe { nix::libc::getsid(pid) };
+        let parent_sid = unsafe { nix::libc::getsid(0) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(child_sid, pid);
+        assert_ne!(child_sid, parent_sid);
     }
 }
