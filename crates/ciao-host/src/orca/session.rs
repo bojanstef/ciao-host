@@ -1,7 +1,7 @@
 //! One viewer per Ciao terminal. Dropping the WebSocket releases Orca's viewer only.
 use super::{
     Runtime,
-    channel::{Channel, Pairing},
+    channel::{Channel, ChannelError, Pairing},
     uuid,
 };
 use crate::{
@@ -12,6 +12,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -155,8 +156,77 @@ pub(crate) struct OrcaSession {
     task: JoinHandle<()>,
     high_output: Arc<QueueSize>,
 }
-struct Viewer {
-    channel: Channel,
+/// What a viewer needs from Orca's encrypted channel. `next` must be cancel-safe: the viewer
+/// polls it against input, resizes and its own deadline.
+pub(super) trait ViewerChannel: Send {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> impl Future<Output = Result<String, ChannelError>> + Send;
+    fn next(&mut self) -> impl Future<Output = Result<Value, ChannelError>> + Send;
+}
+impl ViewerChannel for Channel {
+    async fn request(&mut self, method: &str, params: Value) -> Result<String, ChannelError> {
+        Channel::request(self, method, params).await
+    }
+    async fn next(&mut self) -> Result<Value, ChannelError> {
+        Channel::next(self).await
+    }
+}
+
+/// Why a viewer stopped. Each reason has one meaning for the phone: only a refusal of input by a
+/// pane that is still there is `InputClosed`; everything else is a lost runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewerEnd {
+    /// Orca refused a write. The pane is still there.
+    WriteRefused,
+    /// The phone sent bytes Orca cannot carry: Orca accepts UTF-8 text only.
+    NotUtf8,
+    /// Orca answered neither a write nor a viewport claim within five seconds.
+    NoAnswer,
+    SendFailed,
+    ChannelFailed,
+    RequestFailed,
+    MalformedData,
+    UnknownEvent,
+    UnsolicitedAnswer,
+    UnexpectedAnswer,
+    ResizeRefused,
+    OutputClosed,
+    ResizeClosed,
+}
+impl ViewerEnd {
+    fn error(self) -> PtyError {
+        match self {
+            Self::WriteRefused | Self::NotUtf8 => PtyError::InputClosed,
+            Self::NoAnswer
+            | Self::SendFailed
+            | Self::ChannelFailed
+            | Self::RequestFailed
+            | Self::MalformedData
+            | Self::UnknownEvent
+            | Self::UnsolicitedAnswer
+            | Self::UnexpectedAnswer
+            | Self::ResizeRefused
+            | Self::OutputClosed
+            | Self::ResizeClosed => PtyError::WaitFailed,
+        }
+    }
+}
+
+/// The longest UTF-8 prefix of `text`, within one payload, that never splits a scalar.
+fn sendable(text: &[u8]) -> Result<usize, ViewerEnd> {
+    let window = &text[..text.len().min(MAX_DATA_PAYLOAD)];
+    match std::str::from_utf8(window) {
+        Ok(_) => Ok(window.len()),
+        Err(e) if e.error_len().is_none() => Ok(e.valid_up_to()),
+        Err(_) => Err(ViewerEnd::NotUtf8),
+    }
+}
+
+struct Viewer<C = Channel> {
+    channel: C,
     subscription: String,
     handle: String,
     client: Value,
@@ -220,13 +290,15 @@ impl Viewer {
             snapshot,
         ))
     }
+}
+impl<C: ViewerChannel> Viewer<C> {
     async fn forward(
         bytes: &str,
         tx: &mpsc::Sender<QueuedBytes>,
         peak: &Arc<QueueSize>,
-    ) -> Result<(), PtyError> {
+    ) -> Result<(), ViewerEnd> {
         for bytes in bytes.as_bytes().chunks(MAX_DATA_PAYLOAD) {
-            let permit = tx.reserve().await.map_err(|_| PtyError::InputClosed)?;
+            let permit = tx.reserve().await.map_err(|_| ViewerEnd::OutputClosed)?;
             permit.send(QueuedBytes::new(bytes.to_vec(), peak));
         }
         Ok(())
@@ -234,74 +306,87 @@ impl Viewer {
     async fn run(
         &mut self,
         initial: String,
-        tx: mpsc::Sender<QueuedBytes>,
-        mut input: mpsc::Receiver<InputChunk>,
-        mut dimensions: watch::Receiver<Dimensions>,
-        peak: Arc<QueueSize>,
-    ) -> Result<PtyExit, PtyError> {
-        Self::forward(&initial, &tx, &peak)
-            .await
-            .map_err(|e| ended("output_closed", e))?;
+        tx: &mpsc::Sender<QueuedBytes>,
+        input: &mut mpsc::Receiver<InputChunk>,
+        dimensions: &mut watch::Receiver<Dimensions>,
+        peak: &Arc<QueueSize>,
+    ) -> Result<PtyExit, ViewerEnd> {
+        Self::forward(&initial, tx, peak).await?;
         let mut pending: Option<(String, PendingOperation)> = None;
-        let mut utf8 = Vec::new();
+        // Accepted input not yet sent. Orca answers one write at a time, so everything queued
+        // behind a write goes out together in the next one, up to one payload.
+        let mut text = Vec::new();
+        // The queue closes only when Ciao releases this viewer: send what was accepted, then end.
+        let mut closing = false;
         let mut deadline = tokio::time::Instant::now();
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline), if pending.is_some() => {
-                    return Err(ended("no_answer", PtyError::InputClosed));
-                }
-                msg = input.recv(), if pending.is_none() => {
-                    // The queue closes only when Ciao releases this viewer, after every accepted
-                    // write was answered.
-                    let Some(chunk) = msg else { return Ok(PtyExit::Closed) };
-                    utf8.extend_from_slice(chunk.bytes());
-                    // A UTF-8 scalar may straddle Ciao data frames. Orca accepts UTF-8 text.
-                    let n = match std::str::from_utf8(&utf8) {
-                        Ok(_) => utf8.len(),
-                        Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                        Err(_) => return Err(ended("invalid_utf8", PtyError::InvalidInput)),
-                    };
-                    if n == 0 { continue; }
-                    let text = std::str::from_utf8(&utf8[..n]).map_err(|_| ended("invalid_utf8", PtyError::InvalidInput))?;
+            if pending.is_none() {
+                let n = sendable(&text)?;
+                if n > 0 {
+                    let chunk = std::str::from_utf8(&text[..n]).map_err(|_| ViewerEnd::NotUtf8)?;
                     self.viewport = viewport(*dimensions.borrow());
                     let params = json!({
-                        "terminal": self.handle, "client": self.client, "viewport": self.viewport, "text": text
+                        "terminal": self.handle, "client": self.client, "viewport": self.viewport, "text": chunk
                     });
-                    let id = self.channel.request("terminal.send", params).await.map_err(|_| ended("send_failed", PtyError::InputClosed))?;
-                    utf8.drain(..n);
+                    let id = self
+                        .channel
+                        .request("terminal.send", params)
+                        .await
+                        .map_err(|_| ViewerEnd::SendFailed)?;
+                    text.drain(..n);
                     pending = Some((id, PendingOperation::Write));
                     deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    continue;
                 }
-                changed = dimensions.changed(), if pending.is_none() => {
-                    changed.map_err(|_| ended("resize_closed", PtyError::ResizeFailed))?;
+                if closing {
+                    return Ok(PtyExit::Closed);
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline), if pending.is_some() => {
+                    return Err(ViewerEnd::NoAnswer);
+                }
+                msg = input.recv(), if pending.is_none() && !closing => {
+                    let Some(chunk) = msg else {
+                        closing = true;
+                        continue;
+                    };
+                    text.extend_from_slice(chunk.bytes());
+                    while text.len() < MAX_DATA_PAYLOAD {
+                        let Ok(chunk) = input.try_recv() else { break };
+                        text.extend_from_slice(chunk.bytes());
+                    }
+                }
+                changed = dimensions.changed(), if pending.is_none() && !closing => {
+                    changed.map_err(|_| ViewerEnd::ResizeClosed)?;
                     self.viewport = viewport(*dimensions.borrow_and_update());
                     let params = json!({
                         "terminal": self.handle, "client": self.client, "viewport": self.viewport, "claim": true
                     });
-                    let id = self.channel.request("terminal.updateViewport", params).await.map_err(|_| ended("resize_send_failed", PtyError::ResizeFailed))?;
+                    let id = self.channel.request("terminal.updateViewport", params).await.map_err(|_| ViewerEnd::SendFailed)?;
                     pending = Some((id, PendingOperation::Resize));
                     deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 }
                 frame = self.channel.next() => {
-                    let frame = frame.map_err(|_| ended("channel_failed", PtyError::WaitFailed))?;
-                    if frame["ok"] != true { return Err(ended("request_failed", PtyError::WaitFailed)); }
+                    let frame = frame.map_err(|_| ViewerEnd::ChannelFailed)?;
+                    if frame["ok"] != true { return Err(ViewerEnd::RequestFailed); }
                     let result = &frame["result"];
                     if frame["id"] == self.subscription {
                         match result["type"].as_str() {
                             Some("data") => {
-                                let chunk = result["chunk"].as_str().ok_or_else(|| ended("malformed_data", PtyError::WaitFailed))?;
-                                Self::forward(chunk, &tx, &peak).await.map_err(|e| ended("output_closed", e))?;
+                                let chunk = result["chunk"].as_str().ok_or(ViewerEnd::MalformedData)?;
+                                Self::forward(chunk, tx, peak).await?;
                             }
                             Some("end") => return Ok(PtyExit::Closed),
                             Some("fit-override-changed") => {}
-                            _ => return Err(ended("unknown_event", PtyError::WaitFailed)),
+                            _ => return Err(ViewerEnd::UnknownEvent),
                         }
                     } else {
-                        let (id, operation) = pending.take().ok_or_else(|| ended("unsolicited_answer", PtyError::WaitFailed))?;
-                        if frame["id"] != id { return Err(ended("unexpected_answer", PtyError::WaitFailed)); }
+                        let (id, operation) = pending.take().ok_or(ViewerEnd::UnsolicitedAnswer)?;
+                        if frame["id"] != id { return Err(ViewerEnd::UnexpectedAnswer); }
                         match operation {
-                            PendingOperation::Write if result["send"]["accepted"] != true => return Err(ended("write_refused", PtyError::InputClosed)),
-                            PendingOperation::Resize if result["updated"] != true => return Err(ended("resize_refused", PtyError::ResizeFailed)),
+                            PendingOperation::Write if result["send"]["accepted"] != true => return Err(ViewerEnd::WriteRefused),
+                            PendingOperation::Resize if result["updated"] != true => return Err(ViewerEnd::ResizeRefused),
                             _ => {}
                         }
                     }
@@ -310,11 +395,42 @@ impl Viewer {
         }
     }
 }
-/// Names the exit site, so a viewer that ends in the field explains itself in the daemon log.
-/// The site is a fixed label and the error a variant name; no terminal content is logged.
-fn ended(site: &'static str, error: PtyError) -> PtyError {
-    tracing::info!(site, error = ?error, "Orca viewer ended");
-    error
+
+#[allow(clippy::too_many_arguments)] // one viewer's whole lifetime; a params struct would be ceremony
+async fn drive<C: ViewerChannel>(
+    mut viewer: Viewer<C>,
+    initial: String,
+    outputs: mpsc::Sender<QueuedBytes>,
+    mut input: mpsc::Receiver<InputChunk>,
+    mut dimensions: watch::Receiver<Dimensions>,
+    peak: Arc<QueueSize>,
+    stop: oneshot::Receiver<()>,
+    exit: watch::Sender<Option<Result<PtyExit, PtyError>>>,
+) {
+    let result = tokio::select! {
+        result = viewer.run(initial, &outputs, &mut input, &mut dimensions, &peak) => {
+            result.map_err(|end| {
+                // A fixed reason, so a viewer that ends in the field names its cause in the
+                // daemon log. No terminal content is logged.
+                tracing::info!(reason = ?end, "Orca viewer ended");
+                end.error()
+            })
+        }
+        _ = stop => Ok(PtyExit::Closed),
+    };
+    // Publish the verdict before any queue closes, so a bridge that finds input or resizes
+    // closed reads why instead of guessing from timing.
+    let _ = exit.send(Some(result));
+    let unsubscribe = json!({
+        "requestId": viewer.subscription,
+        "subscriptionId": format!("{}:{}", viewer.handle, viewer.client["id"].as_str().unwrap_or_default()),
+        "client": viewer.client
+    });
+    let _ = timeout(
+        Duration::from_millis(400),
+        viewer.channel.request("terminal.unsubscribe", unsubscribe),
+    )
+    .await;
 }
 
 impl OrcaSession {
@@ -353,7 +469,7 @@ impl OrcaSession {
         size: Dimensions,
         proof: Option<&super::route::Proof>,
     ) -> Result<Self, PtyError> {
-        let (mut viewer, initial) = timeout(
+        let (viewer, initial) = timeout(
             Duration::from_secs(6),
             Viewer::open(profile, credentials, workspace, pane, size, proof),
         )
@@ -361,31 +477,31 @@ impl OrcaSession {
         .ok()
         .flatten()
         .ok_or(PtyError::SessionUnavailable)?;
+        Ok(Self::start(viewer, initial, size))
+    }
+
+    fn start<C: ViewerChannel + 'static>(
+        viewer: Viewer<C>,
+        initial: String,
+        size: Dimensions,
+    ) -> Self {
         let (inputs, input) = InputQueue::new();
         let (outputs, output) = mpsc::channel(HOST_PENDING_OUTPUT_BYTES / MAX_DATA_PAYLOAD);
         let (resize, dimensions) = watch::channel(size);
         let (exit_tx, exit) = watch::channel(None);
         let (stop_tx, stop) = oneshot::channel();
         let high_output = Arc::new(QueueSize::default());
-        let high = high_output.clone();
-        let task = tokio::spawn(async move {
-            let result = tokio::select! {
-                result = viewer.run(initial, outputs, input, dimensions, high) => result,
-                _ = stop => Ok(PtyExit::Closed)
-            };
-            let unsubscribe = json!({
-                "requestId": viewer.subscription,
-                "subscriptionId": format!("{}:{}", viewer.handle, viewer.client["id"].as_str().unwrap_or_default()),
-                "client": viewer.client
-            });
-            let _ = timeout(
-                Duration::from_millis(400),
-                viewer.channel.request("terminal.unsubscribe", unsubscribe),
-            )
-            .await;
-            let _ = exit_tx.send(Some(result));
-        });
-        Ok(Self {
+        let task = tokio::spawn(drive(
+            viewer,
+            initial,
+            outputs,
+            input,
+            dimensions,
+            high_output.clone(),
+            stop,
+            exit_tx,
+        ));
+        Self {
             id: crate::protocol::base64url(&rand::random::<[u8; 16]>()),
             input: inputs,
             resize,
@@ -394,7 +510,7 @@ impl OrcaSession {
             stop: Some(stop_tx),
             task,
             high_output,
-        })
+        }
     }
     #[cfg(test)]
     pub(crate) async fn send_input(&self, bytes: Vec<u8>) -> Result<(), PtyError> {
@@ -445,57 +561,112 @@ impl Drop for OrcaSession {
 }
 
 #[cfg(test)]
-impl OrcaSession {
-    /// A session driven by a scripted viewer instead of an Orca runtime.
-    fn scripted<F>(
-        viewer: impl FnOnce(mpsc::Receiver<InputChunk>, mpsc::Sender<QueuedBytes>, Arc<QueueSize>) -> F,
-    ) -> Self
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let (input, pending) = InputQueue::new();
-        let (resize, _) = watch::channel(Dimensions {
-            cols: 80,
-            rows: 24,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
-        let (outputs, output) = mpsc::channel(HOST_PENDING_OUTPUT_BYTES / MAX_DATA_PAYLOAD);
-        let (_, exit) = watch::channel(None);
-        let high_output = Arc::new(QueueSize::default());
-        let task = tokio::spawn(viewer(pending, outputs, high_output.clone()));
-        Self {
-            id: String::new(),
-            input,
-            resize,
-            output,
-            exit,
-            stop: None,
-            task,
-            high_output,
+pub(crate) mod scripted {
+    //! A scripted Orca runtime behind the real viewer, so tests drive `Viewer::run`, the
+    //! task around it and `OrcaSession::cleanup` without a desktop app.
+    use super::*;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+    pub(crate) const SUBSCRIPTION: &str = "subscription";
+
+    #[derive(Debug)]
+    pub(crate) struct Request {
+        pub(crate) id: String,
+        pub(crate) method: String,
+        pub(crate) params: Value,
+    }
+
+    struct ScriptedChannel {
+        requests: UnboundedSender<Request>,
+        frames: UnboundedReceiver<Value>,
+        sent: u64,
+    }
+    impl ViewerChannel for ScriptedChannel {
+        async fn request(&mut self, method: &str, params: Value) -> Result<String, ChannelError> {
+            self.sent += 1;
+            let id = format!("request-{}", self.sent);
+            self.requests
+                .send(Request {
+                    id: id.clone(),
+                    method: method.into(),
+                    params,
+                })
+                .map_err(|_| ChannelError)?;
+            if method == "terminal.unsubscribe" {
+                // A busy runtime: the viewer must not depend on this answer.
+                std::future::pending::<()>().await;
+            }
+            Ok(id)
+        }
+        async fn next(&mut self) -> Result<Value, ChannelError> {
+            self.frames.recv().await.ok_or(ChannelError)
         }
     }
 
-    /// A session whose viewer has not taken any input yet, as during one Orca round trip.
-    fn stalled() -> (Self, ()) {
-        let session = Self::scripted(|input, output, _| async move {
-            let _held = (input, output);
-            std::future::pending::<()>().await
-        });
-        (session, ())
+    /// The runtime's side: what the viewer asked for, and what Orca sends back.
+    pub(crate) struct Orca {
+        requests: UnboundedReceiver<Request>,
+        frames: Option<UnboundedSender<Value>>,
+    }
+    impl Orca {
+        pub(crate) async fn request(&mut self) -> Request {
+            timeout(Duration::from_secs(5), self.requests.recv())
+                .await
+                .expect("the viewer sent no request")
+                .expect("the viewer is gone")
+        }
+        /// The next `terminal.send`, skipping nothing: any other request first is a failure.
+        pub(crate) async fn write(&mut self) -> Request {
+            let request = self.request().await;
+            assert_eq!(request.method, "terminal.send");
+            request
+        }
+        fn frame(&self, frame: Value) {
+            if let Some(frames) = &self.frames {
+                let _ = frames.send(frame);
+            }
+        }
+        pub(crate) fn answer_write(&self, request: &Request, accepted: bool) {
+            self.frame(
+                json!({"id": request.id, "ok": true, "result": {"send": {"accepted": accepted}}}),
+            );
+        }
+        pub(crate) fn data(&self, chunk: &str) {
+            self.frame(
+                json!({"id": SUBSCRIPTION, "ok": true, "result": {"type": "data", "chunk": chunk}}),
+            );
+        }
+        pub(crate) fn end(&self) {
+            self.frame(json!({"id": SUBSCRIPTION, "ok": true, "result": {"type": "end"}}));
+        }
+        /// The runtime's channel breaks.
+        pub(crate) fn fail(&mut self) {
+            self.frames = None;
+        }
     }
 
-    /// A viewer that must forward `bytes` of output before it reads any input, as a real
-    /// viewer does when output precedes the answer to a pending write.
-    pub(crate) fn output_before_input(bytes: usize) -> Self {
-        Self::scripted(move |mut input, output, peak| async move {
-            if Viewer::forward(&"x".repeat(bytes), &output, &peak)
-                .await
-                .is_ok()
-            {
-                while input.recv().await.is_some() {}
-            }
-        })
+    impl OrcaSession {
+        pub(crate) fn scripted(size: Dimensions) -> (Self, Orca) {
+            let (requests, requested) = unbounded_channel();
+            let (frames, incoming) = unbounded_channel();
+            let viewer = Viewer {
+                channel: ScriptedChannel {
+                    requests,
+                    frames: incoming,
+                    sent: 0,
+                },
+                subscription: SUBSCRIPTION.into(),
+                handle: "term_scripted".into(),
+                client: json!({"id": "scripted", "type": "desktop"}),
+                viewport: viewport(size),
+            };
+            let session = Self::start(viewer, String::new(), size);
+            let orca = Orca {
+                requests: requested,
+                frames: Some(frames),
+            };
+            (session, orca)
+        }
     }
 }
 
@@ -534,11 +705,32 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {needle}"));
     }
+    fn size() -> Dimensions {
+        Dimensions {
+            cols: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    async fn verdict(session: &OrcaSession) -> Result<PtyExit, PtyError> {
+        let mut exit = session.exit.clone();
+        timeout(Duration::from_secs(5), exit.wait_for(Option::is_some))
+            .await
+            .expect("the viewer published no verdict")
+            .expect("the viewer task is gone")
+            .clone()
+            .expect("checked above")
+    }
+
     /// The phone sends one frame per scrolled line or key. A burst arriving within one
     /// Orca round trip is a few bytes, far below the input byte bound, and must queue.
     #[tokio::test]
     async fn burst_of_small_frames_queues_while_the_viewer_is_busy() {
-        let (session, _viewer) = OrcaSession::stalled();
+        let (session, mut orca) = OrcaSession::scripted(size());
+        session.send_input(b"x".to_vec()).await.unwrap();
+        let _busy = orca.write().await;
         for frame in 0..8 {
             assert_eq!(
                 session.send_input(b"\x1b[A".to_vec()).await,
@@ -547,6 +739,86 @@ mod tests {
             );
         }
         assert_eq!(session.high_water().input_bytes, 24);
+    }
+
+    /// Orca answers one write at a time. Everything queued behind a write goes out in the
+    /// next write, up to one payload, instead of one round trip per frame.
+    #[tokio::test]
+    async fn queued_frames_go_out_together_in_the_next_write() {
+        let (session, mut orca) = OrcaSession::scripted(size());
+        session.send_input(b"x".to_vec()).await.unwrap();
+        let first = orca.write().await;
+        for _ in 0..100 {
+            session.send_input(b"\x1b[A".to_vec()).await.unwrap();
+        }
+        orca.answer_write(&first, true);
+        let next = orca.write().await;
+        assert_eq!(next.params["text"], "\x1b[A".repeat(100));
+    }
+
+    #[tokio::test]
+    async fn a_combined_write_stays_within_one_payload_and_never_splits_a_scalar() {
+        let (session, mut orca) = OrcaSession::scripted(size());
+        session.send_input(b"x".to_vec()).await.unwrap();
+        let first = orca.write().await;
+        let filler = "y".repeat(MAX_DATA_PAYLOAD - 1);
+        session
+            .send_input(filler.clone().into_bytes())
+            .await
+            .unwrap();
+        // "é" is two bytes; the first lands on the payload boundary.
+        session.send_input(vec![0xc3]).await.unwrap();
+        session.send_input(vec![0xa9]).await.unwrap();
+        orca.answer_write(&first, true);
+        let second = orca.write().await;
+        assert_eq!(second.params["text"], filler.as_str());
+        orca.answer_write(&second, true);
+        assert_eq!(orca.write().await.params["text"], "é");
+    }
+
+    /// Cleanup closes the queue: the viewer writes what it accepted, then ends normally.
+    #[tokio::test]
+    async fn cleanup_sends_accepted_input_and_ends_closed() {
+        let (mut session, mut orca) = OrcaSession::scripted(size());
+        session.send_input(b"abc".to_vec()).await.unwrap();
+        let first = orca.write().await;
+        session.send_input(b"def".to_vec()).await.unwrap();
+        let runtime = async {
+            orca.answer_write(&first, true);
+            let second = orca.write().await;
+            assert_eq!(second.params["text"], "def");
+            orca.answer_write(&second, true);
+        };
+        let (cleaned, ()) = tokio::join!(session.cleanup(), runtime);
+        cleaned.unwrap();
+        assert_eq!(verdict(&session).await, Ok(PtyExit::Closed));
+    }
+
+    /// Whoever finds the viewer's queues closed must be able to read why, so the verdict is
+    /// published before the viewer releases anything, even when Orca is slow to unsubscribe.
+    #[tokio::test]
+    async fn a_lost_runtime_is_published_before_the_viewer_lets_go() {
+        let (session, mut orca) = OrcaSession::scripted(size());
+        orca.fail();
+        let unsubscribe = orca.request().await;
+        assert_eq!(unsubscribe.method, "terminal.unsubscribe");
+        assert_eq!(
+            session.exit.borrow().clone(),
+            Some(Err(PtyError::WaitFailed))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_refusal_by_a_live_pane_is_input_closed() {
+        let (session, mut orca) = OrcaSession::scripted(size());
+        session.send_input(b"a".to_vec()).await.unwrap();
+        let write = orca.write().await;
+        orca.answer_write(&write, false);
+        assert_eq!(verdict(&session).await, Err(PtyError::InputClosed));
+
+        let (session, _orca) = OrcaSession::scripted(size());
+        session.send_input(vec![0xff]).await.unwrap();
+        assert_eq!(verdict(&session).await, Err(PtyError::InputClosed));
     }
 
     /// The phone sends one frame per scrolled line. Before the byte-bounded queue, the fifth
@@ -572,11 +844,23 @@ mod tests {
         for letter in b'a'..=b'x' {
             view.send_input(vec![letter]).await.unwrap();
         }
-        until(
-            &mut view,
-            &format!("{}abcdefghijklmnopqrstuvwx", "^[[A".repeat(8)),
-        )
-        .await;
+        // A carriage return inside a combined write submits the line exactly once.
+        for frame in [&b"\r"[..], b"1", b"2", b"\r"] {
+            view.send_input(frame.to_vec()).await.unwrap();
+        }
+        // The tty echoes each line as typed and `cat -v` repeats it once submitted, so each
+        // line appears exactly twice however the frames were combined into writes.
+        let line = format!("{}abcdefghijklmnopqrstuvwx\r\n", "^[[A".repeat(8));
+        let mut seen = String::new();
+        timeout(Duration::from_secs(8), async {
+            while seen.matches(&line).count() < 2 || seen.matches("12\r\n").count() < 2 {
+                let chunk = view.next_output().await.expect("stream ended");
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out; saw {seen:?}"));
+        assert!(seen.find(&line) < seen.find("12\r\n"), "lines out of order");
         assert!(
             view.exit.borrow().is_none(),
             "the viewer ended during the burst"

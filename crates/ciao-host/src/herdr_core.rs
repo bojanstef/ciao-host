@@ -784,6 +784,9 @@ pub(crate) struct CoreSession {
 #[derive(Clone)]
 pub(crate) struct CoreExitWatcher(watch::Receiver<Option<Result<PtyExit, PtyError>>>);
 impl CoreExitWatcher {
+    pub(crate) fn verdict(&self) -> Option<Result<PtyExit, PtyError>> {
+        self.0.borrow().clone()
+    }
     pub(crate) async fn wait(&mut self) -> Result<PtyExit, PtyError> {
         loop {
             if let Some(exit) = self.0.borrow().clone() {
@@ -892,18 +895,21 @@ impl CoreSession {
         let high_output = Arc::new(AtomicUsize::new(0));
         let write_exit = exit_tx.clone();
         let write_task = tokio::spawn(async move {
-            if write_loop(write, channel, input_rx, write_credit, resize_rx)
+            let (mut input_rx, mut resize_rx) = (input_rx, resize_rx);
+            if write_loop(write, channel, &mut input_rx, write_credit, &mut resize_rx)
                 .await
                 .is_err()
             {
-                let _ = write_exit.send(Some(Err(PtyError::InputClosed)));
+                // A broken socket loses the whole session, not just its input. The verdict
+                // goes out before the input queue closes, so a refused push can read it.
+                publish_verdict(&write_exit, Err(PtyError::WaitFailed));
             }
         });
         let high = high_output.clone();
         let read_task = tokio::spawn(async move {
             let outcome =
                 read_loop(read, buffered, channel, output_tx, consumed, high, &version).await;
-            let _ = exit_tx.send(Some(outcome));
+            publish_verdict(&exit_tx, outcome);
         });
         Ok(Self {
             terminal_id: crate::protocol::base64url(&rand::random::<[u8; 16]>()),
@@ -965,12 +971,26 @@ impl Drop for CoreSession {
     }
 }
 
+/// The first verdict wins: a socket that breaks after the session ended does not rewrite why.
+fn publish_verdict(
+    exit: &watch::Sender<Option<Result<PtyExit, PtyError>>>,
+    verdict: Result<PtyExit, PtyError>,
+) {
+    exit.send_if_modified(|current| {
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(verdict);
+        true
+    });
+}
+
 async fn write_loop(
     mut write: OwnedWriteHalf,
     channel: u32,
-    mut input: mpsc::Receiver<InputChunk>,
+    input: &mut mpsc::Receiver<InputChunk>,
     credit: Arc<ConsumedCredit>,
-    mut resize: watch::Receiver<Dimensions>,
+    resize: &mut watch::Receiver<Dimensions>,
 ) -> std::io::Result<()> {
     loop {
         tokio::select! {

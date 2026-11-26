@@ -72,6 +72,20 @@ impl InputQueue {
         }
     }
 
+    /// Room for `len` bytes if there is some now; `None` when the frame must wait.
+    pub(crate) fn try_reserve(&self, len: usize) -> Result<Option<InputPermit>, PtyError> {
+        let count = (1..=MAX_DATA_PAYLOAD)
+            .contains(&len)
+            .then(|| u32::try_from(len).ok())
+            .flatten()
+            .ok_or(PtyError::InvalidInput)?;
+        match self.bytes.clone().try_acquire_many_owned(count) {
+            Ok(permit) => Ok(Some(InputPermit(permit))),
+            Err(tokio::sync::TryAcquireError::NoPermits) => Ok(None),
+            Err(tokio::sync::TryAcquireError::Closed) => Err(PtyError::InputClosed),
+        }
+    }
+
     /// Queues `bytes` in the room `permit` reserved for them.
     pub(crate) fn push(&self, bytes: Vec<u8>, permit: InputPermit) -> Result<(), PtyError> {
         if permit.0.num_permits() != bytes.len() {

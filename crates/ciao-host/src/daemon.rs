@@ -4208,6 +4208,7 @@ async fn bridge_terminal(
         Incoming(Result<TerminalFrame, HostProtocolError>),
         Output(Option<crate::terminal_session::TerminalOutput>),
         Process(Result<PtyExit, PtyError>),
+        InputRoom(Result<crate::terminal_input::InputPermit, PtyError>),
         ConnectionClosed,
         ServerShutdown,
     }
@@ -4220,6 +4221,12 @@ async fn bridge_terminal(
     let mut exit_watcher = session.exit_watcher();
     let mut process_exit = None;
     let mut output_finished = false;
+    // Spec 002 §8: a full input queue stops QUIC reads. One input frame waits for room and at
+    // most one more is read behind it and parked, so a Close or resize right behind a waiting
+    // frame is still honoured, while exit, output and connection loss are watched throughout.
+    // A Close behind a parked frame is read only once the waiting frame is queued.
+    let mut waiting: Option<WaitingInput> = None;
+    let mut parked: Option<Vec<u8>> = None;
 
     loop {
         if process_exit.is_some() && output_finished {
@@ -4229,9 +4236,15 @@ async fn bridge_terminal(
         }
 
         let event = tokio::select! {
-            frame = frames.next(recv), if process_exit.is_none() => Event::Incoming(frame),
+            frame = frames.next(recv), if process_exit.is_none() && parked.is_none() => Event::Incoming(frame),
             output = session.next_output(), if !output_finished => Event::Output(output),
             exit = exit_watcher.wait(), if process_exit.is_none() => Event::Process(exit),
+            permit = async {
+                match waiting.as_mut() {
+                    Some(waiting) => waiting.room.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            }, if waiting.is_some() && process_exit.is_none() => Event::InputRoom(permit),
             _ = connection.closed() => Event::ConnectionClosed,
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
@@ -4242,6 +4255,8 @@ async fn bridge_terminal(
             }
         };
 
+        // An input or resize the backend refused: its published verdict says why.
+        let mut refused = None;
         match event {
             Event::Incoming(Ok(frame)) => {
                 receive_state = match receive_state.accept(&frame) {
@@ -4259,94 +4274,18 @@ async fn bridge_terminal(
                         // Spec 025: the only evidence that a prompt was typed on a device rather
                         // than at this machine's own keyboard.
                         whereabouts.note_device_input();
-                        // Input waits for room in the byte-bounded queue; output keeps flowing
-                        // meanwhile (see `input_room_or_output`).
-                        let room = session.input().reserve(bytes.len());
-                        tokio::pin!(room);
-                        let permit = loop {
-                            let step = tokio::select! {
-                                step = input_room_or_output(session, room.as_mut(), output_finished) => step,
-                                _ = connection.closed() => {
-                                    cleanup_terminal(
-                                        session,
-                                        tmux_detach_binary,
-                                        CleanupReason::ConnectionLost,
-                                    )
-                                    .await;
-                                    return Ok(());
-                                }
-                                changed = shutdown.changed() => {
-                                    if changed.is_ok() && *shutdown.borrow() {
-                                        connection.close(
-                                            VarInt::from_u32(crate::host_protocol::CONNECTION_SERVER_SHUTDOWN),
-                                            b"daemon shutdown",
-                                        );
-                                        cleanup_terminal(
-                                            session,
-                                            tmux_detach_binary,
-                                            CleanupReason::ServerShutdown,
-                                        )
-                                        .await;
-                                        return Ok(());
-                                    }
-                                    InputStep::Room(Err(PtyError::InputClosed))
-                                }
-                            };
-                            match step {
-                                InputStep::Room(permit) => break permit,
-                                InputStep::Output(Some(output)) => {
-                                    if write_terminal_frame(
-                                        send,
-                                        &TerminalFrame::Output(output.bytes().to_vec()),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        cleanup_terminal(
-                                            session,
-                                            tmux_detach_binary,
-                                            CleanupReason::BridgeFailure,
-                                        )
-                                        .await;
-                                        return Ok(());
-                                    }
-                                }
-                                InputStep::Output(None) => output_finished = true,
+                        if waiting.is_some() {
+                            parked = Some(bytes);
+                        } else {
+                            match offer_input(session, bytes) {
+                                Ok(next) => waiting = next,
+                                Err(error) => refused = Some(error),
                             }
-                        };
-                        if let Err(error) =
-                            permit.and_then(|permit| session.input().push(bytes, permit))
-                        {
-                            tracing::info!(error = ?error, "terminal input refused");
-                            let (code, message, reset) = terminal_input_error(error);
-                            send_terminal_error(send, Some(terminal_id), code, message).await;
-                            finish_terminal_error(send, recv, reset).await;
-                            cleanup_terminal(
-                                session,
-                                tmux_detach_binary,
-                                CleanupReason::BridgeFailure,
-                            )
-                            .await;
-                            return Ok(());
                         }
                     }
                     TerminalFrame::Resize(dimensions) => {
-                        if session.request_resize(dimensions).is_err() {
-                            send_terminal_error(
-                                send,
-                                Some(terminal_id),
-                                "internal_error",
-                                "The Mac could not resize the terminal.",
-                            )
-                            .await;
-                            finish_terminal_error(send, recv, STREAM_INTERNAL).await;
-                            cleanup_terminal(
-                                session,
-                                tmux_detach_binary,
-                                CleanupReason::BridgeFailure,
-                            )
-                            .await;
-                            return Ok(());
+                        if let Err(error) = session.request_resize(dimensions) {
+                            refused = Some(error);
                         }
                     }
                     TerminalFrame::Close => {
@@ -4356,6 +4295,20 @@ async fn bridge_terminal(
                         return Ok(());
                     }
                     _ => unreachable!("host receive state accepted only client frames"),
+                }
+            }
+            Event::InputRoom(permit) => {
+                let bytes = waiting
+                    .take()
+                    .map(|waiting| waiting.bytes)
+                    .unwrap_or_default();
+                let queued = permit.and_then(|permit| session.input().push(bytes, permit));
+                match queued.and_then(|()| match parked.take() {
+                    Some(bytes) => offer_input(session, bytes),
+                    None => Ok(None),
+                }) {
+                    Ok(next) => waiting = next,
+                    Err(error) => refused = Some(error),
                 }
             }
             Event::Incoming(Err(error)) => {
@@ -4385,22 +4338,16 @@ async fn bridge_terminal(
             Event::Output(None) => output_finished = true,
             Event::Process(Ok(exit)) => {
                 process_exit = Some(exit);
+                waiting = None;
+                parked = None;
                 let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
             }
             Event::Process(Err(error)) => {
                 tracing::info!(error = ?error, "terminal backend failed");
-                // A backend whose input path ended reports it here when no input was waiting.
-                let (code, message, reset) = if error == PtyError::InputClosed {
-                    terminal_input_error(error)
-                } else {
-                    (
-                        "internal_error",
-                        "The Mac could not observe the shell exit.",
-                        STREAM_INTERNAL,
-                    )
-                };
-                send_terminal_error(send, Some(terminal_id), code, message).await;
-                finish_terminal_error(send, recv, reset).await;
+                let failure = TerminalFailure::of_backend(error);
+                send_terminal_error(send, Some(terminal_id), failure.code(), failure.message())
+                    .await;
+                finish_terminal_error(send, recv, failure.reset()).await;
                 cleanup_terminal(session, tmux_detach_binary, CleanupReason::BridgeFailure).await;
                 return Ok(());
             }
@@ -4417,51 +4364,125 @@ async fn bridge_terminal(
                 return Ok(());
             }
         }
+
+        if let Some(error) = refused {
+            match TerminalFailure::of_refusal(error, exit_watcher.verdict()) {
+                Refusal::Exited(exit) => {
+                    // The backend ended normally first: report its exit, not the refusal.
+                    process_exit = Some(exit);
+                    waiting = None;
+                    parked = None;
+                    let _ = recv.stop(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED));
+                }
+                Refusal::Failed(failure) => {
+                    tracing::info!(error = ?error, failure = ?failure, "terminal input or resize refused");
+                    send_terminal_error(send, Some(terminal_id), failure.code(), failure.message())
+                        .await;
+                    finish_terminal_error(send, recv, failure.reset()).await;
+                    cleanup_terminal(session, tmux_detach_binary, CleanupReason::BridgeFailure)
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
-enum InputStep {
-    Room(Result<crate::terminal_input::InputPermit, PtyError>),
-    Output(Option<crate::terminal_session::TerminalOutput>),
-}
-
-/// Waits for input room or the next output, whichever comes first. The bridge forwards output
-/// while input waits: an Orca viewer answers a write only after it forwards the output queued
-/// ahead of the answer, so waiting for room without draining output would wedge both ways.
-async fn input_room_or_output(
-    session: &mut crate::terminal_session::TerminalSession,
+/// An input frame waiting for room in the backend's byte-bounded queue.
+struct WaitingInput {
+    bytes: Vec<u8>,
     room: std::pin::Pin<
-        &mut impl std::future::Future<Output = Result<crate::terminal_input::InputPermit, PtyError>>,
+        Box<
+            dyn std::future::Future<Output = Result<crate::terminal_input::InputPermit, PtyError>>
+                + Send,
+        >,
     >,
-    output_finished: bool,
-) -> InputStep {
-    tokio::select! {
-        permit = room => InputStep::Room(permit),
-        output = session.next_output(), if !output_finished => InputStep::Output(output),
+}
+
+/// Queues `bytes` now if there is room, or returns them waiting for room.
+fn offer_input(
+    session: &crate::terminal_session::TerminalSession,
+    bytes: Vec<u8>,
+) -> Result<Option<WaitingInput>, PtyError> {
+    let input = session.input();
+    match input.try_reserve(bytes.len())? {
+        Some(permit) => input.push(bytes, permit).map(|()| None),
+        None => {
+            let room = Box::pin(input.reserve(bytes.len()));
+            Ok(Some(WaitingInput { bytes, room }))
+        }
     }
 }
 
-/// The one mapping from a refused input frame to the error the phone shows. Input waits for
-/// room, so a refusal is never backpressure: the frame was invalid or the input path is gone.
-fn terminal_input_error(error: PtyError) -> (&'static str, &'static str, u32) {
-    match error {
-        PtyError::InvalidInput => (
-            "malformed_request",
-            "The terminal input frame is invalid.",
-            STREAM_MALFORMED,
-        ),
-        PtyError::InputClosed
-        | PtyError::ShellUnavailable
-        | PtyError::OpenFailed
-        | PtyError::SpawnFailed
-        | PtyError::SessionUnavailable
-        | PtyError::ResizeFailed
-        | PtyError::WaitFailed
-        | PtyError::CleanupFailed => (
-            "input_closed",
-            "The terminal stopped accepting input.",
-            STREAM_PTY_FAILURE,
-        ),
+/// What the phone is told when a terminal fails. One owner for the code, message and reset, so
+/// the same failure reads the same whether or not input happened to be waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalFailure {
+    /// The phone sent an empty or oversized input frame. Not retryable.
+    MalformedInput,
+    /// The terminal is still there but refused input. Not retryable as is.
+    InputRefused,
+    /// The host lost the terminal's backend or runtime. Reconnecting may succeed.
+    TerminalLost,
+}
+
+enum Refusal {
+    Exited(PtyExit),
+    Failed(TerminalFailure),
+}
+
+impl TerminalFailure {
+    /// A backend's published failure. Backends report `InputClosed` only when a terminal that
+    /// is still running refused input; every other error means the backend itself is gone.
+    fn of_backend(error: PtyError) -> Self {
+        match error {
+            PtyError::InvalidInput => Self::MalformedInput,
+            PtyError::InputClosed => Self::InputRefused,
+            PtyError::ShellUnavailable
+            | PtyError::OpenFailed
+            | PtyError::SpawnFailed
+            | PtyError::SessionUnavailable
+            | PtyError::ResizeFailed
+            | PtyError::WaitFailed
+            | PtyError::CleanupFailed => Self::TerminalLost,
+        }
+    }
+
+    /// An input or resize the bridge could not hand over. The backend's verdict, published
+    /// before it closes any queue, decides; without one the backend still runs and refused.
+    fn of_refusal(error: PtyError, verdict: Option<Result<PtyExit, PtyError>>) -> Refusal {
+        if error == PtyError::InvalidInput {
+            return Refusal::Failed(Self::MalformedInput);
+        }
+        match verdict {
+            Some(Ok(exit)) => Refusal::Exited(exit),
+            Some(Err(error)) => Refusal::Failed(Self::of_backend(error)),
+            None if error == PtyError::InputClosed => Refusal::Failed(Self::InputRefused),
+            None => Refusal::Failed(Self::TerminalLost),
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::MalformedInput => "malformed_request",
+            Self::InputRefused => "input_closed",
+            Self::TerminalLost => "terminal_lost",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::MalformedInput => "The terminal input frame is invalid.",
+            Self::InputRefused => "The terminal stopped accepting input.",
+            Self::TerminalLost => "The Mac lost this terminal. Reconnect to continue.",
+        }
+    }
+
+    fn reset(self) -> u32 {
+        match self {
+            Self::MalformedInput => STREAM_MALFORMED,
+            Self::InputRefused | Self::TerminalLost => STREAM_PTY_FAILURE,
+        }
     }
 }
 
@@ -5171,59 +5192,244 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    /// A viewer that forwards output ahead of answering input must not wedge a bridge whose
-    /// input queue is full: the bridge keeps forwarding output while the next frame waits.
-    #[tokio::test]
-    async fn input_waiting_for_room_keeps_output_flowing() {
-        use super::*;
+    /// `bridge_terminal` over a real local connection, with a scripted Orca runtime behind the
+    /// real viewer. Assertions are on what the phone reads from the terminal stream.
+    mod bridge {
+        use super::super::*;
         use crate::host_protocol::{
-            HOST_PENDING_INPUT_BYTES, HOST_PENDING_OUTPUT_BYTES, MAX_DATA_PAYLOAD,
+            HOST_PENDING_INPUT_BYTES, MAX_DATA_PAYLOAD, read_terminal_frame,
         };
-        let mut session = crate::terminal_session::TerminalSession::Orca(
-            crate::orca::session::OrcaSession::output_before_input(2 * HOST_PENDING_OUTPUT_BYTES),
-        );
-        for _ in 0..HOST_PENDING_INPUT_BYTES / MAX_DATA_PAYLOAD {
-            let permit = session.input().reserve(MAX_DATA_PAYLOAD).await.unwrap();
-            session
-                .input()
-                .push(vec![b'p'; MAX_DATA_PAYLOAD], permit)
-                .unwrap();
+        use crate::orca::session::{OrcaSession, scripted::Orca};
+        use crate::terminal_session::TerminalSession;
+
+        struct Phone {
+            send: iroh::endpoint::SendStream,
+            recv: iroh::endpoint::RecvStream,
+            output: usize,
+            _connection: Connection,
+            _endpoints: (Endpoint, Endpoint),
+            host: tokio::task::JoinHandle<Connection>,
         }
-        let bytes = b"\x1b[A".to_vec();
-        let room = session.input().reserve(bytes.len());
-        tokio::pin!(room);
-        let mut forwarded = 0;
-        let mut output_finished = false;
-        let permit = timeout(Duration::from_secs(10), async {
-            loop {
-                match input_room_or_output(&mut session, room.as_mut(), output_finished).await {
-                    InputStep::Room(permit) => break permit,
-                    InputStep::Output(Some(output)) => forwarded += output.bytes().len(),
-                    InputStep::Output(None) => output_finished = true,
-                }
+
+        /// What the phone saw end the terminal.
+        #[derive(Debug, PartialEq)]
+        enum Ending {
+            Error(String),
+            Exit(String),
+        }
+
+        impl Phone {
+            async fn frame(&mut self, frame: TerminalFrame) {
+                write_terminal_frame(&mut self.send, &frame).await.unwrap();
             }
-        })
-        .await
-        .expect("input waited behind output nobody forwarded");
-        session.input().push(bytes, permit.unwrap()).unwrap();
-        assert!(forwarded >= HOST_PENDING_OUTPUT_BYTES);
+            async fn input(&mut self, bytes: &[u8]) {
+                self.frame(TerminalFrame::Input(bytes.to_vec())).await;
+            }
+            /// Reads until the terminal ends, counting output on the way.
+            async fn ending(&mut self) -> Ending {
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        match read_terminal_frame(&mut self.recv).await.unwrap() {
+                            TerminalFrame::Output(bytes) => self.output += bytes.len(),
+                            TerminalFrame::Error(error) => return Ending::Error(error.code),
+                            TerminalFrame::Exit(exit) => return Ending::Exit(exit.kind),
+                            other => panic!("unexpected frame {other:?}"),
+                        }
+                    }
+                })
+                .await
+                .expect("the terminal did not end")
+            }
+            async fn finish(self) {
+                drop(self.host.await.unwrap());
+            }
+        }
+
+        async fn bridged() -> (Phone, Orca) {
+            let size = crate::host_protocol::Dimensions {
+                cols: 80,
+                rows: 24,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            let (session, orca) = OrcaSession::scripted(size);
+            let host = Endpoint::builder(presets::N0DisableRelay)
+                .secret_key(iroh::SecretKey::generate())
+                .alpns(vec![HOST_ALPN.to_vec()])
+                .transport_config(host_transport_config())
+                .bind()
+                .await
+                .unwrap();
+            let client = Endpoint::builder(presets::N0DisableRelay)
+                .secret_key(iroh::SecretKey::generate())
+                .bind()
+                .await
+                .unwrap();
+            let server = tokio::spawn({
+                let host = host.clone();
+                async move {
+                    let connection = host.accept().await.unwrap().await.unwrap();
+                    let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                    let (_shutdown, shutdown) = watch::channel(false);
+                    let mut session = TerminalSession::Orca(session);
+                    let terminal_id = session.terminal_id().to_owned();
+                    bridge_terminal(
+                        &connection,
+                        &mut send,
+                        &mut recv,
+                        &terminal_id,
+                        &mut session,
+                        None,
+                        &crate::whereabouts::Whereabouts::default(),
+                        shutdown,
+                    )
+                    .await
+                    .unwrap();
+                    connection
+                }
+            });
+            let connection = client.connect(host.addr(), HOST_ALPN).await.unwrap();
+            let (send, recv) = connection.open_bi().await.unwrap();
+            let phone = Phone {
+                send,
+                recv,
+                output: 0,
+                _connection: connection,
+                _endpoints: (host, client),
+                host: server,
+            };
+            (phone, orca)
+        }
+
+        /// A lost runtime reads `terminal_lost`, whether or not input arrived after it died.
+        #[tokio::test]
+        async fn a_lost_runtime_reads_the_same_with_or_without_input_after_it() {
+            let (mut phone, mut orca) = bridged().await;
+            phone.input(b"a").await;
+            let write = orca.write().await;
+            orca.answer_write(&write, true);
+            orca.fail();
+            assert_eq!(phone.ending().await, Ending::Error("terminal_lost".into()));
+            phone.finish().await;
+
+            let (mut phone, mut orca) = bridged().await;
+            phone.input(b"a").await;
+            let _unanswered = orca.write().await;
+            orca.fail();
+            // The viewer has let go of the runtime; its queues may still be open or not.
+            assert_eq!(orca.request().await.method, "terminal.unsubscribe");
+            phone.input(b"b").await;
+            assert_eq!(phone.ending().await, Ending::Error("terminal_lost".into()));
+            phone.finish().await;
+        }
+
+        #[tokio::test]
+        async fn a_refused_write_reads_input_closed() {
+            let (mut phone, mut orca) = bridged().await;
+            phone.input(b"a").await;
+            let write = orca.write().await;
+            orca.answer_write(&write, false);
+            assert_eq!(phone.ending().await, Ending::Error("input_closed".into()));
+            phone.finish().await;
+        }
+
+        /// Spec 002 §8 stops reading input when the queue is full, but a Close right behind
+        /// the waiting frame is still honoured.
+        #[tokio::test]
+        async fn close_behind_waiting_input_is_honoured() {
+            let (mut phone, mut orca) = bridged().await;
+            phone.input(&[b'x'; MAX_DATA_PAYLOAD]).await;
+            let _unanswered = orca.write().await;
+            for _ in 0..=HOST_PENDING_INPUT_BYTES / MAX_DATA_PAYLOAD {
+                phone.input(&[b'x'; MAX_DATA_PAYLOAD]).await;
+            }
+            phone.frame(TerminalFrame::Close).await;
+            assert_eq!(phone.ending().await, Ending::Exit("closed".into()));
+            phone.finish().await;
+        }
+
+        /// The terminal ending while input waits for room is reported as its exit.
+        #[tokio::test]
+        async fn an_exit_while_input_waits_reads_as_the_exit() {
+            let (mut phone, mut orca) = bridged().await;
+            phone.input(&[b'x'; MAX_DATA_PAYLOAD]).await;
+            let _unanswered = orca.write().await;
+            for _ in 0..=HOST_PENDING_INPUT_BYTES / MAX_DATA_PAYLOAD {
+                phone.input(&[b'x'; MAX_DATA_PAYLOAD]).await;
+            }
+            orca.end();
+            assert_eq!(phone.ending().await, Ending::Exit("closed".into()));
+            phone.finish().await;
+        }
+
+        const FLOOD_BYTES: usize = 16 * crate::host_protocol::HOST_PENDING_OUTPUT_BYTES;
+
+        /// A viewer that forwards output ahead of answering a write must not wedge a bridge
+        /// whose input queue is full: output keeps flowing while the next frame waits.
+        #[tokio::test]
+        async fn output_keeps_flowing_while_input_waits() {
+            let (mut phone, mut orca) = bridged().await;
+            phone.input(&[b'x'; MAX_DATA_PAYLOAD]).await;
+            let first = orca.write().await;
+            for _ in 0..=HOST_PENDING_INPUT_BYTES / MAX_DATA_PAYLOAD {
+                phone.input(&[b'x'; MAX_DATA_PAYLOAD]).await;
+            }
+            // Far more output than the queues hold, ahead of the write's answer: the bridge
+            // reaches its waiting frame long before this drains.
+            let flood = "o".repeat(MAX_DATA_PAYLOAD);
+            for _ in 0..FLOOD_BYTES / MAX_DATA_PAYLOAD {
+                orca.data(&flood);
+            }
+            orca.answer_write(&first, true);
+            // The viewer reaches the answer only if the bridge drained the flood. The phone
+            // keeps reading meanwhile, as a real one does.
+            let runtime = async {
+                let second = orca.write().await;
+                orca.answer_write(&second, true);
+                orca.end();
+            };
+            let (ending, ()) = tokio::join!(phone.ending(), runtime);
+            assert_eq!(ending, Ending::Exit("closed".into()));
+            assert!(phone.output >= FLOOD_BYTES);
+            phone.finish().await;
+        }
     }
 
     #[test]
-    fn refused_input_is_never_reported_as_backpressure() {
+    fn terminal_failures_have_one_meaning_each() {
         use super::*;
+        use TerminalFailure::*;
+        let failed = |error, verdict| match TerminalFailure::of_refusal(error, verdict) {
+            Refusal::Failed(failure) => Some(failure),
+            Refusal::Exited(_) => None,
+        };
+        assert_eq!(failed(PtyError::InvalidInput, None), Some(MalformedInput));
+        assert_eq!(failed(PtyError::InputClosed, None), Some(InputRefused));
+        assert_eq!(failed(PtyError::ResizeFailed, None), Some(TerminalLost));
         assert_eq!(
-            terminal_input_error(PtyError::InputClosed),
-            (
-                "input_closed",
-                "The terminal stopped accepting input.",
-                STREAM_PTY_FAILURE
-            )
+            failed(PtyError::InputClosed, Some(Err(PtyError::WaitFailed))),
+            Some(TerminalLost)
         );
         assert_eq!(
-            terminal_input_error(PtyError::InvalidInput).0,
-            "malformed_request"
+            failed(PtyError::InputClosed, Some(Ok(PtyExit::Closed))),
+            None,
+            "an exit is reported as the exit"
         );
+        assert_eq!(
+            TerminalFailure::of_backend(PtyError::InputClosed),
+            InputRefused
+        );
+        assert_eq!(
+            TerminalFailure::of_backend(PtyError::WaitFailed),
+            TerminalLost
+        );
+        for (failure, code, reset) in [
+            (MalformedInput, "malformed_request", STREAM_MALFORMED),
+            (InputRefused, "input_closed", STREAM_PTY_FAILURE),
+            (TerminalLost, "terminal_lost", STREAM_PTY_FAILURE),
+        ] {
+            assert_eq!((failure.code(), failure.reset()), (code, reset));
+        }
     }
 
     #[tokio::test]

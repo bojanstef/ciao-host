@@ -97,6 +97,10 @@ pub(crate) struct PtyExitWatcher {
 }
 
 impl PtyExitWatcher {
+    pub(crate) fn verdict(&self) -> Option<Result<PtyExit, PtyError>> {
+        self.receiver.borrow().clone()
+    }
+
     pub(crate) async fn wait(&mut self) -> Result<PtyExit, PtyError> {
         loop {
             if let Some(result) = self.receiver.borrow().clone() {

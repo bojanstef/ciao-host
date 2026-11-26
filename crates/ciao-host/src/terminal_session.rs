@@ -41,6 +41,15 @@ impl TerminalOutput {
     }
 }
 impl TerminalExitWatcher {
+    /// The backend's verdict, if it has published one. Backends publish it before closing any
+    /// of their queues, so a refused input or resize can always be explained.
+    pub(crate) fn verdict(&self) -> Option<Result<PtyExit, PtyError>> {
+        match self {
+            Self::Pty(watcher) => watcher.verdict(),
+            Self::Core(watcher) => watcher.verdict(),
+            Self::Orca(rx) => rx.borrow().clone(),
+        }
+    }
     pub(crate) async fn wait(&mut self) -> Result<PtyExit, PtyError> {
         match self {
             Self::Pty(watcher) => watcher.wait().await,
