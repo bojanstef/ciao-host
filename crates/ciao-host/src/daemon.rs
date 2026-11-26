@@ -3063,6 +3063,7 @@ async fn handle_agent_stream(
     remote_id: EndpointId,
     state: Arc<RuntimeState>,
 ) -> Result<()> {
+    let send = &mut AgentSend::new(send);
     // Recheck local authorization before decoding the operation handshake.
     if !state.paired_devices.lock().contains(remote_id) {
         send_agent_error(send, "authorization_denied").await;
@@ -3071,18 +3072,18 @@ async fn handle_agent_stream(
     let open_body = match timeout(HOST_OPERATION_TIMEOUT, read_agent_frame(recv)).await {
         Ok(Ok(body)) => body,
         Ok(Err(error)) => {
-            reset_stream(send, recv, agent_stream_reset_code(&error));
+            send.end_after_failure(recv, agent_stream_reset_code(&error));
             return Ok(());
         }
         Err(_) => {
-            reset_stream(send, recv, STREAM_MALFORMED);
+            send.end_after_failure(recv, STREAM_MALFORMED);
             return Ok(());
         }
     };
     let open: AgentStreamOpen = match decode_agent_body(&open_body) {
         Ok(open) => open,
         Err(error) => {
-            reset_stream(send, recv, agent_stream_reset_code(&error));
+            send.end_after_failure(recv, agent_stream_reset_code(&error));
             return Ok(());
         }
     };
@@ -3141,9 +3142,80 @@ async fn handle_agent_stream(
         );
         // Ended here, not left to `Drop`: the connection outlives a failed subscription, and a
         // read the phone parked on it must return.
-        reset_stream(send, recv, agent_stream_error_reset_code(&error));
+        send.end_after_failure(recv, agent_stream_error_reset_code(&error));
     }
     Ok(())
+}
+
+/// Whether an agent stream's send half has been finished. Once it has, the frames before the
+/// FIN are the phone's answer, and a reset would discard whichever of them the phone has not
+/// acknowledged yet: the transport stops retransmitting a stream once it is reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentSendHalf {
+    Open,
+    /// Finished here, or found already closed when finishing was attempted.
+    Finished,
+}
+
+/// An agent stream's send half together with its [`AgentSendHalf`], so that a failure after
+/// the answer was finished ends the stream without destroying the answer. Every agent-stream
+/// function writes through this, never through the bare stream, so the state cannot go stale.
+struct AgentSend<'a> {
+    stream: &'a mut iroh::endpoint::SendStream,
+    half: AgentSendHalf,
+}
+
+impl<'a> AgentSend<'a> {
+    fn new(stream: &'a mut iroh::endpoint::SendStream) -> Self {
+        Self {
+            stream,
+            half: AgentSendHalf::Open,
+        }
+    }
+
+    /// Finishes the send half. True when this call finished it, false when it was already
+    /// finished or reset.
+    fn finish(&mut self) -> bool {
+        self.half = AgentSendHalf::Finished;
+        self.stream.finish().is_ok()
+    }
+
+    /// Ends a stream whose handler failed. An open send half is reset with `code`; a finished
+    /// one is left to deliver its answer, and only the receive half is stopped.
+    fn end_after_failure(&mut self, recv: &mut iroh::endpoint::RecvStream, code: u32) {
+        match self.half {
+            AgentSendHalf::Open => reset_stream(self.stream, recv, code),
+            AgentSendHalf::Finished => {
+                let _ = recv.stop(VarInt::from_u32(code));
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for AgentSend<'_> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut *self.get_mut().stream), cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut *self.get_mut().stream), cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.half = AgentSendHalf::Finished;
+        tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut *this.stream), cx)
+    }
 }
 
 /// The reset code for an agent stream that failed: the protocol error's own code when there is
@@ -3168,7 +3240,7 @@ fn agent_stream_error_category(error: &anyhow::Error) -> &'static str {
 
 async fn serve_agent_operation(
     connection: &Connection,
-    send: &mut iroh::endpoint::SendStream,
+    send: &mut AgentSend<'_>,
     recv: &mut iroh::endpoint::RecvStream,
     remote_id: EndpointId,
     state: Arc<RuntimeState>,
@@ -3736,8 +3808,10 @@ async fn serve_agent_operation(
                                     break;
                                 }
                                 if command.session_id != session_id {
+                                    // The phone ends its subscription on any Error frame, so
+                                    // the error is this stream's last frame.
                                     send_agent_error(send, "session_mismatch").await;
-                                    continue;
+                                    break;
                                 }
                                 let receipt = state.agent_sessions.submit_command(command).await;
                                 write_agent_frame(
@@ -3951,7 +4025,7 @@ async fn require_finished_agent_request(recv: &mut iroh::endpoint::RecvStream) -
     }
 }
 
-async fn send_agent_error(send: &mut iroh::endpoint::SendStream, code: &str) {
+async fn send_agent_error(send: &mut AgentSend<'_>, code: &str) {
     // Every refusal on this stream passes through here, so this is the one place that makes
     // a rejected request distinguishable from one that never arrived. The lifecycle log only
     // fires where an outcome exists, which is why a promote rejected during handshake
@@ -3968,9 +4042,9 @@ async fn send_agent_error(send: &mut iroh::endpoint::SendStream, code: &str) {
     finish_agent_send(send).await;
 }
 
-async fn finish_agent_send(send: &mut iroh::endpoint::SendStream) {
-    if send.finish().is_ok() {
-        let _ = timeout(Duration::from_secs(1), send.stopped()).await;
+async fn finish_agent_send(send: &mut AgentSend<'_>) {
+    if send.finish() {
+        let _ = timeout(Duration::from_secs(1), send.stream.stopped()).await;
     }
 }
 
@@ -8532,96 +8606,133 @@ mod tests {
         paired.hang_up().await;
     }
 
+    /// A live Pi session the adapter bridge registered, and a subscription to it that has
+    /// already delivered its snapshot.
+    struct LiveSubscription {
+        snapshot: crate::agent_protocol::AgentSessionSnapshot,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+        adapter_bridge: UnixStream,
+        bridge_task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl LiveSubscription {
+        async fn open(paired: &PairedHost) -> Self {
+            use crate::agent_protocol::{AgentStreamOpen, CAPABILITY_AGENT_SESSION_V1};
+
+            let (daemon_bridge, mut adapter_bridge) = UnixStream::pair().unwrap();
+            let bridge_task = tokio::spawn({
+                let state = paired.state.clone();
+                async move { handle_agent_bridge(daemon_bridge, state).await }
+            });
+            write_agent_frame(
+                &mut adapter_bridge,
+                &serde_json::json!({
+                    "v": 1,
+                    "type": "register",
+                    "adapter": "pi",
+                    "adapter_version": crate::pi_adapter::PINNED_PI_VERSION,
+                    "mode": "tui",
+                    "session_id": "fixture-upstream-session",
+                    "process_nonce": "0123456789abcdef0123456789abcdef",
+                    "process_id": std::process::id(),
+                    "workspace_display": "Fixture workspace",
+                    "commands": {
+                        "prompt": true,
+                        "steer": true,
+                        "follow_up": true,
+                        "interrupt": true
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            let registered: serde_json::Value =
+                decode_agent_body(&read_agent_frame(&mut adapter_bridge).await.unwrap()).unwrap();
+            assert_eq!(registered["type"], "registered");
+            let session_id = registered["session_id"].as_str().unwrap().to_owned();
+            for frame in [
+                serde_json::json!({"v": 1, "type": "snapshot_start"}),
+                serde_json::json!({"v": 1, "type": "snapshot_end"}),
+            ] {
+                write_agent_frame(&mut adapter_bridge, &frame)
+                    .await
+                    .unwrap();
+            }
+            timeout(Duration::from_secs(2), async {
+                while paired.state.agent_sessions.snapshot(&session_id).is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the adapter's snapshot never landed");
+
+            let (mut send, mut recv) = paired.connection.open_bi().await.unwrap();
+            write_stream_preface(&mut send, StreamKind::Agent)
+                .await
+                .unwrap();
+            write_agent_frame(
+                &mut send,
+                &AgentStreamOpen {
+                    v: 1,
+                    message_type: "agent_stream_open".into(),
+                    client_instance_id: "0123456789abcdef0123456789abcdef".into(),
+                    operation: "agent.session.subscribe".into(),
+                    capabilities: vec![CAPABILITY_AGENT_SESSION_V1.into()],
+                    session_id: Some(session_id.clone()),
+                    before_sequence: None,
+                    page_limit: None,
+                    workspace_id: None,
+                    lifecycle_command_id: None,
+                    expected_generation: None,
+                    entry_id: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_agent_server(&mut recv).await,
+                AgentServerFrame::StreamAccepted { .. }
+            ));
+            let AgentServerFrame::SessionSnapshot { snapshot, .. } =
+                read_agent_server(&mut recv).await
+            else {
+                panic!("expected the subscription's snapshot");
+            };
+            Self {
+                snapshot: *snapshot,
+                send,
+                recv,
+                adapter_bridge,
+                bridge_task,
+            }
+        }
+    }
+
+    async fn end_adapter_bridge(
+        adapter_bridge: UnixStream,
+        bridge_task: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        drop(adapter_bridge);
+        let _ = timeout(Duration::from_secs(3), bridge_task).await;
+    }
+
     /// An Agent subscription whose phone resets it must end the host's half explicitly, not by
     /// whatever `Drop` happens to do, so the phone's parked read returns and the connection
     /// stays up for the next subscription.
     #[tokio::test]
     async fn a_reset_subscription_ends_the_host_half() {
-        use crate::agent_protocol::{AgentStreamOpen, CAPABILITY_AGENT_SESSION_V1};
-
         let paired = PairedHost::start(WorkspaceConfig::for_home(std::path::Path::new(
             "/nonexistent-test-home",
         )))
         .await;
-        let (daemon_bridge, mut adapter_bridge) = UnixStream::pair().unwrap();
-        let bridge_task = tokio::spawn({
-            let state = paired.state.clone();
-            async move { handle_agent_bridge(daemon_bridge, state).await }
-        });
-        write_agent_frame(
-            &mut adapter_bridge,
-            &serde_json::json!({
-                "v": 1,
-                "type": "register",
-                "adapter": "pi",
-                "adapter_version": crate::pi_adapter::PINNED_PI_VERSION,
-                "mode": "tui",
-                "session_id": "fixture-upstream-session",
-                "process_nonce": "0123456789abcdef0123456789abcdef",
-                "process_id": std::process::id(),
-                "workspace_display": "Fixture workspace",
-                "commands": {
-                    "prompt": true,
-                    "steer": true,
-                    "follow_up": true,
-                    "interrupt": true
-                }
-            }),
-        )
-        .await
-        .unwrap();
-        let registered: serde_json::Value =
-            decode_agent_body(&read_agent_frame(&mut adapter_bridge).await.unwrap()).unwrap();
-        assert_eq!(registered["type"], "registered");
-        let session_id = registered["session_id"].as_str().unwrap().to_owned();
-        for frame in [
-            serde_json::json!({"v": 1, "type": "snapshot_start"}),
-            serde_json::json!({"v": 1, "type": "snapshot_end"}),
-        ] {
-            write_agent_frame(&mut adapter_bridge, &frame)
-                .await
-                .unwrap();
-        }
-        timeout(Duration::from_secs(2), async {
-            while paired.state.agent_sessions.snapshot(&session_id).is_none() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the adapter's snapshot never landed");
-
-        let (mut send, mut recv) = paired.connection.open_bi().await.unwrap();
-        write_stream_preface(&mut send, StreamKind::Agent)
-            .await
-            .unwrap();
-        write_agent_frame(
-            &mut send,
-            &AgentStreamOpen {
-                v: 1,
-                message_type: "agent_stream_open".into(),
-                client_instance_id: "0123456789abcdef0123456789abcdef".into(),
-                operation: "agent.session.subscribe".into(),
-                capabilities: vec![CAPABILITY_AGENT_SESSION_V1.into()],
-                session_id: Some(session_id.clone()),
-                before_sequence: None,
-                page_limit: None,
-                workspace_id: None,
-                lifecycle_command_id: None,
-                expected_generation: None,
-                entry_id: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_agent_server(&mut recv).await,
-            AgentServerFrame::StreamAccepted { .. }
-        ));
-        assert!(matches!(
-            read_agent_server(&mut recv).await,
-            AgentServerFrame::SessionSnapshot { .. }
-        ));
-
+        let LiveSubscription {
+            mut send,
+            recv,
+            adapter_bridge,
+            bridge_task,
+            ..
+        } = LiveSubscription::open(&paired).await;
         let parked = park_read(recv).await;
         send.reset(VarInt::from_u32(crate::host_protocol::STREAM_CANCELLED))
             .unwrap();
@@ -8637,9 +8748,130 @@ mod tests {
         );
         assert!(paired.connection.close_reason().is_none());
         assert_host_info_answers(&paired.connection).await;
-
-        drop(adapter_bridge);
-        let _ = timeout(Duration::from_secs(3), bridge_task).await;
+        end_adapter_bridge(adapter_bridge, bridge_task).await;
         paired.hang_up().await;
+    }
+
+    /// The phone treats an Error frame inside a subscription as the subscription's end, so a
+    /// refused command ends it on the host too: the error is the stream's last frame, the
+    /// stream is finished behind it, and the subscription's slot is released. A host that kept
+    /// serving went on reading commands from a phone that had stopped listening, and the next
+    /// write to the finished stream failed into a reset that could discard the error itself.
+    #[tokio::test]
+    async fn a_refused_subscription_command_ends_the_subscription() {
+        use crate::agent_protocol::{AgentCommand, AgentCommandKind};
+
+        let paired = PairedHost::start(WorkspaceConfig::for_home(std::path::Path::new(
+            "/nonexistent-test-home",
+        )))
+        .await;
+        let LiveSubscription {
+            snapshot,
+            mut send,
+            mut recv,
+            adapter_bridge,
+            bridge_task,
+            ..
+        } = LiveSubscription::open(&paired).await;
+        assert_eq!(paired.state.active_agent_subscriptions.lock().total, 1);
+
+        write_agent_frame(
+            &mut send,
+            &AgentClientFrame::CommandSubmit {
+                command: AgentCommand {
+                    v: 1,
+                    command_id: "22222222222222222222222222222222".into(),
+                    session_id: "another-session".into(),
+                    snapshot_epoch: snapshot.snapshot_epoch,
+                    expected_generation: snapshot.process_generation,
+                    expected_revision: Some(snapshot.revision),
+                    kind: AgentCommandKind::Prompt {
+                        text: "Synthetic misaddressed command.".into(),
+                    },
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let AgentServerFrame::Error { code, .. } = read_agent_server(&mut recv).await else {
+            panic!("expected the refusal");
+        };
+        assert_eq!(code, "session_mismatch");
+        let rest = timeout(Duration::from_secs(2), recv.read_to_end(64))
+            .await
+            .expect("the refused subscription was never finished")
+            .expect("the refused subscription ended other than by FIN");
+        assert!(rest.is_empty());
+        timeout(Duration::from_secs(3), async {
+            while paired.state.active_agent_subscriptions.lock().total != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the host kept serving a subscription the phone has stopped listening to");
+        assert!(paired.connection.close_reason().is_none());
+        assert_host_info_answers(&paired.connection).await;
+        end_adapter_bridge(adapter_bridge, bridge_task).await;
+        paired.hang_up().await;
+    }
+
+    /// A failure after an agent answer was finished must not reset the stream: a reset stops
+    /// the transport retransmitting the answer, so whatever of it the phone had not yet
+    /// acknowledged would be lost. Finishing and failing with no await between them leaves the
+    /// whole answer unsent, which makes that loss certain rather than a matter of packet luck.
+    #[tokio::test]
+    async fn a_failure_after_a_finished_agent_answer_keeps_the_answer() {
+        const ALPN: &[u8] = b"ciao-test/agent-send";
+        let host = Endpoint::builder(presets::N0DisableRelay)
+            .secret_key(iroh::SecretKey::generate())
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let client = Endpoint::builder(presets::N0DisableRelay)
+            .secret_key(iroh::SecretKey::generate())
+            .bind()
+            .await
+            .unwrap();
+        let accepted = tokio::spawn({
+            let host = host.clone();
+            async move { host.accept().await.unwrap().await.unwrap() }
+        });
+        let connection = client.connect(host.addr(), ALPN).await.unwrap();
+        let host_connection = accepted.await.unwrap();
+        let (mut client_send, mut client_recv) = connection.open_bi().await.unwrap();
+        // A stream reaches the other side with its first byte.
+        client_send.write_all(b"x").await.unwrap();
+        let (mut send, mut recv) = host_connection.accept_bi().await.unwrap();
+
+        let mut agent_send = AgentSend::new(&mut send);
+        write_agent_frame(
+            &mut agent_send,
+            &AgentServerFrame::Error {
+                v: AGENT_PROTOCOL_VERSION,
+                code: "session_mismatch".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(agent_send.finish());
+        agent_send.end_after_failure(&mut recv, STREAM_INTERNAL);
+
+        let answer = timeout(Duration::from_secs(2), read_agent_frame(&mut client_recv))
+            .await
+            .expect("the answer never arrived")
+            .expect("the finished answer was destroyed by a reset");
+        let AgentServerFrame::Error { code, .. } = decode_agent_body(&answer).unwrap() else {
+            panic!("expected the finished answer");
+        };
+        assert_eq!(code, "session_mismatch");
+        let rest = timeout(Duration::from_secs(2), client_recv.read_to_end(64))
+            .await
+            .unwrap()
+            .expect("the finished answer ended other than by FIN");
+        assert!(rest.is_empty());
+        connection.close(0_u32.into(), b"test complete");
+        client.close().await;
+        host.close().await;
     }
 }
